@@ -127,7 +127,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // Unknown id => revoked:true. A licenseId this hub never issued has no
     // business running; failing safe here is the whole kill switch.
     const revoked = !store.isKnown(body.licenseId) || store.isRevoked(body.licenseId);
-    sendJson(res, 200, revoked ? { ok: true, revoked: true } : { ok: true });
+    // The reply also carries the latest published beta version (when one
+    // exists) so the bot can show "update available" — informational only;
+    // a bot that ignores it loses nothing.
+    const latest = readLatest()?.version;
+    sendJson(res, 200, {
+      ok: true,
+      ...(revoked ? { revoked: true } : {}),
+      ...(latest ? { latest } : {}),
+    });
   }
 
   async function feedbackIntake(req: IncomingMessage, res: ServerResponse): Promise<void> {
