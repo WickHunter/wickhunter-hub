@@ -18,6 +18,7 @@ export interface HubConfig {
   port: number;
   adminToken: string;   // HUB_ADMIN_TOKEN; empty = the whole admin surface answers 503
   publicOrigin: string; // what testers paste, e.g. https://45.76.105.174/hub
+  srcDir: string;       // git checkout the self-upgrade pulls + reinstalls from
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
@@ -34,5 +35,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     port,
     adminToken: env.HUB_ADMIN_TOKEN ?? "",
     publicOrigin: env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`,
+    srcDir: env.HUB_SRC_DIR ?? "/root/dev/wickhunter-hub",
   };
 }

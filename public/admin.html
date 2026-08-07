@@ -1,7 +1,8 @@
 <!doctype html>
-<!-- Wick Hunter hub admin. Deliberately minimal: one page, three API calls
-     (list / issue / revoke). The admin token is prompted for once and kept in
-     a JS variable only — no cookies, no sessions, nothing persisted. -->
+<!-- Wick Hunter hub admin. Deliberately minimal: one page, a handful of API
+     calls. The admin token is entered through a REAL password form (so the
+     browser's password manager can save and autofill it) but is kept in a JS
+     variable only — no cookies, no sessions, nothing persisted by the page. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -9,30 +10,61 @@
 <title>Wick Hunter Hub</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 68rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; } h1 small { font-weight: normal; opacity: .6; }
-  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8884; white-space: nowrap; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 68rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin: 1.2rem 0 .4rem; } h1 small { font-weight: normal; opacity: .6; }
+  .tbl { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #8884; white-space: nowrap; }
   td.name { white-space: normal; }
   .revoked { opacity: .5; text-decoration: line-through; }
   .state-active { color: #2a7; } .state-expired { color: #b80; } .state-revoked { color: #c33; }
-  form { display: flex; gap: .5rem; align-items: center; margin-top: 1.5rem; flex-wrap: wrap; }
-  input, button { font: inherit; padding: .3rem .6rem; }
-  input[name=name] { width: 16rem; } input[name=days] { width: 5rem; }
+  form, .actions { display: flex; gap: .5rem; align-items: center; margin-top: .8rem; flex-wrap: wrap; }
+  input, button, select { font: inherit; padding: .45rem .7rem; min-height: 2.6rem; border-radius: 6px; }
+  button { cursor: pointer; }
+  input[name=name] { width: 14rem; max-width: 100%; } input[name=days] { width: 5rem; }
   #issued { margin-top: 1rem; padding: 1rem; border: 1px solid #8884; border-radius: 6px; display: none; }
   #issued textarea { width: 100%; font: 12px/1.4 ui-monospace, monospace; margin-top: .5rem; }
-  #err { color: #c33; margin-top: 1rem; }
+  #err { color: #c33; margin-top: 1rem; overflow-wrap: anywhere; }
+  #note { color: #2a7; margin-top: 1rem; }
   button.revoke { color: #c33; }
+  .muted { opacity: .6; }
+  /* sign-in overlay: a real form so password managers offer autofill */
+  #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
+  #gate .card { width: min(92vw, 22rem); border: 1px solid #8884; border-radius: 10px; padding: 1.2rem; }
+  #gate input[type=password] { width: 100%; font-size: 16px; } /* 16px = no iOS zoom */
+  #gate button { width: 100%; margin-top: .6rem; }
+  @media (max-width: 640px) {
+    body { margin: .8rem auto; }
+    th, td { padding: .4rem .45rem; }
+    input[name=name] { width: 100%; }
+  }
 </style>
 </head>
 <body>
+
+<div id="gate">
+  <form class="card" id="gateForm" method="post" action="#">
+    <h1 style="margin-top:0">Wick Hunter Hub</h1>
+    <p class="muted" style="margin:.2rem 0 .8rem">Enter the hub admin token.</p>
+    <input type="text" name="username" value="hub-admin" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+    <input type="password" name="token" autocomplete="current-password" autocapitalize="none" spellcheck="false" required placeholder="HUB_ADMIN_TOKEN">
+    <button type="submit">Sign in</button>
+    <div id="gateErr" style="color:#c33;margin-top:.6rem"></div>
+  </form>
+</div>
+
 <h1>Wick Hunter Hub <small>— beta licensing</small></h1>
+<div class="actions">
+  <button type="button" id="refresh">Refresh</button>
+  <button type="button" id="upgradeHub">Upgrade hub</button>
+  <span id="hubVer" class="muted"></span>
+</div>
 
 <form id="issueForm">
   <input name="name" placeholder="Tester name" required>
   <input name="days" type="number" value="30" min="1" max="3650" required> days
   <button type="submit">Issue license</button>
-  <button type="button" id="refresh">Refresh</button>
 </form>
 
 <div id="issued">
@@ -42,33 +74,44 @@
 </div>
 
 <div id="err"></div>
-<table>
+<div id="note"></div>
+<div class="tbl"><table>
   <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th></th></tr></thead>
   <tbody id="rows"><tr><td colspan="8">loading…</td></tr></tbody>
-</table>
+</table></div>
 
-<h1 style="margin-top:2.5rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
-<form onsubmit="return false">
+<h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
+<div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
   <button type="button" id="fbExport">Export all (JSON, logs included)</button>
-  <span style="opacity:.6">Export is the file to hand to your assistant for triage.</span>
-</form>
-<table>
+  <span class="muted">Export is the file to hand to your assistant for triage.</span>
+</div>
+<div class="tbl"><table>
   <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th></tr></thead>
   <tbody id="fbRows"><tr><td colspan="7">loading…</td></tr></tbody>
-</table>
+</table></div>
 
 <script>
 "use strict";
 // Works both direct (http://127.0.0.1:8091/admin) and behind nginx (/hub/admin):
 // strip the trailing /admin from wherever this page was served.
 const base = location.pathname.replace(/\/admin\/?$/, "");
-let token = ""; // memory only, by design
-let installCmd = "";
+let token = ""; // memory only, by design — the browser's password manager persists it
 
-function askToken(msg) {
-  token = window.prompt(msg || "Hub admin token (x-hub-admin):") || "";
+function showGate(msg) {
+  document.getElementById("gateErr").textContent = msg || "";
+  document.getElementById("gate").style.display = "grid";
+  document.querySelector("#gateForm input[name=token]").focus();
 }
+
+document.getElementById("gateForm").onsubmit = (ev) => {
+  ev.preventDefault();
+  token = ev.target.token.value.trim();
+  if (!token) return;
+  document.getElementById("gate").style.display = "none";
+  refresh();
+  fbRefresh();
+};
 
 async function api(path, opts) {
   const res = await fetch(base + path, Object.assign({}, opts, {
@@ -76,7 +119,7 @@ async function api(path, opts) {
                            (opts && opts.headers) || {}),
   }));
   const body = await res.json().catch(() => ({ ok: false, error: "bad response" }));
-  if (res.status === 401) { askToken("Wrong token — try again:"); throw new Error("unauthorized"); }
+  if (res.status === 401) { showGate("Wrong token — try again."); throw new Error("unauthorized"); }
   if (!body.ok) throw new Error(body.error || ("HTTP " + res.status));
   return body;
 }
@@ -89,7 +132,7 @@ async function refresh() {
   err.textContent = "";
   let data;
   try { data = await api("/admin/api/licenses"); }
-  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; else refresh(); return; }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
   const rows = document.getElementById("rows");
   rows.innerHTML = "";
   if (data.licenses.length === 0) {
@@ -116,7 +159,7 @@ async function refresh() {
       btn.onclick = async () => {
         if (!confirm("Revoke license for " + l.name + "? Their bot stops at its next check-in.")) return;
         try { await api("/admin/api/licenses/revoke", { method: "POST", body: JSON.stringify({ id: l.id }) }); }
-        catch (e) { err.textContent = e.message; }
+        catch (e) { document.getElementById("err").textContent = e.message; }
         refresh();
       };
       tr.lastElementChild.appendChild(btn);
@@ -125,6 +168,7 @@ async function refresh() {
   }
 }
 
+let installCmd = "";
 document.getElementById("issueForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const f = ev.target;
@@ -145,15 +189,46 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
     refresh();
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
-
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = refresh;
+document.getElementById("refresh").onclick = () => { refresh(); fbRefresh(); };
 
+// ── self-upgrade ────────────────────────────────────────────────────────────
+async function health() {
+  try { return (await (await fetch(base + "/api/health")).json()).version || ""; }
+  catch { return ""; }
+}
+document.getElementById("upgradeHub").onclick = async () => {
+  if (!confirm("Upgrade the hub to the latest pushed version? It pulls the source checkout, reinstalls, and restarts itself (takes ~1 minute).")) return;
+  const note = document.getElementById("note");
+  const err = document.getElementById("err");
+  err.textContent = ""; note.textContent = "";
+  const before = await health();
+  let started;
+  try { started = await api("/admin/api/upgrade", { method: "POST" }); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+  note.textContent = "Upgrading from v" + (before || started.version) + " — waiting for the hub to come back…";
+  const t0 = Date.now();
+  const poll = setInterval(async () => {
+    const v = await health();
+    if (v && v !== before) {
+      clearInterval(poll);
+      note.textContent = "Hub upgraded: v" + before + " → v" + v + ".";
+      refresh(); fbRefresh();
+    } else if (Date.now() - t0 > 120000) {
+      clearInterval(poll);
+      err.textContent = "The hub did not report a new version after 2 minutes. If it is still on v" + before +
+        ", there may have been nothing new to pull, or the upgrade failed — check data/upgrade.log on the VPS.";
+    }
+  }, 3000);
+};
+health().then((v) => { document.getElementById("hubVer").textContent = v ? "hub v" + v : ""; });
+
+// ── feedback ────────────────────────────────────────────────────────────────
 async function fbRefresh() {
   const err = document.getElementById("err");
   let data;
   try { data = await api("/admin/api/feedback"); }
-  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; else fbRefresh(); return; }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
   const rows = document.getElementById("fbRows");
   rows.innerHTML = "";
   if (data.reports.length === 0) {
@@ -170,7 +245,7 @@ async function fbRefresh() {
       "<td>" + esc(r.version || "—") + "</td>" +
       "<td>" + r.logLines + (r.logsTruncated ? "+" : "") + "</td>" +
       "<td></td>" +
-      '<td class="name" style="white-space:normal;max-width:28rem">' + esc(r.text) + "</td>";
+      '<td class="name" style="white-space:normal;min-width:14rem;max-width:28rem">' + esc(r.text) + "</td>";
     const sel = document.createElement("select");
     for (const s of ["new", "discussing", "fixed"]) {
       const o = document.createElement("option");
@@ -186,12 +261,10 @@ async function fbRefresh() {
     rows.appendChild(tr);
   }
 }
-
 document.getElementById("fbRefresh").onclick = fbRefresh;
 document.getElementById("fbExport").onclick = async () => {
-  // fetch with the admin header, then hand the bytes to the browser as a file.
   const res = await fetch(base + "/admin/api/feedback/export", { headers: { "x-hub-admin": token } });
-  if (res.status === 401) { askToken("Wrong token — try again:"); return; }
+  if (res.status === 401) { showGate("Wrong token — try again."); return; }
   const blob = await res.blob();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -200,9 +273,7 @@ document.getElementById("fbExport").onclick = async () => {
   URL.revokeObjectURL(a.href);
 };
 
-askToken();
-refresh();
-fbRefresh();
+showGate();
 </script>
 </body>
 </html>

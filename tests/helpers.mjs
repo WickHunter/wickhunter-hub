@@ -23,7 +23,7 @@ export function freshStore() {
 }
 
 /** A full hub on an ephemeral port. Returns fetch-ready origin + teardown. */
-export async function freshHub(overrides = {}) {
+export async function freshHub(overrides = {}, deps = undefined) {
   const { store, dataDir } = freshStore();
   const releasesDir = tmpDir("releases");
   const cfg = {
@@ -35,9 +35,10 @@ export async function freshHub(overrides = {}) {
     port: 0,
     adminToken: "test-admin-token",
     publicOrigin: "https://hub.test/hub",
+    srcDir: "/nonexistent/hub-src",
     ...overrides,
   };
-  const hub = createHub(cfg);
+  const hub = createHub(cfg, deps);
   const port = await hub.listen();
   return {
     hub,

@@ -15,6 +15,7 @@
 //   admin    GET  /admin/api/feedback            report list (sans logs)
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
+//   admin    POST /admin/api/upgrade             self-upgrade: git pull + install-hub.sh (detached)
 //
 // "keyed" = a valid, unexpired, unrevoked LHK1 token in ?key=. "admin" = the
 // HUB_ADMIN_TOKEN in an x-hub-admin header, compared constant-time. No
@@ -37,6 +38,7 @@ import {
 import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
 import { HUB_VERSION } from "./version.js";
+import { spawn as nodeSpawn } from "node:child_process";
 
 const MAX_BODY_BYTES = 64 * 1024; // largest legitimate body is a tiny JSON object
 // Feedback carries a bounded log tail (see feedback.ts caps) — its own limit:
@@ -56,8 +58,15 @@ interface LatestJson {
   sha256: string;
 }
 
-export function createHub(cfg: HubConfig): Hub {
+export interface HubDeps {
+  /** Injectable for tests; production is node:child_process.spawn. */
+  spawn?: typeof nodeSpawn;
+}
+
+export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
+  const spawn = deps.spawn ?? nodeSpawn;
+  let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -273,6 +282,35 @@ export function createHub(cfg: HubConfig): Hub {
         license: issued.payload,
         token: issued.token,
         installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
+      });
+    }
+    if (m === "POST" && p === "/admin/api/upgrade") {
+      // Self-upgrade: pull the source checkout and re-run its installer. The
+      // installer restarts this very service, so the work MUST outlive us —
+      // a plain child dies with our cgroup on restart. systemd-run puts it in
+      // its own transient unit; the log lands beside the hub's data.
+      if (upgradeStartedAt) {
+        return sendJson(res, 409, { ok: false, error: "an upgrade is already running — the hub will restart when it finishes" });
+      }
+      upgradeStartedAt = Date.now();
+      const log = path.join(cfg.dataDir, "upgrade.log");
+      const cmd = `cd ${JSON.stringify(cfg.srcDir)} && git pull --ff-only && bash install-hub.sh`;
+      try {
+        const child = spawn(
+          "systemd-run",
+          ["--unit", `wickhunter-hub-upgrade-${Date.now()}`, "--collect", "/bin/bash", "-lc", `(${cmd}) >> ${JSON.stringify(log)} 2>&1`],
+          { stdio: "ignore", detached: true },
+        );
+        child.on("error", () => { upgradeStartedAt = 0; });
+        child.unref();
+      } catch {
+        upgradeStartedAt = 0;
+        return sendJson(res, 500, { ok: false, error: "could not start the upgrade (systemd-run unavailable?)" });
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        version: HUB_VERSION,
+        note: "upgrade started — the hub restarts itself; watch /api/health for the new version. Log: data/upgrade.log",
       });
     }
     if (m === "GET" && p === "/admin/api/feedback") {
