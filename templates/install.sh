@@ -86,9 +86,16 @@ fi
 rsync -a --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
 
-say "Installing runtime dependencies"
-( cd "$APP_DIR" && npm ci --omit=dev --no-audit --no-fund >/dev/null )
-ok "dependencies installed"
+# The beta artifact runs on Node builtins + what is bundled into server.js;
+# its only declared deps are ws's OPTIONAL native accelerators, and it ships
+# no lockfile — so `npm ci` is wrong here (it dies without one, which took a
+# live tester install down). Best-effort `npm install`, never fatal.
+say "Installing optional runtime accelerators"
+if ( cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 ); then
+  ok "accelerators installed"
+else
+  warn "optional accelerators skipped — the bot runs fine without them"
+fi
 
 # ── Configuration (idempotent: existing values are kept) ────────────────────
 say "Configuring"
