@@ -8,6 +8,16 @@ runs on the same VPS as the bot (its own systemd unit, loopback-only on
 Zero runtime dependencies: node builtins only. TypeScript + a hermetic test
 suite gate every commit: `npx tsc && node tests/run-all.mjs`.
 
+## Tester feedback
+
+Beta bots POST bug reports / feature requests to `/api/feedback`, authenticated
+by their own license token (genuine-but-expired may file; revoked/unknown may
+not). Each report carries the tester's verified name, app version, install id
+and a bounded tail of their Activity log (300 lines / 200 KB, oldest dropped).
+The admin page lists them with a `new / discussing / fixed` status per row, and
+**Export all** downloads the entire set — logs included — as one JSON file to
+hand to your assistant for triage.
+
 ## License format v1 (pinned)
 
 ```

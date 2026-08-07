@@ -166,6 +166,43 @@ export class LicenseStore {
     return { ok: true, payload };
   }
 
+  /** Signature + shape ONLY — deliberately ignores expiry and revocation.
+   *  For surfaces where a lapsed-but-genuine tester still gets a hearing
+   *  (feedback intake: an expired key may file a bug; a revoked one may not,
+   *  but that check is the CALLER's, via isKnown/isRevoked, so the caller can
+   *  distinguish the cases instead of collapsing them into one refusal). */
+  decodeGenuine(token: string): LicensePayload | null {
+    const parts = typeof token === "string" ? token.split(".") : [];
+    if (parts.length !== 3 || parts[0] !== TOKEN_PREFIX) return null;
+    const payloadBytes = Buffer.from(parts[1]!, "base64url");
+    const sig = Buffer.from(parts[2]!, "base64url");
+    let sigOk = false;
+    try {
+      sigOk = edVerify(null, payloadBytes, this.loadKeys().pub, sig);
+    } catch {
+      sigOk = false;
+    }
+    if (!sigOk) return null;
+    let payload: LicensePayload;
+    try {
+      payload = JSON.parse(payloadBytes.toString("utf8")) as LicensePayload;
+    } catch {
+      return null;
+    }
+    if (
+      payload === null || typeof payload !== "object" ||
+      payload.v !== 1 ||
+      typeof payload.id !== "string" || !payload.id ||
+      typeof payload.name !== "string" ||
+      typeof payload.exp !== "number" ||
+      typeof payload.iat !== "number" ||
+      typeof payload.plan !== "string"
+    ) {
+      return null;
+    }
+    return payload;
+  }
+
   isRevoked(id: string): boolean {
     return Object.hasOwn(readJson<RevokedFile>(this.revokedFile, { revoked: {} }).revoked, id);
   }

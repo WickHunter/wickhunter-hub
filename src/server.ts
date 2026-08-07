@@ -4,6 +4,7 @@
 // Surfaces, outermost first:
 //   public   GET  /api/health                    liveness + version
 //   keyed    POST /api/license/checkin           bot phone-home; answers revoked
+//   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /api/latest?key=<token>        release metadata (version/file/sha256)
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
@@ -11,6 +12,9 @@
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
 //   admin    POST /admin/api/licenses/revoke     {id}
+//   admin    GET  /admin/api/feedback            report list (sans logs)
+//   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
+//   admin    GET  /admin/api/feedback/export     full JSON download, logs included
 //
 // "keyed" = a valid, unexpired, unrevoked LHK1 token in ?key=. "admin" = the
 // HUB_ADMIN_TOKEN in an x-hub-admin header, compared constant-time. No
@@ -26,11 +30,17 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { recordCheckin, readRoster } from "./checkins.js";
+import {
+  FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, listFeedback, setFeedbackStatus,
+  type FeedbackStatus,
+} from "./feedback.js";
 import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
 import { HUB_VERSION } from "./version.js";
 
 const MAX_BODY_BYTES = 64 * 1024; // largest legitimate body is a tiny JSON object
+// Feedback carries a bounded log tail (see feedback.ts caps) — its own limit:
+const MAX_FEEDBACK_BODY_BYTES = 256 * 1024;
 
 export interface Hub {
   server: http.Server;
@@ -70,6 +80,7 @@ export function createHub(cfg: HubConfig): Hub {
       return sendJson(res, 200, { ok: true, version: HUB_VERSION });
     }
     if (m === "POST" && p === "/api/license/checkin") return checkin(req, res);
+    if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
     if (m === "GET" && p.startsWith("/download/")) return download(url, res);
@@ -108,6 +119,37 @@ export function createHub(cfg: HubConfig): Hub {
     // business running; failing safe here is the whole kill switch.
     const revoked = !store.isKnown(body.licenseId) || store.isRevoked(body.licenseId);
     sendJson(res, 200, revoked ? { ok: true, revoked: true } : { ok: true });
+  }
+
+  async function feedbackIntake(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody(req, MAX_FEEDBACK_BODY_BYTES);
+    if (body === null) return sendJson(res, 400, { ok: false, error: "bad feedback body" });
+    // Auth is the license TOKEN in the body — same credential the bot already
+    // holds. Genuine-but-EXPIRED may still file (a lapsed tester reporting a
+    // bug is exactly who we want to hear from); unknown or revoked may not.
+    const payload = store.decodeGenuine(typeof body.license === "string" ? body.license : "");
+    if (!payload) return sendJson(res, 403, { ok: false, error: "a valid license is required to file a report" });
+    if (!store.isKnown(payload.id) || store.isRevoked(payload.id)) {
+      return sendJson(res, 403, { ok: false, error: "this license is not accepted here" });
+    }
+    const kind = body.kind;
+    if (kind !== "bug" && kind !== "feature") return sendJson(res, 400, { ok: false, error: "kind must be bug or feature" });
+    const text = typeof body.text === "string" ? body.text.trim() : "";
+    if (!text) return sendJson(res, 400, { ok: false, error: "an empty report says nothing — describe what happened" });
+    const { logs, truncated } = clampLogs(body.logs);
+    const rec = appendFeedback(cfg.dataDir, {
+      ts: typeof body.ts === "number" ? body.ts : 0,
+      ip: clientIp(req),
+      licenseId: payload.id,
+      name: payload.name,
+      installId: typeof body.installId === "string" ? body.installId.slice(0, 64) : "",
+      version: typeof body.version === "string" ? body.version.slice(0, 32) : "",
+      kind,
+      text: text.slice(0, FEEDBACK_TEXT_MAX),
+      logs,
+      logsTruncated: truncated,
+    });
+    sendJson(res, 200, { ok: true, id: rec.id });
   }
 
   /** Shared gate for install.sh / latest / download. Sends the 403 itself. */
@@ -233,6 +275,39 @@ export function createHub(cfg: HubConfig): Hub {
         installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
       });
     }
+    if (m === "GET" && p === "/admin/api/feedback") {
+      // Table view: everything EXCEPT the logs (they can be hundreds of KB
+      // per report) — the export carries those.
+      const reports = listFeedback(cfg.dataDir)
+        .sort((a, b) => b.at - a.at)
+        .map(({ logs, ...rest }) => ({ ...rest, logLines: logs.length }));
+      return sendJson(res, 200, { ok: true, reports });
+    }
+    if (m === "POST" && p === "/admin/api/feedback/status") {
+      const body = await readJsonBody(req);
+      if (
+        body === null || typeof body.id !== "string" || !body.id ||
+        typeof body.status !== "string" || !FEEDBACK_STATUSES.includes(body.status as FeedbackStatus)
+      ) {
+        return sendJson(res, 400, { ok: false, error: "expected {id, status: new|discussing|fixed}" });
+      }
+      if (!setFeedbackStatus(cfg.dataDir, body.id, body.status as FeedbackStatus)) {
+        return sendJson(res, 404, { ok: false, error: "unknown report id" });
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+    if (m === "GET" && p === "/admin/api/feedback/export") {
+      // The whole set, LOGS INCLUDED — the file the operator hands to their
+      // assistant for triage. Attachment headers so the browser downloads it.
+      const reports = listFeedback(cfg.dataDir).sort((a, b) => b.at - a.at);
+      const bytes = Buffer.from(JSON.stringify({ exportedAt: Date.now(), hubVersion: HUB_VERSION, reports }, null, 2));
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": bytes.length,
+        "content-disposition": `attachment; filename="wickhunter-feedback-${new Date().toISOString().slice(0, 10)}.json"`,
+      });
+      return void res.end(bytes);
+    }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.id !== "string" || !body.id) {
@@ -285,13 +360,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /** Read a JSON object body; null on any malformation (caller answers 400). */
-function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+function readJsonBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         req.destroy();
         resolve(null);
         return;

@@ -47,6 +47,17 @@
   <tbody id="rows"><tr><td colspan="8">loading…</td></tr></tbody>
 </table>
 
+<h1 style="margin-top:2.5rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
+<form onsubmit="return false">
+  <button type="button" id="fbRefresh">Refresh</button>
+  <button type="button" id="fbExport">Export all (JSON, logs included)</button>
+  <span style="opacity:.6">Export is the file to hand to your assistant for triage.</span>
+</form>
+<table>
+  <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th></tr></thead>
+  <tbody id="fbRows"><tr><td colspan="7">loading…</td></tr></tbody>
+</table>
+
 <script>
 "use strict";
 // Works both direct (http://127.0.0.1:8091/admin) and behind nginx (/hub/admin):
@@ -138,8 +149,60 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
 document.getElementById("refresh").onclick = refresh;
 
+async function fbRefresh() {
+  const err = document.getElementById("err");
+  let data;
+  try { data = await api("/admin/api/feedback"); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; else fbRefresh(); return; }
+  const rows = document.getElementById("fbRows");
+  rows.innerHTML = "";
+  if (data.reports.length === 0) {
+    rows.innerHTML = '<tr><td colspan="7">no reports yet</td></tr>';
+    return;
+  }
+  for (const r of data.reports) {
+    const tr = document.createElement("tr");
+    if (r.status === "fixed") tr.style.opacity = ".5";
+    tr.innerHTML =
+      "<td>" + fmt(r.at) + "</td>" +
+      '<td class="name" title="' + esc(r.licenseId) + '">' + esc(r.name) + "</td>" +
+      "<td>" + (r.kind === "bug" ? "🐞 bug" : "✨ feature") + "</td>" +
+      "<td>" + esc(r.version || "—") + "</td>" +
+      "<td>" + r.logLines + (r.logsTruncated ? "+" : "") + "</td>" +
+      "<td></td>" +
+      '<td class="name" style="white-space:normal;max-width:28rem">' + esc(r.text) + "</td>";
+    const sel = document.createElement("select");
+    for (const s of ["new", "discussing", "fixed"]) {
+      const o = document.createElement("option");
+      o.value = s; o.textContent = s; if (r.status === s) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = async () => {
+      try { await api("/admin/api/feedback/status", { method: "POST", body: JSON.stringify({ id: r.id, status: sel.value }) }); }
+      catch (e) { document.getElementById("err").textContent = e.message; }
+      fbRefresh();
+    };
+    tr.children[5].appendChild(sel);
+    rows.appendChild(tr);
+  }
+}
+
+document.getElementById("fbRefresh").onclick = fbRefresh;
+document.getElementById("fbExport").onclick = async () => {
+  // fetch with the admin header, then hand the bytes to the browser as a file.
+  const res = await fetch(base + "/admin/api/feedback/export", { headers: { "x-hub-admin": token } });
+  if (res.status === 401) { askToken("Wrong token — try again:"); return; }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (res.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || "wickhunter-feedback.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
 askToken();
 refresh();
+fbRefresh();
 </script>
 </body>
 </html>
