@@ -120,12 +120,29 @@ else
   ok "keeping existing LIQHUNTER_SECRET"
 fi
 
+# The bot refuses to boot on a plaintext password under 16 characters — so the
+# installer must never store one. The old auto-generate (base64 12 bytes minus
+# stripped symbols) landed at ~15 chars and crash-looped a real tester box.
 LOGIN_PW=$(get_env LIQHUNTER_LOGIN_PASSWORD)
+if [ -n "$LOGIN_PW" ] && [ "${#LOGIN_PW}" -lt 16 ]; then
+  warn "existing login password is under the bot's 16-character minimum — replacing it"
+  LOGIN_PW=""
+fi
 if [ -z "$LOGIN_PW" ]; then
-  ask LOGIN_PW "Choose a dashboard login password (Enter to auto-generate): " --secret
-  [ -n "$LOGIN_PW" ] || LOGIN_PW=$(openssl rand -base64 12 | tr -d '/+=')
+  while :; do
+    ask LOGIN_PW "Choose a dashboard login password (16+ characters; Enter to auto-generate): " --secret
+    if [ -z "$LOGIN_PW" ] || [ "${#LOGIN_PW}" -ge 16 ]; then break; fi
+    warn "too short — the bot requires at least 16 characters"
+  done
+  GENERATED=""
+  if [ -z "$LOGIN_PW" ]; then LOGIN_PW=$(openssl rand -hex 12); GENERATED=1; fi
   set_env LIQHUNTER_LOGIN_PASSWORD "$LOGIN_PW"
-  ok "login password configured"
+  if [ -n "$GENERATED" ]; then
+    say "YOUR DASHBOARD PASSWORD (write it down; also stored in $ENV_FILE):"
+    printf '\n    %s\n\n' "$LOGIN_PW"
+  else
+    ok "login password configured"
+  fi
 else
   ok "keeping existing login password"
 fi
