@@ -139,6 +139,12 @@ ok "license key installed"
 
 # ── systemd ─────────────────────────────────────────────────────────────────
 say "Installing the systemd service"
+# The beta artifact is one bundled server.js at the app root (its package.json
+# start script is `node server.js`); the full-tree layout is dist/server/index.js.
+# Detect which this build is — pointing systemd at the wrong one is a crash loop.
+ENTRY="server.js"
+[ -f "$APP_DIR/server.js" ] || ENTRY="dist/server/index.js"
+[ -f "$APP_DIR/$ENTRY" ] || die "no server entry found in the unpacked build (looked for server.js and dist/server/index.js)"
 unit_tmp=$(mktemp)
 printf '%s\n' \
   '[Unit]' \
@@ -149,7 +155,7 @@ printf '%s\n' \
   '[Service]' \
   "WorkingDirectory=$APP_DIR" \
   "EnvironmentFile=$ENV_FILE" \
-  "ExecStart=$(command -v node) dist/server/index.js" \
+  "ExecStart=$(command -v node) $ENTRY" \
   'Restart=always' \
   'RestartSec=5' \
   '' \
