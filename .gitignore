@@ -1,0 +1,10 @@
+# Build output ships via the installer's own build step, never via git.
+dist/
+node_modules/
+
+# Live state: signing key, issued licenses, revocations, check-ins. NEVER commit.
+data/
+
+# Beta tarballs are copied in by the release step; only the contract doc is tracked.
+releases/*
+!releases/README.md

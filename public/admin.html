@@ -1,0 +1,145 @@
+<!doctype html>
+<!-- Wick Hunter hub admin. Deliberately minimal: one page, three API calls
+     (list / issue / revoke). The admin token is prompted for once and kept in
+     a JS variable only — no cookies, no sessions, nothing persisted. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wick Hunter Hub</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 68rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; } h1 small { font-weight: normal; opacity: .6; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8884; white-space: nowrap; }
+  td.name { white-space: normal; }
+  .revoked { opacity: .5; text-decoration: line-through; }
+  .state-active { color: #2a7; } .state-expired { color: #b80; } .state-revoked { color: #c33; }
+  form { display: flex; gap: .5rem; align-items: center; margin-top: 1.5rem; flex-wrap: wrap; }
+  input, button { font: inherit; padding: .3rem .6rem; }
+  input[name=name] { width: 16rem; } input[name=days] { width: 5rem; }
+  #issued { margin-top: 1rem; padding: 1rem; border: 1px solid #8884; border-radius: 6px; display: none; }
+  #issued textarea { width: 100%; font: 12px/1.4 ui-monospace, monospace; margin-top: .5rem; }
+  #err { color: #c33; margin-top: 1rem; }
+  button.revoke { color: #c33; }
+</style>
+</head>
+<body>
+<h1>Wick Hunter Hub <small>— beta licensing</small></h1>
+
+<form id="issueForm">
+  <input name="name" placeholder="Tester name" required>
+  <input name="days" type="number" value="30" min="1" max="3650" required> days
+  <button type="submit">Issue license</button>
+  <button type="button" id="refresh">Refresh</button>
+</form>
+
+<div id="issued">
+  <strong>License issued.</strong> Copy now — the token is not shown again in full.
+  <textarea id="issuedText" rows="6" readonly></textarea>
+  <button type="button" id="copyIssued">Copy invite command</button>
+</div>
+
+<div id="err"></div>
+<table>
+  <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th></th></tr></thead>
+  <tbody id="rows"><tr><td colspan="8">loading…</td></tr></tbody>
+</table>
+
+<script>
+"use strict";
+// Works both direct (http://127.0.0.1:8091/admin) and behind nginx (/hub/admin):
+// strip the trailing /admin from wherever this page was served.
+const base = location.pathname.replace(/\/admin\/?$/, "");
+let token = ""; // memory only, by design
+let installCmd = "";
+
+function askToken(msg) {
+  token = window.prompt(msg || "Hub admin token (x-hub-admin):") || "";
+}
+
+async function api(path, opts) {
+  const res = await fetch(base + path, Object.assign({}, opts, {
+    headers: Object.assign({ "x-hub-admin": token, "content-type": "application/json" },
+                           (opts && opts.headers) || {}),
+  }));
+  const body = await res.json().catch(() => ({ ok: false, error: "bad response" }));
+  if (res.status === 401) { askToken("Wrong token — try again:"); throw new Error("unauthorized"); }
+  if (!body.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function fmt(ms) { return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) : "—"; }
+function esc(s) { const d = document.createElement("span"); d.textContent = String(s); return d.innerHTML; }
+
+async function refresh() {
+  const err = document.getElementById("err");
+  err.textContent = "";
+  let data;
+  try { data = await api("/admin/api/licenses"); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; else refresh(); return; }
+  const rows = document.getElementById("rows");
+  rows.innerHTML = "";
+  if (data.licenses.length === 0) {
+    rows.innerHTML = '<tr><td colspan="8">no licenses yet</td></tr>';
+    return;
+  }
+  for (const l of data.licenses) {
+    const state = l.revoked ? "revoked" : (l.exp <= Date.now() ? "expired" : "active");
+    const tr = document.createElement("tr");
+    if (l.revoked) tr.className = "revoked";
+    tr.innerHTML =
+      '<td class="name" title="' + esc(l.id) + '">' + esc(l.name) + "</td>" +
+      '<td class="state-' + state + '">' + state + "</td>" +
+      "<td>" + fmt(l.exp).slice(0, 10) + "</td>" +
+      "<td>" + fmt(l.lastSeen && l.lastSeen.lastSeen) + "</td>" +
+      "<td>" + esc(l.lastSeen ? l.lastSeen.version : "—") + "</td>" +
+      "<td>" + esc(l.lastSeen ? l.lastSeen.ip : "—") + "</td>" +
+      "<td>" + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
+      "<td></td>";
+    if (!l.revoked) {
+      const btn = document.createElement("button");
+      btn.className = "revoke";
+      btn.textContent = "Revoke";
+      btn.onclick = async () => {
+        if (!confirm("Revoke license for " + l.name + "? Their bot stops at its next check-in.")) return;
+        try { await api("/admin/api/licenses/revoke", { method: "POST", body: JSON.stringify({ id: l.id }) }); }
+        catch (e) { err.textContent = e.message; }
+        refresh();
+      };
+      tr.lastElementChild.appendChild(btn);
+    }
+    rows.appendChild(tr);
+  }
+}
+
+document.getElementById("issueForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const err = document.getElementById("err");
+  err.textContent = "";
+  try {
+    const data = await api("/admin/api/licenses", {
+      method: "POST",
+      body: JSON.stringify({ name: f.name.value, days: Number(f.days.value) }),
+    });
+    installCmd = data.installCommand;
+    document.getElementById("issuedText").value =
+      "Tester: " + data.license.name +
+      "\nExpires: " + fmt(data.license.exp) +
+      "\n\nInstall command:\n" + data.installCommand;
+    document.getElementById("issued").style.display = "block";
+    f.name.value = "";
+    refresh();
+  } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
+};
+
+document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
+document.getElementById("refresh").onclick = refresh;
+
+askToken();
+refresh();
+</script>
+</body>
+</html>
