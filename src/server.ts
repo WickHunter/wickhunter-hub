@@ -12,6 +12,7 @@
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
 //   admin    POST /admin/api/licenses/revoke     {id}
+//   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
@@ -353,6 +354,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         "content-disposition": `attachment; filename="wickhunter-feedback-${new Date().toISOString().slice(0, 10)}.json"`,
       });
       return void res.end(bytes);
+    }
+    if (m === "GET" && p === "/admin/api/licenses/command") {
+      const id = url.searchParams.get("id") ?? "";
+      const token = id ? store.tokenFor(id) : null;
+      if (!token) return sendJson(res, 404, { ok: false, error: "unknown or revoked license id" });
+      return sendJson(res, 200, {
+        ok: true,
+        installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash`,
+      });
     }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);

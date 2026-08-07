@@ -105,4 +105,15 @@ await test("keygen refuses to overwrite; public raw key is 32 bytes", () => {
   assert.match(keys.privatePem, /BEGIN PRIVATE KEY/);
 });
 
+
+await test("tokenFor rebuilds the EXACT original token; revoked/unknown get nothing", async () => {
+  const { store } = freshStore();
+  const issued = store.issue("Reinvite", 30);
+  assert.equal(store.tokenFor(issued.payload.id), issued.token); // byte-identical — Ed25519 is deterministic
+  assert.equal(store.verify(store.tokenFor(issued.payload.id)).ok, true);
+  store.revoke(issued.payload.id);
+  assert.equal(store.tokenFor(issued.payload.id), null); // a revoked tester gets no fresh copy
+  assert.equal(store.tokenFor("never-issued"), null);
+});
+
 summary("license");

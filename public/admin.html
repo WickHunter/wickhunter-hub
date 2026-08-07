@@ -153,6 +153,17 @@ async function refresh() {
       "<td>" + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
       "<td></td>";
     if (!l.revoked) {
+      const copy = document.createElement("button");
+      copy.textContent = "Copy install command";
+      copy.onclick = async () => {
+        try {
+          const d = await api("/admin/api/licenses/command?id=" + encodeURIComponent(l.id));
+          await navigator.clipboard.writeText(d.installCommand);
+          copy.textContent = "Copied!";
+          setTimeout(() => { copy.textContent = "Copy install command"; }, 1500);
+        } catch (e) { if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message; }
+      };
+      tr.lastElementChild.appendChild(copy);
       const btn = document.createElement("button");
       btn.className = "revoke";
       btn.textContent = "Revoke";

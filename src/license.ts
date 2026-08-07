@@ -166,6 +166,21 @@ export class LicenseStore {
     return { ok: true, payload };
   }
 
+  /** Rebuild the exact token for an already-issued license. Ed25519 is
+   *  DETERMINISTIC, so re-signing the stored payload (whose JSON key order is
+   *  the pinned v1 wire order, preserved by the registry round-trip)
+   *  reproduces the original token byte-for-byte — the hub never needs to
+   *  store tokens to re-issue an invite. Null for unknown or revoked ids:
+   *  a revoked tester does not get a fresh copy of their key. */
+  tokenFor(id: string): string | null {
+    const registry = readJson<Record<string, LicensePayload>>(this.licensesFile, {});
+    const payload = registry[id];
+    if (!payload || this.isRevoked(id)) return null;
+    const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
+    const sig = edSign(null, payloadBytes, this.loadKeys().priv);
+    return `${TOKEN_PREFIX}.${payloadBytes.toString("base64url")}.${sig.toString("base64url")}`;
+  }
+
   /** Signature + shape ONLY — deliberately ignores expiry and revocation.
    *  For surfaces where a lapsed-but-genuine tester still gets a hearing
    *  (feedback intake: an expired key may file a bug; a revoked one may not,
