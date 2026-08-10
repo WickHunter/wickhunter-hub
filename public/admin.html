@@ -31,6 +31,7 @@
   .expinput { width: 9.2rem; }
   .expsave { margin-left: .3rem; }
   .expsave:disabled { opacity: .45; cursor: default; }
+  .share { color: #c33; font-weight: 600; white-space: nowrap; }
   .muted { opacity: .6; }
   /* sign-in overlay: a real form so password managers offer autofill */
   #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
@@ -157,8 +158,26 @@ async function refresh() {
       "<td>" + fmt(l.lastSeen && l.lastSeen.lastSeen) + "</td>" +
       "<td>" + esc(l.lastSeen ? vlabel(l.lastSeen.version) : "—") + "</td>" +
       "<td>" + esc(l.lastSeen ? l.lastSeen.ip : "—") + "</td>" +
-      "<td>" + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
+      '<td class="instcell">' + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
       "<td></td>";
+    // ── ONE KEY, MORE THAN ONE MACHINE ──────────────────────────────────────
+    // Nothing binds a licence to an install, so a shared key runs everywhere at
+    // once — and the roster hides it, because its single row is last-write-wins
+    // and the two installs just overwrite each other. `sharing` counts DISTINCT
+    // installs that checked in inside the same recent window, which a reinstall
+    // does not trip: the replaced install stops phoning home immediately.
+    // Reported only. Enforcing first-install-wins would kill a legitimate
+    // reinstall with no way back.
+    if (l.sharing && l.sharing.installs > 1) {
+      const warn = document.createElement("span");
+      warn.className = "share";
+      warn.textContent = " \u26a0 " + l.sharing.installs + " installs";
+      warn.title = l.sharing.installs + " different installs checked in with this key in the last "
+        + l.sharing.windowHours + "h, from " + l.sharing.ips + " IP(s). A reinstall does not do this — "
+        + "the replaced install stops checking in. Revoking is per-key, so it stops every copy at once.";
+      tr.querySelector(".instcell").appendChild(warn);
+    }
+
     // ── EXPIRY, EDITABLE ────────────────────────────────────────────────────
     // A revoked license keeps a plain date: `setExpiry` refuses one server-side
     // (a revoked tester does not get a fresh key), so offering the control

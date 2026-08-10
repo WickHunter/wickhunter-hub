@@ -178,6 +178,77 @@ await test("the admin page offers the expiry control and prints versions with a 
     "the page does not warn that a running bot keeps the old expiry");
 });
 
+// ── ONE KEY ON MORE THAN ONE MACHINE ────────────────────────────────────────
+// Nothing binds a licence to an install, so a shared key runs everywhere at
+// once and the roster hides it (one last-write-wins row per licence). The
+// ledger is where the second install is visible.
+//
+// The check that MATTERS here is the reinstall case: a tester who reinstalls,
+// moves VPS or loses data/ mints a new installId, and a rule that flagged "more
+// than one id ever" would light up half an honest roster and be ignored within
+// a week. Only installs active in the SAME window count.
+await test("two installs on one key are flagged; a reinstall is not", async () => {
+  const shared = await jsonReq(`${h.origin}/admin/api/licenses`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ name: "Shared Key", days: 30 }),
+  });
+  const sharedId = shared.body.license.id;
+  const solo = await jsonReq(`${h.origin}/admin/api/licenses`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ name: "Reinstaller", days: 30 }),
+  });
+  const soloId = solo.body.license.id;
+
+  // Two machines, same key, both live now.
+  for (const installId of ["aaaaaaaa-1111", "bbbbbbbb-2222"]) {
+    await jsonReq(`${h.origin}/api/license/checkin`, {
+      method: "POST",
+      body: JSON.stringify({ licenseId: sharedId, installId, version: "0.74.80", ts: Date.now() }),
+    });
+  }
+  // One machine that was replaced: the OLD install checked in days ago and has
+  // been quiet since, the new one is live. Written straight to the ledger so
+  // the old row can carry an old `at` — the HTTP path always stamps "now".
+  const { appendFileSync } = await import("node:fs");
+  const path = await import("node:path");
+  appendFileSync(path.join(h.cfg.dataDir, "checkins.jsonl"),
+    JSON.stringify({ licenseId: soloId, installId: "old-install", version: "0.74.70",
+                     ts: Date.now(), ip: "10.0.0.9", at: Date.now() - 9 * 86_400_000 }) + "\n");
+  await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: soloId, installId: "new-install", version: "0.74.80", ts: Date.now() }),
+  });
+
+  const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
+  const sharedRow = list.body.licenses.find((l) => l.id === sharedId);
+  const soloRow = list.body.licenses.find((l) => l.id === soloId);
+
+  assert.equal(sharedRow.sharing.installs, 2, "two concurrent installs were not counted");
+  assert.ok(sharedRow.sharing.windowHours > 0);
+  assert.equal(soloRow.sharing.installs, 1,
+    "a reinstall was counted as sharing — the signal is cumulative, not concurrent, and is useless");
+});
+
+await test("the sharing flag reaches the admin page, and reports rather than enforces", async () => {
+  const r = await fetch(`${h.origin}/admin`);
+  const html = await r.text();
+  assert.ok(/l\.sharing && l\.sharing\.installs > 1/.test(html), "the page never reads the sharing signal");
+  assert.ok(/installs checked in with this key/.test(html), "no explanation of what the flag means");
+  // A shared key still WORKS — this release detects, it does not lock anyone
+  // out, and a test that let enforcement slip in silently would be worse than
+  // no test at all.
+  const issued = await jsonReq(`${h.origin}/admin/api/licenses`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ name: "Still Works", days: 5 }),
+  });
+  const id = issued.body.license.id;
+  for (const installId of ["one", "two"]) {
+    const c = await jsonReq(`${h.origin}/api/license/checkin`, {
+      method: "POST",
+      body: JSON.stringify({ licenseId: id, installId, version: "0.74.80", ts: Date.now() }),
+    });
+    assert.equal(c.status, 200);
+    assert.ok(!c.body.revoked, "a second install was refused — that is enforcement, which was not asked for");
+  }
+});
+
 await h.close();
 
 await test("with no HUB_ADMIN_TOKEN configured the whole admin surface is 503", async () => {

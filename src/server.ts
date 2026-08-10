@@ -32,7 +32,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import { recordCheckin, readRoster } from "./checkins.js";
+import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import {
   FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, listFeedback, setFeedbackStatus,
   type FeedbackStatus,
@@ -273,7 +273,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
     if (m === "GET" && p === "/admin/api/licenses") {
       const roster = readRoster(cfg.dataDir);
-      const licenses = store.list().map((l) => ({ ...l, lastSeen: roster[l.id] ?? null }));
+      // Reported, never enforced — see `sharingSignals`. The roster is
+      // last-write-wins per licence, so two installs sharing a key overwrite
+      // each other there and nothing looks wrong; the ledger is where the
+      // second one is visible.
+      const sharing = sharingSignals(cfg.dataDir);
+      const licenses = store.list().map((l) => ({
+        ...l, lastSeen: roster[l.id] ?? null, sharing: sharing[l.id] ?? null,
+      }));
       return sendJson(res, 200, { ok: true, origin: cfg.publicOrigin, licenses });
     }
     if (m === "POST" && p === "/admin/api/licenses") {
