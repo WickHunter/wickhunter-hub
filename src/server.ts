@@ -11,6 +11,7 @@
 //   admin    GET  /admin                         static admin page (auth lives in its API calls)
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
+//   admin    POST /admin/api/licenses/expiry     {id, exp} -> re-minted command
 //   admin    POST /admin/api/licenses/revoke     {id}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
@@ -362,6 +363,30 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, {
         ok: true,
         installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash`,
+      });
+    }
+    // ── CHANGE AN ISSUED LICENSE'S EXPIRY ──────────────────────────────────
+    // Returns the re-minted install command alongside the updated record,
+    // because the two are inseparable: `exp` is inside the SIGNED payload and
+    // the bot checks it offline, so the new date does nothing until the tester
+    // installs this command. The check-in answers `revoked` and `latest` and
+    // carries no expiry at all. The admin page prints that, and the field name
+    // `installCommand` is the same one `/licenses/command` returns so the page
+    // renders it through the same path.
+    if (m === "POST" && p === "/admin/api/licenses/expiry") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.id !== "string" || !body.id || typeof body.exp !== "number") {
+        return sendJson(res, 400, { ok: false, error: "expected {id, exp} with exp a unix-ms timestamp" });
+      }
+      let payload;
+      try { payload = store.setExpiry(body.id, body.exp); }
+      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }); }
+      if (!payload) return sendJson(res, 404, { ok: false, error: "unknown or revoked license id" });
+      const token = store.tokenFor(body.id);
+      return sendJson(res, 200, {
+        ok: true,
+        exp: payload.exp,
+        installCommand: token ? `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
       });
     }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {

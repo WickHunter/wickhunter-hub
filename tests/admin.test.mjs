@@ -100,6 +100,84 @@ await test("admin page is served and drives the three endpoints", async () => {
   assert.ok(!/document\.cookie|localStorage|sessionStorage/.test(html), "token must stay in memory only");
 });
 
+// ── EDITING AN ISSUED LICENSE'S EXPIRY ──────────────────────────────────────
+// Operator ask: "allow edit to expiry date here". The load-bearing property is
+// not that the stored date changes — it is that the token is RE-MINTED, because
+// `exp` lives inside the signed payload and the bot checks it offline. A change
+// that did not hand back a new install command would read as done on the admin
+// page while every running bot kept the old date forever.
+await test("editing expiry re-mints the token and hands back a new install command", async () => {
+  const issued = await jsonReq(`${h.origin}/admin/api/licenses`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ name: "Expiry Edit", days: 10 }),
+  });
+  const id = issued.body.license.id;
+  const before = issued.body.license.exp;
+  const beforeCmd = issued.body.installCommand;
+
+  const exp = before + 30 * 86_400_000;
+  const r = await jsonReq(`${h.origin}/admin/api/licenses/expiry`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ id, exp }),
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.exp, exp);
+  assert.ok(r.body.installCommand, "no install command returned — the new expiry would never reach the tester");
+  assert.notEqual(r.body.installCommand, beforeCmd, "the token did not change, so the tester's expiry did not either");
+
+  // The list agrees, and the re-minted token verifies with the NEW expiry.
+  const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
+  assert.equal(list.body.licenses.find((l) => l.id === id).exp, exp);
+  const token = r.body.installCommand.match(/key=([^"]+)"/)[1];
+  const v = h.store.verify(token);
+  assert.equal(v.ok, true, "the re-minted token does not verify");
+  assert.equal(v.payload.exp, exp);
+  // Identity is preserved — this is the SAME license, not a new one.
+  assert.equal(v.payload.id, id);
+  assert.equal(v.payload.iat, issued.body.license.iat);
+});
+
+await test("expiry edits are bounded, and a revoked license is refused", async () => {
+  const issued = await jsonReq(`${h.origin}/admin/api/licenses`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ name: "Expiry Bounds", days: 10 }),
+  });
+  const id = issued.body.license.id;
+  const iat = issued.body.license.iat;
+
+  for (const [exp, why] of [[iat - 1, "before issue"], [iat, "at issue"],
+                            [iat + 3651 * 86_400_000, "beyond 3650 days"]]) {
+    const r = await jsonReq(`${h.origin}/admin/api/licenses/expiry`, {
+      method: "POST", headers: AUTH, body: JSON.stringify({ id, exp }),
+    });
+    assert.equal(r.status, 400, `expected refusal: ${why}`);
+  }
+  // Shape errors are refused before anything is written.
+  const bad = await jsonReq(`${h.origin}/admin/api/licenses/expiry`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ id }),
+  });
+  assert.equal(bad.status, 400);
+
+  // A revoked tester does not get a fresh key — the same rule `tokenFor` obeys.
+  await jsonReq(`${h.origin}/admin/api/licenses/revoke`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ id }),
+  });
+  const after = await jsonReq(`${h.origin}/admin/api/licenses/expiry`, {
+    method: "POST", headers: AUTH, body: JSON.stringify({ id, exp: iat + 60 * 86_400_000 }),
+  });
+  assert.equal(after.status, 404);
+});
+
+await test("the admin page offers the expiry control and prints versions with a v", async () => {
+  const r = await fetch(`${h.origin}/admin`);
+  const html = await r.text();
+  assert.ok(html.includes('/admin/api/licenses/expiry'), "the page never calls the expiry endpoint");
+  assert.ok(/function vlabel/.test(html), "no version formatter");
+  // Both tables go through it — the licence row and the feedback row.
+  assert.ok(html.includes("vlabel(l.lastSeen.version)"), "licence table does not use vlabel");
+  assert.ok(html.includes("vlabel(r.version)"), "feedback table does not use vlabel");
+  // And the operator is told the new date does not reach a running bot by itself.
+  assert.ok(/keeps the OLD expiry until they run it/.test(html),
+    "the page does not warn that a running bot keeps the old expiry");
+});
+
 await h.close();
 
 await test("with no HUB_ADMIN_TOKEN configured the whole admin surface is 503", async () => {

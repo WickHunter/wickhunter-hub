@@ -28,6 +28,9 @@
   #err { color: #c33; margin-top: 1rem; overflow-wrap: anywhere; }
   #note { color: #2a7; margin-top: 1rem; }
   button.revoke { color: #c33; }
+  .expinput { width: 9.2rem; }
+  .expsave { margin-left: .3rem; }
+  .expsave:disabled { opacity: .45; cursor: default; }
   .muted { opacity: .6; }
   /* sign-in overlay: a real form so password managers offer autofill */
   #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
@@ -126,6 +129,10 @@ async function api(path, opts) {
 
 function fmt(ms) { return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) : "—"; }
 function esc(s) { const d = document.createElement("span"); d.textContent = String(s); return d.innerHTML; }
+// Versions are shown the way the project writes them everywhere else — v0.74.80,
+// not 0.74.80. Anything already carrying a `v`, or not version-shaped at all, is
+// passed through untouched rather than gaining a second one.
+function vlabel(v) { const t = String(v || "").trim(); return /^\d/.test(t) ? "v" + t : t; }
 
 async function refresh() {
   const err = document.getElementById("err");
@@ -146,12 +153,67 @@ async function refresh() {
     tr.innerHTML =
       '<td class="name" title="' + esc(l.id) + '">' + esc(l.name) + "</td>" +
       '<td class="state-' + state + '">' + state + "</td>" +
-      "<td>" + fmt(l.exp).slice(0, 10) + "</td>" +
+      '<td class="expcell"></td>' +
       "<td>" + fmt(l.lastSeen && l.lastSeen.lastSeen) + "</td>" +
-      "<td>" + esc(l.lastSeen ? l.lastSeen.version : "—") + "</td>" +
+      "<td>" + esc(l.lastSeen ? vlabel(l.lastSeen.version) : "—") + "</td>" +
       "<td>" + esc(l.lastSeen ? l.lastSeen.ip : "—") + "</td>" +
       "<td>" + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
       "<td></td>";
+    // ── EXPIRY, EDITABLE ────────────────────────────────────────────────────
+    // A revoked license keeps a plain date: `setExpiry` refuses one server-side
+    // (a revoked tester does not get a fresh key), so offering the control
+    // would be offering something that cannot work.
+    const expCell = tr.querySelector(".expcell");
+    const expText = fmt(l.exp).slice(0, 10);
+    if (l.revoked) {
+      expCell.textContent = expText;
+    } else {
+      const input = document.createElement("input");
+      input.type = "date";
+      input.value = expText;
+      input.className = "expinput";
+      const save = document.createElement("button");
+      save.textContent = "Save";
+      save.className = "expsave";
+      save.disabled = true;
+      input.oninput = () => { save.disabled = input.value === expText || !input.value; };
+      save.onclick = async () => {
+        // Keep the ISSUED time-of-day and move only the DATE, so the cell always
+        // reads back exactly the day that was picked. Parsing the input as
+        // UTC-midnight instead would drift the shown date by a day for anyone
+        // west of UTC.
+        const picked = new Date(input.value + "T00:00:00Z");
+        if (Number.isNaN(picked.getTime())) return;
+        const old = new Date(l.exp);
+        picked.setUTCHours(old.getUTCHours(), old.getUTCMinutes(), old.getUTCSeconds(), old.getUTCMilliseconds());
+        save.disabled = true; save.textContent = "Saving…";
+        try {
+          const d = await api("/admin/api/licenses/expiry", {
+            method: "POST",
+            body: JSON.stringify({ id: l.id, exp: picked.getTime() }),
+          });
+          // THE PART THAT MATTERS. `exp` is inside the SIGNED token and the bot
+          // checks it offline; the daily check-in answers `revoked` and
+          // `latest` and carries no expiry. So the new date changes nothing on
+          // a running bot until this command is installed — say it, and put the
+          // command where it can be copied without hunting for it.
+          if (d.installCommand) {
+            document.getElementById("issuedText").value = d.installCommand;
+            document.getElementById("issued").style.display = "block";
+          }
+          document.getElementById("note").textContent =
+            "Expiry for " + l.name + " is now " + input.value +
+            " — send them the install command above. Their bot keeps the OLD expiry until they run it:" +
+            " the date is inside the signed key, and the daily check-in cannot change it.";
+        } catch (e) {
+          if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+        }
+        save.textContent = "Save";
+        refresh();
+      };
+      expCell.appendChild(input);
+      expCell.appendChild(save);
+    }
     if (!l.revoked) {
       const copy = document.createElement("button");
       copy.textContent = "Copy install command";
@@ -253,7 +315,7 @@ async function fbRefresh() {
       "<td>" + fmt(r.at) + "</td>" +
       '<td class="name" title="' + esc(r.licenseId) + '">' + esc(r.name) + "</td>" +
       "<td>" + (r.kind === "bug" ? "🐞 bug" : "✨ feature") + "</td>" +
-      "<td>" + esc(r.version || "—") + "</td>" +
+      "<td>" + esc(r.version ? vlabel(r.version) : "—") + "</td>" +
       "<td>" + r.logLines + (r.logsTruncated ? "+" : "") + "</td>" +
       "<td></td>" +
       '<td class="name" style="white-space:normal;min-width:14rem;max-width:28rem">' + esc(r.text) + "</td>";
