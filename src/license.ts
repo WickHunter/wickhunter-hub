@@ -222,6 +222,49 @@ export class LicenseStore {
     return Object.hasOwn(readJson<RevokedFile>(this.revokedFile, { revoked: {} }).revoked, id);
   }
 
+  /** ── CHANGE AN ISSUED LICENSE'S EXPIRY ──────────────────────────────────
+   *
+   *  Rewrites the stored payload's `exp` and returns the updated record, so
+   *  `tokenFor(id)` then re-signs it into a NEW token.
+   *
+   *  WHAT THIS DOES NOT DO, and the caller must say so out loud: it does not
+   *  change the expiry of the token the tester is already running. `exp` lives
+   *  INSIDE the signed payload, and the bot checks it offline against its own
+   *  stored copy — the daily check-in answers `revoked` and `latest` and
+   *  carries no expiry at all. So an extension only takes effect once the
+   *  tester installs the re-minted token, and a shortening does not cut anyone
+   *  off early. Revocation is the mechanism that acts on a running bot.
+   *
+   *  The payload is rebuilt in the PINNED v1 KEY ORDER rather than mutated in
+   *  place. JS object insertion order survives JSON.stringify, the token is a
+   *  signature over those exact bytes, and `tokenFor`'s whole contract is that
+   *  re-signing a stored payload reproduces the token byte-for-byte. A
+   *  registry round-trip that reordered a key would silently mint a token that
+   *  verifies but differs from the one the operator last copied.
+   *
+   *  Refuses a revoked id for the same reason `tokenFor` does: a revoked
+   *  tester does not get a fresh key, and extending one would be the start of
+   *  exactly that. */
+  setExpiry(id: string, exp: number, now = Date.now()): LicensePayload | null {
+    const registry = readJson<Record<string, LicensePayload>>(this.licensesFile, {});
+    const current = registry[id];
+    if (!current || this.isRevoked(id)) return null;
+    if (!Number.isFinite(exp)) throw new Error("exp must be a finite unix-ms timestamp");
+    const ms = Math.round(exp);
+    // Bounded by the same reasoning as `issue()`'s 1..3650 days, measured from
+    // when the license was ISSUED so the window cannot be walked forward
+    // indefinitely by repeated edits.
+    if (ms <= current.iat) throw new Error("expiry must be after the license was issued");
+    if (ms > current.iat + 3650 * 86_400_000) throw new Error("expiry must be within 3650 days of issue");
+    void now;
+    const payload: LicensePayload = {
+      v: current.v, id: current.id, name: current.name, exp: ms, iat: current.iat, plan: current.plan,
+    };
+    registry[id] = payload;
+    writeJsonAtomic(this.licensesFile, registry);
+    return payload;
+  }
+
   /** Revoke by id. Returns false for an id this hub never issued (caller
    *  decides whether that is an error); revoking twice is a no-op success. */
   revoke(id: string, now = new Date()): boolean {
