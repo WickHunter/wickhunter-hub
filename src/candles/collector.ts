@@ -364,8 +364,18 @@ export class VenueCollector {
       }
       if (cov.interiorMissing > 0) {
         const hole = this.oldestHole(rec.symbol, now);
-        if (hole) {
-          repair.push({ symbol: rec.symbol, startMs: hole[0], endMs: Math.min(hole[1], hole[0] + pageSpan), kind: "repair" });
+        // A FULL PAGE FORWARD FROM THE HOLE, exactly the shape of a tail
+        // request — NOT a window clamped to the hole's own end.
+        //
+        // v0.2.6: clamping to `hole[1]` produced narrow, odd-shaped ranges that
+        // Bitget's history-candles answered with HTTP 400. Every kline request
+        // on the venue failed — 298 consecutive, 157 requests for 0 candles —
+        // because 155 gapped symbols each queued one. Asking for a normal page
+        // from the hole's start fills the hole AND whatever follows it, and is
+        // the request shape already proven against all three venues.
+        if (hole && hole[0] <= newestClosed) {
+          const endMs = Math.min(newestClosed, hole[0] + pageSpan);
+          if (endMs > hole[0]) repair.push({ symbol: rec.symbol, startMs: hole[0], endMs, kind: "repair" });
         }
       }
       if (cov.firstClosedMs !== null && cov.firstClosedMs > horizon) {

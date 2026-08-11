@@ -360,6 +360,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.6 — **HOTFIX: the repair request shape broke Bitget.** v0.2.5 clamped a
+  repair window to the hole's own end, producing narrow ranges that Bitget's
+  `history-candles` answered with HTTP 400 — every kline request on the venue
+  failed (298 consecutive; 157 requests, 0 candles) because each of 155 gapped
+  symbols queued one. A repair now asks for a full page forward from the hole's
+  start: the same request shape already proven against all three venues, which
+  fills the hole and whatever follows it. Zero-length and past-the-tail ranges
+  are refused before they are issued. No stored candle was affected — the
+  failing requests wrote nothing.
 - v0.2.5 — **catching up never punches a hole, and holes get repaired.** A
   defect shipped in v0.2.4: the tail asked for the NEWEST page, so a symbol more
   than one page behind had every minute between what we held and where that page
