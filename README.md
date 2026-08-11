@@ -18,6 +18,112 @@ The admin page lists them with a `new / discussing / fixed` status per row, and
 **Export all** downloads the entire set — logs included — as one JSON file to
 hand to your assistant for triage.
 
+## Candle seed
+
+The bot's Optimized Liquidation Bot computes per-pair entry bands from each
+venue's own 1-minute history. Warming a full auto pair list from the venue takes
+about 12 hours (~139,500 requests for ~643 pairs at 3.2 req/s) and every fresh
+install pays it again. The hub collects that history once and serves it as a
+signed download, turning the warm-up into one request per pair.
+
+**The hub is a seed, never a source of truth.** Candles decide entry bands and
+bands decide real orders, so a subtly wrong copy would give every user wrong
+entries at the same moment instead of one install misbehaving. The bot therefore
+re-checks the payload against the venue and discards the whole seed on any
+mismatch. Three properties carry that weight:
+
+- **Closed candles only.** Never a forming bar. Filtered against the hub's own
+  clock in `dropUnclosed` and again in `CandleStore.write`, so it does not
+  depend on any venue's framing being what we expect. Measured per venue:
+  Bitget's `/candles` returns the forming bar and its `/history-candles` does
+  not (we read the latter); Bitunix excludes it; Bybit includes it.
+- **Per venue, per symbol, venue-native spellings.** Never normalised, never
+  joined across venues. The same coin is `PEPEUSDT` on Bitget and
+  `1000PEPEUSDT` on Bitunix — different books, different prices — and the live
+  instrument lists differ by 168 symbols one way and 126 the other.
+- **Completeness is stated, never inferred.** `lastClosedMs` is read off the
+  newest slot actually filled, and `gaps` lists every missing sub-range
+  explicitly. Storage keeps presence per minute, so "we have nothing after
+  here" is never deduced from a short page.
+
+### Wire contract v1 (pinned)
+
+```
+GET /api/candles/seed?venue=<bybit|bitunix|bitget>&symbol=<VENUE-NATIVE>&fromMs=<ms>&toMs=<ms>
+
+{ "v":1, "venue","symbol", "interval":"1", "fromMs","toMs","lastClosedMs",
+  "rows":[[openMs,open,high,low,close,volume],...], "gaps":[[fromMs,toMs],...],
+  "keyId":"seed-1", "sig":"<base64 Ed25519>" }
+```
+
+`rows` oldest-first, strictly increasing, every `openMs` a multiple of 60000,
+numbers not strings. `sig` is Ed25519 over the UTF-8 JSON of the object with
+`sig` removed and keys in exactly this order — the verifier must reproduce it
+byte-for-byte:
+
+```
+v, venue, symbol, interval, fromMs, toMs, lastClosedMs, rows, gaps, keyId
+```
+
+Errors: `400` bad venue or malformed window · `404` symbol not listed on that
+venue · `503` nothing collected yet for it. **Never a 200 with empty `rows`** —
+that would be indistinguishable from a genuinely empty window. Served gzipped
+when the client accepts it.
+
+Signing reuses the hub's existing Ed25519 licence key (`data/license-signing.key`),
+so there is one key to generate, back up and bake into the bot. `keyId` names it
+for rotation. **Seeding requires a valid licence key** (`?key=`), like every
+other download surface here: it is a licensed benefit and by far the heaviest
+thing the hub serves. `HUB_CANDLE_REQUIRE_LICENSE=0` opens it for a local test
+hub; nothing else in the licence path changes either way.
+
+### Turning collectors on
+
+Off by default — collecting is hours of outbound requests and gigabytes on disk,
+so it is a deliberate operator action, not something a hub upgrade starts doing.
+In `/etc/wickhunter-hub/env`:
+
+```
+HUB_CANDLE_VENUES=bybit,bitunix,bitget
+```
+
+Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
+`HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
+`HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_KEY_ID` (`seed-1`),
+`HUB_CANDLE_TICK_MS` (60s).
+
+New listings are picked up automatically: the instrument list is re-read on its
+own cadence and a new symbol starts collecting on the next tick, no restart.
+Delistings stop polling and keep their history. A pair listed hours ago is
+served with its short history and an explicit leading gap — never as a thin
+result that looks complete.
+
+### Storage
+
+`data/candles/<venue>/<SYMBOL>/<YYYY-MM-DD>.c1m` — one UTC day per file, 1440
+fixed 48-byte slots, slot *i* holding the candle at `dayStart + i*60000`. Plain
+files, node builtins only, consistent with the rest of the hub's state; no
+database dependency, because 1-minute candles are a dense exactly-gridded series
+whose every key is known in advance. Presence is stored rather than inferred,
+gaps are computed from the data, writes are idempotent and order-free, and
+retention pruning is `unlink` of whole day files. Budget ~2 MB per symbol-month,
+about 4 GB across all three venues at 30 days.
+
+**Back this up or not, as you like** — unlike `data/licenses.json` it is
+entirely reproducible by re-collecting, just slowly.
+
+### Admin
+
+The **Exchanges** panel on the admin page shows one card per venue: RUNNING /
+STALLED / FAILING (a collector that last succeeded 40 minutes ago on a 1-minute
+cadence is stalled even if nothing threw — it is never "idle", there is always a
+tail to advance), last success and last error with times, symbols split into
+seedable / backfilling / gapped / empty, oldest and newest candle held, total
+missing minutes with the worst offenders named, and pairs first listed in the
+last 24h with how much history they hold so far. A venue with no collector says
+so rather than showing zeroes that would read as a working collector with an
+empty store.
+
 ## License format v1 (pinned)
 
 ```
@@ -129,6 +235,7 @@ Testers upgrade by re-running their install command.
 | `data/revoked.json` | durable revocations | revoked keys work again |
 | `data/roster.json` | compact last-seen per license | rebuildable from the ledger |
 | `data/checkins.jsonl` | append-only check-in ledger | history gone |
+| `data/candles/` | collected 1m candles, per venue per symbol | seeds go cold until re-collected (hours, not fatal) |
 | `releases/` | beta tarballs + `latest.json` | republish from the bot repo |
 | `/etc/wickhunter-hub/env` | `HUB_ADMIN_TOKEN`, origin, port | regenerate via `install-hub.sh` |
 
@@ -145,8 +252,10 @@ anywhere private is enough; everything else is reproducible.
 | `GET /install.sh?key=` | valid token | personalised tester installer |
 | `GET /api/latest?key=` | valid token | `{version,file,sha256}` |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
+| `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
 | `GET /admin` | none (page holds no secrets) | static admin page |
 | `GET/POST /admin/api/licenses[/revoke]` | `x-hub-admin` header, constant-time | list / issue / revoke |
+| `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status |
 
 License keys travel in query strings by design (curl-pasteable); the hub never
 logs a URL's query, and the shipped nginx snippet sets `access_log off` for
@@ -165,6 +274,13 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.0 — candle seed service: per-venue 1m collectors (Bybit, Bitunix,
+  Bitget) with automatic pick-up of new listings and clean handling of
+  delistings, fixed-slot binary day-file storage with presence stored rather
+  than inferred, the signed `GET /api/candles/seed` contract v1 (Ed25519 over
+  pinned canonical bytes, reusing the licence key, gzip), and an Exchanges
+  status panel on the admin page. Collectors off unless `HUB_CANDLE_VENUES`
+  is set.
 - v0.1.0 — initial hub: LHK1 licensing (issue/verify/revoke, Ed25519),
   check-in intake (ledger + roster), keyed install.sh + release downloads,
   admin surface (CLI, HTTP API, one static page), install-hub.sh with nginx
