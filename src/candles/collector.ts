@@ -295,6 +295,12 @@ export class VenueCollector {
    *  and re-done only after the hole has been written into. */
   private holeCache = new Map<string, { at: number; gap: [number, number] | null }>();
 
+  /** Oldest minute we have PROVEN the venue has no history for, per symbol.
+   *  Deliberately NOT folded into coverage: it is a fact about the venue's
+   *  records, not about our own, and mixing the two is what reported a young
+   *  listing's pre-listing silence as a gap in its data (v0.2.8). */
+  private backfillFloor = new Map<string, number>();
+
   /** The oldest interior hole in a symbol, or null. Interior holes are the one
    *  failure that poisons a seed while the symbol looks deep AND current, and
    *  NOTHING else repairs them: backfill only ever digs backward from
@@ -378,9 +384,16 @@ export class VenueCollector {
           if (endMs > hole[0]) repair.push({ symbol: rec.symbol, startMs: hole[0], endMs, kind: "repair" });
         }
       }
-      if (cov.firstClosedMs !== null && cov.firstClosedMs > horizon) {
-        const endMs = cov.firstClosedMs - MINUTE_MS;
-        backfill.push({ symbol: rec.symbol, startMs: Math.max(horizon, endMs - pageSpan), endMs, kind: "backfill" });
+      if (cov.firstClosedMs !== null) {
+        // Dig from the older of "our oldest candle" and "the oldest minute we
+        // have proved empty", so an empty page is not re-requested forever
+        // WITHOUT pretending the empty range is held history.
+        const floor = this.backfillFloor.get(rec.symbol);
+        const digFrom = floor === undefined ? cov.firstClosedMs : Math.min(cov.firstClosedMs, floor);
+        if (digFrom > horizon) {
+          const endMs = digFrom - MINUTE_MS;
+          backfill.push({ symbol: rec.symbol, startMs: Math.max(horizon, endMs - pageSpan), endMs, kind: "backfill" });
+        }
       }
     }
     // Round-robin the tail so a long symbol list still gets even attention.
@@ -524,20 +537,24 @@ export class VenueCollector {
         // look again rather than re-requesting a range that is now filled.
         if (item.kind === "repair" && w.newlyFilled > 0) this.holeCache.delete(item.symbol);
         if (item.kind === "backfill" && page.empty) {
-          // The venue has no more history here. Record that by moving our
-          // first-held marker down to the range we just proved empty, so the
-          // backfill does not ask for it again every tick forever.
+          // The venue has no more history here. Recorded in a SEPARATE floor,
+          // never by moving `firstClosedMs`.
           //
-          // NOTE what this does NOT do: it does not mark the symbol "complete".
-          // Completeness is never inferred from a short or empty page anywhere
-          // in this service — the seed's `gaps` are read off stored presence,
-          // so a range we could not fill stays visible as a gap regardless of
-          // what this cursor says. This is only a politeness to the venue.
-          const cov = this.coverage(item.symbol);
-          this.coverageCache.set(item.symbol, {
-            ...cov,
-            firstClosedMs: cov.firstClosedMs === null ? null : Math.min(cov.firstClosedMs, item.startMs),
-          });
+          // v0.2.8 — moving `firstClosedMs` down to a range we had just proved
+          // EMPTY is what made a young listing look broken. Coverage computes
+          // `interiorMissing = span - count`, and span runs from
+          // `firstClosedMs`; dragging that marker back across history the pair
+          // never had inflated span while count stood still, so the symbol
+          // reported a hole the exact size of its own pre-listing silence — and
+          // it compounded, one page per pass, until it hit the retention
+          // horizon. On the operator's box: newly listed Bybit equity tokens
+          // (CSOPSKHYNIX2L, MEITUAN, EBAY) reading 25-29.5 DAY gaps, and
+          // 1,034,104 "missing minutes" across the venue.
+          //
+          // A pair that did not exist yet is not a pair with a hole in it. The
+          // floor below stops the backfill re-asking; the coverage arithmetic
+          // stays about candles that were actually possible.
+          this.backfillFloor.set(item.symbol, Math.min(this.backfillFloor.get(item.symbol) ?? Infinity, item.startMs));
         }
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;

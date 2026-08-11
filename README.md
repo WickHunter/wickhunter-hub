@@ -360,6 +360,21 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.8 — **a young listing is no longer reported as gapped.** Operator: "What
+  if a pair isn't 30 days old? I think that's some of these gaps but shouldn't
+  be listed as a gap?" Exactly right. When the venue answered a backfill with an
+  empty page, the collector recorded "no more history here" by dragging
+  `firstClosedMs` DOWN across the range it had just proved empty — and coverage
+  computes `interiorMissing = span - count` from that marker, so span grew while
+  count stood still and the pair reported a hole the size of its own
+  **pre-listing silence**. It compounded one page per pass until it reached the
+  retention horizon: newly listed Bybit equity tokens (CSOPSKHYNIX2L, MEITUAN,
+  EBAY) read **25–29.5 day gaps**, and the venue totalled **1,034,104 "missing
+  minutes"** that were never missing. The proven-empty floor is now tracked
+  separately from held coverage — it still stops the backfill re-asking the same
+  range forever, but the gap arithmetic is only ever about candles that were
+  actually possible. A pair that did not exist yet is not a pair with a hole in
+  it.
 - v0.2.7 — **the version the hub reports is now checked, not commented.**
   `src/version.ts` carried "keep in lockstep with package.json" as a comment and
   drifted for five releases: 0.2.2 through 0.2.6 all shipped while it said

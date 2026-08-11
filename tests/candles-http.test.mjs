@@ -809,6 +809,51 @@ await test("an interior hole is REPAIRED — backfill can never reach one", asyn
     "the hole was filled — a gapped symbol poisons a seed while looking deep and current");
 });
 
+await test("a YOUNG LISTING is not gapped — pre-listing silence is not a hole", async () => {
+  // THE OPERATOR'S CATCH (v0.2.8): "What if a pair isn't 30 days old? I think
+  // that's some of these gaps but shouldn't be listed as a gap?" Exactly right.
+  // The backfill used to record "the venue has no more history" by dragging
+  // `firstClosedMs` DOWN across the empty range — and coverage computes
+  // `interiorMissing = span - count` from that marker, so span grew while count
+  // stood still and the pair reported a hole the size of its own pre-listing
+  // silence. It compounded one page per pass: newly listed Bybit equity tokens
+  // read 25-29.5 DAY gaps, 1,034,104 "missing minutes" across the venue.
+  const listedAt = NEWEST_CLOSED - 120 * MINUTE_MS;   // this pair is two hours old
+  const venue = stubVenue({ symbols: ["NEWLISTUSDT"], listedSince: { NEWLISTUSDT: listedAt } });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  // Several passes, so the backfill hits the empty range repeatedly — the
+  // compounding is the part that turned a small lie into a 29-day one.
+  for (let i = 0; i < 6; i++) await svc.tickAll(NOW);
+
+  const cov = svc.collector("bitget").coverage("NEWLISTUSDT");
+  assert.ok(cov.lastClosedMs !== null, "precondition: it did collect what exists");
+  assert.equal(cov.interiorMissing, 0, "a pair that did not exist yet is not a pair with a hole in it");
+  assert.equal(cov.firstClosedMs, listedAt, "and its oldest candle is its LISTING, not a probe marker");
+
+  const st = svc.status(NOW).find((v) => v.venue === "bitget");
+  assert.equal(st.counts.gapped, 0, "so it is not counted as gapped");
+  assert.equal(st.totalMissingMinutes, 0, "and contributes nothing to missing minutes");
+});
+
+await test("…but the empty range is still not re-requested forever", async () => {
+  // The floor still has to do its original job: without it the backfill asks
+  // the venue for the same pre-listing range every single pass.
+  const listedAt = NEWEST_CLOSED - 120 * MINUTE_MS;
+  const venue = stubVenue({ symbols: ["NEWLISTUSDT"], listedSince: { NEWLISTUSDT: listedAt } });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  venue.state.requests.length = 0;
+  for (let i = 0; i < 4; i++) await svc.tickAll(NOW);
+  // Without the floor being CONSULTED, every pass asks for the identical
+  // pre-listing range forever. With it, the dig walks downward — so the test is
+  // that the ranges MOVE, not that the request count stops.
+  const ranges = venue.state.requests
+    .filter((u) => u.includes("symbol=NEWLISTUSDT"))
+    .map((u) => new URL(u).searchParams.get("endTime"));
+  assert.ok(ranges.length >= 2, `precondition: it kept digging (${ranges.length})`);
+  assert.equal(new Set(ranges).size, ranges.length, `each pass asks a NEW range, never the same one again (${ranges.join(",")})`);
+});
+
 await test("the SEEDABLE ceiling is derived from the cadence, never set beside it", async () => {
   // THE BUG THIS PREVENTS: poll every 150 minutes, judge seedable at 15, and
   // every symbol is permanently un-seedable while the collector works
