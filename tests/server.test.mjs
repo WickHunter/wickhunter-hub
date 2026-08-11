@@ -19,6 +19,20 @@ fs.writeFileSync(
   JSON.stringify({ version: "0.9.0", file: relName, sha256: createHash("sha256").update(tarball).digest("hex") }),
 );
 
+await test("HUB_VERSION, package.json and the changelog agree — nothing drifts on a comment", async () => {
+  // v0.2.7 — this is the test that did not exist. `src/version.ts` said 0.2.1
+  // while package.json said 0.2.6: five releases reported themselves as a build
+  // that had not run for hours, on the admin page and on /api/health alike.
+  const { HUB_VERSION } = await import("../dist/src/version.js");
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(HUB_VERSION, pkg.version, "src/version.ts must match package.json");
+  // And the changelog's newest entry, so a release cannot ship undocumented.
+  const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const newest = /^- v(\d+\.\d+\.\d+)/m.exec(readme.slice(readme.indexOf("## Changelog")));
+  assert.ok(newest, "the changelog has a versioned newest entry");
+  assert.equal(newest[1], pkg.version, "the newest changelog entry must name this version");
+});
+
 await test("health reports ok + version", async () => {
   const r = await jsonReq(`${h.origin}/api/health`);
   assert.equal(r.status, 200);

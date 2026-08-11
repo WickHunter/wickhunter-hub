@@ -360,6 +360,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.7 — **the version the hub reports is now checked, not commented.**
+  `src/version.ts` carried "keep in lockstep with package.json" as a comment and
+  drifted for five releases: 0.2.2 through 0.2.6 all shipped while it said
+  0.2.1, so the admin page and `GET /api/health` reported a build that had not
+  run for hours. `install-hub.sh` does compare the served version against
+  package.json and refused correctly — but the admin **Upgrade hub** button runs
+  it detached into `data/upgrade.log`, so the refusal landed where nobody looks
+  while the restart itself had already succeeded. The suite now pins
+  `HUB_VERSION`, `package.json` and the newest changelog entry to each other.
 - v0.2.6 — **HOTFIX: the repair request shape broke Bitget.** v0.2.5 clamped a
   repair window to the hole's own end, producing narrow ranges that Bitget's
   `history-candles` answered with HTTP 400 — every kline request on the venue
