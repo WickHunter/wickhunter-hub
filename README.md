@@ -360,6 +360,16 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.9 — **the tail cadence drops to 100 minutes, for the seed cross-check.**
+  Page utilisation wants this number high; the bot's seed verification wants it
+  low, and that is the harder bound. Every seed is checked against one recent
+  venue page before a candle is accepted and **zero overlap is a failure** — an
+  unverifiable seed is discarded exactly like a wrong one. Bitunix and Bitget
+  pages span 200 minutes, so at the previous 150 the overlap margin was only 50
+  minutes; one slow sweep past it and every seed on those venues is silently
+  refused while each bot falls back to a ~12-hour venue warm-up. 100 leaves a
+  100-minute margin and still fills half a page per request — 3.5x the
+  utilisation this replaced. `HUB_CANDLE_TAIL_FILL_MIN` still overrides it.
 - v0.2.8 — **a young listing is no longer reported as gapped.** Operator: "What
   if a pair isn't 30 days old? I think that's some of these gaps but shouldn't
   be listed as a gap?" Exactly right. When the venue answered a backfill with an

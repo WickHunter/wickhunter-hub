@@ -85,11 +85,22 @@ export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
   minRequestsPerSecond: 0.5,
   rateLimitCooldownMs: 60_000,
   rateLimitMaxCooldownMs: 15 * 60_000,
-  // 150 minutes: three quarters of the 200-row page Bitunix and Bitget both
-  // cap at. Bybit's page holds 1000, but the same 150 is used there rather than
-  // 750 — a 12-hour-old tail buys nothing on a venue that is not refusing us,
-  // and one number is easier to reason about than a per-venue table.
-  tailFillMinutes: 150,
+  // ── 100 MINUTES, AND THE SECOND CONSTRAINT THAT SET IT (v0.2.9) ───────────
+  // Page utilisation wants this HIGH: at 200 rows, 150 minutes filled three
+  // quarters of a page. The seed CROSS-CHECK wants it LOW, and it is the
+  // harder bound. Every hub seed is verified against one recent venue page
+  // before a candle enters a bot's store, and ZERO OVERLAP IS A FAILURE — an
+  // unverifiable seed is discarded exactly like a wrong one. Bitunix and Bitget
+  // pages span 200 minutes, so a tail this many minutes stale leaves
+  // (200 - tailFillMinutes) of overlap. At 150 that margin was 50 minutes; one
+  // slow sweep past it and every seed on those venues is silently refused and
+  // every bot falls back to a ~12-hour venue warm-up.
+  //
+  // 100 leaves a 100-minute margin — half the page — and still fills half of it
+  // per request, which is 3.5x the utilisation this replaced. Bybit's 1000-row
+  // page was never near this bound; one number stays easier to reason about
+  // than a per-venue table.
+  tailFillMinutes: 100,
   symbolRefreshMs: 15 * 60_000,
   stallAfterMs: 10 * 60_000,
   failingAfter: 5,
