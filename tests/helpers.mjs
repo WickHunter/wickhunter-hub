@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { generateSigningKey, LicenseStore } from "../dist/src/license.js";
 import { createHub } from "../dist/src/server.js";
+import { DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 
@@ -36,6 +37,14 @@ export async function freshHub(overrides = {}, deps = undefined) {
     adminToken: "test-admin-token",
     publicOrigin: "https://hub.test/hub",
     srcDir: "/nonexistent/hub-src",
+    // Candle collectors are OFF unless a suite asks for them: a test hub must
+    // never make an outbound venue request. Suites that exercise the collector
+    // pass their own venue list plus a stub fetch through `deps`.
+    candleVenues: [],
+    candleKeyId: "seed-1",
+    candleRequireLicense: true,
+    candleTickMs: 60_000,
+    candleOptions: { ...DEFAULT_COLLECTOR_OPTIONS },
     ...overrides,
   };
   const hub = createHub(cfg, deps);

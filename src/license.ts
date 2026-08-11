@@ -111,6 +111,33 @@ export class LicenseStore {
     return this.loadKeys().pub.export({ type: "spki", format: "pem" }).toString();
   }
 
+  /** The 32 raw public-key bytes, base64url — the compact form baked into the
+   *  bot. Same encoding `generateSigningKey` reports at keygen time, offered
+   *  here so the admin page can show the operator which key to pair a
+   *  seed-verifying client against without them re-running keygen. */
+  publicKeyRawB64u(): string {
+    const spki = this.loadKeys().pub.export({ type: "spki", format: "der" });
+    return Buffer.from(spki.subarray(spki.length - 32)).toString("base64url");
+  }
+
+  /** Ed25519-sign arbitrary bytes with the hub's signing key.
+   *
+   *  This is the SAME key and the same primitive that mints LHK1 licence
+   *  tokens, deliberately: the candle-seed service needs signed payloads, and a
+   *  second key would mean a second thing to generate, back up, rotate and bake
+   *  into the bot, for no security gain. Nothing about it is licence-specific —
+   *  `issue()` signs a payload, this signs a caller's bytes.
+   *
+   *  Domain separation is structural rather than by prefix: a licence signature
+   *  covers a JSON object with `v/id/name/exp/iat/plan`, a seed signature covers
+   *  one with `v/venue/symbol/interval/...`, and neither parses as the other, so
+   *  a signature lifted from one surface is inert on the other.
+   *
+   *  Returns a signature only — never key material, per this module's rule. */
+  sign(bytes: Buffer): Buffer {
+    return edSign(null, bytes, this.loadKeys().priv);
+  }
+
   issue(name: string, days: number, now = Date.now()): { payload: LicensePayload; token: string } {
     const trimmed = name.trim();
     if (!trimmed || trimmed.length > 120) throw new Error("name must be 1..120 characters");

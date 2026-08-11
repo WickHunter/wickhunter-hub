@@ -8,6 +8,7 @@
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /api/latest?key=<token>        release metadata (version/file/sha256)
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
+//   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   admin    GET  /admin                         static admin page (auth lives in its API calls)
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
@@ -29,9 +30,12 @@
 // log for /hub/ either; if the operator turns one on, that is on them.
 import fs from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { CandleService, type CandleServiceDeps } from "./candles/service.js";
+import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import {
   FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, listFeedback, setFeedbackStatus,
@@ -49,6 +53,7 @@ const MAX_FEEDBACK_BODY_BYTES = 256 * 1024;
 export interface Hub {
   server: http.Server;
   store: LicenseStore;
+  candles: CandleService;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
@@ -63,11 +68,25 @@ interface LatestJson {
 export interface HubDeps {
   /** Injectable for tests; production is node:child_process.spawn. */
   spawn?: typeof nodeSpawn;
+  /** Injectable so candle tests never touch the network. */
+  candleFetch?: CandleServiceDeps["fetchLike"];
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
   const spawn = deps.spawn ?? nodeSpawn;
+  // The seed signer IS the licence signer — one Ed25519 key for the hub, so
+  // there is one thing to generate, back up, rotate and bake into the bot.
+  const candles = new CandleService(
+    {
+      dataDir: cfg.dataDir,
+      venues: cfg.candleVenues,
+      keyId: cfg.candleKeyId,
+      options: cfg.candleOptions,
+      tickMs: cfg.candleTickMs,
+    },
+    { sign: (bytes) => store.sign(bytes), fetchLike: deps.candleFetch },
+  );
   let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
 
   const server = http.createServer((req, res) => {
@@ -94,6 +113,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
+    if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
     if (m === "GET" && p.startsWith("/download/")) return download(url, res);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
@@ -244,6 +264,66 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     stream.on("error", () => res.destroy());
   }
 
+  // ── candle seed ───────────────────────────────────────────────────────────
+  //
+  // GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=  — wire contract v1.
+  //
+  // AUTH DECISION: this endpoint is KEYED, like every other download surface
+  // on this hub. Three reasons. It is a licensed benefit — the whole point is
+  // saving a tester the ~12-hour venue warm-up. It is by far the heaviest thing
+  // the hub serves, tens of MB per pair-window and gigabytes across a fleet, so
+  // an unauthenticated copy of it is an open bandwidth tap. And it costs the
+  // bot nothing: it already holds a token and already sends `?key=` for
+  // install.sh, /api/latest and /download. Nothing in the licence path is
+  // weakened or bypassed — `requireKey` is the same gate, unchanged, and a
+  // revoked or expired key is refused here exactly as it is there.
+  // HUB_CANDLE_REQUIRE_LICENSE=0 exists for a local test hub only.
+  //
+  // The 403 here is JSON, unlike the plain-text 403 the curl-facing endpoints
+  // send, because this endpoint's client is a JSON parser.
+  async function candleSeed(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    if (cfg.candleRequireLicense) {
+      const v = store.verify(url.searchParams.get("key") ?? "");
+      if (!v.ok) return sendJson(res, 403, { ok: false, error: `license ${v.reason}` });
+    }
+    const venue = url.searchParams.get("venue") ?? "";
+    const symbol = url.searchParams.get("symbol") ?? "";
+    if (!isVenueId(venue)) {
+      return sendJson(res, 400, { ok: false, error: `unknown venue: ${venue.slice(0, 32)}` });
+    }
+    // The symbol is a VENUE-NATIVE spelling and becomes a path segment; the
+    // store whitelists it too, but rejecting it here keeps the 400/404 split
+    // meaningful (malformed request vs. symbol this venue does not list).
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(symbol)) {
+      return sendJson(res, 400, { ok: false, error: "symbol must be a venue-native instrument spelling" });
+    }
+    const rawFrom = url.searchParams.get("fromMs");
+    const rawTo = url.searchParams.get("toMs");
+    if (rawFrom === null || rawTo === null || !/^\d{1,15}$/.test(rawFrom) || !/^\d{1,15}$/.test(rawTo)) {
+      return sendJson(res, 400, { ok: false, error: "fromMs and toMs must be epoch-ms integers" });
+    }
+    const outcome = candles.seed({ venue, symbol, fromMs: Number(rawFrom), toMs: Number(rawTo) });
+    if (!outcome.ok) return sendJson(res, outcome.code, { ok: false, error: outcome.error });
+
+    // The payload's own key order IS the signed canonical order plus `sig`
+    // last, so serialising it directly cannot disagree with what was signed.
+    const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+    const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+    // A 30-day seed is ~43k rows of mostly-decimal JSON; gzip takes roughly an
+    // order of magnitude off it, which is the difference between this being a
+    // download and being a problem.
+    const bytes = wantsGzip ? gzipSync(body) : body;
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": bytes.length,
+      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+      // Candles are immutable once closed, but `lastClosedMs` advances every
+      // minute, so the response is only good for about that long.
+      "cache-control": "public, max-age=60",
+    });
+    res.end(bytes);
+  }
+
   // ── admin surface ─────────────────────────────────────────────────────────
 
   function adminPage(res: ServerResponse): void {
@@ -330,6 +410,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         note: "upgrade started — the hub restarts itself; watch /api/health for the new version. Log: data/upgrade.log",
       });
     }
+    // Per-exchange collector status: one card per venue on the admin page.
+    // Venues with no collector configured are included and say so — a card of
+    // zeroes would be indistinguishable from a collector that is running and
+    // has collected nothing, which is the opposite diagnosis.
+    if (m === "GET" && p === "/admin/api/candles") {
+      let seedPublicKey: string | null = null;
+      try { seedPublicKey = store.publicKeyRawB64u(); } catch { seedPublicKey = null; }
+      return sendJson(res, 200, {
+        ok: true,
+        enabled: candles.enabled,
+        keyId: cfg.candleKeyId,
+        requiresLicense: cfg.candleRequireLicense,
+        retentionDays: cfg.candleOptions.retentionDays,
+        // The public half of the seed-signing key, so the operator can pair a
+        // verifying client without re-running keygen. Public material only.
+        seedPublicKey,
+        venues: candles.status(),
+      });
+    }
     if (m === "GET" && p === "/admin/api/feedback") {
       // Table view: everything EXCEPT the logs (they can be hundreds of KB
       // per report) — the export carries those.
@@ -410,16 +509,21 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   return {
     server,
     store,
+    candles,
     listen: () =>
       new Promise<number>((resolve, reject) => {
         server.once("error", reject);
         server.listen(cfg.port, cfg.host, () => {
           server.removeListener("error", reject);
+          // Collectors start only once the hub is actually serving, so a hub
+          // that cannot bind never begins hammering three exchanges.
+          candles.start();
           resolve((server.address() as AddressInfo).port);
         });
       }),
     close: () =>
       new Promise<void>((resolve, reject) => {
+        candles.stop();
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),
