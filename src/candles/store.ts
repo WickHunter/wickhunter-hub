@@ -48,6 +48,33 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const MINUTE_MS = 60_000;
+
+/** ── v0.2.10 — THE CLOCK-SKEW GRACE ────────────────────────────────────────
+ *
+ *  Both gates that decide "is this candle closed" read the HUB's clock, never
+ *  the venue's — deliberately, so a venue that changes its framing cannot fool
+ *  us. That makes our clock the authority, and skew is asymmetric:
+ *
+ *    · clock BEHIND  — harmless. A closed candle is dropped and collected on
+ *                      the next pass.
+ *    · clock AHEAD   — the failure. `newestClosedOpenMs` is
+ *                      floor(now) - 1 minute, so a hub running even a few
+ *                      seconds fast accepts a bar the venue still considers
+ *                      FORMING. And it is permanent: tails move forward,
+ *                      backfill digs backward, and repair fills only ABSENT
+ *                      slots. Nothing re-fetches a minute already written to
+ *                      correct its value.
+ *
+ *  What that costs is invisible from both ends. The bot cross-checks every seed
+ *  against a live venue page and discards the WHOLE seed on any mismatch, so a
+ *  skewed hub does not corrupt anyone's bands — it silently serves seeds that
+ *  always fail verification while this panel reports perfect health, and every
+ *  bot falls back to a ~12-hour venue warm-up.
+ *
+ *  One minute of grace makes any skew under 60 seconds structurally incapable
+ *  of admitting a forming bar. Against a 100-minute tail cadence the freshness
+ *  it costs is nothing. */
+export const CLOSED_GRACE_MS = 60_000;
 export const SLOTS_PER_DAY = 1440;
 export const RECORD_BYTES = 48;
 export const DAY_MS = SLOTS_PER_DAY * MINUTE_MS;
@@ -118,6 +145,14 @@ export function dayKey(dayStartMs: number): string {
  *  earlier. Every venue adapter's output is filtered through this, whatever
  *  that venue's own framing does, so "did this exchange hand us a forming bar"
  *  can never be the difference between a right and a wrong seed. */
+/** The newest minute this collector is willing to treat as SETTLED: the newest
+ *  closed minute, less `CLOSED_GRACE_MS`. Used for what we STORE. `dropUnclosed`
+ *  keeps its own unmargined test — that one is about the venue's forming bar,
+ *  this one is about our own clock being wrong. */
+export function settledOpenMs(now: number): number {
+  return newestClosedOpenMs(now) - CLOSED_GRACE_MS;
+}
+
 export function newestClosedOpenMs(now: number): number {
   return floorMinute(now) - MINUTE_MS;
 }

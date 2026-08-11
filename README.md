@@ -360,6 +360,26 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.10 — **a finished venue no longer reports a fault, and a fast clock can
+  no longer store a forming bar.** Two consequences of the tail cadence, both
+  found on the operator's live panel. (1) **CAUGHT UP IS NOT STALLED.** A venue
+  whose symbols are all current correctly issues no requests for up to
+  `HUB_CANDLE_TAIL_FILL_MIN`; the only thing still touching `lastSuccessAt` is
+  the 15-minute symbol refresh, against a 10-minute stall ceiling — so a
+  FINISHED venue reported STALLED for a third of every quarter-hour. Bybit hit
+  it at 695 of 699 seedable with zero gaps. A pass that finds nothing due now
+  reads RUNNING and says why; a collector that has stopped ticking altogether
+  is still stalled. (2) **A CLOCK-SKEW GRACE.** Both closed-candle gates read
+  the hub's own clock, so skew is asymmetric: behind is harmless, AHEAD accepts
+  a bar the venue still considers forming — and permanently, since nothing
+  re-fetches a minute already written to correct it. That failure is invisible
+  from both ends: the bot discards the whole seed on any mismatch, so a skewed
+  hub silently serves seeds that always fail verification while this panel
+  reports perfect health. Candles are now stored only once **settled**
+  (`CLOSED_GRACE_MS`, one minute), making any skew under 60 seconds
+  structurally incapable of admitting a forming bar. `dropUnclosed` keeps its
+  own unmargined test — that one is about the venue's framing, this is about
+  our clock being wrong.
 - v0.2.9 — **the tail cadence drops to 100 minutes, for the seed cross-check.**
   Page utilisation wants this number high; the bot's seed verification wants it
   low, and that is the harder bound. Every seed is checked against one recent

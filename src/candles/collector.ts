@@ -29,7 +29,7 @@
 import path from "node:path";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import {
-  CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, type Candle, type SymbolCoverage,
+  CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, settledOpenMs, type Candle, type SymbolCoverage,
 } from "./store.js";
 import { ADAPTERS, dropUnclosed, isRateLimit, type FetchLike, type VenueId } from "./venues.js";
 
@@ -312,6 +312,10 @@ export class VenueCollector {
    *  listing's pre-listing silence as a gap in its data (v0.2.8). */
   private backfillFloor = new Map<string, number>();
 
+  /** Did the LAST pass find anything due? v0.2.10 — the difference between a
+   *  collector that is behind and one that has simply finished. */
+  private lastTickHadWork = true;
+
   /** The oldest interior hole in a symbol, or null. Interior holes are the one
    *  failure that poisons a seed while the symbol looks deep AND current, and
    *  NOTHING else repairs them: backfill only ever digs backward from
@@ -336,7 +340,9 @@ export class VenueCollector {
 
   private workQueue(now: number): Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> {
     const adapter = ADAPTERS[this.venue];
-    const newestClosed = newestClosedOpenMs(now);
+    // v0.2.10 — SETTLED, not merely closed: one minute of grace against our
+    // own clock running fast. See CLOSED_GRACE_MS.
+    const newestClosed = settledOpenMs(now);
     const horizon = newestClosed - this.opts.retentionDays * DAY_MS;
     const pageSpan = (adapter.pageLimit - 1) * MINUTE_MS;
     const tail: Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> = [];
@@ -523,7 +529,11 @@ export class VenueCollector {
     }
 
     const queue = this.workQueue(now);
-    const newestClosed = newestClosedOpenMs(now);
+    // NOTHING DUE IS NOT NOTHING WORKING. Recorded before the loop so a venue
+    // that has CAUGHT UP is distinguishable from one that has fallen behind —
+    // they look identical from `lastSuccessAt` alone. See health().
+    this.lastTickHadWork = queue.length > 0;
+    const newestClosed = settledOpenMs(now);
     let requests = 0;
     let written = 0;
     this.lastPollAt = now;
@@ -644,6 +654,26 @@ export class VenueCollector {
     }
     const age = now - this.lastSuccessAt;
     if (age >= this.opts.stallAfterMs) {
+      // ── v0.2.10 — CAUGHT UP IS NOT STALLED ──────────────────────────────
+      // The note below used to be true: every symbol was due every minute, so
+      // silence really was always a fault. The v0.2.4 tail cadence ended that.
+      // A venue whose symbols are all current and none yet `tailFillMinutes`
+      // behind correctly issues NO requests for up to that long — and with a
+      // 15-minute symbol refresh against a 10-minute stall ceiling, a FINISHED
+      // venue spent a third of every quarter-hour reporting a fault it did not
+      // have. Bybit hit it the moment it reached 695 of 699 seedable with zero
+      // gaps: the panel said STALLED about a collector that had run out of
+      // things to do.
+      //
+      // A tick must still be RUNNING for this to apply, so a service that has
+      // stopped ticking altogether is stalled exactly as before.
+      const polledRecently = this.lastPollAt !== null && now - this.lastPollAt < this.opts.stallAfterMs;
+      if (polledRecently && !this.lastTickHadWork) {
+        return {
+          ...base, state: "running",
+          detail: `caught up — every tracked symbol is current and nothing is due yet (a tail is polled once it is ${this.opts.tailFillMinutes} minutes behind)`,
+        };
+      }
       // Deliberately not "idle": this collector always has a tail to advance,
       // so there is no such thing as nothing to do. Silence is a fault.
       return {

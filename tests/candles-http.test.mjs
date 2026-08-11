@@ -345,7 +345,14 @@ await test("the collector never stores a forming bar even though the stub venue 
   const { svc } = serviceWith("bitget", venue.fetchLike);
   await svc.tickAll(NOW);
   const cov = svc.collector("bitget").coverage("BTCUSDT");
-  assert.equal(cov.lastClosedMs, NEWEST_CLOSED, "stops at the newest CLOSED minute, not the one in progress");
+  // v0.2.10 — it stops one minute EARLIER than the newest closed bar now: the
+  // clock-skew grace (CLOSED_GRACE_MS). The claim this test makes is unchanged
+  // and strictly stronger — the forming bar never reaches disk — but the
+  // boundary moved, so it is read from the same function the collector uses
+  // rather than typed in again.
+  const { settledOpenMs } = await import("../dist/src/candles/store.js");
+  assert.equal(cov.lastClosedMs, settledOpenMs(NOW), "stops at the newest SETTLED minute, not the one in progress");
+  assert.ok(cov.lastClosedMs < NEWEST_CLOSED, "and deliberately short of the newest closed one, as the grace intends");
 });
 
 // ── PER-EXCHANGE STATUS ─────────────────────────────────────────────────────
@@ -852,6 +859,67 @@ await test("…but the empty range is still not re-requested forever", async () 
     .map((u) => new URL(u).searchParams.get("endTime"));
   assert.ok(ranges.length >= 2, `precondition: it kept digging (${ranges.length})`);
   assert.equal(new Set(ranges).size, ranges.length, `each pass asks a NEW range, never the same one again (${ranges.join(",")})`);
+});
+
+await test("a FINISHED venue reads RUNNING, not STALLED — nothing due is not nothing working", async () => {
+  // THE FALSE ALARM (v0.2.10): with the tail cadence, a venue whose symbols are
+  // all current correctly issues no requests for up to `tailFillMinutes`. The
+  // only thing still touching lastSuccessAt is the 15-minute symbol refresh,
+  // against a 10-minute stall ceiling — so a FINISHED venue reported a fault
+  // for a third of every quarter-hour. Bybit hit it at 695/699 seedable with
+  // zero gaps: STALLED, about a collector that had run out of things to do.
+  // A genuinely FINISHED venue: retention shallow enough that the first page
+  // already reaches the horizon, so there is no backfill left either. Without
+  // that the symbol still has depth to dig and the pass is not idle at all.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, { retentionDays: 0.05 });
+  await svc.tickAll(at());
+  // Far enough that lastSuccessAt is past the stall ceiling, but NOT far enough
+  // for a tail to be due — precisely the window that used to lie.
+  const later = NOW + (DEFAULT_COLLECTOR_OPTIONS.stallAfterMs + 3 * MINUTE_MS);
+  advance(DEFAULT_COLLECTOR_OPTIONS.stallAfterMs + 3 * MINUTE_MS);
+  venue.state.now = later;
+  await svc.tickAll(later);
+  const h = svc.collector("bitget").health(later);
+  assert.equal(h.state, "running", `a caught-up venue is not stalled (${h.detail})`);
+  assert.match(h.detail, /caught up/, "and it says why it is quiet");
+});
+
+await test("…but a collector that stops TICKING is still stalled", async () => {
+  // The guard must not swallow a real stall: "nothing due" only excuses silence
+  // while a pass is actually running.
+  // Must be the CAUGHT-UP collector — otherwise `lastTickHadWork` is true and
+  // the guard is never reached, so the assertion would pass without testing it.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, { retentionDays: 0.05 });
+  await svc.tickAll(at());
+  advance(3 * MINUTE_MS);
+  venue.state.now = NOW + 3 * MINUTE_MS;
+  await svc.tickAll(NOW + 3 * MINUTE_MS);           // an idle pass: nothing due
+  assert.equal(svc.collector("bitget").health(NOW + 3 * MINUTE_MS).state, "running", "precondition: caught up");
+
+  // Now the service STOPS ticking. lastPollAt goes stale alongside
+  // lastSuccessAt, and "nothing was due" stops excusing the silence.
+  const later = NOW + DEFAULT_COLLECTOR_OPTIONS.stallAfterMs + 15 * MINUTE_MS;
+  assert.equal(svc.collector("bitget").health(later).state, "stalled",
+    "a service that stopped ticking is a real fault and still reports one");
+});
+
+await test("a candle is stored only once it is SETTLED — a fast clock cannot admit a forming bar", async () => {
+  // Both closed-candle gates read OUR clock, so skew is asymmetric: behind is
+  // harmless, AHEAD writes a forming bar permanently (nothing re-fetches a
+  // minute already written to correct it). A skewed hub does not corrupt bands
+  // — the bot discards the whole seed on mismatch — it silently serves seeds
+  // that always fail verification while this panel reports perfect health.
+  const { settledOpenMs, newestClosedOpenMs, CLOSED_GRACE_MS } = await import("../dist/src/candles/store.js");
+  assert.equal(settledOpenMs(NOW), newestClosedOpenMs(NOW) - CLOSED_GRACE_MS, "the grace is applied");
+  assert.ok(CLOSED_GRACE_MS >= MINUTE_MS, "at least a minute, so sub-60s skew cannot reach a forming bar");
+
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const cov = svc.collector("bitget").coverage("AAAUSDT");
+  assert.ok(cov.lastClosedMs <= settledOpenMs(NOW), `nothing newer than the settled boundary reached disk (${cov.lastClosedMs})`);
 });
 
 await test("the SEEDABLE ceiling is derived from the cadence, never set beside it", async () => {
