@@ -5,15 +5,18 @@
 import path from "node:path";
 import { CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs } from "./store.js";
 import {
-  DEFAULT_COLLECTOR_OPTIONS, VenueCollector, type CollectorOptions, type VenueHealth,
+  DEFAULT_COLLECTOR_OPTIONS, VenueCollector, seedableMaxTailAgeMs,
+  type CollectorOptions, type VenueHealth,
 } from "./collector.js";
 import { ADAPTERS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
 
-/** How stale a symbol's tail may be and still count as SEEDABLE. Generous
- *  against a single missed poll, tight enough that a genuinely stuck symbol
- *  does not sit in the healthy bucket. */
-export const SEEDABLE_MAX_TAIL_AGE_MS = 15 * MINUTE_MS;
+// v0.2.4 — the seedable tail ceiling is no longer a constant here. It is
+// DERIVED from the collector's `tailFillMinutes` (see `seedableMaxTailAgeMs` in
+// ./collector.ts), because a symbol is now polled only once it has a page's
+// worth of backlog: a fixed 15-minute ceiling below that polling cadence would
+// mark every symbol un-seedable forever, with the collector working perfectly
+// and the panel reporting nothing servable.
 /** Below this much held history a symbol is still BACKFILLING, not seedable.
  *  24 hours: enough for the bot to compute something meaningful, far short of
  *  the 30-day window it will ask for — which is exactly why the seed states
@@ -297,7 +300,7 @@ export class CandleService {
         bucket = "gapped";
       } else if (
         heldMinutes < SEEDABLE_MIN_MINUTES ||
-        newestClosed - cov.lastClosedMs > SEEDABLE_MAX_TAIL_AGE_MS
+        newestClosed - cov.lastClosedMs > seedableMaxTailAgeMs(this.cfg.options)
       ) {
         bucket = "backfilling";
       } else {
@@ -341,6 +344,7 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
       cooldown,
       numOr(env.HUB_CANDLE_MAX_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.rateLimitMaxCooldownMs),
     ),
+    tailFillMinutes: numOr(env.HUB_CANDLE_TAIL_FILL_MIN, DEFAULT_COLLECTOR_OPTIONS.tailFillMinutes),
     symbolRefreshMs: numOr(env.HUB_CANDLE_SYMBOL_REFRESH_MS, DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs),
     stallAfterMs: numOr(env.HUB_CANDLE_STALL_AFTER_MS, DEFAULT_COLLECTOR_OPTIONS.stallAfterMs),
     failingAfter: numOr(env.HUB_CANDLE_FAILING_AFTER, DEFAULT_COLLECTOR_OPTIONS.failingAfter),

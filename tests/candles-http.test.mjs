@@ -479,7 +479,8 @@ await test("symbols fall into exactly one bucket and the counts add up to tracke
   );
 });
 
-await test("a symbol that is deep but STALE is backfilling, not seedable", async () => {
+/** A deep symbol whose newest candle is `behindMin` minutes old. */
+async function deepSymbolBehind(behindMin) {
   const { svc, dataDir } = serviceWith("bitget", stubVenue().fetchLike);
   const store = new CandleStore(`${dataDir}/candles`);
   await svc.collector("bitget").refreshSymbols(async (url) => ({
@@ -487,12 +488,35 @@ await test("a symbol that is deep but STALE is backfilling, not seedable", async
     json: async () => (url.includes("contracts") ? { code: "00000", data: [{ symbol: "STALEUSDT", symbolStatus: "normal" }] } : { code: "00000", data: [] }),
   }), NOW - 10 * 86_400_000);
   const rows = [];
-  const end = NEWEST_CLOSED - 120 * MINUTE_MS; // two hours behind
+  const end = NEWEST_CLOSED - behindMin * MINUTE_MS;
   for (let i = 0; i < 2000; i++) rows.push(mk(end - (1999 - i) * MINUTE_MS, i));
   store.write("bitget", "STALEUSDT", rows);
-  const s = svc.status(NOW).find((v) => v.venue === "bitget");
+  return svc.status(NOW).find((v) => v.venue === "bitget");
+}
+
+await test("a symbol that is deep but STALE is backfilling, not seedable", async () => {
+  // v0.2.4 — the boundary is DERIVED, not typed in. This test used to plant a
+  // 120-minute-old tail against a hard 15-minute ceiling; the tail cadence
+  // change moved the ceiling to 180, so a fixed 120 would now be judged fresh
+  // and the assertion would have been quietly inverted. Reading the ceiling
+  // from the same function the service reads means the test cannot drift out
+  // from under the behaviour again.
+  const { seedableMaxTailAgeMs, DEFAULT_COLLECTOR_OPTIONS: D } = await import("../dist/src/candles/collector.js");
+  const ceilingMin = seedableMaxTailAgeMs(D) / MINUTE_MS;
+  const s = await deepSymbolBehind(ceilingMin + 30);
   assert.equal(s.counts.seedable, 0, "a stale tail cannot be seedable — the bot would reject it against the venue");
   assert.equal(s.counts.backfilling, 1);
+});
+
+await test("...but a tail INSIDE the polling cadence is seedable — that is the trade A bought", async () => {
+  // The operator approved relaxing freshness so tail requests carry a full page
+  // instead of ~29 rows. A symbol polled on schedule is up to `tailFillMinutes`
+  // behind; if that read as un-seedable the collector would be working
+  // perfectly and the panel would report nothing servable.
+  const { DEFAULT_COLLECTOR_OPTIONS: D } = await import("../dist/src/candles/collector.js");
+  const s = await deepSymbolBehind(D.tailFillMinutes);
+  assert.equal(s.counts.seedable, 1, "a symbol polled on cadence is servable");
+  assert.equal(s.counts.backfilling, 0);
 });
 
 await test("newly listed pairs are counted and named, with the still-backfilling ones separated", async () => {
@@ -678,6 +702,79 @@ await test("recovery creeps back up and NEVER climbs above the configured ceilin
   const rps = svc.collector("bitget").health(at()).effectiveRps;
   assert.ok(rps > 2, `it does climb back (${rps})`);
   assert.ok(rps <= 4, "and stops at the ceiling — the configured rate is a maximum, not a target");
+});
+
+// ── PAGE UTILISATION ────────────────────────────────────────────────────────
+// MEASURED on the operator's box: 202 requests returned 5,768 candles — 28.6
+// rows against a 200-row page, i.e. 14% utilisation. A symbol entered the tail
+// queue the moment it was one minute behind, so with 703 symbols each request
+// collected only the ~29 minutes a sweep took, and backfill — the second half
+// of the queue — never got a turn at all. A rate-limited venue could not
+// converge, however long it ran.
+
+await test("a symbol one minute behind is NOT polled — a request must carry a page", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const first = venue.state.klineRequests;
+  assert.ok(first > 0, "precondition: the first pass collects it");
+
+  // One minute later it is one minute behind. That used to be a whole request
+  // spent collecting one candle. The pass still WORKS — it digs instead — so
+  // the assertion is on the tail specifically, not on request count: the newest
+  // held candle must not advance, because nobody chased it.
+  const tailBefore = svc.collector("bitget").coverage("AAAUSDT").lastClosedMs;
+  venue.state.requests.length = 0;
+  await svc.tickAll(NOW + MINUTE_MS);
+  assert.equal(svc.collector("bitget").coverage("AAAUSDT").lastClosedMs, tailBefore,
+    "the tail was not chased for one minute of backlog");
+  const newest = newestClosedOpenMs(NOW + MINUTE_MS);
+  assert.ok(!venue.state.requests.some((u) => u.includes(`endTime=${newest}`)),
+    "and no request reached for the newest minute — every one was backfill");
+});
+
+await test("...and IS polled once it has a page's worth of backlog", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const before = venue.state.klineRequests;
+  const due = NOW + (DEFAULT_COLLECTOR_OPTIONS.tailFillMinutes + 1) * MINUTE_MS;
+  venue.state.now = due;
+  await svc.tickAll(due);
+  assert.ok(venue.state.klineRequests > before, "the backlog is now worth a request");
+});
+
+await test("a symbol with NOTHING is polled immediately — the cadence is for a tail, not a cold start", async () => {
+  // A brand-new listing must not wait 150 minutes for its first candle.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  assert.notEqual(svc.collector("bitget").coverage("AAAUSDT").lastClosedMs, null, "collected on the very first pass");
+});
+
+await test("the freed budget REACHES backfill — that is the entire point", async () => {
+  // One symbol, already current on its tail but shallow. Under the old rule the
+  // tail was re-requested every pass and depth never advanced.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const oldestAfterFirst = svc.collector("bitget").coverage("AAAUSDT").firstClosedMs;
+  // A minute later: the tail is not due, so the pass must spend itself digging.
+  await svc.tickAll(NOW + MINUTE_MS);
+  const oldestNow = svc.collector("bitget").coverage("AAAUSDT").firstClosedMs;
+  assert.ok(oldestNow < oldestAfterFirst, `backfill advanced (${oldestAfterFirst} -> ${oldestNow})`);
+});
+
+await test("the SEEDABLE ceiling is derived from the cadence, never set beside it", async () => {
+  // THE BUG THIS PREVENTS: poll every 150 minutes, judge seedable at 15, and
+  // every symbol is permanently un-seedable while the collector works
+  // perfectly. Two constants that must agree are two that will not.
+  const { seedableMaxTailAgeMs, DEFAULT_COLLECTOR_OPTIONS: D } = await import("../dist/src/candles/collector.js");
+  assert.ok(seedableMaxTailAgeMs(D) > D.tailFillMinutes * MINUTE_MS,
+    "the ceiling is above the polling cadence, so a symbol polled on time is fresh");
+  // And it tracks a changed cadence rather than staying put.
+  assert.ok(seedableMaxTailAgeMs({ tailFillMinutes: 600 }) > seedableMaxTailAgeMs({ tailFillMinutes: 150 }),
+    "a longer cadence raises the ceiling with it");
 });
 
 await test("an ORDINARY error still counts toward FAILING — backoff did not swallow real faults", async () => {

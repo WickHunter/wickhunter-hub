@@ -48,6 +48,27 @@ export interface CollectorOptions {
    *  refusal up to `rateLimitMaxCooldownMs`. */
   rateLimitCooldownMs: number;
   rateLimitMaxCooldownMs: number;
+  /** ── v0.2.4 — HOW MUCH BACKLOG A TAIL REQUEST SHOULD CARRY ────────────────
+   *
+   *  MEASURED on the operator's box: 202 requests returned 5,768 candles — 28.6
+   *  rows against a 200-row page, **14% page utilisation**. The collector was
+   *  spending its whole Bitunix budget re-fetching tiny tails, because a symbol
+   *  entered the tail queue the moment it was one minute behind, and with 703
+   *  symbols a sweep took ~29 minutes. Backfill never got a turn, so a
+   *  rate-limited venue could not converge at all.
+   *
+   *  A symbol is now TAIL-DUE only once it has accumulated this many minutes of
+   *  backlog, so each request comes back most of a page full. The budget that
+   *  frees goes to depth, which is the queue's second half and was previously
+   *  starved. Same requests, ~7x the candles.
+   *
+   *  THE COST, STATED: the newest candle the hub holds is up to this old. The
+   *  bot bridges that on download with ONE request of its own — which is the
+   *  trade: one request per bot per seed, instead of the hub burning its entire
+   *  venue budget so that bots need not make it. `seedableMaxTailAgeMs` is
+   *  DERIVED from this number rather than set beside it, because two constants
+   *  that must agree are two constants that will not. */
+  tailFillMinutes: number;
   /** How often to re-read the venue's instrument list. */
   symbolRefreshMs: number;
   /** A collector whose last SUCCESS is older than this is STALLED, whether or
@@ -64,10 +85,26 @@ export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
   minRequestsPerSecond: 0.5,
   rateLimitCooldownMs: 60_000,
   rateLimitMaxCooldownMs: 15 * 60_000,
+  // 150 minutes: three quarters of the 200-row page Bitunix and Bitget both
+  // cap at. Bybit's page holds 1000, but the same 150 is used there rather than
+  // 750 — a 12-hour-old tail buys nothing on a venue that is not refusing us,
+  // and one number is easier to reason about than a per-venue table.
+  tailFillMinutes: 150,
   symbolRefreshMs: 15 * 60_000,
   stallAfterMs: 10 * 60_000,
   failingAfter: 5,
 };
+
+/** How stale a symbol's tail may be and still count as SEEDABLE.
+ *
+ *  DERIVED from `tailFillMinutes`, never set beside it: a symbol is polled only
+ *  once it is that far behind, so a ceiling below it would mark every symbol
+ *  un-seedable forever — the collector would be working perfectly and the panel
+ *  would report nothing servable. The 30-minute slack is for the sweep to come
+ *  back round after the backlog is due. */
+export function seedableMaxTailAgeMs(opts: Pick<CollectorOptions, "tailFillMinutes">): number {
+  return (Math.max(1, opts.tailFillMinutes) + 30) * 60_000;
+}
 
 /** AIMD. Halve on a refusal, and only creep back up after a long clean run —
  *  the classic shape, chosen because the venue never tells us its actual budget
@@ -270,7 +307,12 @@ export class VenueCollector {
         tail.push({ symbol: rec.symbol, startMs: newestClosed - pageSpan, endMs: newestClosed, kind: "tail" });
         continue;
       }
-      if (cov.lastClosedMs < newestClosed) {
+      // TAIL-DUE, not merely tail-behind. Asking for one minute costs the same
+      // request as asking for a hundred and fifty (see `tailFillMinutes`), so a
+      // symbol waits until it has a page's worth of backlog to collect. Every
+      // symbol still advances; it advances in useful strides.
+      const behindMs = newestClosed - cov.lastClosedMs;
+      if (behindMs >= this.opts.tailFillMinutes * MINUTE_MS) {
         const startMs = Math.max(cov.lastClosedMs + MINUTE_MS, newestClosed - pageSpan);
         tail.push({ symbol: rec.symbol, startMs, endMs: newestClosed, kind: "tail" });
       }

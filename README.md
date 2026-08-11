@@ -145,6 +145,7 @@ HUB_CANDLE_VENUES=bybit,bitunix,bitget
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 `HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
 `HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_TICK_MS` (60s),
+`HUB_CANDLE_TAIL_FILL_MIN` (150 — how much backlog a tail request waits for),
 `HUB_CANDLE_SIGNER` (`license`) and `HUB_CANDLE_KEY_ID` (derived from the
 signer) — both covered under **Signing key** above; read the four-step order
 there before touching either.
@@ -359,6 +360,25 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.4 — **tail requests carry a page instead of a handful of rows.** Measured
+  on the operator's box: 202 requests returned 5,768 candles — **28.6 rows
+  against a 200-row page, 14% utilisation**. A symbol entered the tail queue the
+  moment it was one minute behind, so with 703 Bitunix symbols a sweep took ~29
+  minutes and each request collected only those ~29 minutes; backfill, the
+  second half of the queue, never got a turn. A rate-limited venue could not
+  converge however long it ran. A symbol is now tail-DUE only once it has
+  `HUB_CANDLE_TAIL_FILL_MIN` (150) minutes of backlog, so each request comes
+  back most of a page full and the freed budget goes to depth — roughly **7x the
+  candles for the same rate limit**, without moving a VPS or dropping a symbol.
+  A symbol with NO candles is still collected on the very first pass; the
+  cadence governs a tail, not a cold start. **The cost, stated:** the newest
+  candle the hub holds is up to 150 minutes old, and the bot bridges that on
+  download with one request of its own — one request per bot per seed, instead
+  of the hub burning its whole venue budget so that bots need not make it.
+  `seedableMaxTailAgeMs` is now DERIVED from the cadence rather than set beside
+  it: a fixed 15-minute ceiling under a 150-minute cadence would mark every
+  symbol un-seedable forever, with the collector working perfectly and the panel
+  reporting nothing servable.
 - v0.2.3 — **feedback reports can be deleted.** Per-row **Delete** on the
   Feedback table, plus **Delete all fixed** for clearing the pile in one call
   rather than a row at a time. `POST /admin/api/feedback/delete` takes `{id}` or
