@@ -290,13 +290,44 @@ export class VenueCollector {
   }
 
   /** Symbols worth polling right now, tail work first then backfill. */
-  private workQueue(now: number): Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" }> {
+  /** Oldest known interior hole per symbol, memoised. Enumerating one costs a
+   *  full-window scan of that symbol's day files, so it is done once per hole
+   *  and re-done only after the hole has been written into. */
+  private holeCache = new Map<string, { at: number; gap: [number, number] | null }>();
+
+  /** The oldest interior hole in a symbol, or null. Interior holes are the one
+   *  failure that poisons a seed while the symbol looks deep AND current, and
+   *  NOTHING else repairs them: backfill only ever digs backward from
+   *  `firstClosedMs`, so a hole inside the held range is permanent until
+   *  something goes and gets it. This is that something. */
+  private oldestHole(symbol: string, now: number): [number, number] | null {
+    const cached = this.holeCache.get(symbol);
+    if (cached && now - cached.at < 10 * 60_000) return cached.gap;
+    const cov = this.coverage(symbol);
+    if (cov.firstClosedMs === null || cov.lastClosedMs === null || cov.interiorMissing <= 0) {
+      this.holeCache.set(symbol, { at: now, gap: null });
+      return null;
+    }
+    let gap: [number, number] | null = null;
+    try {
+      const w = this.store.readWindow(this.venue, symbol, cov.firstClosedMs, cov.lastClosedMs);
+      gap = w.gaps.length ? w.gaps[0]! : null;
+    } catch { gap = null; }
+    this.holeCache.set(symbol, { at: now, gap });
+    return gap;
+  }
+
+  private workQueue(now: number): Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> {
     const adapter = ADAPTERS[this.venue];
     const newestClosed = newestClosedOpenMs(now);
     const horizon = newestClosed - this.opts.retentionDays * DAY_MS;
     const pageSpan = (adapter.pageLimit - 1) * MINUTE_MS;
-    const tail: Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" }> = [];
+    const tail: Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> = [];
     const backfill: typeof tail = [];
+    // REPAIR sits between them: a hole is worse than shallow history (it
+    // poisons a seed while the symbol reads deep and current) and less urgent
+    // than a stale tail (which fails the bot's own verification outright).
+    const repair: typeof tail = [];
 
     for (const rec of this.tracked.values()) {
       if (rec.delisted || !rec.tradable) continue;
@@ -313,8 +344,29 @@ export class VenueCollector {
       // symbol still advances; it advances in useful strides.
       const behindMs = newestClosed - cov.lastClosedMs;
       if (behindMs >= this.opts.tailFillMinutes * MINUTE_MS) {
-        const startMs = Math.max(cov.lastClosedMs + MINUTE_MS, newestClosed - pageSpan);
-        tail.push({ symbol: rec.symbol, startMs, endMs: newestClosed, kind: "tail" });
+        // ── CONTIGUOUS FORWARD FILL (v0.2.5) ────────────────────────────────
+        // ALWAYS from the minute after what we hold, never from
+        // `newestClosed - pageSpan`. That older form asked for the NEWEST page
+        // and, for a symbol more than one page behind, silently skipped every
+        // minute between what we held and where the page began — writing a
+        // permanent interior hole that NOTHING repairs. Backfill only ever digs
+        // backward from `firstClosedMs`, so an interior gap is forever.
+        //
+        // This was live: with a 150-minute cadence against a 199-minute page
+        // span the margin is 49 minutes, and a symbol not served the instant it
+        // came due slipped past it. 155 symbols on two venues took ~25-minute
+        // holes within one tick of the v0.2.4 deploy.
+        //
+        // Catching up now takes as many passes as it takes, each a FULL page,
+        // and the series is contiguous at every moment in between.
+        const startMs = cov.lastClosedMs + MINUTE_MS;
+        tail.push({ symbol: rec.symbol, startMs, endMs: Math.min(newestClosed, startMs + pageSpan), kind: "tail" });
+      }
+      if (cov.interiorMissing > 0) {
+        const hole = this.oldestHole(rec.symbol, now);
+        if (hole) {
+          repair.push({ symbol: rec.symbol, startMs: hole[0], endMs: Math.min(hole[1], hole[0] + pageSpan), kind: "repair" });
+        }
       }
       if (cov.firstClosedMs !== null && cov.firstClosedMs > horizon) {
         const endMs = cov.firstClosedMs - MINUTE_MS;
@@ -327,7 +379,7 @@ export class VenueCollector {
       tail.push(...tail.splice(0, k));
     }
     this.cursor++;
-    return [...tail, ...backfill];
+    return [...tail, ...repair, ...backfill];
   }
 
   /** How many requests this collector may issue in a window of `tickMs`, at the
@@ -458,6 +510,9 @@ export class VenueCollector {
         written += w.written;
         this.candlesWritten += w.newlyFilled;
         this.noteCoverage(item.symbol, closed, w.newlyFilled);
+        // A write may have closed the hole we were chasing; make the next pass
+        // look again rather than re-requesting a range that is now filled.
+        if (item.kind === "repair" && w.newlyFilled > 0) this.holeCache.delete(item.symbol);
         if (item.kind === "backfill" && page.empty) {
           // The venue has no more history here. Record that by moving our
           // first-held marker down to the range we just proved empty, so the

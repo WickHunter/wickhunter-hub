@@ -765,6 +765,50 @@ await test("the freed budget REACHES backfill — that is the entire point", asy
   assert.ok(oldestNow < oldestAfterFirst, `backfill advanced (${oldestAfterFirst} -> ${oldestNow})`);
 });
 
+await test("catching up NEVER skips minutes — a tail request starts where we left off", async () => {
+  // THE LIVE INCIDENT (v0.2.5): the tail asked for the NEWEST page, so a symbol
+  // more than one page behind had every minute between what we held and where
+  // that page began silently dropped — a permanent interior hole, because
+  // backfill only ever digs BACKWARD from firstClosedMs. 155 symbols on two
+  // venues took ~25-minute holes within one tick of the v0.2.4 deploy.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const held = svc.collector("bitget").coverage("AAAUSDT");
+  assert.equal(held.interiorMissing, 0, "precondition: contiguous to start with");
+
+  // Jump far enough ahead that the symbol is behind by MORE than one page.
+  const far = NOW + 600 * MINUTE_MS;
+  venue.state.now = far;
+  await svc.tickAll(far);
+  const after = svc.collector("bitget").coverage("AAAUSDT");
+  assert.equal(after.interiorMissing, 0, "no hole was punched while catching up");
+  assert.ok(after.lastClosedMs > held.lastClosedMs, "and it did advance");
+});
+
+await test("an interior hole is REPAIRED — backfill can never reach one", async () => {
+  // Backfill only ever digs BACKWARD from firstClosedMs, so a hole inside the
+  // held range is permanent unless something goes and gets it. Plant one on
+  // disk before the collector has ever read the symbol, so its first coverage
+  // scan sees the truth.
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const { svc, dataDir } = pacedService("bitget", venue.fetchLike);
+  const store = new CandleStore(`${dataDir}/candles`);
+  const older = [], newer = [];
+  for (let i = 0; i < 40; i++) older.push(mk(NEWEST_CLOSED - (100 - i) * MINUTE_MS, i));
+  for (let i = 0; i < 40; i++) newer.push(mk(NEWEST_CLOSED - (39 - i) * MINUTE_MS, i));
+  store.write("bitget", "AAAUSDT", older);
+  store.write("bitget", "AAAUSDT", newer);   // minutes -60..-40 are ABSENT
+
+  const before = svc.collector("bitget").coverage("AAAUSDT");
+  assert.ok(before.interiorMissing > 0, `precondition: a real hole (${before.interiorMissing} min)`);
+
+  // Give it a handful of passes; the hole is one page at most.
+  for (let i = 0; i < 4; i++) await svc.tickAll(NOW);
+  assert.equal(svc.collector("bitget").coverage("AAAUSDT").interiorMissing, 0,
+    "the hole was filled — a gapped symbol poisons a seed while looking deep and current");
+});
+
 await test("the SEEDABLE ceiling is derived from the cadence, never set beside it", async () => {
   // THE BUG THIS PREVENTS: poll every 150 minutes, judge seedable at 15, and
   // every symbol is permanently un-seedable while the collector works

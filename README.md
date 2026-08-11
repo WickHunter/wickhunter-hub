@@ -360,6 +360,19 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.5 — **catching up never punches a hole, and holes get repaired.** A
+  defect shipped in v0.2.4: the tail asked for the NEWEST page, so a symbol more
+  than one page behind had every minute between what we held and where that page
+  began silently dropped. Backfill only ever digs BACKWARD from the oldest
+  candle, so an interior hole was permanent. Live within a tick of the deploy:
+  155 symbols on two venues took ~25-minute holes. A tail request now always
+  starts at the minute after what we hold and takes a full page forward, so a
+  catch-up is contiguous at every moment. Existing holes are repaired by a new
+  work kind that sits between tail and backfill — a hole is worse than shallow
+  history (it poisons a seed while the symbol reads deep AND current) and less
+  urgent than a stale tail (which fails the bot's verification outright). The
+  oldest hole per symbol is memoised, because finding one costs a full-window
+  scan of that symbol's day files.
 - v0.2.4 — **tail requests carry a page instead of a handful of rows.** Measured
   on the operator's box: 202 requests returned 5,768 candles — **28.6 rows
   against a 200-row page, 14% utilisation**. A symbol entered the tail queue the
