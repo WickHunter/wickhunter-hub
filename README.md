@@ -149,6 +149,27 @@ Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 signer) — both covered under **Signing key** above; read the four-step order
 there before touching either.
 
+**`HUB_CANDLE_RPS` is a CEILING, not a target.** Requests are spaced evenly at
+that rate rather than fired in a burst, and the collector drops below it on its
+own whenever a venue refuses: a rate limit halves the rate and buys silence for
+a doubling cooldown (`HUB_CANDLE_COOLDOWN_MS`, 60s, up to
+`HUB_CANDLE_MAX_COOLDOWN_MS`, 15m), never falling under `HUB_CANDLE_MIN_RPS`
+(0.5). The rate creeps back toward the ceiling after a long clean run. A venue
+in a backoff reads **COOLING** on the exchanges panel with the seconds
+remaining — that is the collector working, not a fault; **STALLED** is the one
+that wants investigating. The panel also states the live rate and how many
+refusals a venue has issued, so "slow" and "broken" are never the same picture.
+
+### Turning collectors off
+
+Same knob, emptied — the collectors stop, the stored candles stay, and adding
+the venues back resumes each symbol where it left off:
+
+```
+HUB_CANDLE_VENUES=
+systemctl restart wickhunter-hub
+```
+
 New listings are picked up automatically: the instrument list is re-read on its
 own cadence and a new symbol starts collecting on the next tick, no restart.
 Delistings stop polling and keep their history. A pair listed hours ago is
@@ -338,6 +359,27 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.2 — **the collector paces itself and backs off.** Measured on the
+  operator's box the day collecting was turned on: `bitunix code 10006:
+  request too frequently` and `ONDOUSDT: HTTP 429`. Two causes, both fixed
+  here. (1) The pass fired its ENTIRE per-minute budget back-to-back and then
+  sat idle — the average was 3.2/s, the instantaneous rate was whatever latency
+  allowed, and venues limit on the instantaneous window. Requests are now spaced
+  by `1000/rate` ms, and the schedule carries across tick boundaries so there is
+  no burst at the top of the minute. (2) A rate-limited request was counted as a
+  plain failure and retried at full rate on the next tick, so a limited backfill
+  spent its whole budget on rejections and could never converge. Rate limits are
+  now their own class (`RateLimitError`, from HTTP 429/418, the venue's own
+  too-frequent codes, or its wording), and on one the collector stops the pass,
+  halves its rate, and goes silent for a doubling cooldown — honouring the
+  venue's `Retry-After` when it asks for longer than we chose. The rate recovers
+  by creeping back up after a long clean run and never exceeds the configured
+  ceiling: `HUB_CANDLE_RPS` is a maximum, not a target. The exchanges panel gains
+  a **COOLING** state (distinct from STALLED — one wants leaving alone, the other
+  wants investigating) and states the live request rate and refusal count. The
+  three collectors now tick concurrently rather than in series: different hosts,
+  independent limits. New knobs, all optional: `HUB_CANDLE_MIN_RPS` (0.5),
+  `HUB_CANDLE_COOLDOWN_MS` (60s), `HUB_CANDLE_MAX_COOLDOWN_MS` (15m).
 - v0.2.1 — the candle seed gets its own Ed25519 key
   (`data/candle-signing.key`, self-generated on first use), so a seed signature
   can no longer pass the licence verifier's signature check and rely on a

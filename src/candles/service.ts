@@ -78,16 +78,24 @@ export interface CandleServiceDeps {
   sign(bytes: Buffer): Buffer;
   /** Injectable so tests never touch the network. */
   fetchLike?: FetchLike;
-  /** Injectable clock, read ONCE at construction to stamp each collector's
-   *  `startedAt`. Without it a caller reasoning about a frozen clock gets
+  /** Injectable clock. Read once at construction to stamp each collector's
+   *  `startedAt` — without it a caller reasoning about a frozen clock gets
    *  negative elapsed time and the never-succeeded collector never reaches
-   *  FAILING. Defaults to `Date.now`, so production is unchanged. */
+   *  FAILING — and read again on every request as the PACING clock, so a
+   *  suite can drive the rate limiter deterministically instead of against
+   *  wall time. Defaults to `Date.now`, so production is unchanged. */
   now?: () => number;
+  /** Injectable delay. The collector paces itself by sleeping between requests;
+   *  a suite passes a no-op so the pacing is exercised without the suite
+   *  actually waiting for it. Defaults to a real timer. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const realFetch: FetchLike = async (url: string) => {
   const res = await fetch(url, { headers: { accept: "application/json" } });
-  return { ok: res.ok, status: res.status, json: () => res.json() };
+  // `headers` is forwarded so a venue's own `Retry-After` can be honoured; the
+  // collector falls back to its own backoff when the header is absent.
+  return { ok: res.ok, status: res.status, json: () => res.json(), headers: res.headers };
 };
 
 export class CandleService {
@@ -141,16 +149,30 @@ export class CandleService {
     this.ticking = true;
     try {
       // The per-second rate governs each venue independently — they are
-      // different hosts and do not share a rate limit.
-      const budget = Math.max(1, Math.round((this.cfg.options.requestsPerSecond * this.cfg.tickMs) / 1000));
-      for (const c of this.collectors.values()) {
+      // different hosts and do not share a rate limit. The BUDGET now comes from
+      // the collector rather than from the configured ceiling, because a
+      // collector that has backed off is entitled to fewer requests, not to the
+      // same number spread thinner.
+      //
+      // The DEADLINE exists because the pass paces itself: a fully-paced tick
+      // would otherwise consume its entire period, and the next interval would
+      // find `ticking` still true and skip — halving the very rate we set. 80%
+      // leaves room for the venues that answer slowly.
+      const deadlineMs = Math.max(1000, Math.round(this.cfg.tickMs * 0.8));
+      const clock = this.deps.now ?? Date.now;
+      const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+      // CONCURRENTLY, not one venue after another. They are different hosts with
+      // independent rate limits, and now that each pass paces itself across most
+      // of the tick period, running them in series would mean the last venue
+      // never got a turn at all.
+      await Promise.all([...this.collectors.values()].map(async (c) => {
         try {
-          await c.tick(this.fetchLike, budget, now);
+          await c.tick(this.fetchLike, c.budgetFor(this.cfg.tickMs), now, { clock, sleep, deadlineMs });
         } catch {
           // A collector's own tick already records its errors in health(); an
           // unexpected throw must never stop the other venues from running.
         }
-      }
+      }));
       if (now - this.lastPruneAt >= DAY_MS) {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);
@@ -301,9 +323,24 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     const n = Number(v);
     return Number.isFinite(n) && n > 0 ? n : d;
   };
+  const requestsPerSecond = numOr(env.HUB_CANDLE_RPS, DEFAULT_COLLECTOR_OPTIONS.requestsPerSecond);
+  const cooldown = numOr(env.HUB_CANDLE_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.rateLimitCooldownMs);
   return {
     retentionDays: numOr(env.HUB_CANDLE_RETENTION_DAYS, DEFAULT_COLLECTOR_OPTIONS.retentionDays),
-    requestsPerSecond: numOr(env.HUB_CANDLE_RPS, DEFAULT_COLLECTOR_OPTIONS.requestsPerSecond),
+    requestsPerSecond,
+    // The floor can never sit ABOVE the ceiling: an operator who sets a very low
+    // HUB_CANDLE_RPS must get that rate, not have a stale default floor quietly
+    // raise it back up past what they asked for.
+    minRequestsPerSecond: Math.min(
+      requestsPerSecond,
+      numOr(env.HUB_CANDLE_MIN_RPS, DEFAULT_COLLECTOR_OPTIONS.minRequestsPerSecond),
+    ),
+    rateLimitCooldownMs: cooldown,
+    // Likewise the max cooldown cannot be shorter than the first one.
+    rateLimitMaxCooldownMs: Math.max(
+      cooldown,
+      numOr(env.HUB_CANDLE_MAX_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.rateLimitMaxCooldownMs),
+    ),
     symbolRefreshMs: numOr(env.HUB_CANDLE_SYMBOL_REFRESH_MS, DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs),
     stallAfterMs: numOr(env.HUB_CANDLE_STALL_AFTER_MS, DEFAULT_COLLECTOR_OPTIONS.stallAfterMs),
     failingAfter: numOr(env.HUB_CANDLE_FAILING_AFTER, DEFAULT_COLLECTOR_OPTIONS.failingAfter),

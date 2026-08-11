@@ -29,6 +29,14 @@ function stubVenue(opts = {}) {
     failWith: opts.failWith ?? null,
     now: opts.now ?? NOW,
     requests: [],
+    // Rate limiting, in the two shapes the venues actually use. `limitAfter` is
+    // how many KLINE requests it serves before it starts refusing; null never
+    // refuses. `limitAs` picks the shape: an HTTP 429 or a 200 carrying the
+    // venue's own too-frequent code.
+    limitAfter: opts.limitAfter ?? null,
+    limitAs: opts.limitAs ?? "http429",
+    retryAfter: opts.retryAfter ?? null,
+    klineRequests: 0,
   };
   const fetchLike = async (url) => {
     state.requests.push(url);
@@ -38,6 +46,17 @@ function stubVenue(opts = {}) {
         ok: true, status: 200,
         json: async () => ({ code: "00000", data: state.symbols.map((s) => (typeof s === "string" ? { symbol: s, symbolStatus: "normal" } : s)) }),
       };
+    }
+    state.klineRequests++;
+    if (state.limitAfter !== null && state.klineRequests > state.limitAfter) {
+      if (state.limitAs === "http429") {
+        return {
+          ok: false, status: 429, json: async () => ({}),
+          headers: { get: (n) => (n.toLowerCase() === "retry-after" ? state.retryAfter : null) },
+        };
+      }
+      // Bitget's adapter reads `code`; this is the venue-body shape.
+      return { ok: true, status: 200, json: async () => ({ code: "429", msg: "too many requests" }) };
     }
     const u = new URL(url);
     const symbol = u.searchParams.get("symbol");
@@ -58,8 +77,9 @@ function stubVenue(opts = {}) {
   return { state, fetchLike };
 }
 
-function serviceWith(venue, fetchLike, overrides = {}) {
+function serviceWith(venue, fetchLike, overrides = {}, deps = {}) {
   const dataDir = tmpDir("cs");
+  const slept = [];
   const svc = new CandleService(
     {
       dataDir,
@@ -71,9 +91,17 @@ function serviceWith(venue, fetchLike, overrides = {}) {
     // The collector's startedAt must come from the SAME frozen clock the
     // assertions use; otherwise elapsed time is measured against real wall
     // time and this suite silently rots about an hour after it is written.
-    { sign: (b) => Buffer.alloc(64), fetchLike, now: () => NOW },
+    // That same clock now also paces requests, and `sleep` RECORDS instead of
+    // waiting — so the pacing is exercised in full and asserted on, without the
+    // suite spending 312 ms per request to observe it.
+    {
+      sign: (b) => Buffer.alloc(64),
+      fetchLike,
+      now: deps.now ?? (() => NOW),
+      sleep: async (ms) => { slept.push(ms); },
+    },
   );
-  return { svc, dataDir };
+  return { svc, dataDir, slept };
 }
 
 // ── THE ENDPOINT ────────────────────────────────────────────────────────────
@@ -482,6 +510,183 @@ await test("newly listed pairs are counted and named, with the still-backfilling
   assert.equal(s.counts.newLast24hBackfilling, 1, "and it is not seedable yet");
   assert.deepEqual(s.newlyListed.map((n) => n.symbol), ["FRESHUSDT"], "named, so 'why is this coin not trading' is answerable on sight");
   assert.equal(s.newlyListed[0].firstSeenAt, NOW - 3_600_000);
+});
+
+// ── PACING AND BACKOFF ──────────────────────────────────────────────────────
+// The collector used to fire its ENTIRE per-minute budget back-to-back and then
+// sit idle. The average was the configured rate; the instantaneous rate was
+// whatever latency allowed, which is the window venues actually limit on — and
+// the operator's box duly collected `bitunix code 10006: request too frequently`
+// and `ONDOUSDT: HTTP 429`. Worse, a refusal was counted as a plain failure and
+// retried at the same rate on the next tick, so a rate-limited backfill spent
+// its whole budget on rejections and could never converge.
+//
+// The clock here is FROZEN, so every paced request asks for a sleep and the
+// spacing is a fact of the fixture rather than of how fast this machine runs.
+
+/** A service whose pacing clock the test drives by hand. */
+function pacedService(venue, fetchLike, overrides = {}) {
+  let t = NOW;
+  const built = serviceWith(venue, fetchLike, overrides, { now: () => t });
+  return { ...built, advance: (ms) => { t += ms; }, at: () => t };
+}
+
+await test("requests are SPACED at the configured rate, not fired in one burst", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"] });
+  const { svc, slept } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+
+  // 1 symbol-list request + 4 klines, each waiting its turn behind the last.
+  assert.ok(slept.length >= 4, `every request after the first waits its turn (got ${slept.length})`);
+  // 3.2/s -> a 313 ms gap. The clock is frozen, so the n-th request is asked to
+  // wait n gaps: the pacing is cumulative and does NOT reset per request.
+  const gap = Math.round(1000 / DEFAULT_COLLECTOR_OPTIONS.requestsPerSecond);
+  assert.equal(slept[0], gap, "the second request waits one gap");
+  assert.equal(slept[1], gap * 2, "the third waits two — the schedule advances, it does not reset");
+  assert.ok(venue.state.requests.length >= 5, "and all the work still happened");
+});
+
+await test("the pacing schedule CARRIES ACROSS ticks — no burst at the tick boundary", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT", "BBBUSDT"] });
+  const { svc, slept, advance } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  const firstTick = slept.length;
+  // Only a hair of real time passes before the next tick.
+  advance(10);
+  await svc.tickAll(NOW + MINUTE_MS);
+  assert.ok(slept.length > firstTick, "the next tick still waits its turn rather than restarting at full speed");
+});
+
+await test("a rate limit STOPS the pass instead of spending the rest of the budget on refusals", async () => {
+  // Ten symbols, refused from the third kline on. The old loop would have burned
+  // all ten slots; this one must stop at the refusal.
+  const symbols = Array.from({ length: 10 }, (_, i) => `S${i}USDT`);
+  const venue = stubVenue({ symbols, limitAfter: 2 });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  assert.equal(venue.state.klineRequests, 3, "two served, one refused, then silence — not ten");
+});
+
+await test("a rate limit is NOT a failure: the venue reads COOLING, never FAILING", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0 });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  // failingAfter is 5; refuse far more often than that.
+  for (let i = 0; i < 8; i++) await svc.tickAll(NOW);
+  const h = svc.collector("bitget").health(NOW);
+  assert.equal(h.state, "cooling", "backing off is not the collector failing");
+  assert.equal(h.consecutiveFailures, 0, "and a refusal never counts toward FAILING");
+  assert.ok(h.rateLimitHits > 0, "the refusals are counted, under their own name");
+  assert.match(h.detail, /rate limited/, "and the panel says why it is quiet");
+});
+
+await test("while cooling it makes NO request at all — the point of a cooldown is silence", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0 });
+  const { svc } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(NOW);
+  assert.ok(venue.state.requests.length > 0, "precondition: it did try once");
+  venue.state.requests.length = 0;
+  await svc.tickAll(NOW + MINUTE_MS);
+  assert.equal(venue.state.requests.length, 0, "not even the symbol list is asked for");
+});
+
+await test("the backoff DOUBLES per consecutive refusal and is capped", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0 });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, {
+    rateLimitCooldownMs: 1_000, rateLimitMaxCooldownMs: 4_000,
+  });
+  const waits = [];
+  for (let i = 0; i < 5; i++) {
+    await svc.tickAll(at());
+    waits.push(svc.collector("bitget").health(at()).cooldownUntil - at());
+    advance(waits.at(-1) + 1); // ride out the cooldown so the next tick tries again
+  }
+  assert.deepEqual(waits, [1_000, 2_000, 4_000, 4_000, 4_000], "1s, 2s, 4s, then held at the cap");
+});
+
+await test("the rate HALVES on a refusal and never goes below the floor", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0 });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, {
+    requestsPerSecond: 4, minRequestsPerSecond: 1, rateLimitCooldownMs: 1_000, rateLimitMaxCooldownMs: 1_000,
+  });
+  const seen = [];
+  for (let i = 0; i < 5; i++) {
+    await svc.tickAll(at());
+    seen.push(svc.collector("bitget").health(at()).effectiveRps);
+    advance(1_001);
+  }
+  assert.deepEqual(seen, [2, 1, 1, 1, 1], "4 -> 2 -> 1, then the floor holds it");
+  assert.ok(seen.every((r) => r >= 1), "a limited venue is still polled slowly, never abandoned");
+});
+
+await test("a backed-off collector gets a SMALLER budget, not the same one spread thinner", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0 });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, {
+    requestsPerSecond: 4, minRequestsPerSecond: 0.5, rateLimitCooldownMs: 1_000, rateLimitMaxCooldownMs: 1_000,
+  });
+  const c = svc.collector("bitget");
+  assert.equal(c.budgetFor(60_000), 240, "4/s over a minute");
+  await svc.tickAll(at());
+  advance(1_001);
+  assert.equal(c.budgetFor(60_000), 120, "after one refusal, half as many requests are permitted");
+});
+
+await test("a venue's own Retry-After wins when it asks for LONGER than we chose", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0, retryAfter: "300" });
+  const { svc, at } = pacedService("bitget", venue.fetchLike, {
+    rateLimitCooldownMs: 1_000, rateLimitMaxCooldownMs: 2_000,
+  });
+  await svc.tickAll(at());
+  assert.equal(svc.collector("bitget").health(at()).cooldownUntil - at(), 300_000, "we wait the 300s it asked for");
+});
+
+await test("a SHORTER Retry-After does not talk us back into the rate just refused", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0, retryAfter: "1" });
+  const { svc, at } = pacedService("bitget", venue.fetchLike, {
+    rateLimitCooldownMs: 30_000, rateLimitMaxCooldownMs: 60_000,
+  });
+  await svc.tickAll(at());
+  assert.equal(svc.collector("bitget").health(at()).cooldownUntil - at(), 30_000, "our own backoff stands");
+});
+
+await test("the venue-BODY shape of a rate limit backs off the same as an HTTP 429", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], limitAfter: 0, limitAs: "body" });
+  const { svc, at } = pacedService("bitget", venue.fetchLike);
+  await svc.tickAll(at());
+  const h = svc.collector("bitget").health(at());
+  assert.equal(h.state, "cooling", "a 200 carrying a too-many-requests code is still a refusal");
+  assert.equal(h.consecutiveFailures, 0);
+});
+
+await test("recovery creeps back up and NEVER climbs above the configured ceiling", async () => {
+  // Refuse once to knock the rate down, then serve cleanly for a long run.
+  const symbols = Array.from({ length: 40 }, (_, i) => `S${i}USDT`);
+  const venue = stubVenue({ symbols, limitAfter: 0 });
+  const { svc, advance, at } = pacedService("bitget", venue.fetchLike, {
+    requestsPerSecond: 4, minRequestsPerSecond: 0.5, rateLimitCooldownMs: 1_000, rateLimitMaxCooldownMs: 1_000,
+  });
+  await svc.tickAll(at());
+  assert.equal(svc.collector("bitget").health(at()).effectiveRps, 2, "knocked down to half");
+
+  venue.state.limitAfter = null; // the venue is happy again
+  advance(1_001);
+  let ticks = 0;
+  while (svc.collector("bitget").health(at()).effectiveRps < 4 && ticks < 40) {
+    advance(MINUTE_MS);
+    await svc.tickAll(at());
+    ticks++;
+  }
+  const rps = svc.collector("bitget").health(at()).effectiveRps;
+  assert.ok(rps > 2, `it does climb back (${rps})`);
+  assert.ok(rps <= 4, "and stops at the ceiling — the configured rate is a maximum, not a target");
+});
+
+await test("an ORDINARY error still counts toward FAILING — backoff did not swallow real faults", async () => {
+  const venue = stubVenue({ symbols: ["AAAUSDT"], failWith: "connect ECONNREFUSED" });
+  const { svc, at } = pacedService("bitget", venue.fetchLike);
+  for (let i = 0; i < 6; i++) await svc.tickAll(at());
+  const h = svc.collector("bitget").health(at());
+  assert.equal(h.state, "failing", "a broken venue is still reported broken");
+  assert.equal(h.rateLimitHits, 0, "and it is not miscounted as a rate limit");
 });
 
 // ── ADMIN ROUTE ─────────────────────────────────────────────────────────────

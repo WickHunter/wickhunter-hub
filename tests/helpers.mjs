@@ -51,7 +51,10 @@ export async function freshHub(overrides = {}, deps = undefined) {
     candleOptions: { ...DEFAULT_COLLECTOR_OPTIONS },
     ...overrides,
   };
-  const hub = createHub(cfg, deps);
+  // A test hub never waits out the collector's request pacing. The pacing still
+  // RUNS — the same code path, the same gaps computed — the sleep is just a
+  // no-op, so a suite that ticks a collector does not spend 312 ms per request.
+  const hub = createHub(cfg, { candleSleep: async () => {}, ...deps });
   const port = await hub.listen();
   return {
     hub,

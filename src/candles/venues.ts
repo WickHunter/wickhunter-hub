@@ -67,8 +67,48 @@ export interface VenueSymbol {
   tradable: boolean;
 }
 
-/** Minimal fetch surface, injectable so tests never touch the network. */
-export type FetchLike = (url: string) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+/** Minimal fetch surface, injectable so tests never touch the network.
+ *  `headers` is OPTIONAL so every existing stub still satisfies the type; when a
+ *  real response carries `Retry-After` we honour it, and when it does not (or
+ *  the caller is a stub) the collector falls back to its own backoff. */
+export type FetchLike = (url: string) => Promise<{
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+  headers?: { get(name: string): string | null };
+}>;
+
+// ── RATE LIMITING ───────────────────────────────────────────────────────────
+// A venue saying "slow down" is NOT the same failure as a venue saying "that
+// symbol does not exist", and treating them alike is how a collector gets
+// itself banned: it counts the refusal, retries at the same rate next tick, and
+// spends its whole budget on rejections that never become candles. This error
+// type is the difference, and the collector backs off on it instead of
+// counting it toward FAILING.
+export class RateLimitError extends Error {
+  readonly rateLimited = true;
+  constructor(message: string, readonly retryAfterMs?: number) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
+export function isRateLimit(err: unknown): err is RateLimitError {
+  return !!err && typeof err === "object" && (err as RateLimitError).rateLimited === true;
+}
+
+/** OBSERVED, not guessed. `bitunix code 10006: request too frequently` and a
+ *  bare `HTTP 429` on the same venue are both from the operator's own collector
+ *  log; Bybit's `retCode 10006` ("Too many visits") is its documented v5 code.
+ *  The message regex is a SAFETY NET over those, not the primary test: a venue
+ *  that invents a new code but still says "too frequent" is still telling us to
+ *  slow down, and mistaking that for a hard error is the expensive direction. */
+const RATE_LIMIT_CODES = new Set(["10006", "10018", "429", "40018"]);
+const RATE_LIMIT_TEXT = /too many|too frequent|frequently|rate.?limit|request limit|visit limit|exceed.*limit/i;
+
+function rateLimited(code: unknown, msg: unknown): boolean {
+  return RATE_LIMIT_CODES.has(String(code)) || RATE_LIMIT_TEXT.test(String(msg ?? ""));
+}
 
 export interface KlinePage {
   candles: Candle[];
@@ -114,8 +154,25 @@ function candle(t: unknown, o: unknown, h: unknown, l: unknown, c: unknown, v: u
   return cand;
 }
 
+/** `Retry-After` is seconds or an HTTP date. Anything unparseable returns
+ *  undefined so the collector uses its own backoff rather than a bogus number. */
+function retryAfterMs(res: { headers?: { get(name: string): string | null } }): number | undefined {
+  const raw = res.headers?.get("retry-after");
+  if (!raw) return undefined;
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs >= 0) return Math.round(secs * 1000);
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
 async function getJson(fetchLike: FetchLike, url: string): Promise<unknown> {
   const res = await fetchLike(url);
+  // 429 is the standard refusal; 418 is what several exchanges escalate to when
+  // a client keeps pushing after 429s, and it is the last warning before an IP
+  // ban. Both mean stop, not fail.
+  if (res.status === 429 || res.status === 418) {
+    throw new RateLimitError(`HTTP ${res.status} (rate limited)`, retryAfterMs(res));
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -161,7 +218,8 @@ const bybit: VenueAdapter = {
     const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}&interval=1&start=${startMs}&end=${endMs}&limit=${this.pageLimit}`;
     const body = (await getJson(fetchLike, url)) as { retCode?: unknown; retMsg?: unknown; result?: { list?: unknown[] } };
     if (body.retCode !== undefined && body.retCode !== 0) {
-      throw new Error(`bybit retCode ${String(body.retCode)}: ${String(body.retMsg ?? "")}`);
+      const text = `bybit retCode ${String(body.retCode)}: ${String(body.retMsg ?? "")}`;
+      throw rateLimited(body.retCode, body.retMsg) ? new RateLimitError(text) : new Error(text);
     }
     const list = asArray(body.result?.list);
     const candles: Candle[] = [];
@@ -200,7 +258,8 @@ const bitunix: VenueAdapter = {
     const url = `https://fapi.bitunix.com/api/v1/futures/market/kline?symbol=${encodeURIComponent(symbol)}&interval=1m&startTime=${startMs}&endTime=${endMs}&limit=${this.pageLimit}`;
     const body = (await getJson(fetchLike, url)) as { code?: unknown; msg?: unknown; data?: unknown[] };
     if (body.code !== undefined && Number(body.code) !== 0) {
-      throw new Error(`bitunix code ${String(body.code)}: ${String(body.msg ?? "")}`);
+      const text = `bitunix code ${String(body.code)}: ${String(body.msg ?? "")}`;
+      throw rateLimited(body.code, body.msg) ? new RateLimitError(text) : new Error(text);
     }
     const list = asArray(body.data);
     const candles: Candle[] = [];
@@ -237,7 +296,8 @@ const bitget: VenueAdapter = {
     const url = `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(symbol)}&productType=usdt-futures&granularity=1m&startTime=${startMs}&endTime=${endMs}&limit=${this.pageLimit}`;
     const body = (await getJson(fetchLike, url)) as { code?: unknown; msg?: unknown; data?: unknown[] };
     if (body.code !== undefined && String(body.code) !== "00000") {
-      throw new Error(`bitget code ${String(body.code)}: ${String(body.msg ?? "")}`);
+      const text = `bitget code ${String(body.code)}: ${String(body.msg ?? "")}`;
+      throw rateLimited(body.code, body.msg) ? new RateLimitError(text) : new Error(text);
     }
     const list = asArray(body.data);
     const candles: Candle[] = [];

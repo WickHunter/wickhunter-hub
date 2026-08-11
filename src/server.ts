@@ -74,6 +74,8 @@ export interface HubDeps {
   spawn?: typeof nodeSpawn;
   /** Injectable so candle tests never touch the network. */
   candleFetch?: CandleServiceDeps["fetchLike"];
+  /** Injectable so candle tests do not wait out the collector's request pacing. */
+  candleSleep?: CandleServiceDeps["sleep"];
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -99,7 +101,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,
     },
-    { sign: signSeed, fetchLike: deps.candleFetch },
+    { sign: signSeed, fetchLike: deps.candleFetch, sleep: deps.candleSleep },
   );
   let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
 

@@ -12,7 +12,7 @@ import { test, summary, freshStore, tmpDir } from "./helpers.mjs";
 import {
   CandleStore, MINUTE_MS, newestClosedOpenMs, floorMinute, dayKey, DAY_FILE_BYTES,
 } from "../dist/src/candles/store.js";
-import { ADAPTERS, dropUnclosed } from "../dist/src/candles/venues.js";
+import { ADAPTERS, dropUnclosed, isRateLimit } from "../dist/src/candles/venues.js";
 import { buildSeed, canonicalBytes, SEED_CANONICAL_KEY_ORDER } from "../dist/src/candles/seed.js";
 
 // ── FROZEN CLOCK ────────────────────────────────────────────────────────────
@@ -101,6 +101,93 @@ await test("BYBIT: the forming bar leads its NEWEST-FIRST list and is dropped (r
   const closed = dropUnclosed(candles, NOW);
   assert.ok(!closed.some((c) => c.openMs === FORMING), "the forming bar is dropped");
   assert.equal(closed.at(-1).openMs, NEWEST_CLOSED, "newest surviving bar is the newest CLOSED one");
+});
+
+// ── RATE LIMITS ARE NOT FAILURES ────────────────────────────────────────────
+// A venue saying "slow down" and a venue saying "that symbol does not exist"
+// arrive down the same pipe and must not be treated alike: one wants a backoff,
+// the other wants counting toward FAILING. These pin the classification at the
+// adapter, which is the only place that can read the venue's own wording.
+//
+// The two Bitunix cases are the operator's OWN collector log, verbatim:
+// `bitunix code 10006: request too frequently` and a bare `HTTP 429` on
+// ONDOUSDT. Everything else here is the same shape on the other two venues.
+
+function stubStatus(status, body = {}, headers = {}) {
+  return async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    headers: { get: (n) => headers[n.toLowerCase()] ?? null },
+  });
+}
+
+await test("HTTP 429 is classified as a rate limit, not a plain failure", async () => {
+  for (const venue of ["bybit", "bitunix", "bitget"]) {
+    const err = await ADAPTERS[venue].fetchKlines(stubStatus(429), "BTCUSDT", 0, 0).then(
+      () => null, (e) => e,
+    );
+    assert.ok(err, `${venue}: 429 throws`);
+    assert.equal(isRateLimit(err), true, `${venue}: 429 is a RateLimitError`);
+  }
+});
+
+await test("HTTP 418 counts too — it is the last warning before an IP ban", async () => {
+  const err = await ADAPTERS.bitget.fetchKlines(stubStatus(418), "BTCUSDT", 0, 0).then(() => null, (e) => e);
+  assert.equal(isRateLimit(err), true);
+});
+
+await test("Retry-After is read off the response, in seconds and as an HTTP date", async () => {
+  const secs = await ADAPTERS.bitunix
+    .fetchKlines(stubStatus(429, {}, { "retry-after": "90" }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.equal(secs.retryAfterMs, 90_000, "seconds form");
+
+  const when = new Date(Date.now() + 120_000).toUTCString();
+  const dated = await ADAPTERS.bitunix
+    .fetchKlines(stubStatus(429, {}, { "retry-after": when }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.ok(dated.retryAfterMs > 110_000 && dated.retryAfterMs <= 120_000, "HTTP-date form");
+
+  const junk = await ADAPTERS.bitunix
+    .fetchKlines(stubStatus(429, {}, { "retry-after": "soon-ish" }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.equal(junk.retryAfterMs, undefined, "unparseable Retry-After yields no number, never a bogus one");
+});
+
+await test("BITUNIX code 10006 — the operator's own refusal — is a rate limit", async () => {
+  const err = await ADAPTERS.bitunix
+    .fetchKlines(stubStatus(200, { code: "10006", msg: "request too frequently" }), "ONDOUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.equal(isRateLimit(err), true);
+  assert.match(err.message, /bitunix code 10006/, "the venue's own wording survives into the message");
+});
+
+await test("BYBIT retCode 10006 and a 'too many visits' message are both rate limits", async () => {
+  const byCode = await ADAPTERS.bybit
+    .fetchKlines(stubStatus(200, { retCode: 10006, retMsg: "Too many visits!" }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.equal(isRateLimit(byCode), true, "by code");
+
+  // A venue that invents a new code but still says it in words is still saying
+  // slow down; the text is the safety net over the code list.
+  const byText = await ADAPTERS.bybit
+    .fetchKlines(stubStatus(200, { retCode: 99999, retMsg: "rate limit exceeded" }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.equal(isRateLimit(byText), true, "by wording");
+});
+
+await test("an ORDINARY venue error is NOT a rate limit — the distinction is the point", async () => {
+  // Bitget's real 40053: `limit` above 200 is rejected outright. That is our
+  // bug, not the venue's budget, and backing off would hide it forever.
+  const err = await ADAPTERS.bitget
+    .fetchKlines(stubStatus(200, { code: "40053", msg: "limit is invalid" }), "BTCUSDT", 0, 0)
+    .then(() => null, (e) => e);
+  assert.ok(err, "it still throws");
+  assert.equal(isRateLimit(err), false, "but it is a plain failure that must count toward FAILING");
+
+  const missing = await ADAPTERS.bitget.fetchKlines(stubStatus(404), "NOSUCHUSDT", 0, 0).then(() => null, (e) => e);
+  assert.equal(isRateLimit(missing), false, "and so is a 404");
 });
 
 await test("a bar that is not on the minute grid is dropped whatever its age", () => {

@@ -31,13 +31,23 @@ import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import {
   CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, type Candle, type SymbolCoverage,
 } from "./store.js";
-import { ADAPTERS, dropUnclosed, type FetchLike, type VenueId } from "./venues.js";
+import { ADAPTERS, dropUnclosed, isRateLimit, type FetchLike, type VenueId } from "./venues.js";
 
 export interface CollectorOptions {
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
   retentionDays: number;
-  /** Requests per second across ALL symbols of this venue. */
+  /** Requests per second across ALL symbols of this venue. A CEILING, not a
+   *  target: the collector paces itself to this and drops BELOW it whenever the
+   *  venue says it is going too fast (see `minRequestsPerSecond`). It never
+   *  climbs above it. */
   requestsPerSecond: number;
+  /** The floor the adaptive rate may not go under. A venue that is limiting us
+   *  hard still gets polled at this rate, slowly, rather than being abandoned. */
+  minRequestsPerSecond: number;
+  /** First cooldown after a rate-limit refusal. Doubles per consecutive
+   *  refusal up to `rateLimitMaxCooldownMs`. */
+  rateLimitCooldownMs: number;
+  rateLimitMaxCooldownMs: number;
   /** How often to re-read the venue's instrument list. */
   symbolRefreshMs: number;
   /** A collector whose last SUCCESS is older than this is STALLED, whether or
@@ -51,10 +61,19 @@ export interface CollectorOptions {
 export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
   retentionDays: 30,
   requestsPerSecond: 3.2,
+  minRequestsPerSecond: 0.5,
+  rateLimitCooldownMs: 60_000,
+  rateLimitMaxCooldownMs: 15 * 60_000,
   symbolRefreshMs: 15 * 60_000,
   stallAfterMs: 10 * 60_000,
   failingAfter: 5,
 };
+
+/** AIMD. Halve on a refusal, and only creep back up after a long clean run —
+ *  the classic shape, chosen because the venue never tells us its actual budget
+ *  and the only way to find it is to approach it slowly and retreat fast. */
+const RATE_RECOVER_AFTER_SUCCESSES = 120;
+const RATE_RECOVER_FACTOR = 1.25;
 
 /** What we know about one tracked symbol. Persisted so `firstSeenAt` — which
  *  the admin panel uses to answer "what appeared today" — survives a restart. */
@@ -74,7 +93,7 @@ interface SymbolsFile {
   symbols: Record<string, TrackedSymbol>;
 }
 
-export type VenueState = "starting" | "running" | "stalled" | "failing";
+export type VenueState = "starting" | "running" | "cooling" | "stalled" | "failing";
 
 export interface VenueHealth {
   venue: VenueId;
@@ -88,6 +107,16 @@ export interface VenueHealth {
   lastSymbolRefreshAt: number | null;
   requestsMade: number;
   candlesWritten: number;
+  /** The rate the collector is ACTUALLY using right now, which is at or below
+   *  the configured ceiling. Shown because "why is this venue so slow" and "why
+   *  is this venue erroring" are different questions with different answers. */
+  effectiveRps: number;
+  /** Configured ceiling, so the panel can say 0.8 of 3.2 rather than a bare number. */
+  configuredRps: number;
+  /** Lifetime count of rate-limit refusals from this venue. */
+  rateLimitHits: number;
+  /** While this is in the future the collector is deliberately not asking. */
+  cooldownUntil: number | null;
 }
 
 export class VenueCollector {
@@ -106,6 +135,18 @@ export class VenueCollector {
   /** Round-robin cursor so one slow symbol cannot starve the rest. */
   private cursor = 0;
 
+  // ── RATE STATE ────────────────────────────────────────────────────────────
+  /** Current adaptive rate. Starts at the configured ceiling and only ever
+   *  moves between `minRequestsPerSecond` and that ceiling. */
+  private effectiveRps: number;
+  /** REAL-clock instant the next request may start. Persists across ticks, so
+   *  the pacing holds at the tick boundary instead of resetting into a burst. */
+  private nextRequestAt = 0;
+  private cooldownUntil = 0;
+  private consecutiveRateLimits = 0;
+  private rateLimitHits = 0;
+  private successStreak = 0;
+
   constructor(
     readonly venue: VenueId,
     private readonly store: CandleStore,
@@ -115,6 +156,7 @@ export class VenueCollector {
   ) {
     this.symbolsFile = path.join(stateDir, venue, "symbols.json");
     this.startedAt = now;
+    this.effectiveRps = opts.requestsPerSecond;
     const file = readJson<SymbolsFile>(this.symbolsFile, { symbols: {} });
     for (const [sym, rec] of Object.entries(file.symbols ?? {})) {
       if (rec && typeof rec.symbol === "string") this.tracked.set(sym, rec);
@@ -246,18 +288,107 @@ export class VenueCollector {
     return [...tail, ...backfill];
   }
 
-  /** One pass. `budget` caps the kline requests it may issue, which is how the
-   *  caller governs the request rate. Returns what it did, for the tests. */
-  async tick(fetchLike: FetchLike, budget: number, now = Date.now()): Promise<{ requests: number; written: number }> {
+  /** How many requests this collector may issue in a window of `tickMs`, at the
+   *  rate it is CURRENTLY entitled to. The service asks rather than computing it
+   *  from the configured ceiling, so a collector that has backed off actually
+   *  gets a smaller budget instead of the same budget spread thinner. */
+  budgetFor(tickMs: number): number {
+    return Math.max(1, Math.round((this.effectiveRps * tickMs) / 1000));
+  }
+
+  /** True while the collector is deliberately silent after a refusal. */
+  cooling(clockNow: number): boolean {
+    return clockNow < this.cooldownUntil;
+  }
+
+  /** Wait until this collector's next request is due. The gap is derived from
+   *  the CURRENT effective rate, and `nextRequestAt` carries across ticks — which
+   *  is the whole point. The old code issued its entire per-minute budget in one
+   *  back-to-back burst and then sat idle, so the AVERAGE was 3.2/s while the
+   *  instantaneous rate was whatever latency allowed. Venues limit on the
+   *  instantaneous window, which is exactly what they were refusing. */
+  private async pace(clock: () => number, sleep: (ms: number) => Promise<void>): Promise<void> {
+    const gapMs = Math.max(1, Math.round(1000 / Math.max(0.01, this.effectiveRps)));
+    const t = clock();
+    if (t < this.nextRequestAt) await sleep(this.nextRequestAt - t);
+    this.nextRequestAt = Math.max(clock(), this.nextRequestAt) + gapMs;
+  }
+
+  /** A venue told us to slow down. Halve the rate, enter a doubling cooldown,
+   *  and — deliberately — do NOT count this toward `consecutiveFailures`: being
+   *  rate limited is not the collector failing, and reporting it as FAILING
+   *  would bury the one fact that explains it. */
+  private noteRateLimited(err: unknown, clockNow: number, at: number, label: string): void {
+    this.rateLimitHits++;
+    this.consecutiveRateLimits++;
+    this.successStreak = 0;
+    this.effectiveRps = Math.max(this.opts.minRequestsPerSecond, this.effectiveRps / 2);
+    const backoff = Math.min(
+      this.opts.rateLimitMaxCooldownMs,
+      this.opts.rateLimitCooldownMs * 2 ** (this.consecutiveRateLimits - 1),
+    );
+    // The venue's own Retry-After wins when it asks for LONGER than we chose.
+    // A shorter one is not taken: it would let a venue talk us back into the
+    // rate it just refused.
+    const asked = (err as { retryAfterMs?: number }).retryAfterMs;
+    const wait = Math.max(backoff, Number.isFinite(asked) ? (asked as number) : 0);
+    this.cooldownUntil = clockNow + wait;
+    this.nextRequestAt = this.cooldownUntil;
+    this.lastError = {
+      message: `${label}: ${(err as Error).message} — backing off ${Math.round(wait / 1000)}s, rate now ${this.effectiveRps.toFixed(2)}/s`,
+      at,
+    };
+  }
+
+  /** A clean request. After a long clean run, creep the rate back toward the
+   *  configured ceiling — never above it. */
+  private noteSuccess(): void {
+    this.consecutiveRateLimits = 0;
+    this.successStreak++;
+    if (this.successStreak >= RATE_RECOVER_AFTER_SUCCESSES && this.effectiveRps < this.opts.requestsPerSecond) {
+      this.successStreak = 0;
+      this.effectiveRps = Math.min(this.opts.requestsPerSecond, this.effectiveRps * RATE_RECOVER_FACTOR);
+    }
+  }
+
+  /** One pass. `budget` caps the kline requests it may issue; `deps.deadlineMs`
+   *  caps the WALL time it may spend, which matters now that the pass paces
+   *  itself — without it a fully-paced tick fills its whole period and the
+   *  service's next interval finds it still running and skips, halving the rate
+   *  it was asked for. Returns what it did, for the tests. */
+  async tick(
+    fetchLike: FetchLike,
+    budget: number,
+    now = Date.now(),
+    deps: { clock?: () => number; sleep?: (ms: number) => Promise<void>; deadlineMs?: number } = {},
+  ): Promise<{ requests: number; written: number }> {
+    const clock = deps.clock ?? Date.now;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const deadlineMs = deps.deadlineMs ?? Infinity;
+    const startedAt = clock();
+
+    // Cooling: say nothing to the venue at all, not even the symbol list. The
+    // point of a cooldown is silence.
+    if (this.cooling(clock())) {
+      this.lastPollAt = now;
+      return { requests: 0, written: 0 };
+    }
+
     if (
       this.lastSymbolRefreshAt === null ||
       now - this.lastSymbolRefreshAt >= this.opts.symbolRefreshMs
     ) {
       try {
+        await this.pace(clock, sleep);
         await this.refreshSymbols(fetchLike, now);
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;
+        this.noteSuccess();
       } catch (err) {
+        if (isRateLimit(err)) {
+          this.noteRateLimited(err, clock(), now, "symbol list");
+          return { requests: 0, written: 0 };
+        }
         this.lastError = { message: (err as Error).message, at: now };
         this.consecutiveFailures++;
       }
@@ -271,6 +402,8 @@ export class VenueCollector {
 
     for (const item of queue) {
       if (requests >= budget) break;
+      if (clock() - startedAt >= deadlineMs) break;
+      await this.pace(clock, sleep);
       requests++;
       this.requestsMade++;
       try {
@@ -301,7 +434,16 @@ export class VenueCollector {
         }
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;
+        this.noteSuccess();
       } catch (err) {
+        if (isRateLimit(err)) {
+          // Stop the pass dead. Spending the rest of the budget on requests the
+          // venue is already refusing is how a rate limit becomes a ban, and it
+          // is also why the old backfill could never converge: every retry cost
+          // a slot and returned no candle.
+          this.noteRateLimited(err, clock(), now, item.symbol);
+          break;
+        }
         this.lastError = { message: `${item.symbol}: ${(err as Error).message}`, at: now };
         this.consecutiveFailures++;
       }
@@ -331,6 +473,10 @@ export class VenueCollector {
       lastSymbolRefreshAt: this.lastSymbolRefreshAt,
       requestsMade: this.requestsMade,
       candlesWritten: this.candlesWritten,
+      effectiveRps: this.effectiveRps,
+      configuredRps: this.opts.requestsPerSecond,
+      rateLimitHits: this.rateLimitHits,
+      cooldownUntil: this.cooldownUntil > now ? this.cooldownUntil : null,
     };
     // FAILING beats STALLED: if requests are actively erroring, that is the
     // more specific and more actionable thing to say.
@@ -338,6 +484,16 @@ export class VenueCollector {
       return {
         ...base, state: "failing",
         detail: `${this.consecutiveFailures} consecutive request failures — last: ${this.lastError?.message ?? "unknown"}`,
+      };
+    }
+    // COOLING beats STALLED. A collector in a backoff is not keeping up either,
+    // but "stalled" would send the operator looking for a fault when the
+    // collector is doing precisely what it should — and the fix for the two is
+    // opposite: one wants investigating, the other wants leaving alone.
+    if (this.cooling(now)) {
+      return {
+        ...base, state: "cooling",
+        detail: `rate limited — silent for another ${Math.max(1, Math.round((this.cooldownUntil - now) / 1000))}s, then resuming at ${this.effectiveRps.toFixed(2)}/s (ceiling ${this.opts.requestsPerSecond}/s, ${this.rateLimitHits} refusals so far)`,
       };
     }
     if (this.lastSuccessAt === null) {
@@ -360,6 +516,12 @@ export class VenueCollector {
         detail: `last successful poll ${Math.round(age / 60_000)}m ago on a 1-minute cadence — nothing threw, but it is not keeping up`,
       };
     }
-    return { ...base, state: "running", detail: `last successful poll ${Math.round(age / 1000)}s ago` };
+    // A collector running well below its ceiling is running CORRECTLY but
+    // slowly, and the operator should not have to guess which. Say the rate
+    // whenever it is throttled; stay quiet about it when it is at full speed.
+    const throttled = this.effectiveRps < this.opts.requestsPerSecond - 1e-9
+      ? ` — throttled to ${this.effectiveRps.toFixed(2)}/s of ${this.opts.requestsPerSecond}/s after ${this.rateLimitHits} rate-limit refusals`
+      : "";
+    return { ...base, state: "running", detail: `last successful poll ${Math.round(age / 1000)}s ago${throttled}` };
   }
 }

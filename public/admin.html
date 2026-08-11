@@ -41,6 +41,7 @@
   .vstate { font-size: .78rem; font-weight: 700; padding: .1rem .45rem; border-radius: 4px; border: 1px solid currentColor; }
   .v-running { color: #2a7; } .v-stalled { color: #b80; }
   .v-failing { color: #c33; } .v-starting { color: #78c; } .v-off { color: #999; }
+  .v-cooling { color: #59c; }
   .venue dl { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; margin: .5rem 0 0; font-size: .88rem; }
   .venue dt { opacity: .65; } .venue dd { margin: 0; }
   .venue .detail { font-size: .85rem; margin: .1rem 0 .3rem; }
@@ -470,6 +471,12 @@ async function cdRefresh() {
       + "<dt>Newest candle</dt><dd>" + (v.newestClosedMs ? fmt(v.newestClosedMs) + " UTC (" + ago(v.newestClosedMs) + ")" : "—") + "</dd>"
       + "<dt>Missing minutes</dt><dd>" + v.totalMissingMinutes.toLocaleString() + "</dd>"
       + "<dt>Requests</dt><dd>" + h.requestsMade.toLocaleString() + " · " + h.candlesWritten.toLocaleString() + " candles</dd>"
+      // The rate is stated whenever the collector is not at full speed, because
+      // "slow" and "broken" look identical from the bucket counts alone.
+      + "<dt>Request rate</dt><dd>" + h.effectiveRps.toFixed(2) + "/s"
+        + (h.effectiveRps < h.configuredRps - 1e-9 ? " <span class=\"muted\">(throttled from " + h.configuredRps + "/s)</span>" : "")
+        + (h.rateLimitHits ? " · " + h.rateLimitHits.toLocaleString() + " rate-limit refusals" : "")
+        + "</dd>"
       + "</dl>";
 
     // A venue quietly accumulating gaps is the failure that poisons seeds
