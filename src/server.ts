@@ -35,6 +35,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { CandleService, type CandleServiceDeps } from "./candles/service.js";
+import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import {
@@ -54,6 +55,9 @@ export interface Hub {
   server: http.Server;
   store: LicenseStore;
   candles: CandleService;
+  /** The dedicated candle-signing key. Exposed so main.ts can print its PUBLIC
+   *  half at startup; it never yields private material to anyone. */
+  candleKey: CandleKeyStore;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
@@ -75,8 +79,18 @@ export interface HubDeps {
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
   const spawn = deps.spawn ?? nodeSpawn;
-  // The seed signer IS the licence signer — one Ed25519 key for the hub, so
-  // there is one thing to generate, back up, rotate and bake into the bot.
+  const candleKey = new CandleKeyStore(cfg.dataDir);
+  // ── WHICH KEY SIGNS A SEED ────────────────────────────────────────────────
+  // One expression picks BOTH halves — `cfg.candleKeyId` was derived from the
+  // same `cfg.candleSigner` back in config.ts — because a payload signed by one
+  // key and labelled another is unverifiable everywhere and diagnosable
+  // nowhere. If you are adding a third signer, add it in both places or in
+  // neither. Default is `"license"`: the licence key, labelled `seed-1`,
+  // exactly as before. See candleSigningFromEnv for why flipping it early
+  // kills seeding silently.
+  const signSeed = cfg.candleSigner === "candle"
+    ? (bytes: Buffer) => candleKey.sign(bytes)
+    : (bytes: Buffer) => store.sign(bytes);
   const candles = new CandleService(
     {
       dataDir: cfg.dataDir,
@@ -85,7 +99,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,
     },
-    { sign: (bytes) => store.sign(bytes), fetchLike: deps.candleFetch },
+    { sign: signSeed, fetchLike: deps.candleFetch },
   );
   let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
 
@@ -415,17 +429,31 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // zeroes would be indistinguishable from a collector that is running and
     // has collected nothing, which is the opposite diagnosis.
     if (m === "GET" && p === "/admin/api/candles") {
+      // PUBLIC halves only. Nothing on this route, on the admin page or in any
+      // log line ever carries private key material — see license.ts's rule,
+      // which candles/key.ts follows.
       let seedPublicKey: string | null = null;
-      try { seedPublicKey = store.publicKeyRawB64u(); } catch { seedPublicKey = null; }
+      try {
+        // The key that is signing seeds RIGHT NOW — it follows the switch, so
+        // this is always the one a client must verify today's payloads with.
+        seedPublicKey = cfg.candleSigner === "candle"
+          ? candleKey.publicKeyRawB64u()
+          : store.publicKeyRawB64u();
+      } catch { seedPublicKey = null; }
+      let candlePublicKey: string | null = null;
+      // The dedicated key is shown whether or not it is in use: rollout step
+      // (b) is "paste this into the bot" and happens BEFORE the switch flips.
+      try { candlePublicKey = candleKey.publicKeyRawB64u(); } catch { candlePublicKey = null; }
       return sendJson(res, 200, {
         ok: true,
         enabled: candles.enabled,
         keyId: cfg.candleKeyId,
+        signer: cfg.candleSigner,
         requiresLicense: cfg.candleRequireLicense,
         retentionDays: cfg.candleOptions.retentionDays,
-        // The public half of the seed-signing key, so the operator can pair a
-        // verifying client without re-running keygen. Public material only.
         seedPublicKey,
+        candleKeyId: CANDLE_KEY_ID,
+        candlePublicKey,
         venues: candles.status(),
       });
     }
@@ -510,6 +538,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     server,
     store,
     candles,
+    candleKey,
     listen: () =>
       new Promise<number>((resolve, reject) => {
         server.once("error", reject);

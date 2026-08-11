@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 import { isVenueId, type VenueId } from "./candles/venues.js";
 import { collectorOptionsFromEnv } from "./candles/service.js";
 import type { CollectorOptions } from "./candles/collector.js";
+import {
+  CANDLE_KEY_ID, CANDLE_SIGNERS, LICENSE_SEED_KEY_ID, RESERVED_KEY_IDS, isCandleSigner,
+  type CandleSigner,
+} from "./candles/key.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -30,8 +34,15 @@ export interface HubConfig {
    *  something a hub upgrade silently starts doing. Venues left out report
    *  "no collector configured" on the admin page rather than looking broken. */
   candleVenues: VenueId[];
+  /** WHICH KEY SIGNS A SEED. `"license"` (the default, and today's behaviour)
+   *  signs with the licence key and emits keyId `"seed-1"`; `"candle"` signs
+   *  with the hub's dedicated candle key and emits `"candle-1"`. Set by
+   *  HUB_CANDLE_SIGNER — see the rollout order in `candleSigningFromEnv`. */
+  candleSigner: CandleSigner;
   /** Names the signing key in the seed payload so it can be rotated without
-   *  breaking clients. Rotating the hub's Ed25519 key means changing this. */
+   *  breaking clients. Derived from `candleSigner` so the label and the key can
+   *  never drift apart; HUB_CANDLE_KEY_ID may rename it, but never to a keyId
+   *  reserved for the other signer. */
   candleKeyId: string;
   /** Seeding requires a valid licence key, exactly like every other download
    *  surface. Set HUB_CANDLE_REQUIRE_LICENSE=0 only for a local test hub. */
@@ -40,11 +51,56 @@ export interface HubConfig {
   candleOptions: CollectorOptions;
 }
 
+// ── THE SIGNING SWITCH, AND THE ORDER IT MUST BE THROWN IN ──────────────────
+//
+// The bot PINS its seed-verifying keys BY keyId and REFUSES an unknown one. So
+// the hub emitting `candle-1` before a bot build exists that knows `candle-1`
+// does not fail loudly — every seed is refused, every pair silently falls back
+// to paging the venue for ~12 hours, and the feature dies quietly. That is the
+// hardest failure shape in this whole service to notice, which is why the
+// default here is the OLD behaviour and why the order below is not optional:
+//
+//   (a) SHIP THIS CHANGE. The dedicated key is generated on first use and its
+//       public half appears in the startup log and on the admin Exchanges
+//       panel. Seeds are still signed by the LICENCE key, still labelled
+//       `seed-1`. Nothing on any bot changes.
+//   (b) PASTE THE PUBLIC KEY into the bot's `OLB_SEED_KEYS`, keyed `candle-1`,
+//       ALONGSIDE the existing `seed-1` entry — never instead of it.
+//   (c) SHIP A BOT BUILD carrying that map, and let it reach the testers.
+//   (d) ONLY THEN set HUB_CANDLE_SIGNER=candle on the hub and restart. Bots on
+//       the new build verify `candle-1`; bots still on the old build refuse —
+//       so (c) has to be actually out, not merely tagged.
+//
+// Rolling back is (d) in reverse: unset HUB_CANDLE_SIGNER, restart, and seeds
+// are `seed-1` again. Keep the `seed-1` entry in the bot until every install
+// has been on a `candle-1`-aware build for long enough to say so.
+export function candleSigningFromEnv(env: NodeJS.ProcessEnv): { signer: CandleSigner; keyId: string } {
+  const raw = (env.HUB_CANDLE_SIGNER ?? "license").trim().toLowerCase();
+  if (!isCandleSigner(raw)) {
+    throw new Error(`HUB_CANDLE_SIGNER must be one of ${CANDLE_SIGNERS.join(" | ")}: ${env.HUB_CANDLE_SIGNER}`);
+  }
+  const signer: CandleSigner = raw;
+  const keyId = (env.HUB_CANDLE_KEY_ID ?? "").trim()
+    || (signer === "candle" ? CANDLE_KEY_ID : LICENSE_SEED_KEY_ID);
+  // A payload signed by one key and LABELLED another verifies nowhere, and the
+  // symptom shows up in someone else's process with no hint of the cause. The
+  // reserved ids therefore bind: refuse to start rather than serve a lie.
+  const owner = RESERVED_KEY_IDS[keyId];
+  if (owner && owner !== signer) {
+    throw new Error(
+      `HUB_CANDLE_KEY_ID=${keyId} is reserved for HUB_CANDLE_SIGNER=${owner}, but the signer is ${signer} — ` +
+      "a seed signed by one key and labelled another cannot be verified by anyone",
+    );
+  }
+  return { signer, keyId };
+}
+
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
   const port = Number(env.HUB_PORT ?? 8091);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`HUB_PORT is not a valid port: ${env.HUB_PORT}`);
   }
+  const signing = candleSigningFromEnv(env);
   return {
     dataDir: env.HUB_DATA_DIR ?? path.join(ROOT, "data"),
     releasesDir: env.HUB_RELEASES_DIR ?? path.join(ROOT, "releases"),
@@ -59,7 +115,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(isVenueId),
-    candleKeyId: env.HUB_CANDLE_KEY_ID ?? "seed-1",
+    // Both come out of one function so the key and its label move together.
+    candleSigner: signing.signer,
+    candleKeyId: signing.keyId,
     // Default ON: the seed is a licensed benefit and multi-GB of egress, and
     // every other download surface here is keyed. `=0` is the escape hatch.
     candleRequireLicense: (env.HUB_CANDLE_REQUIRE_LICENSE ?? "1") !== "0",

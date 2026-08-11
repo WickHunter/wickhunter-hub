@@ -70,12 +70,64 @@ venue · `503` nothing collected yet for it. **Never a 200 with empty `rows`** �
 that would be indistinguishable from a genuinely empty window. Served gzipped
 when the client accepts it.
 
-Signing reuses the hub's existing Ed25519 licence key (`data/license-signing.key`),
-so there is one key to generate, back up and bake into the bot. `keyId` names it
-for rotation. **Seeding requires a valid licence key** (`?key=`), like every
+`keyId` names the key that signed the payload — see **Signing key** below. It is
+`seed-1` today. **Seeding requires a valid licence key** (`?key=`), like every
 other download surface here: it is a licensed benefit and by far the heaviest
 thing the hub serves. `HUB_CANDLE_REQUIRE_LICENSE=0` opens it for a local test
 hub; nothing else in the licence path changes either way.
+
+### Signing key
+
+Seeds were signed with the licence key. That is sound only because of an
+ordering nobody can see: a genuine SEED signature, re-wrapped as
+`LHK1.<seed-canonical-bytes>.<sig>`, **passes the licence verifier's signature
+check** — same key, same primitive — and is refused only afterwards, when the
+verifier re-checks the payload SHAPE and finds no `id/name/exp/iat/plan`. The
+separation therefore rests on the shape check running AFTER the signature check.
+Invert that order, or relax the shape test, and every seed payload the hub has
+ever served becomes a forgeable licence.
+
+So candles get their own key: `data/candle-signing.key`, Ed25519, PKCS8 PEM,
+mode 600, beside the licence key. Self-generated on first use — never in config,
+never in an env var, never committed. `LicenseStore.sign()` is untouched and the
+licence path is unchanged; the overlap has to stay available while the rollout
+below is in flight.
+
+**Which key signs is a switch, and the default is the OLD behaviour:**
+
+| `HUB_CANDLE_SIGNER` | signs with | emits `keyId` |
+| --- | --- | --- |
+| unset / `license` | the licence key (`data/license-signing.key`) | `seed-1` |
+| `candle` | the dedicated key (`data/candle-signing.key`) | `candle-1` |
+
+Both halves move together — the keyId is derived from the signer, so there is no
+second variable to forget. `HUB_CANDLE_KEY_ID` may still rename the key (for
+rotation), but the hub **refuses to start** if that name is the one reserved for
+the other signer: a payload signed by one key and labelled another verifies
+nowhere, and the symptom shows up in someone else's process with no hint of the
+cause.
+
+**Throw the switch in this order, and not before.** The bot pins verifying keys
+by `keyId` and refuses an unknown one, so a hub emitting `candle-1` too early
+does not fail loudly — every seed is refused, every pair silently falls back to
+a ~12-hour venue warm-up, and the feature dies quietly.
+
+1. **Ship the hub change.** The key is generated on first use; its public half
+   is printed once at startup and shown on the admin **Exchanges** panel with a
+   copy button. Seeds are still signed by the licence key, still `seed-1`.
+   Nothing on any bot changes.
+2. **Paste the public key** into the bot's `OLB_SEED_KEYS` under keyId
+   `candle-1`, **alongside** the existing `seed-1` entry — never instead of it.
+   It is base64url of the 32 raw Ed25519 bytes, the same encoding as the bot's
+   `LICENSE_PUBLIC_KEY_B64U`. It is a **public** key: copying it is safe.
+3. **Ship a bot build** carrying that map, and let it reach the testers.
+4. **Only then** set `HUB_CANDLE_SIGNER=candle` in `/etc/wickhunter-hub/env`
+   and restart. Bots on the new build verify `candle-1`; bots still on the old
+   build refuse — so step 3 has to be actually out, not merely tagged.
+
+Rolling back is step 4 in reverse: unset `HUB_CANDLE_SIGNER`, restart, seeds are
+`seed-1` again. Keep the `seed-1` entry in the bot until every install has been
+on a `candle-1`-aware build long enough to say so.
 
 ### Turning collectors on
 
@@ -89,8 +141,10 @@ HUB_CANDLE_VENUES=bybit,bitunix,bitget
 
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 `HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
-`HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_KEY_ID` (`seed-1`),
-`HUB_CANDLE_TICK_MS` (60s).
+`HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_TICK_MS` (60s),
+`HUB_CANDLE_SIGNER` (`license`) and `HUB_CANDLE_KEY_ID` (derived from the
+signer) — both covered under **Signing key** above; read the four-step order
+there before touching either.
 
 New listings are picked up automatically: the instrument list is re-read on its
 own cadence and a new symbol starts collecting on the next tick, no restart.
@@ -123,6 +177,12 @@ missing minutes with the worst offenders named, and pairs first listed in the
 last 24h with how much history they hold so far. A venue with no collector says
 so rather than showing zeroes that would read as a working collector with an
 empty store.
+
+Above the cards sits the **candle seed signing key** box: which key is signing
+right now, the dedicated key's public half in full (base64url, with a copy
+button, explicitly labelled a public key that is safe to copy), and the
+four-step rollout order — because the one thing that must not happen is someone
+flipping `HUB_CANDLE_SIGNER` before a bot build knows `candle-1`.
 
 ## License format v1 (pinned)
 
@@ -231,6 +291,7 @@ Testers upgrade by re-running their install command.
 | Path | What | Loss means |
 | --- | --- | --- |
 | `data/license-signing.key` | Ed25519 private key, mode 600 | **every issued token orphaned** — back this up offline |
+| `data/candle-signing.key` | Ed25519 candle-seed private key, mode 600 | a new key is generated, so every bot pinned to the old `candle-1` public key refuses every seed until re-pasted — back this up too |
 | `data/licenses.json` | registry of issued licenses | can't tell known ids from foreign ones |
 | `data/revoked.json` | durable revocations | revoked keys work again |
 | `data/roster.json` | compact last-seen per license | rebuildable from the ledger |
@@ -255,7 +316,7 @@ anywhere private is enough; everything else is reproducible.
 | `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
 | `GET /admin` | none (page holds no secrets) | static admin page |
 | `GET/POST /admin/api/licenses[/revoke]` | `x-hub-admin` header, constant-time | list / issue / revoke |
-| `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status |
+| `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
 
 License keys travel in query strings by design (curl-pasteable); the hub never
 logs a URL's query, and the shipped nginx snippet sets `access_log off` for
@@ -274,6 +335,16 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.1 — the candle seed gets its own Ed25519 key
+  (`data/candle-signing.key`, self-generated on first use), so a seed signature
+  can no longer pass the licence verifier's signature check and rely on a
+  later shape re-check to be refused. **Default behaviour is unchanged**:
+  seeds are still signed by the licence key and still labelled `seed-1` until
+  the operator sets `HUB_CANDLE_SIGNER=candle` — see the four-step rollout
+  under **Signing key**. The public half is printed once at startup and shown
+  on the admin Exchanges panel with a copy button. Also: the collector's start
+  time comes from the injected clock, so a suite reasoning about elapsed time
+  no longer rots against real wall time.
 - v0.2.0 — candle seed service: per-venue 1m collectors (Bybit, Bitunix,
   Bitget) with automatic pick-up of new listings and clean handling of
   delistings, fixed-slot binary day-file storage with presence stored rather

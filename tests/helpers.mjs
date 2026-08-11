@@ -41,6 +41,10 @@ export async function freshHub(overrides = {}, deps = undefined) {
     // never make an outbound venue request. Suites that exercise the collector
     // pass their own venue list plus a stub fetch through `deps`.
     candleVenues: [],
+    // The shipped default: seeds are signed by the LICENCE key and labelled
+    // "seed-1". A suite that wants the dedicated key overrides BOTH, exactly
+    // as configFromEnv derives them together.
+    candleSigner: "license",
     candleKeyId: "seed-1",
     candleRequireLicense: true,
     candleTickMs: 60_000,

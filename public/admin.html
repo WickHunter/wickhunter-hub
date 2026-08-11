@@ -52,6 +52,15 @@
   .b-gapped { color: #b80; } .b-empty { color: #999; } .b-new { color: #a6c; }
   .venue .worst { font-size: .82rem; margin-top: .45rem; overflow-wrap: anywhere; }
   .venue .noconf { font-size: .88rem; margin-top: .5rem; }
+  /* candle seed signing key — public material, meant to be copied */
+  #seedkey { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; margin-top: .6rem; }
+  #seedkey h2 { font-size: 1rem; margin: 0 0 .3rem; }
+  #seedkey .pub { font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere;
+                  border: 1px solid #8884; border-radius: 6px; padding: .5rem .6rem; margin: .45rem 0; }
+  #seedkey .safe { color: #2a7; font-weight: 600; }
+  #seedkey .steps { font-size: .85rem; margin: .5rem 0 0; padding-left: 1.1rem; }
+  #seedkey .steps li { margin: .1rem 0; }
+  #seedkey .live { font-size: .85rem; margin-top: .4rem; }
   /* sign-in overlay: a real form so password managers offer autofill */
   #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
   #gate .card { width: min(92vw, 22rem); border: 1px solid #8884; border-radius: 10px; padding: 1.2rem; }
@@ -108,6 +117,10 @@
   <button type="button" id="cdRefresh">Refresh</button>
   <span id="cdMeta" class="muted"></span>
 </div>
+<!-- The dedicated candle-signing key's PUBLIC half. It has to be pasted into
+     the bot's source by hand, so it is shown in full, in the encoding the bot
+     already uses, with a copy button and an explicit "this is public". -->
+<div id="seedkey"><div class="muted">loading…</div></div>
 <div id="venues"><div class="muted">loading…</div></div>
 
 <h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
@@ -362,6 +375,48 @@ function dur(mins) {
   return (mins / 1440).toFixed(1) + "d";
 }
 
+// ── the candle seed signing key ─────────────────────────────────────────────
+// This is the PUBLIC half of the hub's dedicated candle key, and the operator
+// pastes it into the bot's source by hand. So it is shown whole (never
+// truncated — a half-copied key is a debugging afternoon), in the same
+// base64url encoding the bot's LICENSE_PUBLIC_KEY_B64U uses, said out loud to
+// be public, with the four-step rollout right beside it because the one thing
+// that must not happen is someone flipping the switch first.
+function cdRenderKey(data) {
+  const box = document.getElementById("seedkey");
+  const signingNow = data.signer === "candle"
+    ? 'the <b>dedicated candle key</b>, labelled <code>' + esc(data.keyId) + "</code>"
+    : 'the <b>licence key</b>, labelled <code>' + esc(data.keyId) + "</code> (the shipped default)";
+  let html = "<h2>Candle seed signing key</h2>";
+  html += '<div class="live">Signing right now: ' + signingNow + ".</div>";
+  if (data.candlePublicKey) {
+    html += '<div class="muted" style="margin-top:.5rem">Dedicated candle key <code>'
+      + esc(data.candleKeyId) + '</code> — <span class="safe">PUBLIC KEY, safe to copy and paste anywhere</span>. '
+      + "Paste this into the bot's <code>OLB_SEED_KEYS</code>:</div>";
+    html += '<div class="pub" id="seedkeyPub">' + esc(data.candlePublicKey) + "</div>";
+    html += '<button type="button" id="seedkeyCopy">Copy public key</button>';
+  } else {
+    html += '<div class="verr">The dedicated candle key could not be read from the data directory.</div>';
+  }
+  html += "<ol class=\"steps\">"
+    + "<li>Hub generates the key and shows it here (done — that is this box).</li>"
+    + "<li>Paste it into the bot's <code>OLB_SEED_KEYS</code> under keyId <code>"
+      + esc(data.candleKeyId) + "</code>, <b>alongside</b> the existing <code>seed-1</code> entry.</li>"
+    + "<li>Ship a bot build with that map and let it reach the testers.</li>"
+    + "<li><b>Only then</b> set <code>HUB_CANDLE_SIGNER=candle</code> and restart the hub. "
+      + "Flipping it earlier makes every bot refuse every seed and fall back to a 12-hour venue warm-up, silently.</li>"
+    + "</ol>";
+  box.innerHTML = html;
+  const copy = document.getElementById("seedkeyCopy");
+  if (copy) {
+    copy.onclick = async () => {
+      await navigator.clipboard.writeText(data.candlePublicKey);
+      copy.textContent = "Copied!";
+      setTimeout(() => { copy.textContent = "Copy public key"; }, 1500);
+    };
+  }
+}
+
 async function cdRefresh() {
   const err = document.getElementById("err");
   let data;
@@ -372,6 +427,8 @@ async function cdRefresh() {
     ? "key " + data.keyId + " · " + data.retentionDays + "d retention · seed "
       + (data.requiresLicense ? "requires a licence key" : "OPEN (no licence required)")
     : "no collectors configured — set HUB_CANDLE_VENUES to turn seeding on";
+
+  cdRenderKey(data);
 
   const wrap = document.getElementById("venues");
   wrap.innerHTML = "";
