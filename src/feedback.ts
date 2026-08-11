@@ -93,6 +93,18 @@ export function listFeedback(dataDir: string): FeedbackRecord[] {
   return out;
 }
 
+/** Rewrite the whole file from a record set. Atomic (tmp + rename) so a crash
+ *  mid-write leaves the previous file intact rather than a truncated one. An
+ *  EMPTY set writes an empty file rather than deleting it — a missing file and
+ *  a file with nothing in it read the same to `listFeedback`, and leaving the
+ *  file in place keeps the directory listing honest about what this hub does. */
+function rewrite(dataDir: string, all: FeedbackRecord[]): void {
+  const file = path.join(dataDir, FILE);
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, all.length ? all.map((r) => JSON.stringify(r)).join("\n") + "\n" : "");
+  fs.renameSync(tmp, file);
+}
+
 /** Move a report between new/discussing/fixed. False = unknown id. */
 export function setFeedbackStatus(dataDir: string, id: string, status: FeedbackStatus): boolean {
   if (!FEEDBACK_STATUSES.includes(status)) return false;
@@ -100,9 +112,26 @@ export function setFeedbackStatus(dataDir: string, id: string, status: FeedbackS
   const hit = all.find((r) => r.id === id);
   if (!hit) return false;
   hit.status = status;
-  const file = path.join(dataDir, FILE);
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, all.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  fs.renameSync(tmp, file);
+  rewrite(dataDir, all);
   return true;
+}
+
+/** Delete reports outright. Returns how many were actually removed, which is
+ *  how the caller distinguishes "deleted" from "already gone" — an id that
+ *  matched nothing must not report success, or the admin page will show a row
+ *  vanishing that is still on disk under a different id.
+ *
+ *  This is a REAL delete, not a status. The operator asked for it to stay
+ *  organised, and a fourth status would leave the row in the export forever;
+ *  the export is the artifact handed over for triage, so a deleted report has
+ *  to leave that too. Deletion is therefore irreversible by design — the admin
+ *  page confirms before calling, and the export is the backup. */
+export function deleteFeedback(dataDir: string, ids: readonly string[]): number {
+  const kill = new Set(ids.filter((i) => typeof i === "string" && i));
+  if (kill.size === 0) return 0;
+  const all = listFeedback(dataDir);
+  const keep = all.filter((r) => !kill.has(r.id));
+  const removed = all.length - keep.length;
+  if (removed > 0) rewrite(dataDir, keep);
+  return removed;
 }

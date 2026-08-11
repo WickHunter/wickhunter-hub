@@ -17,6 +17,7 @@
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
+//   admin    POST /admin/api/feedback/delete     {id} or {ids:[...]} -> gone for good
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
 //   admin    POST /admin/api/upgrade             self-upgrade: git pull + install-hub.sh (detached)
 //
@@ -39,8 +40,8 @@ import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import {
-  FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, listFeedback, setFeedbackStatus,
-  type FeedbackStatus,
+  FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, deleteFeedback, listFeedback,
+  setFeedbackStatus, type FeedbackStatus,
 } from "./feedback.js";
 import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
@@ -479,6 +480,21 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         return sendJson(res, 404, { ok: false, error: "unknown report id" });
       }
       return sendJson(res, 200, { ok: true });
+    }
+    if (m === "POST" && p === "/admin/api/feedback/delete") {
+      // Accepts one id or many, so "clear every fixed report" is one call
+      // rather than a loop of requests each rewriting the file.
+      const body = await readJsonBody(req);
+      const ids: unknown = body === null ? null : Array.isArray(body.ids) ? body.ids : body.id;
+      const list = (Array.isArray(ids) ? ids : [ids]).filter((x): x is string => typeof x === "string" && !!x);
+      if (list.length === 0) {
+        return sendJson(res, 400, { ok: false, error: "expected {id} or {ids: [...]}" });
+      }
+      const removed = deleteFeedback(cfg.dataDir, list);
+      // An id that matched nothing is a 404, not a quiet success: the admin
+      // page would otherwise drop a row that is still on disk.
+      if (removed === 0) return sendJson(res, 404, { ok: false, error: "no such report id" });
+      return sendJson(res, 200, { ok: true, removed });
     }
     if (m === "GET" && p === "/admin/api/feedback/export") {
       // The whole set, LOGS INCLUDED — the file the operator hands to their

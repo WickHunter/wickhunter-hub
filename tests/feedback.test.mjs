@@ -125,6 +125,89 @@ await test("export downloads the WHOLE set, logs included, as a named attachment
   assert.equal(anon.status, 401);
 });
 
+// ── DELETE ──────────────────────────────────────────────────────────────────
+// A real delete, not a fourth status: the export is the artifact handed over
+// for triage, so a report the operator has finished with has to leave that too.
+// It is therefore irreversible, and these pin that it removes exactly what was
+// asked for and nothing else.
+
+await test("delete removes ONE report and leaves the rest untouched", async () => {
+  await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify(report({ text: "delete me" })) });
+  await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify(report({ text: "keep me" })) });
+  const before = listFeedback(h.dataDir);
+  const doomed = before.find((r) => r.text === "delete me");
+  const spared = before.find((r) => r.text === "keep me");
+
+  const r = await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", headers: ADMIN, body: JSON.stringify({ id: doomed.id }) });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.removed, 1, "it says how many it removed");
+
+  const after = listFeedback(h.dataDir);
+  assert.equal(after.length, before.length - 1, "exactly one fewer");
+  assert.equal(after.find((x) => x.id === doomed.id), undefined, "the named one is gone");
+  assert.ok(after.find((x) => x.id === spared.id), "its neighbour is not");
+});
+
+await test("a deleted report leaves the EXPORT too — the export is the copy of record", async () => {
+  const rec = listFeedback(h.dataDir).find((r) => r.text === "keep me");
+  await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", headers: ADMIN, body: JSON.stringify({ id: rec.id }) });
+  const body = JSON.parse(await (await fetch(`${h.origin}/admin/api/feedback/export`, { headers: ADMIN })).text());
+  assert.ok(!body.reports.some((x) => x.id === rec.id), "a deleted report is not still sitting in the triage file");
+});
+
+await test("many ids go in one call — clearing the fixed pile is not N requests", async () => {
+  const ids = [];
+  for (const text of ["batch a", "batch b", "batch c"]) {
+    await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify(report({ text })) });
+    ids.push(listFeedback(h.dataDir).find((r) => r.text === text).id);
+  }
+  const before = listFeedback(h.dataDir).length;
+  const r = await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", headers: ADMIN, body: JSON.stringify({ ids }) });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.removed, 3);
+  assert.equal(listFeedback(h.dataDir).length, before - 3);
+});
+
+await test("an id that matched nothing is a 404, never a quiet success", async () => {
+  // The admin page drops the row on a 200. Reporting success for an id that is
+  // still on disk under a different spelling would make the table lie.
+  const before = listFeedback(h.dataDir).length;
+  const r = await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", headers: ADMIN, body: JSON.stringify({ id: "no-such-id" }) });
+  assert.equal(r.status, 404);
+  assert.equal(listFeedback(h.dataDir).length, before, "and nothing was touched");
+});
+
+await test("delete is admin-gated and refuses a body with no id", async () => {
+  const rec = listFeedback(h.dataDir)[0];
+  const anon = await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", body: JSON.stringify({ id: rec.id }) });
+  assert.equal(anon.status, 401, "no admin token, no delete");
+  assert.ok(listFeedback(h.dataDir).some((x) => x.id === rec.id), "and the report survives the attempt");
+
+  for (const body of [{}, { ids: [] }, { id: "" }, { ids: ["", null] }]) {
+    const r = await jsonReq(`${h.origin}/admin/api/feedback/delete`, { method: "POST", headers: ADMIN, body: JSON.stringify(body) });
+    assert.equal(r.status, 400, `refused: ${JSON.stringify(body)}`);
+  }
+});
+
+await test("deleting the LAST report leaves a readable empty store, not a broken one", async () => {
+  const solo = await freshHub();
+  const key = solo.store.issue("Solo", 30);
+  await jsonReq(`${solo.origin}/api/feedback`, { method: "POST", body: JSON.stringify({ ...report(), license: key.token, text: "only one" }) });
+  const id = listFeedback(solo.dataDir)[0].id;
+  const r = await jsonReq(`${solo.origin}/admin/api/feedback/delete`, {
+    method: "POST", headers: { "x-hub-admin": solo.cfg.adminToken }, body: JSON.stringify({ id }),
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(listFeedback(solo.dataDir), [], "reads as empty rather than throwing");
+  // And the store still accepts a new report afterwards — an emptied file must
+  // not leave a stray blank line that the next append turns into a torn record.
+  await jsonReq(`${solo.origin}/api/feedback`, { method: "POST", body: JSON.stringify({ ...report(), license: key.token, text: "after the purge" }) });
+  const back = listFeedback(solo.dataDir);
+  assert.equal(back.length, 1, "one report, cleanly parsed");
+  assert.equal(back[0].text, "after the purge");
+  await solo.close();
+});
+
 await test("a torn tail line in feedback.jsonl is skipped, never fatal", async () => {
   fs.appendFileSync(path.join(h.dataDir, "feedback.jsonl"), '{"half a rec');
   const before = listFeedback(h.dataDir).length;
@@ -132,6 +215,19 @@ await test("a torn tail line in feedback.jsonl is skipped, never fatal", async (
   const r = await jsonReq(`${h.origin}/admin/api/feedback`, { headers: ADMIN });
   assert.equal(r.status, 200);
   assert.equal(r.body.reports.length, before);
+});
+
+await test("the admin page offers per-row Delete and a Delete-all-fixed, both confirmed first", async () => {
+  const page = await (await fetch(`${h.origin}/admin`)).text();
+  assert.ok(page.includes("/admin/api/feedback/delete"), "the page is wired to the delete endpoint");
+  assert.ok(page.includes('id="fbClearFixed"'), "a bulk control for the fixed pile");
+  // Deletion is irreversible and the export is the only copy, so neither path
+  // may fire straight off a click.
+  const deleteCalls = page.split("/admin/api/feedback/delete").length - 1;
+  assert.equal(deleteCalls, 2, "exactly two callers: one row, one bulk");
+  assert.ok((page.match(/confirm\(/g) ?? []).length >= 2, "both ask before deleting");
+  assert.match(page, /cannot be undone/, "and the row prompt says so in words");
+  assert.match(page, /Export first/, "the bulk prompt points at the export as the backup");
 });
 
 await h.close();

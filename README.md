@@ -359,6 +359,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.3 — **feedback reports can be deleted.** Per-row **Delete** on the
+  Feedback table, plus **Delete all fixed** for clearing the pile in one call
+  rather than a row at a time. `POST /admin/api/feedback/delete` takes `{id}` or
+  `{ids:[...]}`, is admin-gated, and answers 404 for an id that matched nothing
+  — a quiet success would make the table drop a row that is still on disk. This
+  is a real delete, not a fourth status: the export is the artifact handed over
+  for triage, so a report you have finished with has to leave that too. It is
+  therefore irreversible, both paths confirm first, and **the export is your
+  only copy** — take one before a bulk clear.
 - v0.2.2 — **the collector paces itself and backs off.** Measured on the
   operator's box the day collecting was turned on: `bitunix code 10006:
   request too frequently` and `ONDOUSDT: HTTP 429`. Two causes, both fixed

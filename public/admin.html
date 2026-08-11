@@ -128,11 +128,15 @@
 <div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
   <button type="button" id="fbExport">Export all (JSON, logs included)</button>
-  <span class="muted">Export is the file to hand to your assistant for triage.</span>
+  <!-- Clearing the fixed pile is the whole point of "stay organised", and doing
+       it one row at a time is the thing that stops getting done. Export first:
+       a delete is permanent and the export is the only copy. -->
+  <button type="button" id="fbClearFixed">Delete all fixed</button>
+  <span class="muted">Export is the file to hand to your assistant for triage — and your only copy once a report is deleted.</span>
 </div>
 <div class="tbl"><table>
-  <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th></tr></thead>
-  <tbody id="fbRows"><tr><td colspan="7">loading…</td></tr></tbody>
+  <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th><th></th></tr></thead>
+  <tbody id="fbRows"><tr><td colspan="8">loading…</td></tr></tbody>
 </table></div>
 
 <script>
@@ -508,7 +512,7 @@ async function fbRefresh() {
   const rows = document.getElementById("fbRows");
   rows.innerHTML = "";
   if (data.reports.length === 0) {
-    rows.innerHTML = '<tr><td colspan="7">no reports yet</td></tr>';
+    rows.innerHTML = '<tr><td colspan="8">no reports yet</td></tr>';
     return;
   }
   for (const r of data.reports) {
@@ -521,7 +525,8 @@ async function fbRefresh() {
       "<td>" + esc(r.version ? vlabel(r.version) : "—") + "</td>" +
       "<td>" + r.logLines + (r.logsTruncated ? "+" : "") + "</td>" +
       "<td></td>" +
-      '<td class="name" style="white-space:normal;min-width:14rem;max-width:28rem">' + esc(r.text) + "</td>";
+      '<td class="name" style="white-space:normal;min-width:14rem;max-width:28rem">' + esc(r.text) + "</td>" +
+      "<td></td>";
     const sel = document.createElement("select");
     for (const s of ["new", "discussing", "fixed"]) {
       const o = document.createElement("option");
@@ -534,9 +539,38 @@ async function fbRefresh() {
       fbRefresh();
     };
     tr.children[5].appendChild(sel);
+    // Delete is permanent and there is no undo, so it asks — and it quotes the
+    // report back, because the rows are sorted by time and the one under the
+    // cursor is not always the one in mind.
+    const del = document.createElement("button");
+    del.type = "button";
+    del.textContent = "Delete";
+    del.title = "Delete this report permanently. It leaves the export too.";
+    del.onclick = async () => {
+      const quoted = r.text.length > 90 ? r.text.slice(0, 90) + "…" : r.text;
+      if (!confirm("Delete this " + r.kind + " report permanently?\n\n" + quoted + "\n\nThis cannot be undone and it will no longer appear in the export.")) return;
+      try { await api("/admin/api/feedback/delete", { method: "POST", body: JSON.stringify({ id: r.id }) }); }
+      catch (e) { document.getElementById("err").textContent = e.message; }
+      fbRefresh();
+    };
+    tr.children[7].appendChild(del);
     rows.appendChild(tr);
   }
+  // Kept on the parsed rows rather than re-fetched, so the button counts the
+  // same set the table is showing.
+  fbFixedIds = data.reports.filter((r) => r.status === "fixed").map((r) => r.id);
+  const clear = document.getElementById("fbClearFixed");
+  clear.disabled = fbFixedIds.length === 0;
+  clear.textContent = fbFixedIds.length ? "Delete all fixed (" + fbFixedIds.length + ")" : "Delete all fixed";
 }
+let fbFixedIds = [];
+document.getElementById("fbClearFixed").onclick = async () => {
+  if (fbFixedIds.length === 0) return;
+  if (!confirm("Delete " + fbFixedIds.length + " report(s) marked fixed, permanently?\n\nThey will no longer appear in the export. Export first if you want a copy.")) return;
+  try { await api("/admin/api/feedback/delete", { method: "POST", body: JSON.stringify({ ids: fbFixedIds }) }); }
+  catch (e) { document.getElementById("err").textContent = e.message; }
+  fbRefresh();
+};
 document.getElementById("fbRefresh").onclick = fbRefresh;
 document.getElementById("fbExport").onclick = async () => {
   const res = await fetch(base + "/admin/api/feedback/export", { headers: { "x-hub-admin": token } });
