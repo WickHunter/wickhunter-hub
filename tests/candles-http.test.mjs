@@ -68,7 +68,10 @@ function serviceWith(venue, fetchLike, overrides = {}) {
       options: { ...DEFAULT_COLLECTOR_OPTIONS, ...overrides },
       tickMs: 60_000,
     },
-    { sign: (b) => Buffer.alloc(64), fetchLike },
+    // The collector's startedAt must come from the SAME frozen clock the
+    // assertions use; otherwise elapsed time is measured against real wall
+    // time and this suite silently rots about an hour after it is written.
+    { sign: (b) => Buffer.alloc(64), fetchLike, now: () => NOW },
   );
   return { svc, dataDir };
 }

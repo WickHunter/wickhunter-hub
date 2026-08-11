@@ -78,6 +78,11 @@ export interface CandleServiceDeps {
   sign(bytes: Buffer): Buffer;
   /** Injectable so tests never touch the network. */
   fetchLike?: FetchLike;
+  /** Injectable clock, read ONCE at construction to stamp each collector's
+   *  `startedAt`. Without it a caller reasoning about a frozen clock gets
+   *  negative elapsed time and the never-succeeded collector never reaches
+   *  FAILING. Defaults to `Date.now`, so production is unchanged. */
+  now?: () => number;
 }
 
 const realFetch: FetchLike = async (url: string) => {
@@ -97,7 +102,14 @@ export class CandleService {
     this.store = new CandleStore(path.join(cfg.dataDir, "candles"));
     this.fetchLike = deps.fetchLike ?? realFetch;
     for (const v of cfg.venues) {
-      this.collectors.set(v, new VenueCollector(v, this.store, path.join(cfg.dataDir, "candles"), cfg.options));
+      // v0.2.1 — the collector's START TIME comes from the injected clock, not
+      // from `Date.now()` inside its own constructor. `VenueCollector` has
+      // always taken `now` as a parameter; the service simply never passed it,
+      // so `startedAt` was real time while a caller reasoning about a frozen
+      // clock saw its elapsed-time arithmetic go NEGATIVE — and a collector
+      // that has never succeeded then reads "starting" forever instead of
+      // FAILING, which is the one state transition the operator asked for.
+      this.collectors.set(v, new VenueCollector(v, this.store, path.join(cfg.dataDir, "candles"), cfg.options, deps.now?.() ?? Date.now()));
     }
   }
 
