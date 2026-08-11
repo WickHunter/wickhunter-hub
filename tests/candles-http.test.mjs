@@ -496,5 +496,17 @@ await test("the admin candles route needs the admin token and reports every venu
   assert.ok(typeof r.body.seedPublicKey === "string" && r.body.seedPublicKey.length > 0, "public key offered for pairing");
 });
 
+await test("the admin page carries the per-exchange panel and refreshes it with the rest", async () => {
+  const page = await (await fetch(`${h.origin}/admin`)).text();
+  assert.match(page, /id="venues"/, "a container for the venue cards");
+  assert.match(page, /admin\/api\/candles/, "wired to the status route");
+  assert.match(page, /NO COLLECTOR/, "an unconfigured venue says so rather than showing zeroes");
+  for (const field of ["seedable", "backfilling", "gapped", "Oldest candle", "Newest candle", "Missing minutes", "Worst gaps", "New in 24h"]) {
+    assert.ok(page.includes(field), `panel states ${field}`);
+  }
+  assert.match(page, /document\.getElementById\("refresh"\)\.onclick = \(\) => \{ refresh\(\); cdRefresh\(\); fbRefresh\(\); \}/,
+    "the page's Refresh button refreshes the venue cards too");
+});
+
 await h.close();
 summary("candles-http");

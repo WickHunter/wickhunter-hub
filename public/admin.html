@@ -33,6 +33,25 @@
   .expsave:disabled { opacity: .45; cursor: default; }
   .share { color: #c33; font-weight: 600; white-space: nowrap; }
   .muted { opacity: .6; }
+  /* per-exchange collector cards */
+  #venues { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: .8rem; margin-top: .6rem; }
+  .venue { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; }
+  .venue h2 { font-size: 1.05rem; margin: 0 0 .35rem; display: flex; align-items: baseline; gap: .5rem; }
+  .venue h2 .id { text-transform: uppercase; letter-spacing: .04em; }
+  .vstate { font-size: .78rem; font-weight: 700; padding: .1rem .45rem; border-radius: 4px; border: 1px solid currentColor; }
+  .v-running { color: #2a7; } .v-stalled { color: #b80; }
+  .v-failing { color: #c33; } .v-starting { color: #78c; } .v-off { color: #999; }
+  .venue dl { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; margin: .5rem 0 0; font-size: .88rem; }
+  .venue dt { opacity: .65; } .venue dd { margin: 0; }
+  .venue .detail { font-size: .85rem; margin: .1rem 0 .3rem; }
+  .venue .verr { color: #c33; font-size: .82rem; overflow-wrap: anywhere; margin-top: .4rem; }
+  .buckets { display: flex; flex-wrap: wrap; gap: .3rem; margin: .55rem 0 .1rem; }
+  .bkt { font-size: .8rem; padding: .12rem .45rem; border-radius: 4px; border: 1px solid #8886; white-space: nowrap; }
+  .bkt b { font-weight: 700; }
+  .b-seedable { color: #2a7; } .b-backfilling { color: #78c; }
+  .b-gapped { color: #b80; } .b-empty { color: #999; } .b-new { color: #a6c; }
+  .venue .worst { font-size: .82rem; margin-top: .45rem; overflow-wrap: anywhere; }
+  .venue .noconf { font-size: .88rem; margin-top: .5rem; }
   /* sign-in overlay: a real form so password managers offer autofill */
   #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
   #gate .card { width: min(92vw, 22rem); border: 1px solid #8884; border-radius: 10px; padding: 1.2rem; }
@@ -84,6 +103,13 @@
   <tbody id="rows"><tr><td colspan="8">loading…</td></tr></tbody>
 </table></div>
 
+<h1 style="margin-top:2.2rem">Exchanges <small>— 1m candle collectors feeding the seed</small></h1>
+<div class="actions">
+  <button type="button" id="cdRefresh">Refresh</button>
+  <span id="cdMeta" class="muted"></span>
+</div>
+<div id="venues"><div class="muted">loading…</div></div>
+
 <h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
 <div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
@@ -114,6 +140,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   if (!token) return;
   document.getElementById("gate").style.display = "none";
   refresh();
+  cdRefresh();
   fbRefresh();
 };
 
@@ -282,7 +309,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); fbRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); cdRefresh(); fbRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -305,7 +332,7 @@ document.getElementById("upgradeHub").onclick = async () => {
     if (v && v !== before) {
       clearInterval(poll);
       note.textContent = "Hub upgraded: v" + before + " → v" + v + ".";
-      refresh(); fbRefresh();
+      refresh(); cdRefresh(); fbRefresh();
     } else if (Date.now() - t0 > 120000) {
       clearInterval(poll);
       err.textContent = "The hub did not report a new version after 2 minutes. If it is still on v" + before +
@@ -314,6 +341,99 @@ document.getElementById("upgradeHub").onclick = async () => {
   }, 3000);
 };
 health().then((v) => { document.getElementById("hubVer").textContent = v ? "hub v" + v : ""; });
+
+// ── per-exchange collector status ───────────────────────────────────────────
+// One card per venue. The numbers are stated plainly and never rolled into a
+// single health score: when a tester says "my bot isn't warming", the operator
+// needs to see WHICH of these is wrong, and one number would hide exactly that.
+function ago(ms) {
+  if (!ms) return "never";
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 90) return s + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function when(ms) { return ms ? fmt(ms) + " UTC (" + ago(ms) + ")" : "—"; }
+function dur(mins) {
+  if (!mins) return "0";
+  if (mins < 120) return mins + "m";
+  if (mins < 2880) return (mins / 60).toFixed(1) + "h";
+  return (mins / 1440).toFixed(1) + "d";
+}
+
+async function cdRefresh() {
+  const err = document.getElementById("err");
+  let data;
+  try { data = await api("/admin/api/candles"); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+
+  document.getElementById("cdMeta").textContent = data.enabled
+    ? "key " + data.keyId + " · " + data.retentionDays + "d retention · seed "
+      + (data.requiresLicense ? "requires a licence key" : "OPEN (no licence required)")
+    : "no collectors configured — set HUB_CANDLE_VENUES to turn seeding on";
+
+  const wrap = document.getElementById("venues");
+  wrap.innerHTML = "";
+  for (const v of data.venues) {
+    const card = document.createElement("div");
+    card.className = "venue";
+    const h = v.health;
+    // A venue with no collector says THAT. Rendering zeroes here would look
+    // exactly like a working collector that has collected nothing — the
+    // opposite diagnosis.
+    const state = v.configured ? h.state : "off";
+    const label = v.configured ? state.toUpperCase() : "NO COLLECTOR";
+    let html = '<h2><span class="id">' + esc(v.venue) + '</span>'
+      + '<span class="vstate v-' + state + '">' + label + "</span></h2>";
+
+    if (!v.configured) {
+      html += '<div class="noconf">No collector is configured for this exchange, so the hub holds no candles for it and '
+        + 'every seed request answers 503. Add it to <code>HUB_CANDLE_VENUES</code> to start collecting.</div>';
+      card.innerHTML = html;
+      wrap.appendChild(card);
+      continue;
+    }
+
+    html += '<div class="detail">' + esc(h.detail) + "</div>";
+    html += '<div class="buckets">'
+      + '<span class="bkt b-seedable"><b>' + v.counts.seedable + "</b> seedable</span>"
+      + '<span class="bkt b-backfilling"><b>' + v.counts.backfilling + "</b> backfilling</span>"
+      + '<span class="bkt b-gapped"><b>' + v.counts.gapped + "</b> gapped</span>"
+      + '<span class="bkt b-empty"><b>' + v.counts.empty + "</b> empty</span>"
+      + (v.counts.newLast24h ? '<span class="bkt b-new"><b>' + v.counts.newLast24h + "</b> new in 24h</span>" : "")
+      + "</div>";
+
+    html += "<dl>"
+      + "<dt>Symbols tracked</dt><dd>" + v.counts.tracked
+        + (v.counts.delisted ? ' <span class="muted">(' + v.counts.delisted + " delisted)</span>" : "") + "</dd>"
+      + "<dt>Last success</dt><dd>" + when(h.lastSuccessAt) + "</dd>"
+      + "<dt>Symbol list</dt><dd>" + when(h.lastSymbolRefreshAt) + "</dd>"
+      + "<dt>Oldest candle</dt><dd>" + (v.oldestClosedMs ? fmt(v.oldestClosedMs) + " UTC" : "—") + "</dd>"
+      + "<dt>Newest candle</dt><dd>" + (v.newestClosedMs ? fmt(v.newestClosedMs) + " UTC (" + ago(v.newestClosedMs) + ")" : "—") + "</dd>"
+      + "<dt>Missing minutes</dt><dd>" + v.totalMissingMinutes.toLocaleString() + "</dd>"
+      + "<dt>Requests</dt><dd>" + h.requestsMade.toLocaleString() + " · " + h.candlesWritten.toLocaleString() + " candles</dd>"
+      + "</dl>";
+
+    // A venue quietly accumulating gaps is the failure that poisons seeds
+    // without ever throwing, so the worst offenders are named on the card.
+    if (v.worstGaps.length) {
+      html += '<div class="worst"><span class="muted">Worst gaps:</span> '
+        + v.worstGaps.map((g) => esc(g.symbol) + " (" + dur(g.missingMinutes) + ")").join(", ") + "</div>";
+    }
+    // "Why is this new coin not trading?" should be answerable on sight.
+    if (v.newlyListed.length) {
+      html += '<div class="worst"><span class="muted">New in 24h:</span> '
+        + v.newlyListed.map((n) => esc(n.symbol) + " (" + n.bucket + ", " + dur(n.heldMinutes) + " held)").join(", ") + "</div>";
+    }
+    if (h.lastError) {
+      html += '<div class="verr">Last error ' + ago(h.lastError.at) + ": " + esc(h.lastError.message) + "</div>";
+    }
+    card.innerHTML = html;
+    wrap.appendChild(card);
+  }
+}
+document.getElementById("cdRefresh").onclick = cdRefresh;
 
 // ── feedback ────────────────────────────────────────────────────────────────
 async function fbRefresh() {
