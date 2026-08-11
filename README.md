@@ -113,13 +113,16 @@ does not fail loudly — every seed is refused, every pair silently falls back t
 a ~12-hour venue warm-up, and the feature dies quietly.
 
 1. **Ship the hub change.** The key is generated on first use; its public half
-   is printed once at startup and shown on the admin **Exchanges** panel with a
-   copy button. Seeds are still signed by the licence key, still `seed-1`.
-   Nothing on any bot changes.
+   is printed once at startup, shown on the admin **Exchanges** panel with a
+   copy button, and printed by `npm run candlekey` if you are on the box with a
+   shell. Seeds are still signed by the licence key, still `seed-1`. Nothing on
+   any bot changes.
 2. **Paste the public key** into the bot's `OLB_SEED_KEYS` under keyId
    `candle-1`, **alongside** the existing `seed-1` entry — never instead of it.
    It is base64url of the 32 raw Ed25519 bytes, the same encoding as the bot's
-   `LICENSE_PUBLIC_KEY_B64U`. It is a **public** key: copying it is safe.
+   `LICENSE_PUBLIC_KEY_B64U`. It is a **public** key: copying it is safe. Every
+   hub has its OWN key — take it from the hub you actually serve seeds from,
+   never from a dev checkout.
 3. **Ship a bot build** carrying that map, and let it reach the testers.
 4. **Only then** set `HUB_CANDLE_SIGNER=candle` in `/etc/wickhunter-hub/env`
    and restart. Bots on the new build verify `candle-1`; bots still on the old
