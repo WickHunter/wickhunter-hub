@@ -52,6 +52,7 @@ export async function freshHub(overrides = {}, deps = undefined) {
   return {
     hub,
     store,
+    candles: hub.candles,
     cfg,
     dataDir,
     releasesDir,
