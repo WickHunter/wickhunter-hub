@@ -14,6 +14,8 @@
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
 //   admin    POST /admin/api/licenses/expiry     {id, exp} -> re-minted command
 //   admin    POST /admin/api/licenses/revoke     {id}
+//   admin    GET  /admin/api/flags                per-licence feature flags
+//   admin    POST /admin/api/flags                {id|"default", flag, state:true|false|null}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
@@ -39,6 +41,7 @@ import { CandleService, type CandleServiceDeps } from "./candles/service.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
+import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
   FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, deleteFeedback, listFeedback,
   setFeedbackStatus, type FeedbackStatus,
@@ -170,10 +173,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // exists) so the bot can show "update available" — informational only;
     // a bot that ignores it loses nothing.
     const latest = readLatest()?.version;
+    // v0.2.11 — FEATURE FLAGS, per licence. See src/flags.ts for why they ride
+    // the check-in rather than the signed token (format v1 is pinned, and a
+    // reply reaches every already-issued key without a reissue).
+    //
+    // ALWAYS SENT, even when empty. The bot distinguishes an absent `flags` key
+    // ("this hub predates flags — leave my cache alone") from `{}` ("the hub
+    // says none"), and only the second can turn a feature back off. A hub that
+    // omitted the key when it had nothing to say could never darken anything.
+    //
+    // Sent to REVOKED and unknown ids too, for the same reason `latest` is: the
+    // reply is about what this build would show, and a revoked install still
+    // deserves a truthful answer. Nothing here grants access to anything — the
+    // licence gate is a separate mechanism at the order-submit seam.
+    const flags = flagsFor(cfg.dataDir, body.licenseId);
     sendJson(res, 200, {
       ok: true,
       ...(revoked ? { revoked: true } : {}),
       ...(latest ? { latest } : {}),
+      flags,
     });
   }
 
@@ -540,6 +558,43 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         exp: payload.exp,
         installCommand: token ? `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
       });
+    }
+    if (m === "GET" && p === "/admin/api/flags") {
+      return sendJson(res, 200, { ok: true, flags: readFlags(cfg.dataDir) });
+    }
+    if (m === "POST" && p === "/admin/api/flags") {
+      const body = await readJsonBody(req);
+      // `id` is a licence id, or the literal "default" for everyone. `state`
+      // is true / false / null — false is how ONE tester is excluded from a
+      // default, null removes the entry and falls back to it.
+      if (
+        body === null ||
+        typeof body.id !== "string" || !body.id ||
+        typeof body.flag !== "string" || !body.flag ||
+        !(body.state === true || body.state === false || body.state === null)
+      ) {
+        return sendJson(res, 400, { ok: false, error: "expected {id, flag, state: true|false|null}" });
+      }
+      // A flag name is echoed straight into a JSON file and then into every
+      // check-in reply, so it is length-capped and charset-restricted here
+      // rather than trusted. The BOT ignores names it does not know, which is
+      // the real protection; this is the hygiene that keeps the file readable.
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(body.flag)) {
+        return sendJson(res, 400, { ok: false, error: "flag names are letters, digits and underscores, max 40 chars" });
+      }
+      // v0.2.12 — REFUSED, not silently dropped. `setFlag` also guards these
+      // (see src/flags.ts on why `__proto__` is not an ordinary key here), but
+      // a guard that returns the file unchanged would answer 200 and report
+      // "nothing happened" — which is exactly how the original defect stayed
+      // invisible. The FLAG name needs the same treatment: the charset rule
+      // above excludes `__proto__` (it starts with an underscore) but not
+      // `constructor` or `prototype`.
+      if (isUnsafeKey(body.id) || isUnsafeKey(body.flag)) {
+        const bad = isUnsafeKey(body.id) ? `licence id "${body.id}"` : `flag name "${body.flag}"`;
+        return sendJson(res, 400, { ok: false, error: `${bad} is not usable — it collides with a JavaScript object member` });
+      }
+      const file = setFlag(cfg.dataDir, body.id.slice(0, 64), body.flag, body.state);
+      return sendJson(res, 200, { ok: true, flags: file });
     }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);

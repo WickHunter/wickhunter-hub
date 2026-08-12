@@ -47,7 +47,15 @@ await test("checkin records to jsonl + roster and answers ok", async () => {
     body: JSON.stringify({ licenseId: lic.id, installId: "inst-1", version: "0.9.0", ts: 1723000000000 }),
   });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.body, { ok: true, latest: "0.9.0" }); // no revoked flag; latest rides along for the bot's update banner
+  // v0.2.11 — `flags` joined the reply, ALWAYS present even when empty. That is
+  // not cosmetic: the bot distinguishes an absent key ("this hub predates flags
+  // — leave my cache alone") from `{}` ("the hub says none"), and only the
+  // second can turn a feature back off. A hub that omitted the key when it had
+  // nothing to say could never darken a feature it had previously lit. The
+  // deep-equal is kept rather than loosened to a subset check, because the
+  // whole point of asserting the exact body is that a field cannot join this
+  // reply without someone deciding it should.
+  assert.deepEqual(r.body, { ok: true, latest: "0.9.0", flags: {} }); // no revoked flag; latest rides along for the bot's update banner
   const lines = fs.readFileSync(path.join(h.dataDir, "checkins.jsonl"), "utf8").trim().split("\n");
   const last = JSON.parse(lines[lines.length - 1]);
   assert.equal(last.licenseId, lic.id);
@@ -65,7 +73,12 @@ await test("checkin for a revoked license answers revoked:true (and still record
     method: "POST",
     body: JSON.stringify({ licenseId: lic.id, installId: "inst-2", version: "0.9.0", ts: Date.now() }),
   });
-  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0" });
+  // v0.2.11 — flags travel to a REVOKED install too, for the same reason
+  // `latest` does: the reply describes what this build would show, and a
+  // revoked install still deserves a truthful answer. Nothing here grants
+  // access to anything — the licence gate is a separate mechanism, at the
+  // bot's order-submit seam.
+  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {} });
   assert.equal(readRoster(h.dataDir)[lic.id].installId, "inst-2");
 });
 
@@ -74,7 +87,7 @@ await test("checkin for an id this hub never issued answers revoked:true", async
     method: "POST",
     body: JSON.stringify({ licenseId: "not-ours", installId: "inst-3", version: "0.9.0", ts: Date.now() }),
   });
-  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0" });
+  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {} });
 });
 
 await test("malformed checkin body is a 400", async () => {

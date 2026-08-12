@@ -360,6 +360,59 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.12 — **`__proto__` is not a licence id.** Found by an independent audit of
+  v0.2.11 and reproduced end to end against the real route.
+
+  `byLicense["__proto__"]` does not resolve to `undefined` — it resolves through
+  the inherited accessor to **`Object.prototype` itself**, so the `??=` in
+  `setFlag` never assigned and the next write landed on the global prototype.
+  From that moment every plain object in the process inherited the flag,
+  including the check-in reply built for an unrelated, legitimate licence — and
+  the route answered **200 while reporting the file as unchanged**, which is
+  precisely how it would have stayed invisible.
+
+  It needs no malice: pasting a wrong value into an id field is enough.
+
+  Fixed in three places rather than one. The three names that can reach the
+  prototype are **refused at the route** (a 400, not a silent no-op — a guard
+  that returns the file unchanged reproduces the original invisibility), refused
+  again in `setFlag`, and the maps themselves are now `Object.create(null)`, so a
+  future door that forgets the check still has no prototype to corrupt. The flag
+  NAME gets the same treatment as the id: the charset rule already excluded
+  `__proto__`, but not `constructor` or `prototype`.
+
+  The same root cause was fixed on `checkins.ts`'s roster, which is reachable
+  from the **unauthenticated** check-in route: `roster["__proto__"] = {…}` sets
+  that object's prototype instead of adding a row, so the check-in silently
+  vanished from the roster — and from `sharingSignals`, the one thing that
+  catches a key being run on several machines.
+
+- v0.2.11 — **per-licence FEATURE FLAGS, so one bot build serves alpha and beta.**
+  The bot now ships unfinished features compiled in but DARK; this is the half
+  that decides who may see them. `data/flags.json` carries a `default` set plus
+  per-licence overrides, and every check-in reply names the merged result.
+
+  **WHY NOT IN THE SIGNED TOKEN.** `src/license.ts` opens with "License format
+  v1 — PINNED. Any change needs a new LHK2 prefix, never a mutation of v1."
+  Putting flags in the payload would break that rule, or force every issued key
+  to be reissued before a single tester could be given a feature. The check-in
+  reply already carries `revoked` and `latest`, is answered per licence, and
+  happens daily — so flags belong there. Every key already issued gains them
+  with no reissue, enabling one tester lands within a day, and disabling is
+  equally cheap, which matters because the whole point is shipping things that
+  are not finished.
+
+  `flags` is **always** in the reply, even empty: the bot distinguishes an absent
+  key ("this hub predates flags — leave my cache alone") from `{}` ("the hub says
+  none"), and only the second can turn a feature back off. Only TRUE flags are
+  emitted — an explicit `false` in `byLicense` exists to cancel a default for one
+  tester, and once cancelled there is nothing to say.
+
+  This hub keeps **no registry of valid flag names**, deliberately: the build
+  that implements a flag is the authority on what it means, and the bot ignores
+  names it does not know. A registry here would have to be redeployed in lockstep
+  with every bot release. New: `GET`/`POST /admin/api/flags`.
+
 - v0.2.10 — **a finished venue no longer reports a fault, and a fast clock can
   no longer store a forming bar.** Two consequences of the tail cadence, both
   found on the operator's live panel. (1) **CAUGHT UP IS NOT STALLED.** A venue
