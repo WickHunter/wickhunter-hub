@@ -360,6 +360,32 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.11 — **per-licence FEATURE FLAGS, so one bot build serves alpha and beta.**
+  The bot now ships unfinished features compiled in but DARK; this is the half
+  that decides who may see them. `data/flags.json` carries a `default` set plus
+  per-licence overrides, and every check-in reply names the merged result.
+
+  **WHY NOT IN THE SIGNED TOKEN.** `src/license.ts` opens with "License format
+  v1 — PINNED. Any change needs a new LHK2 prefix, never a mutation of v1."
+  Putting flags in the payload would break that rule, or force every issued key
+  to be reissued before a single tester could be given a feature. The check-in
+  reply already carries `revoked` and `latest`, is answered per licence, and
+  happens daily — so flags belong there. Every key already issued gains them
+  with no reissue, enabling one tester lands within a day, and disabling is
+  equally cheap, which matters because the whole point is shipping things that
+  are not finished.
+
+  `flags` is **always** in the reply, even empty: the bot distinguishes an absent
+  key ("this hub predates flags — leave my cache alone") from `{}` ("the hub says
+  none"), and only the second can turn a feature back off. Only TRUE flags are
+  emitted — an explicit `false` in `byLicense` exists to cancel a default for one
+  tester, and once cancelled there is nothing to say.
+
+  This hub keeps **no registry of valid flag names**, deliberately: the build
+  that implements a flag is the authority on what it means, and the bot ignores
+  names it does not know. A registry here would have to be redeployed in lockstep
+  with every bot release. New: `GET`/`POST /admin/api/flags`.
+
 - v0.2.10 — **a finished venue no longer reports a fault, and a fast clock can
   no longer store a forming bar.** Two consequences of the tail cadence, both
   found on the operator's live panel. (1) **CAUGHT UP IS NOT STALLED.** A venue
