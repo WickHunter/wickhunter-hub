@@ -16,6 +16,8 @@
 //     because the bot treats absent and false identically.
 import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
+import fs from "node:fs";
+import path from "node:path";
 
 const h = await freshHub();
 const AUTH = { "x-hub-admin": "test-admin-token" };
@@ -134,6 +136,58 @@ await test("a malformed write is refused rather than half-applied", async () => 
   // …and nothing changed.
   const r = await jsonReq(`${h.origin}/admin/api/flags`, { headers: AUTH });
   assert.equal(Object.keys(r.body.flags.default).length, 1);
+});
+
+// ── v0.2.12 — KEYS THAT ARE NOT KEYS ──────────────────────────────────────
+//
+// Found by audit and reproduced end to end against the real route. A licence id
+// of `__proto__` is not an ordinary string: `byLicense["__proto__"]` resolves
+// through the inherited accessor to Object.prototype ITSELF, so `??=` never
+// assigns and the write lands on the global prototype. From then on EVERY plain
+// object in the process inherits the flag — including the check-in reply built
+// for an unrelated, legitimate licence — while the route answers 200 and
+// reports the file as unchanged.
+await test("a licence id of __proto__ is REFUSED, not silently applied", async () => {
+  const r = await setFlag("__proto__", "dcaStyles", true);
+  assert.equal(r.status, 400, "a 200 here is how the original defect stayed invisible");
+  // THE PROOF: no plain object in this process inherits anything.
+  assert.equal(Object.prototype.dcaStyles, undefined);
+  assert.equal({}.dcaStyles, undefined);
+});
+
+await test("…and neither the file nor an unrelated licence was touched", async () => {
+  const seen = await checkin(beta);
+  // `beta` had the default lit earlier in this file; the point is that nothing
+  // NEW appeared on it, and that the reply's own object is clean.
+  assert.equal(Object.prototype.hasOwnProperty.call(seen.flags, "__proto__"), false);
+  const r = await jsonReq(`${h.origin}/admin/api/flags`, { headers: AUTH });
+  assert.equal(Object.prototype.hasOwnProperty.call(r.body.flags.byLicense, "__proto__"), false);
+});
+
+await test("constructor and prototype are refused for the same reason", async () => {
+  for (const id of ["constructor", "prototype"]) {
+    assert.equal((await setFlag(id, "dcaStyles", true)).status, 400, id);
+  }
+  for (const flag of ["constructor", "prototype"]) {
+    assert.equal((await setFlag("default", flag, true)).status, 400, flag);
+  }
+  assert.equal({}.dcaStyles, undefined);
+});
+
+await test("an UNAUTHENTICATED check-in cannot make its own row vanish from the roster", async () => {
+  // Same root cause on a path with no admin token at all: `roster[licenseId]`
+  // with the id `__proto__` sets the object's prototype instead of adding a
+  // row, so the check-in silently disappears — and `sharingSignals`, the one
+  // thing that catches a shared key, never sees it.
+  const r = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: "__proto__", installId: "inst-x", version: "0.75.4", ts: Date.now() }),
+  });
+  assert.equal(r.status, 200);
+  const roster = JSON.parse(fs.readFileSync(path.join(h.dataDir, "roster.json"), "utf8"));
+  assert.ok(Object.prototype.hasOwnProperty.call(roster, "__proto__"),
+    "the row must be RECORDED as an ordinary key, not swallowed as a prototype");
+  assert.equal(roster.__proto__.installId, "inst-x");
 });
 
 await test("the hub keeps NO registry of valid flag names — the bot owns that", async () => {

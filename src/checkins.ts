@@ -29,7 +29,21 @@ const ROSTER_FILE = "roster.json";
 export function recordCheckin(dataDir: string, c: CheckinInput, ip: string, now = Date.now()): void {
   appendJsonl(path.join(dataDir, CHECKINS_FILE), { ...c, ip, at: now });
   const rosterFile = path.join(dataDir, ROSTER_FILE);
-  const roster = readJson<Record<string, RosterEntry>>(rosterFile, {});
+  // ── v0.2.12 — THE SAME ROOT CAUSE AS THE FLAGS ROUTE, ON AN UNAUTHENTICATED
+  // PATH. `licenseId` here comes straight off the wire from any caller. Writing
+  // `roster["__proto__"] = {...}` on a plain object does not create an entry —
+  // it SETS THAT OBJECT'S PROTOTYPE — so the row silently vanishes from the
+  // roster (and from `sharingSignals`, which is the one thing that catches a
+  // shared key). A `Map`-like bare object has no prototype to reassign, so the
+  // id becomes an ordinary key and the row is recorded like any other.
+  //
+  // The LEDGER above is unaffected either way — it is append-only JSONL and the
+  // id is just a string in it. That is why the ledger, not the roster, is the
+  // truth (see the note below).
+  const roster: Record<string, RosterEntry> = Object.assign(
+    Object.create(null) as Record<string, RosterEntry>,
+    readJson<Record<string, RosterEntry>>(rosterFile, {}),
+  );
   const prev = roster[c.licenseId];
   roster[c.licenseId] = {
     installId: c.installId,

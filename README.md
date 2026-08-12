@@ -360,6 +360,33 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.12 — **`__proto__` is not a licence id.** Found by an independent audit of
+  v0.2.11 and reproduced end to end against the real route.
+
+  `byLicense["__proto__"]` does not resolve to `undefined` — it resolves through
+  the inherited accessor to **`Object.prototype` itself**, so the `??=` in
+  `setFlag` never assigned and the next write landed on the global prototype.
+  From that moment every plain object in the process inherited the flag,
+  including the check-in reply built for an unrelated, legitimate licence — and
+  the route answered **200 while reporting the file as unchanged**, which is
+  precisely how it would have stayed invisible.
+
+  It needs no malice: pasting a wrong value into an id field is enough.
+
+  Fixed in three places rather than one. The three names that can reach the
+  prototype are **refused at the route** (a 400, not a silent no-op — a guard
+  that returns the file unchanged reproduces the original invisibility), refused
+  again in `setFlag`, and the maps themselves are now `Object.create(null)`, so a
+  future door that forgets the check still has no prototype to corrupt. The flag
+  NAME gets the same treatment as the id: the charset rule already excluded
+  `__proto__`, but not `constructor` or `prototype`.
+
+  The same root cause was fixed on `checkins.ts`'s roster, which is reachable
+  from the **unauthenticated** check-in route: `roster["__proto__"] = {…}` sets
+  that object's prototype instead of adding a row, so the check-in silently
+  vanished from the roster — and from `sharingSignals`, the one thing that
+  catches a key being run on several machines.
+
 - v0.2.11 — **per-licence FEATURE FLAGS, so one bot build serves alpha and beta.**
   The bot now ships unfinished features compiled in but DARK; this is the half
   that decides who may see them. `data/flags.json` carries a `default` set plus

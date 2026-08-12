@@ -38,12 +38,33 @@ import { readJson, writeJsonAtomic } from "./jsonfile.js";
 
 const FLAGS_FILE = "flags.json";
 
+/** ── v0.2.12 — KEYS THAT ARE NOT KEYS ──────────────────────────────────────
+ *
+ *  Found by audit, reproduced end to end against the real route. A licence id
+ *  of `__proto__` is not an ordinary string here: `byLicense["__proto__"]`
+ *  resolves through the inherited accessor to `Object.prototype` ITSELF, so
+ *  `??=` sees a value and never assigns, and the next write lands on the global
+ *  prototype. From then on EVERY plain object in the process inherits the flag
+ *  — including the check-in reply built for an unrelated, legitimate licence —
+ *  and the route answers 200 while reporting the file as unchanged.
+ *
+ *  It needs no malice to happen: pasting a wrong value into an id field is
+ *  enough. So the three names that can reach the prototype are refused at every
+ *  door rather than sanitised at one of them, and `Object.create(null)` is used
+ *  for the maps themselves so a future door that forgets the check still cannot
+ *  find a prototype to corrupt. */
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+export const isUnsafeKey = (k: string): boolean => UNSAFE_KEYS.has(k);
+/** A map with NO prototype — nothing to pollute, and nothing inherited to
+ *  mistake for an entry. */
+const bare = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+
 export interface FlagsFile {
   default: Record<string, boolean>;
   byLicense: Record<string, Record<string, boolean>>;
 }
 
-const EMPTY: FlagsFile = { default: {}, byLicense: {} };
+const EMPTY: FlagsFile = { default: bare<boolean>(), byLicense: bare<Record<string, boolean>>() };
 
 /** Tolerant of a hand-edited or absent file: a malformed half is replaced by an
  *  empty one rather than throwing. The bot fails DARK on anything it does not
@@ -52,17 +73,22 @@ const EMPTY: FlagsFile = { default: {}, byLicense: {} };
 export function readFlags(dataDir: string): FlagsFile {
   const raw = readJson<Partial<FlagsFile>>(path.join(dataDir, FLAGS_FILE), EMPTY);
   const obj = (v: unknown): Record<string, boolean> => {
-    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
-    const out: Record<string, boolean> = {};
+    const out = bare<boolean>();
+    if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+    // `Object.entries` already skips inherited keys, but a file hand-edited to
+    // contain a literal "__proto__" member yields it as an OWN key here, and
+    // writing it into a plain object would set that object's prototype.
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof val === "boolean") out[k] = val;
+      if (typeof val === "boolean" && !isUnsafeKey(k)) out[k] = val;
     }
     return out;
   };
-  const byLicense: Record<string, Record<string, boolean>> = {};
+  const byLicense = bare<Record<string, boolean>>();
   const src = raw?.byLicense;
   if (src && typeof src === "object" && !Array.isArray(src)) {
-    for (const [id, v] of Object.entries(src as Record<string, unknown>)) byLicense[id] = obj(v);
+    for (const [id, v] of Object.entries(src as Record<string, unknown>)) {
+      if (!isUnsafeKey(id)) byLicense[id] = obj(v);
+    }
   }
   return { default: obj(raw?.default), byLicense };
 }
@@ -73,9 +99,10 @@ export function readFlags(dataDir: string): FlagsFile {
  *  (both dark), so sending the false would be noise. */
 export function flagsFor(dataDir: string, licenseId: string): Record<string, boolean> {
   const f = readFlags(dataDir);
-  const merged = { ...f.default, ...(f.byLicense[licenseId] ?? {}) };
+  const own = !isUnsafeKey(licenseId) ? (f.byLicense[licenseId] ?? {}) : {};
+  const merged = { ...f.default, ...own };
   const out: Record<string, boolean> = {};
-  for (const [k, v] of Object.entries(merged)) if (v === true) out[k] = true;
+  for (const [k, v] of Object.entries(merged)) if (v === true && !isUnsafeKey(k)) out[k] = true;
   return out;
 }
 
@@ -86,7 +113,12 @@ export function flagsFor(dataDir: string, licenseId: string): Record<string, boo
  *  Returns the file as it now stands, so the caller can echo it back. */
 export function setFlag(dataDir: string, licenseId: string, flag: string, state: boolean | null): FlagsFile {
   const f = readFlags(dataDir);
-  const bucket = licenseId === "default" ? f.default : (f.byLicense[licenseId] ??= {});
+  // Refused rather than sanitised-and-applied: an id or flag by one of these
+  // names is a mistake somewhere upstream, and silently writing it to a
+  // different key would hide that mistake instead of surfacing it. The route
+  // turns this into a 400.
+  if (isUnsafeKey(licenseId) || isUnsafeKey(flag)) return f;
+  const bucket = licenseId === "default" ? f.default : (f.byLicense[licenseId] ??= bare<boolean>());
   if (state === null) delete bucket[flag];
   else bucket[flag] = state;
   // Housekeeping: an emptied per-licence bucket is removed so the file does not

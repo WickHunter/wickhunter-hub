@@ -41,7 +41,7 @@ import { CandleService, type CandleServiceDeps } from "./candles/service.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
-import { flagsFor, readFlags, setFlag } from "./flags.js";
+import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
   FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, deleteFeedback, listFeedback,
   setFeedbackStatus, type FeedbackStatus,
@@ -581,6 +581,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // the real protection; this is the hygiene that keeps the file readable.
       if (!/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(body.flag)) {
         return sendJson(res, 400, { ok: false, error: "flag names are letters, digits and underscores, max 40 chars" });
+      }
+      // v0.2.12 — REFUSED, not silently dropped. `setFlag` also guards these
+      // (see src/flags.ts on why `__proto__` is not an ordinary key here), but
+      // a guard that returns the file unchanged would answer 200 and report
+      // "nothing happened" — which is exactly how the original defect stayed
+      // invisible. The FLAG name needs the same treatment: the charset rule
+      // above excludes `__proto__` (it starts with an underscore) but not
+      // `constructor` or `prototype`.
+      if (isUnsafeKey(body.id) || isUnsafeKey(body.flag)) {
+        const bad = isUnsafeKey(body.id) ? `licence id "${body.id}"` : `flag name "${body.flag}"`;
+        return sendJson(res, 400, { ok: false, error: `${bad} is not usable — it collides with a JavaScript object member` });
       }
       const file = setFlag(cfg.dataDir, body.id.slice(0, 64), body.flag, body.state);
       return sendJson(res, 200, { ok: true, flags: file });
