@@ -360,6 +360,26 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.17 — **the websocket tail is wired, and OFF until an operator asks.**
+  v0.2.16 was the protocol; this is the sockets — chunking at each venue's own
+  topic cap, bounded jittered reconnect, and closed candles written straight to
+  the store. `HUB_CANDLE_STREAM=bitget,bitunix` turns it on per venue, and that
+  list is INTERSECTED with the collecting venues rather than trusted: a stream
+  is a faster tail for a venue the collector already owns, never a way to
+  collect one it does not.
+  **Default OFF on purpose.** Bitget and Bitunix were verified against their
+  live streams; **Bybit's adapter was not** — this build environment is
+  geo-blocked from Bybit — and a default-on stream would make that unverified
+  leg everyone's problem on upgrade.
+  **The property that makes it safe to enable:** the runner only ever writes
+  closed candles the REST tail would have fetched later. It never backfills,
+  never touches retention or the tracked set, and never reports health the
+  collector acts on, so if every socket dies the collector repairs the gap on
+  its own schedule and turning it off again leaves nothing behind. The forming
+  bar held across a reconnect is DROPPED rather than published — a bar
+  assembled from a fraction of its trades is worse than a gap this system
+  already knows how to repair. Reconnect is jittered so one blip cannot
+  reconnect every chunk of every venue on the same tick.
 - v0.2.16 — **the websocket tail: candle protocol work, verified against the
   live streams.** The collector polls, which is why `tailFillMinutes` is 100 — a
   request returning one row is a request wasted, so a symbol is not tail-due

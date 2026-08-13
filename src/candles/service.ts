@@ -9,6 +9,8 @@ import {
   type CollectorOptions, type VenueHealth,
 } from "./collector.js";
 import { ADAPTERS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
+import { STREAM_ADAPTERS } from "./stream.js";
+import { VenueStreamRunner } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
 
 // v0.2.4 — the seedable tail ceiling is no longer a constant here. It is
@@ -75,6 +77,13 @@ export interface CandleServiceConfig {
   options: CollectorOptions;
   /** Tick period. One minute matches the candle cadence. */
   tickMs: number;
+  /** ── v0.2.17 — VENUES WHOSE TAIL COMES FROM A WEBSOCKET ──────────────────
+   *
+   *  A SUBSET of `venues`, never a superset: a stream is a faster tail for a
+   *  venue the collector already owns, not a way to collect one it does not.
+   *  Absent/empty = REST only, which is every install's behaviour until an
+   *  operator sets `HUB_CANDLE_STREAM`. */
+  streamVenues?: VenueId[];
 }
 
 export interface CandleServiceDeps {
@@ -107,6 +116,19 @@ export class CandleService {
   private readonly fetchLike: FetchLike;
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
+  /** ── v0.2.17 — THE WEBSOCKET TAIL, OFF UNLESS ASKED FOR ──────────────────
+   *
+   *  Empty unless `HUB_CANDLE_STREAM` names venues. OFF by default on purpose:
+   *  the Bitget and Bitunix adapters were verified against their live streams,
+   *  but BYBIT'S WAS NOT — this build environment is geo-blocked from Bybit and
+   *  could not probe it, so its frame shape rests on the v5 contract and the
+   *  working client in the bot repo. A default-on stream would make that
+   *  unverified leg everyone's problem on upgrade.
+   *
+   *  Turning it on is additive and reversible: the runner only ever writes
+   *  closed candles the REST tail would have fetched later, so switching it off
+   *  again leaves nothing behind but a gap the collector already repairs. */
+  private readonly streams = new Map<VenueId, VenueStreamRunner>();
   private lastPruneAt = 0;
 
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
@@ -144,6 +166,23 @@ export class CandleService {
 
   start(): void {
     if (this.timer || !this.enabled) return;
+    // The stream is started BEFORE the REST timer so a restart's first closed
+    // minutes arrive from the socket rather than being paged for.
+    for (const v of this.cfg.streamVenues ?? []) {
+      if (!this.collectors.has(v)) continue;
+      const collector = this.collectors.get(v)!;
+      const runner = new VenueStreamRunner({
+        adapter: STREAM_ADAPTERS[v],
+        // Read fresh on every resync, so a new listing joins the stream on the
+        // collector's own listing cadence with no restart.
+        symbols: () => collector.symbols().filter((t) => !t.delisted).map((t) => t.symbol),
+        write: (symbol, candles, notAfterMs) => { this.store.write(v, symbol, candles, notAfterMs); },
+        now: this.deps.now,
+        log: (m) => console.log(`[candles·stream] ${m}`),
+      });
+      this.streams.set(v, runner);
+      runner.start();
+    }
     this.timer = setInterval(() => void this.tickAll(), this.cfg.tickMs);
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
@@ -153,6 +192,20 @@ export class CandleService {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    for (const r of this.streams.values()) r.stop();
+    this.streams.clear();
+  }
+
+  /** Live socket state, for the admin panel. Empty when the tail is off. */
+  streamStatus(): Array<ReturnType<VenueStreamRunner["status"]>> {
+    return [...this.streams.values()].map((r) => r.status());
+  }
+
+  /** Re-chunk every runner against the current tracked set. Called on the same
+   *  pass that refreshes listings, so a new symbol starts streaming without a
+   *  restart; a no-op when the set has not changed. */
+  resyncStreams(): void {
+    for (const r of this.streams.values()) r.resync();
   }
 
   /** One pass over every venue. Re-entrancy guarded: a tick that overruns its
