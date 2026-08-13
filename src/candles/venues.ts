@@ -120,6 +120,21 @@ export interface VenueAdapter {
   readonly id: VenueId;
   /** Rows per kline page this venue will actually honour. */
   readonly pageLimit: number;
+  /** ── v0.2.15 — THIS VENUE'S OWN PUBLIC-REQUEST CEILING, PER IP ────────────
+   *
+   *  A venue fact, so it belongs beside `pageLimit` rather than in one global
+   *  number the collector applies to all three. The hub ran every venue at a
+   *  single 3.2 req/s: 32% of Bitunix's documented limit, 16% of Bitget's and
+   *  2.7% of Bybit's — so the collector was budget-starved on the two venues
+   *  that need it most, and the operator's tails stayed ~100 minutes behind
+   *  because there was never enough budget to do better.
+   *
+   *  DELIBERATELY ABOUT HALF of each venue's documented figure, not all of it.
+   *  These are the hub's OWN requests, made continuously and forever, and the
+   *  collector's adaptive backoff is a recovery mechanism rather than a licence
+   *  to sit on the limit. An operator who sets HUB_CANDLE_RPS overrides this
+   *  for every venue — their number always wins, including a lower one. */
+  readonly publicRequestsPerSecond: number;
   /** Human note for the admin panel. */
   readonly klineEndpoint: string;
   listSymbols(fetchLike: FetchLike): Promise<VenueSymbol[]>;
@@ -193,6 +208,11 @@ function sortOldestFirst(candles: Candle[]): Candle[] {
 const bybit: VenueAdapter = {
   id: "bybit",
   pageLimit: 1000,
+  // 600 requests / 5s per IP, shared public+private. The hub reads PUBLIC only
+  // and is the sole consumer here, but 15/s is 12.5% of that — deliberately far
+  // below, because this venue's budget is the one an operator's own bots also
+  // draw on when their install talks to Bybit directly.
+  publicRequestsPerSecond: 15,
   klineEndpoint: "GET /v5/market/kline (category=linear, interval=1)",
   async listSymbols(fetchLike) {
     const out: VenueSymbol[] = [];
@@ -240,6 +260,8 @@ const bybit: VenueAdapter = {
 const bitunix: VenueAdapter = {
   id: "bitunix",
   pageLimit: 200,
+  // Documented 10 req/sec/ip for market data. Half of it.
+  publicRequestsPerSecond: 5,
   klineEndpoint: "GET /api/v1/futures/market/kline (interval=1m)",
   async listSymbols(fetchLike) {
     const body = (await getJson(fetchLike, "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs")) as { data?: unknown[] };
@@ -281,6 +303,8 @@ const bitunix: VenueAdapter = {
 const bitget: VenueAdapter = {
   id: "bitget",
   pageLimit: 200,
+  // Documented 20 times/1s per IP for market data. Half of it.
+  publicRequestsPerSecond: 10,
   klineEndpoint: "GET /api/v2/mix/market/history-candles (granularity=1m)",
   async listSymbols(fetchLike) {
     const body = (await getJson(fetchLike, "https://api.bitget.com/api/v2/mix/market/contracts?productType=usdt-futures")) as { data?: unknown[] };

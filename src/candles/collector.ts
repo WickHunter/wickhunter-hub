@@ -77,6 +77,18 @@ export interface CollectorOptions {
   stallAfterMs: number;
   /** Consecutive failed requests before the venue reads as FAILING. */
   failingAfter: number;
+  /** ── v0.2.15 — PER-VENUE CEILINGS, WHEN THE OPERATOR HAS NOT SET ONE ──────
+   *
+   *  Present only when `HUB_CANDLE_RPS` is UNSET. One global rate applied to
+   *  three venues with limits of 10, 20 and ~120 req/s meant the collector ran
+   *  at a third of what the tightest venue allows and a fortieth of the
+   *  loosest — and a budget-starved collector is exactly why the operator's
+   *  tails sat ~100 minutes behind.
+   *
+   *  An operator's own `HUB_CANDLE_RPS` clears this map entirely rather than
+   *  being merged with it: a single number they set must mean what it says on
+   *  every venue, including when it is LOWER than these. */
+  perVenueRequestsPerSecond?: Partial<Record<VenueId, number>>;
 }
 
 export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {

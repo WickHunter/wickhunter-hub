@@ -120,7 +120,17 @@ export class CandleService {
       // clock saw its elapsed-time arithmetic go NEGATIVE — and a collector
       // that has never succeeded then reads "starting" forever instead of
       // FAILING, which is the one state transition the operator asked for.
-      this.collectors.set(v, new VenueCollector(v, this.store, path.join(cfg.dataDir, "candles"), cfg.options, deps.now?.() ?? Date.now()));
+      // v0.2.15 — each collector runs at ITS OWN venue's ceiling. The floor is
+      // re-clamped here too: a per-venue ceiling below the shared floor would
+      // otherwise let the floor quietly raise this venue back above its limit,
+      // which is the same invariant `collectorOptionsFromEnv` protects.
+      const venueRps = cfg.options.perVenueRequestsPerSecond?.[v] ?? cfg.options.requestsPerSecond;
+      const venueOpts: CollectorOptions = {
+        ...cfg.options,
+        requestsPerSecond: venueRps,
+        minRequestsPerSecond: Math.min(venueRps, cfg.options.minRequestsPerSecond),
+      };
+      this.collectors.set(v, new VenueCollector(v, this.store, path.join(cfg.dataDir, "candles"), venueOpts, deps.now?.() ?? Date.now()));
     }
   }
 
@@ -326,7 +336,12 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     const n = Number(v);
     return Number.isFinite(n) && n > 0 ? n : d;
   };
+  const rpsSet = Number.isFinite(Number(env.HUB_CANDLE_RPS)) && Number(env.HUB_CANDLE_RPS) > 0;
   const requestsPerSecond = numOr(env.HUB_CANDLE_RPS, DEFAULT_COLLECTOR_OPTIONS.requestsPerSecond);
+  // The per-venue table applies ONLY when the operator has not named a rate.
+  const perVenueRequestsPerSecond = rpsSet
+    ? undefined
+    : Object.fromEntries(VENUE_IDS.map((v) => [v, ADAPTERS[v].publicRequestsPerSecond])) as Partial<Record<VenueId, number>>;
   const cooldown = numOr(env.HUB_CANDLE_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.rateLimitCooldownMs);
   return {
     retentionDays: numOr(env.HUB_CANDLE_RETENTION_DAYS, DEFAULT_COLLECTOR_OPTIONS.retentionDays),
@@ -348,5 +363,6 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     symbolRefreshMs: numOr(env.HUB_CANDLE_SYMBOL_REFRESH_MS, DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs),
     stallAfterMs: numOr(env.HUB_CANDLE_STALL_AFTER_MS, DEFAULT_COLLECTOR_OPTIONS.stallAfterMs),
     failingAfter: numOr(env.HUB_CANDLE_FAILING_AFTER, DEFAULT_COLLECTOR_OPTIONS.failingAfter),
+    perVenueRequestsPerSecond,
   };
 }

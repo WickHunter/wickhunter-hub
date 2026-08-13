@@ -360,6 +360,25 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.15 — **each venue collects at its own documented rate.** Every collector
+  ran at ONE global 3.2 req/s: 32% of Bitunix's documented 10/s, 16% of
+  Bitget's 20/s and 2.7% of Bybit's ~120/s. The two venues that need the budget
+  most were the ones starved of it, and a budget-starved collector is exactly
+  why tails sat ~100 minutes behind — `tailFillMinutes` is high because a
+  request that returns one row is a request wasted, and there was never enough
+  budget to do better. Ceilings are now a VENUE FACT beside `pageLimit`
+  (Bybit 15/s, Bitget 10/s, Bitunix 5/s — about half of each documented figure,
+  because these are continuous requests and the adaptive backoff is a recovery
+  mechanism, not a licence to sit on the limit). `HUB_CANDLE_RPS` still
+  overrides every venue and CLEARS the table, so an operator's single number
+  means what it says — including when it is lower.
+  **A related constraint has just been lifted bot-side and is worth knowing
+  here:** liqhunter v0.79.0 anchors the seed cross-check at the seed's own
+  reach instead of at `now`, so the "(200 − tailFillMinutes) of overlap"
+  reasoning that pinned `tailFillMinutes` to 100 no longer binds. Freshness and
+  page utilisation can now be traded on their own merits. Nothing here changes
+  `tailFillMinutes` — that is an operator decision, and it should be made with
+  the new headroom in mind rather than against a cliff that no longer exists.
 - v0.2.14 — **the candle signing card stops reading as a to-do.** It led with
   the dedicated key and a numbered four-step rollout, which looks like
   outstanding setup work. It is not: the shipped default signs with the licence
