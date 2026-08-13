@@ -9,6 +9,10 @@
 //   keyed    GET  /api/latest?key=<token>        release metadata (version/file/sha256)
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
+//   keyed    GET  /api/hub/strategies            community Strat gallery
+//   keyed    POST /api/hub/strategies/publish    share 1..N bots as one Strat
+//   keyed    POST /api/hub/strategies/vote       one vote per LICENCE
+//   keyed    POST /api/hub/strategies/delete     an author removes their own
 //   admin    GET  /admin                         static admin page (auth lives in its API calls)
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
@@ -23,7 +27,9 @@
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
 //   admin    POST /admin/api/upgrade             self-upgrade: git pull + install-hub.sh (detached)
 //
-// "keyed" = a valid, unexpired, unrevoked LHK1 token in ?key=. "admin" = the
+// "keyed" = a valid, unexpired, unrevoked LHK1 token in ?key= — or, on the
+// community routes, in an `x-license` header, which is what the bot sends and
+// what keeps a token out of an access log. "admin" = the
 // HUB_ADMIN_TOKEN in an x-hub-admin header, compared constant-time. No
 // sessions, no cookies anywhere.
 //
@@ -38,6 +44,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { CandleService, type CandleServiceDeps } from "./candles/service.js";
+import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
@@ -84,6 +91,10 @@ export interface HubDeps {
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
+  const community = new CommunityService(cfg.dataDir);
+  /** A Strat body is bigger than a vote and smaller than a feedback log dump:
+   *  ten bot configs, capped again inside the service regardless of this. */
+  const STRAT_BODY_BYTES_MAX = 256 * 1024;
   const spawn = deps.spawn ?? nodeSpawn;
   const candleKey = new CandleKeyStore(cfg.dataDir);
   // ── WHICH KEY SIGNS A SEED ────────────────────────────────────────────────
@@ -134,6 +145,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
     if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
+    // ── the community Strat gallery ────────────────────────────────────────
+    // These paths are the BOT's existing ones, deliberately: a liqhunter
+    // install can also host a gallery (LIQHUNTER_HUB_KEY with no URL), and
+    // keeping one wire contract means the two are interchangeable and an
+    // operator can move between them without upgrading every install.
+    if (m === "GET" && p === "/api/hub/strategies") return communityList(req, url, res);
+    if (m === "POST" && p === "/api/hub/strategies/publish") return communityPublish(req, url, res);
+    if (m === "POST" && p === "/api/hub/strategies/vote") return communityVote(req, url, res);
+    if (m === "POST" && p === "/api/hub/strategies/delete") return communityDelete(req, url, res);
     if (m === "GET" && p.startsWith("/download/")) return download(url, res);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
@@ -193,6 +213,64 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ...(latest ? { latest } : {}),
       flags,
     });
+  }
+
+  // ── community Strat gallery ───────────────────────────────────────────────
+  //
+  // AUTH IS THE LICENCE, and identity comes from the VERIFIED payload rather
+  // than anything in the body. That is the feedback.ts rule ("name from the
+  // VERIFIED token payload, never the body") and it matters more here, because
+  // this surface can DELETE. The bot sends an `install` string and a free-text
+  // `author`; both are display-only and neither may decide who owns what.
+  //
+  // The token is read from `x-license` (what the bot sends — a header keeps it
+  // out of access logs) or from `?key=`, the convention every other keyed route
+  // here uses. Accepting both costs one line and means neither side had to
+  // move to meet the other.
+  function communityLicense(req: IncomingMessage, url: URL, res: ServerResponse): { id: string } | null {
+    const header = req.headers["x-license"];
+    const raw = String((Array.isArray(header) ? header[0] : header) ?? url.searchParams.get("key") ?? "").trim();
+    const payload = store.decodeGenuine(raw);
+    if (!payload || !store.isKnown(payload.id) || store.isRevoked(payload.id)) {
+      sendJson(res, 403, { ok: false, error: "a valid license is required to use the community gallery" });
+      return null;
+    }
+    return { id: payload.id };
+  }
+
+  function communityList(req: IncomingMessage, url: URL, res: ServerResponse): void {
+    const who = communityLicense(req, url, res);
+    if (!who) return;
+    sendJson(res, 200, { ok: true, strategies: community.list(who.id) });
+  }
+
+  async function communityPublish(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const who = communityLicense(req, url, res);
+    if (!who) return;
+    const body = await readJsonBody(req, STRAT_BODY_BYTES_MAX);
+    if (body === null) return sendJson(res, 400, { ok: false, error: "bad strategy body" });
+    const r = community.publish({ licenseId: who.id, name: body.name, desc: body.desc, author: body.author, bots: body.bots });
+    sendJson(res, r.ok ? 200 : 400, r);
+  }
+
+  async function communityVote(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const who = communityLicense(req, url, res);
+    if (!who) return;
+    const body = await readJsonBody(req);
+    if (body === null) return sendJson(res, 400, { ok: false, error: "bad vote body" });
+    sendJson(res, 200, community.vote(body.id, who.id, body.vote));
+  }
+
+  async function communityDelete(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const who = communityLicense(req, url, res);
+    if (!who) return;
+    const body = await readJsonBody(req);
+    if (body === null) return sendJson(res, 400, { ok: false, error: "bad delete body" });
+    // A wrong owner and an unknown id give the IDENTICAL answer — see
+    // CommunityService.deleteOwn. Distinguishing them would confirm the
+    // existence of arbitrary ids to anyone holding any valid licence.
+    const ok = community.deleteOwn(body.id, who.id);
+    sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { ok: false, error: "no such strategy of yours" });
   }
 
   async function feedbackIntake(req: IncomingMessage, res: ServerResponse): Promise<void> {
