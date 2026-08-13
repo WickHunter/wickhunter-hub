@@ -34,6 +34,10 @@ export interface HubConfig {
    *  something a hub upgrade silently starts doing. Venues left out report
    *  "no collector configured" on the admin page rather than looking broken. */
   candleVenues: VenueId[];
+  /** v0.2.17 — OPTIONAL, because `HubConfig` is built by hand (tests, tools)
+   *  as well as by `configFromEnv`. A required field here reads fine and then
+   *  throws at the ONE call site that filters it — which is what it did. */
+  candleStreamVenues?: VenueId[];
   /** WHICH KEY SIGNS A SEED. `"license"` (the default, and today's behaviour)
    *  signs with the licence key and emits keyId `"seed-1"`; `"candle"` signs
    *  with the hub's dedicated candle key and emits `"candle-1"`. Set by
@@ -112,6 +116,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     publicOrigin: env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`,
     srcDir: env.HUB_SRC_DIR ?? "/root/dev/wickhunter-hub",
     candleVenues: (env.HUB_CANDLE_VENUES ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(isVenueId),
+    // v0.2.17 — venues whose TAIL comes from a websocket. A SUBSET of the
+    // collecting venues, intersected below rather than trusted: naming a venue
+    // here that is not collecting would open sockets for a roster nobody is
+    // tracking. Absent = REST only, which is every install today.
+    candleStreamVenues: (env.HUB_CANDLE_STREAM ?? "")
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(isVenueId),

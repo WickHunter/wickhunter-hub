@@ -112,6 +112,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     {
       dataDir: cfg.dataDir,
       venues: cfg.candleVenues,
+      // INTERSECTED, not trusted: a stream is a faster tail for a venue the
+      // collector already owns, never a way to collect one it does not.
+      streamVenues: (cfg.candleStreamVenues ?? []).filter((v) => cfg.candleVenues.includes(v)),
       keyId: cfg.candleKeyId,
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,

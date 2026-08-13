@@ -360,6 +360,74 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.17 — **the websocket tail is wired, and OFF until an operator asks.**
+  v0.2.16 was the protocol; this is the sockets — chunking at each venue's own
+  topic cap, bounded jittered reconnect, and closed candles written straight to
+  the store. `HUB_CANDLE_STREAM=bitget,bitunix` turns it on per venue, and that
+  list is INTERSECTED with the collecting venues rather than trusted: a stream
+  is a faster tail for a venue the collector already owns, never a way to
+  collect one it does not.
+  **Default OFF on purpose.** Bitget and Bitunix were verified against their
+  live streams; **Bybit's adapter was not** — this build environment is
+  geo-blocked from Bybit — and a default-on stream would make that unverified
+  leg everyone's problem on upgrade.
+  **The property that makes it safe to enable:** the runner only ever writes
+  closed candles the REST tail would have fetched later. It never backfills,
+  never touches retention or the tracked set, and never reports health the
+  collector acts on, so if every socket dies the collector repairs the gap on
+  its own schedule and turning it off again leaves nothing behind. The forming
+  bar held across a reconnect is DROPPED rather than published — a bar
+  assembled from a fraction of its trades is worse than a gap this system
+  already knows how to repair. Reconnect is jittered so one blip cannot
+  reconnect every chunk of every venue on the same tick.
+- v0.2.16 — **the websocket tail: candle protocol work, verified against the
+  live streams.** The collector polls, which is why `tailFillMinutes` is 100 — a
+  request returning one row is a request wasted, so a symbol is not tail-due
+  until it has most of a page. A stream removes the reason for that trade: closed
+  minutes arrive as they happen at no REST cost, so the tail is current AND the
+  whole request budget goes to depth.
+  **Zero new dependencies** — Node >= 22 (this package's own `engines`) ships a
+  global `WebSocket`, and a candle feed is not the place to start adding packages
+  that run beside the signing key.
+  **The hard part is that two of three venues never mark a candle closed.** Frames
+  were captured LIVE from the real endpoints while writing this: Bitget repeats
+  the same `openMs` with changing values as the bar forms, and **Bitunix carries
+  no candle open time at all** — only a message `ts`, so the minute must be
+  derived from it, which is a materially weaker guarantee than the other two and
+  is named (`openMsFromTs`) rather than inlined. Only Bybit states closure.
+  So a minute is published only once the venue sends a LATER minute — an ORDERING
+  fact about the venue is own stream, never a comparison against this machine is
+  clock, which `olb-venue-candles.ts` refuses for entries and a hub feeding every
+  install has no more right to.
+  Verified end to end against the live Bitget and Bitunix streams: each published
+  bar is close equals the next bar is open, which only holds if parsing, bucketing
+  and the closure rule are all correct. **Bybit is leg is from its v5 contract and
+  the working client in the bot repo — this build environment is geo-blocked from
+  Bybit and could not probe it. Verify that one against a live stream before
+  enabling it.**
+  **This release is the PROTOCOL only** — adapters, the closure buffer and their
+  tests. The connection manager (reconnect, resubscribe, per-connection topic
+  batching) and the service wiring are not built, so nothing streams yet and
+  nothing changes at runtime.
+- v0.2.15 — **each venue collects at its own documented rate.** Every collector
+  ran at ONE global 3.2 req/s: 32% of Bitunix's documented 10/s, 16% of
+  Bitget's 20/s and 2.7% of Bybit's ~120/s. The two venues that need the budget
+  most were the ones starved of it, and a budget-starved collector is exactly
+  why tails sat ~100 minutes behind — `tailFillMinutes` is high because a
+  request that returns one row is a request wasted, and there was never enough
+  budget to do better. Ceilings are now a VENUE FACT beside `pageLimit`
+  (Bybit 15/s, Bitget 10/s, Bitunix 5/s — about half of each documented figure,
+  because these are continuous requests and the adaptive backoff is a recovery
+  mechanism, not a licence to sit on the limit). `HUB_CANDLE_RPS` still
+  overrides every venue and CLEARS the table, so an operator's single number
+  means what it says — including when it is lower.
+  **A related constraint has just been lifted bot-side and is worth knowing
+  here:** liqhunter v0.79.0 anchors the seed cross-check at the seed's own
+  reach instead of at `now`, so the "(200 − tailFillMinutes) of overlap"
+  reasoning that pinned `tailFillMinutes` to 100 no longer binds. Freshness and
+  page utilisation can now be traded on their own merits. Nothing here changes
+  `tailFillMinutes` — that is an operator decision, and it should be made with
+  the new headroom in mind rather than against a cliff that no longer exists.
 - v0.2.14 — **the candle signing card stops reading as a to-do.** It led with
   the dedicated key and a numbered four-step rollout, which looks like
   outstanding setup work. It is not: the shipped default signs with the licence

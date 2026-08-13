@@ -1,6 +1,6 @@
 {
   "name": "wickhunter-hub",
-  "version": "0.2.14",
+  "version": "0.2.17",
   "private": true,
   "type": "module",
   "description": "Wick Hunter beta admin hub: license issuing/revocation, beta build distribution, tester check-ins. Contains NO trading code.",

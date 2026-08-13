@@ -463,4 +463,35 @@ await test("a malformed or oversized window is 400", () => {
   assert.equal(buildSeed({ venue: "bitget", symbol: "BTCUSDT", fromMs: 0, toMs: 60_000 * 60_001 }, d).code, 400, "too large");
 });
 
+// ── v0.2.15 — PER-VENUE REQUEST CEILINGS ──────────────────────────────────
+await test("each venue collects at its OWN documented rate, not one global figure", async () => {
+  const { ADAPTERS, VENUE_IDS } = await import("../dist/src/candles/venues.js");
+  const { collectorOptionsFromEnv } = await import("../dist/src/candles/service.js");
+
+  // Every venue must state a ceiling, and none may exceed its documented
+  // public limit. These are the numbers the hub promises the operator it will
+  // stay under, so they are asserted rather than left to a comment.
+  const documented = { bybit: 120, bitunix: 10, bitget: 20 };
+  for (const v of VENUE_IDS) {
+    const rps = ADAPTERS[v].publicRequestsPerSecond;
+    assert.ok(rps > 0, `${v} states a ceiling`);
+    assert.ok(rps <= documented[v] / 2,
+      `${v} sits at or below HALF its documented ${documented[v]}/s (got ${rps})`);
+  }
+
+  // With no operator override, the per-venue table is populated…
+  const auto = collectorOptionsFromEnv({});
+  assert.ok(auto.perVenueRequestsPerSecond, "the per-venue table is present when HUB_CANDLE_RPS is unset");
+  assert.equal(auto.perVenueRequestsPerSecond.bitunix, ADAPTERS.bitunix.publicRequestsPerSecond);
+  assert.equal(auto.perVenueRequestsPerSecond.bitget, ADAPTERS.bitget.publicRequestsPerSecond);
+
+  // …and the operator's own number CLEARS it, so one figure they set means the
+  // same thing on every venue — including when it is LOWER than the defaults,
+  // which is the direction that matters if they are being rate limited.
+  const forced = collectorOptionsFromEnv({ HUB_CANDLE_RPS: "1.5" });
+  assert.equal(forced.perVenueRequestsPerSecond, undefined, "an explicit rate clears the table");
+  assert.equal(forced.requestsPerSecond, 1.5);
+  assert.ok(forced.minRequestsPerSecond <= 1.5, "and the floor can never sit above it");
+});
+
 summary("candles");
