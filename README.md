@@ -360,6 +360,17 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.14 — **the candle signing card stops reading as a to-do.** It led with
+  the dedicated key and a numbered four-step rollout, which looks like
+  outstanding setup work. It is not: the shipped default signs with the licence
+  key, every bot pins that key at build time, and seeding works for every
+  install with nothing pasted anywhere by anyone. The card now says "nothing to
+  do" and folds the dedicated key away as optional hardening. That step cannot
+  be automated and the card now says why — the bot pins its verification keys
+  **in the build** on purpose, so a compromised hub cannot introduce a key of
+  its own; fetching keys from the hub would defeat pinning entirely. A
+  dedicated key therefore always costs one bot release, which is a trade to
+  take deliberately rather than a chore to be nagged about on every visit.
 - v0.2.13 — **the community Strat gallery.** Four keyed routes
   (`/api/hub/strategies` + `/publish`, `/vote`, `/delete`) serving the gallery
   every liqhunter install now resolves to by default. A **Strat is one or more

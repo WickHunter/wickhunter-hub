@@ -384,9 +384,14 @@ function dur(mins) {
 // This is the PUBLIC half of the hub's dedicated candle key, and the operator
 // pastes it into the bot's source by hand. So it is shown whole (never
 // truncated — a half-copied key is a debugging afternoon), in the same
-// base64url encoding the bot's LICENSE_PUBLIC_KEY_B64U uses, said out loud to
-// be public, with the four-step rollout right beside it because the one thing
-// that must not happen is someone flipping the switch first.
+// base64url encoding the bot's LICENSE_PUBLIC_KEY_B64U uses, and said out loud
+// to be public.
+//
+// v0.2.14 — but it is FOLDED AWAY behind a summary, and the card now leads
+// with "nothing to do". On the shipped default the whole rollout is optional
+// hardening, and presenting it as a numbered checklist made routine setup look
+// unfinished. The one thing that must not happen — flipping the switch before
+// the bots have the key — is still stated, inside.
 function cdRenderKey(data) {
   const box = document.getElementById("seedkey");
   const signingNow = data.signer === "candle"
@@ -394,10 +399,41 @@ function cdRenderKey(data) {
     : 'the <b>licence key</b>, labelled <code>' + esc(data.keyId) + "</code> (the shipped default)";
   let html = "<h2>Candle seed signing key</h2>";
   html += '<div class="live">Signing right now: ' + signingNow + ".</div>";
+
+  // ── v0.2.14 — THIS CARD IS NOT A TO-DO ──────────────────────────────────
+  //
+  // It used to lead with the dedicated key and a numbered four-step rollout,
+  // which reads as setup work that is outstanding. It is not: the SHIPPED
+  // DEFAULT signs with the licence key, every bot already pins that key at
+  // build time, and seeding works for every install with nothing pasted
+  // anywhere by anyone (operator, 2026-08-13: "this should be done
+  // automatically, nothing needed for me or users to do" — it already is).
+  //
+  // The dedicated key remains available as OPTIONAL hardening, and it is
+  // folded away because it CANNOT be made automatic: the bot pins its
+  // verification keys in the build ON PURPOSE, so that a compromised hub
+  // cannot hand out a key of its own and have bots trust it. Fetching keys
+  // from the hub would defeat the entire point of pinning, so a dedicated key
+  // will always cost one bot release. That is a trade to take deliberately,
+  // not a chore to be nagged about on every visit.
+  if (data.signer !== "candle") {
+    html += '<div class="muted" style="margin-top:.5rem">Nothing to do — this is the shipped default. '
+      + "Every bot pins this key at build time, so seeding works for every install with no configuration "
+      + "on your side or theirs.</div>";
+  }
+
+  html += '<details style="margin-top:.75rem"><summary class="muted" style="cursor:pointer">'
+    + (data.signer === "candle"
+        ? "Dedicated key rollout (in use)"
+        : "Optional: sign with a dedicated candle key instead")
+    + "</summary>";
+  html += '<div class="muted" style="margin-top:.5rem">This separates seed signing from licensing, so rotating '
+    + "one does not touch the other. It is the only step here that is not automatic, and it cannot be: the bot "
+    + "pins its verification keys <b>in the build</b> so a compromised hub cannot introduce a key of its own. "
+    + "That means a dedicated key always costs one bot release.</div>";
   if (data.candlePublicKey) {
-    html += '<div class="muted" style="margin-top:.5rem">Dedicated candle key <code>'
-      + esc(data.candleKeyId) + '</code> — <span class="safe">PUBLIC KEY, safe to copy and paste anywhere</span>. '
-      + "Paste this into the bot's <code>OLB_SEED_KEYS</code>:</div>";
+    html += '<div class="muted" style="margin-top:.5rem">Candle key <code>'
+      + esc(data.candleKeyId) + '</code> — <span class="safe">PUBLIC KEY, safe to copy and paste anywhere</span>:</div>';
     html += '<div class="pub" id="seedkeyPub">' + esc(data.candlePublicKey) + "</div>";
     html += '<button type="button" id="seedkeyCopy">Copy public key</button>';
   } else {
@@ -410,7 +446,7 @@ function cdRenderKey(data) {
     + "<li>Ship a bot build with that map and let it reach the testers.</li>"
     + "<li><b>Only then</b> set <code>HUB_CANDLE_SIGNER=candle</code> and restart the hub. "
       + "Flipping it earlier makes every bot refuse every seed and fall back to a 12-hour venue warm-up, silently.</li>"
-    + "</ol>";
+    + "</ol></details>";
   box.innerHTML = html;
   const copy = document.getElementById("seedkeyCopy");
   if (copy) {
