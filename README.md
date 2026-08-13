@@ -360,6 +360,35 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.16 — **the websocket tail: candle protocol work, verified against the
+  live streams.** The collector polls, which is why `tailFillMinutes` is 100 — a
+  request returning one row is a request wasted, so a symbol is not tail-due
+  until it has most of a page. A stream removes the reason for that trade: closed
+  minutes arrive as they happen at no REST cost, so the tail is current AND the
+  whole request budget goes to depth.
+  **Zero new dependencies** — Node >= 22 (this package's own `engines`) ships a
+  global `WebSocket`, and a candle feed is not the place to start adding packages
+  that run beside the signing key.
+  **The hard part is that two of three venues never mark a candle closed.** Frames
+  were captured LIVE from the real endpoints while writing this: Bitget repeats
+  the same `openMs` with changing values as the bar forms, and **Bitunix carries
+  no candle open time at all** — only a message `ts`, so the minute must be
+  derived from it, which is a materially weaker guarantee than the other two and
+  is named (`openMsFromTs`) rather than inlined. Only Bybit states closure.
+  So a minute is published only once the venue sends a LATER minute — an ORDERING
+  fact about the venue is own stream, never a comparison against this machine is
+  clock, which `olb-venue-candles.ts` refuses for entries and a hub feeding every
+  install has no more right to.
+  Verified end to end against the live Bitget and Bitunix streams: each published
+  bar is close equals the next bar is open, which only holds if parsing, bucketing
+  and the closure rule are all correct. **Bybit is leg is from its v5 contract and
+  the working client in the bot repo — this build environment is geo-blocked from
+  Bybit and could not probe it. Verify that one against a live stream before
+  enabling it.**
+  **This release is the PROTOCOL only** — adapters, the closure buffer and their
+  tests. The connection manager (reconnect, resubscribe, per-connection topic
+  batching) and the service wiring are not built, so nothing streams yet and
+  nothing changes at runtime.
 - v0.2.15 — **each venue collects at its own documented rate.** Every collector
   ran at ONE global 3.2 req/s: 32% of Bitunix's documented 10/s, 16% of
   Bitget's 20/s and 2.7% of Bybit's ~120/s. The two venues that need the budget
