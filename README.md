@@ -360,6 +360,23 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.13 — **the community Strat gallery.** Four keyed routes
+  (`/api/hub/strategies` + `/publish`, `/vote`, `/delete`) serving the gallery
+  every liqhunter install now resolves to by default. A **Strat is one or more
+  bots** under one name — "a liq bot and a hedge bot together" — and is
+  self-contained: it carries each bot's full config, never a reference to
+  another Strat, which would break the moment an author deleted a member.
+  **Identity comes from the verified licence, never the body** (the
+  `feedback.ts` rule, and it matters more here because this is the first
+  tester-facing surface that can DELETE): ownership and votes key on the signed
+  payload's licence id, while the `install` string and free-text `author` the
+  bot sends are display-only. A wrong owner and an unknown id give the
+  identical 404, or the hub confirms which ids exist to anyone with a valid
+  licence. An author's delete is hard, not a tombstone. No licence id ever
+  reaches a client. **No performance figure is served and nothing stands in its
+  place** — a Strat can hold bots whose interaction no replay models. The token
+  is accepted from an `x-license` header (what the bot sends; keeps it out of
+  access logs) or from `?key=`.
 - v0.2.12 — **`__proto__` is not a licence id.** Found by an independent audit of
   v0.2.11 and reproduced end to end against the real route.
 
