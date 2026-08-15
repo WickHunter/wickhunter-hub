@@ -229,11 +229,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // The token is read from `x-license` (what the bot sends — a header keeps it
   // out of access logs) or from `?key=`, the convention every other keyed route
   // here uses. Accepting both costs one line and means neither side had to
-  // move to meet the other.
+  // move to meet the other. Through `licenseTokenOf`, which is the ONE place
+  // that order is decided — see its docstring for why that matters.
   function communityLicense(req: IncomingMessage, url: URL, res: ServerResponse): { id: string } | null {
-    const header = req.headers["x-license"];
-    const raw = String((Array.isArray(header) ? header[0] : header) ?? url.searchParams.get("key") ?? "").trim();
-    const payload = store.decodeGenuine(raw);
+    const payload = store.decodeGenuine(licenseTokenOf(req, url));
     if (!payload || !store.isKnown(payload.id) || store.isRevoked(payload.id)) {
       sendJson(res, 403, { ok: false, error: "a valid license is required to use the community gallery" });
       return null;
@@ -305,6 +304,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       logsTruncated: truncated,
     });
     sendJson(res, 200, { ok: true, id: rec.id });
+  }
+
+  /** ── WHERE A LICENCE TOKEN IS READ FROM, AND THERE IS ONE OF THESE ────────
+   *
+   *  `x-license` FIRST, `?key=` second. The header keeps the token out of
+   *  access logs; the query parameter is the convention the curl-facing
+   *  endpoints use and is what every already-installed bot sends, so it cannot
+   *  be dropped without silently cutting those installs off.
+   *
+   *  ONE FUNCTION because there were two readings of this idea and they had
+   *  already drifted: `communityLicense` read the header and the seed endpoint
+   *  did not, so the HEAVIER surface had the weaker handling. A second copy is
+   *  how the next surface gets it wrong too.
+   *
+   *  NOT used by `requireKey`: install.sh and /download are fetched by a bare
+   *  `curl` line a human pastes, which has no header to send — and install.sh
+   *  additionally SUBSTITUTES `?key=` into the script it returns, so the query
+   *  parameter is load-bearing there rather than incidental. */
+  function licenseTokenOf(req: IncomingMessage, url: URL): string {
+    const header = req.headers["x-license"];
+    return String((Array.isArray(header) ? header[0] : header) ?? url.searchParams.get("key") ?? "").trim();
   }
 
   /** Shared gate for install.sh / latest / download. Sends the 403 itself. */
@@ -397,9 +417,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   //
   // The 403 here is JSON, unlike the plain-text 403 the curl-facing endpoints
   // send, because this endpoint's client is a JSON parser.
+  //
+  // THE TOKEN IS READ FROM `x-license` FIRST, and that is the point of this
+  // paragraph. A licence in a QUERY STRING is written to every access log it
+  // passes through — this hub's, nginx's, and any proxy between — where it
+  // outlives the request and is readable by anyone with log access, which is
+  // not the same set as "people entitled to a licence". `communityLicense`
+  // already reads the header for exactly this reason and says so; the seed
+  // endpoint is the heavier of the two surfaces and had the weaker handling.
+  //
+  // `?key=` IS STILL ACCEPTED, and must be: an install older than the release
+  // that starts sending the header has no other way to ask, and a hub upgrade
+  // that silently stopped seeding those installs would look like the venue
+  // warm-up simply coming back. Accepting both is one line and costs nothing.
+  // Header first, so an install sending both is judged on the safer one.
   async function candleSeed(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     if (cfg.candleRequireLicense) {
-      const v = store.verify(url.searchParams.get("key") ?? "");
+      const v = store.verify(licenseTokenOf(req, url));
       if (!v.ok) return sendJson(res, 403, { ok: false, error: `license ${v.reason}` });
     }
     const venue = url.searchParams.get("venue") ?? "";
