@@ -137,6 +137,43 @@ await test("a valid key gets a signed seed whose signature verifies over the wir
     "a client that strips sig and re-serialises in the documented order verifies it");
 });
 
+// ── THE LICENCE MAY TRAVEL IN A HEADER, AND THE QUERY STRING STILL WORKS ────
+//
+// A licence in a query string is written to every access log the request passes
+// through — this hub's, nginx's, any proxy between — where it outlives the
+// request and is readable by anyone with log access. The header keeps it out of
+// all of them.
+//
+// Both cases are driven, and the second is the load-bearing one: `?key=` is the
+// only thing an install older than the release that starts sending the header
+// can use, and a hub that quietly stopped serving those would look exactly like
+// the venue warm-up coming back. Neither of these can be established by reading
+// the route — the header name has to actually reach `store.verify`.
+await test("the seed accepts the licence in an x-license header, keeping it out of access logs", async () => {
+  const q = { venue: "bitget", symbol: "BTCUSDT", fromMs: DAY0, toMs: DAY0 + 4 * MINUTE_MS };
+  const viaHeader = await fetch(`${h.origin}/api/candles/seed?${new URLSearchParams(q)}`, {
+    headers: { "x-license": token },
+  });
+  assert.equal(viaHeader.status, 200, "the header alone authenticates — no key= anywhere in the URL");
+  const viaQuery = await fetch(seedUrl({ ...q, key: token }));
+  assert.equal(viaQuery.status, 200, "and ?key= still works: an older install has no other way to ask");
+  assert.deepEqual(
+    JSON.parse(await viaHeader.text()),
+    JSON.parse(await viaQuery.text()),
+    "the same seed either way — the token's route in must not change the payload",
+  );
+});
+
+await test("a bad licence in the header is refused, and a valid ?key= beside it does not rescue it", async () => {
+  // Header FIRST is deliberate: an install sending both is judged on the safer
+  // one. If the fallback won instead, a stolen-from-a-log key would outrank the
+  // header and the whole point of reading the header first would be gone.
+  const q = { venue: "bitget", symbol: "BTCUSDT", fromMs: DAY0, toMs: DAY0 + 4 * MINUTE_MS, key: token };
+  const r = await jsonReq(seedUrl(q), { headers: { "x-license": "LHK1.not-a-real-token.xx" } });
+  assert.equal(r.status, 403);
+  assert.match(r.body.error, /license/);
+});
+
 await test("rows are numbers on the wire, oldest first, every openMs a multiple of 60000", async () => {
   const res = await fetch(seedUrl({ venue: "bitget", symbol: "BTCUSDT", fromMs: DAY0, toMs: DAY0 + 4 * MINUTE_MS, key: token }));
   const body = JSON.parse(await res.text());

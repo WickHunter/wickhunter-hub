@@ -360,6 +360,23 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.18 — **the candle seed takes its licence in a header, and `?key=` still
+  works.** A licence in a query string is written to every access log the request
+  passes through — this hub's, nginx's, any proxy between — where it outlives the
+  request and is readable by anyone with log access, which is not the same set as
+  "people entitled to a licence". `/api/candles/seed` now reads `x-license`
+  first, exactly as the community routes already did and for exactly that stated
+  reason: **the heavier of the two surfaces had the weaker handling.** `?key=` is
+  still accepted and must be — an install older than the bot release that starts
+  sending the header has no other way to ask, and a hub that quietly stopped
+  seeding those would look like the venue warm-up simply coming back. Header
+  first, so an install sending both is judged on the safer one. `licenseTokenOf`
+  is now the ONE place that order is decided (there were two readings of this
+  idea and they had already drifted); `requireKey` deliberately does NOT use it —
+  install.sh and `/download` are fetched by a bare `curl` line a human pastes,
+  which has no header to send, and install.sh SUBSTITUTES `?key=` into the script
+  it returns. Mutation-verified: restoring the query-only read turns the header
+  check red and nothing else notices.
 - v0.2.17 — **the websocket tail is wired, and OFF until an operator asks.**
   v0.2.16 was the protocol; this is the sockets — chunking at each venue's own
   topic cap, bounded jittered reconnect, and closed candles written straight to
