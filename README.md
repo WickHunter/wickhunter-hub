@@ -36,7 +36,7 @@ mismatch. Three properties carry that weight:
   clock in `dropUnclosed` and again in `CandleStore.write`, so it does not
   depend on any venue's framing being what we expect. Measured per venue:
   Bitget's `/candles` returns the forming bar and its `/history-candles` does
-  not (we read the latter); Bitunix excludes it; Bybit includes it.
+  not (we read the latter); Bitunix excludes it; Bybit and Aster include it.
 - **Per venue, per symbol, venue-native spellings.** Never normalised, never
   joined across venues. The same coin is `PEPEUSDT` on Bitget and
   `1000PEPEUSDT` on Bitunix — different books, different prices — and the live
@@ -49,7 +49,7 @@ mismatch. Three properties carry that weight:
 ### Wire contract v1 (pinned)
 
 ```
-GET /api/candles/seed?venue=<bybit|bitunix|bitget>&symbol=<VENUE-NATIVE>&fromMs=<ms>&toMs=<ms>
+GET /api/candles/seed?venue=<bybit|bitunix|bitget|aster>&symbol=<VENUE-NATIVE>&fromMs=<ms>&toMs=<ms>
 
 { "v":1, "venue","symbol", "interval":"1", "fromMs","toMs","lastClosedMs",
   "rows":[[openMs,open,high,low,close,volume],...], "gaps":[[fromMs,toMs],...],
@@ -139,7 +139,7 @@ so it is a deliberate operator action, not something a hub upgrade starts doing.
 In `/etc/wickhunter-hub/env`:
 
 ```
-HUB_CANDLE_VENUES=bybit,bitunix,bitget
+HUB_CANDLE_VENUES=bybit,bitunix,bitget,aster
 ```
 
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
@@ -160,6 +160,27 @@ in a backoff reads **COOLING** on the exchanges panel with the seconds
 remaining — that is the collector working, not a fault; **STALLED** is the one
 that wants investigating. The panel also states the live rate and how many
 refusals a venue has issued, so "slow" and "broken" are never the same picture.
+
+Each venue runs at **its own** published ceiling when `HUB_CANDLE_RPS` is unset
+— Bybit 15/s, Bitget 10/s, Bitunix 5/s, Aster 4/s, each about half what that
+venue allows. Setting `HUB_CANDLE_RPS` replaces all four with your number,
+including when it is lower.
+
+**Aster is paced to a weight budget, not a request count.** Its published limit
+is `REQUEST_WEIGHT` **2400 per minute per IP** — stated in its docs and in the
+`rateLimits` array of its own `/fapi/v1/exchangeInfo` — and a kline request
+costs weight by the page size asked for (`[1,100)`→1, `[100,500)`→2,
+`[500,1000]`→5, `>1000`→10, measured against the live API). The hub pages at
+**1000 rows for 5 weight**, which is the best rows-per-weight the venue offers
+— its 1500-row maximum costs 10 and is a third worse value — and runs at
+**4 req/s**, exactly half the budget, ~240 pages a minute. Aster also reports
+this IP's spend in `x-mbx-used-weight-1m` on every response: past 80% of the
+budget the collector backs off on its own, keeping the page it has already paid
+for. **That readout outranks `HUB_CANDLE_RPS`** — set it too high for Aster and
+the venue's own number pulls you back, which is the intended direction, because
+this venue bans repeat offenders for 2 minutes to 3 days and an IP ban here
+takes history away from every install at once. It also means the hub notices if
+something else on the same box is spending the IP's Aster budget.
 
 ### Turning collectors off
 
@@ -186,7 +207,7 @@ database dependency, because 1-minute candles are a dense exactly-gridded series
 whose every key is known in advance. Presence is stored rather than inferred,
 gaps are computed from the data, writes are idempotent and order-free, and
 retention pruning is `unlink` of whole day files. Budget ~2 MB per symbol-month,
-about 4 GB across all three venues at 30 days.
+about 5 GB across all four venues at 30 days.
 
 **Back this up or not, as you like** — unlike `data/licenses.json` it is
 entirely reproducible by re-collecting, just slowly.
@@ -360,6 +381,55 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.19 — **AsterDex collects, and it is the first venue whose limit is not a
+  request rate.** Aster is a Binance USD-M clone: `https://fapi.asterdex.com`,
+  `GET /fapi/v1/klines`, `wss://fstream.asterdex.com`. **Mainnet only** — there
+  is a testnet base, it is deliberately not wired even as a fallback, and a test
+  reads the built files to prove no testnet host appears in either adapter.
+  **THE CEILING IS REQUEST_WEIGHT 2400/MINUTE PER IP**, which the venue publishes
+  in its docs *and* in the `rateLimits` array of its own `/fapi/v1/exchangeInfo`,
+  and a kline request's weight depends on the `limit` asked for — `[1,100)`→1,
+  `[100,500)`→2, `[500,1000]`→5, `>1000`→10. Measured live, not inherited:
+  repeated identical requests moved `x-mbx-used-weight-1m` by exactly those
+  amounts. **The page is 1000 rows, not the venue's 1500 maximum**, because 1000
+  rows for 5 weight is 200 rows per weight unit and 1500 rows for 10 weight is
+  only 150 — the biggest page this venue allows is 25% worse value than the one
+  below it, so "ask for the maximum" is the wrong optimisation and there is now a
+  test that says why. The collect rate is **derived** from that arithmetic
+  (`asterPacedRps`), never typed in: 2400 × ½ ÷ 5 ÷ 60 = **4 req/s**, exactly
+  half the published budget, matching what the other three venues do with their
+  own figures. That is 240 pages a minute, so a ~530-pair roster warms 30 days
+  of 1-minute history in about an hour and a half.
+  **Aster also publishes this IP's spend on every response**, and the collector
+  now acts on it: over 80% of the budget a page comes back carrying `slowDown`,
+  the rate halves and the venue is left alone for a cooldown — the same handling
+  a 429 gets, one notch early, because Aster bans repeat offenders for 2 minutes
+  to 3 days and an IP ban on the hub takes history away from every install at
+  once. The candles are **kept**, not thrown away: their weight is already spent,
+  and discarding them is the "budget spent on requests that never become candles"
+  failure the rate-limit handling exists to avoid. This also makes the venue's
+  real budget outrank `HUB_CANDLE_RPS` — an operator who sets that too high is
+  throttled back by the venue's own readout. The other three venues never set the
+  field and are bit-for-bit unchanged.
+  **Its websocket states closure.** `x` ("Is this kline closed?") is documented
+  *and* was observed flipping `false`→`true` on the minute boundary, and the
+  frame carries the candle's own open time `t` — so Aster is the second venue to
+  state closure and the first whose statement this repo proved rather than
+  inherited. It needs no application-level ping (Aster sends protocol ping
+  frames, which Node answers itself) and its subscribe is **one frame per
+  chunk**, because the venue caps incoming messages at 10/s and bans IPs it
+  repeatedly disconnects.
+  **One venue quirk that would have cost a live collector its pass:** Aster
+  refuses `startTime === endTime` outright (HTTP 400, `-1023 "Start time is
+  greater than end time."`), and the collector's backfill produces exactly that
+  window on the pass that lands on the retention horizon. The end is widened to
+  the last millisecond of the requested minute, which cannot reach the next
+  minute's open time and so changes no other window's meaning. This is the
+  v0.2.6 Bitget incident — odd-shaped ranges answered with HTTP 400, 298
+  consecutive failures — headed off rather than repeated.
+  Also: `VENUE_IDS` is now the source for the panel-card, stream-adapter and
+  paced-rate checks instead of three typed-out lists, so the *next* venue cannot
+  be added and forgotten by any of them.
 - v0.2.18 — **the candle seed takes its licence in a header, and `?key=` still
   works.** A licence in a query string is written to every access log the request
   passes through — this hub's, nginx's, any proxy between — where it outlives the

@@ -591,6 +591,19 @@ export class VenueCollector {
         }
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;
+        // ── v0.2.19 — THE VENUE SAID "NEARLY" RATHER THAN "NO" ──────────────
+        // Aster publishes this IP's spend against its own weight budget on
+        // every response; nobody else does, and for them `slowDown` is always
+        // undefined. The candles are KEPT — their cost is already paid, and
+        // discarding them is the "budget spent on things that never become
+        // candles" failure the RateLimitError note warns about — but the pass
+        // stops here and the rate halves, exactly as a real refusal would.
+        // Backing off one notch early is how the 429 -> 418 -> multi-day IP ban
+        // ladder is never climbed at all.
+        if (page.slowDown) {
+          this.noteRateLimited(page.slowDown, clock(), now, item.symbol);
+          break;
+        }
         this.noteSuccess();
       } catch (err) {
         if (isRateLimit(err)) {

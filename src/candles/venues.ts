@@ -27,6 +27,12 @@
 //           pinned by a REPLAY TEST against a recorded-shape page that contains
 //           a forming bar, rather than by a live probe. See the note below on
 //           why that is nonetheless safe.
+//   aster   /fapi/v1/klines                      INCLUDES it.
+//           probed at 1787004960000+ with an explicit endTime on the forming
+//           minute; the forming bar came back. Probed WITHOUT a range it is
+//           usually there and occasionally not (the venue publishes the bar
+//           once the minute has a trade in it), which is a second reason the
+//           answer never rests on the venue's framing.
 //
 // ── WHY THE ANSWER DOES NOT DEPEND ON GETTING THAT TABLE RIGHT ──────────────
 // Every adapter's output passes through `dropUnclosed` against the hub's own
@@ -46,11 +52,12 @@
 // turnover. Reading the field by its name would inflate volume by roughly the
 // price of the coin — about 64,000x on BTC — and every seeded band derived from
 // it would be wrong. Bitunix's adapter therefore reads `quoteVol` for volume,
-// and that is not a typo.
+// and that is not a typo. Aster's row is Binance-shaped: index 5 is base volume
+// and index 7 is the quote turnover, both honestly named in its docs.
 import type { Candle } from "./store.js";
 import { MINUTE_MS, newestClosedOpenMs } from "./store.js";
 
-export const VENUE_IDS = ["bybit", "bitunix", "bitget"] as const;
+export const VENUE_IDS = ["bybit", "bitunix", "bitget", "aster"] as const;
 export type VenueId = (typeof VENUE_IDS)[number];
 
 export function isVenueId(v: unknown): v is VenueId {
@@ -114,6 +121,18 @@ export interface KlinePage {
   candles: Candle[];
   /** True when the venue answered but has no rows in the asked-for range. */
   empty: boolean;
+  /** ── v0.2.19 — "SLOW DOWN", SAID BEFORE THE REFUSAL ──────────────────────
+   *
+   *  Set when the venue's OWN budget readout says we are near its ceiling.
+   *  Only Aster publishes one (`x-mbx-used-weight-1m`); the other three leave
+   *  this undefined and are bit-for-bit unchanged.
+   *
+   *  RETURNED BESIDE THE PAGE RATHER THAN THROWN, and that is the whole point:
+   *  the weight for this request is already spent, so throwing the candles away
+   *  would be the exact failure the `RateLimitError` note above describes — a
+   *  collector spending its budget on requests that never become candles. The
+   *  collector treats it as a refusal for PACING and keeps the page. */
+  slowDown?: RateLimitError;
 }
 
 export interface VenueAdapter {
@@ -180,14 +199,21 @@ function retryAfterMs(res: { headers?: { get(name: string): string | null } }): 
   return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
 }
 
+/** THE http-status refusal rule, in ONE place because two venue readers now
+ *  need it. 429 is the standard refusal; 418 is what several exchanges escalate
+ *  to when a client keeps pushing after 429s, and it is the last warning before
+ *  an IP ban. Both mean stop, not fail. */
+function httpRefusal(res: { status: number; headers?: { get(name: string): string | null } }): RateLimitError | null {
+  if (res.status === 429 || res.status === 418) {
+    return new RateLimitError(`HTTP ${res.status} (rate limited)`, retryAfterMs(res));
+  }
+  return null;
+}
+
 async function getJson(fetchLike: FetchLike, url: string): Promise<unknown> {
   const res = await fetchLike(url);
-  // 429 is the standard refusal; 418 is what several exchanges escalate to when
-  // a client keeps pushing after 429s, and it is the last warning before an IP
-  // ban. Both mean stop, not fail.
-  if (res.status === 429 || res.status === 418) {
-    throw new RateLimitError(`HTTP ${res.status} (rate limited)`, retryAfterMs(res));
-  }
+  const refused = httpRefusal(res);
+  if (refused) throw refused;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -336,4 +362,179 @@ const bitget: VenueAdapter = {
   },
 };
 
-export const ADAPTERS: Record<VenueId, VenueAdapter> = { bybit, bitunix, bitget };
+// ── ASTER ───────────────────────────────────────────────────────────────────
+// A Binance USD-M clone: the same `/fapi/v1` routes, the same array-shaped
+// kline rows, the same weight-based rate limiting and the same `x-mbx-*`
+// headers. MAINNET ONLY. There is a testnet base and it is deliberately not
+// wired, not even as a fallback: testnet candles are a fiction, and a hub that
+// quietly served them would be serving prices that verify against nothing.
+//
+// ── THE LIMIT IS WEIGHT PER MINUTE, NOT REQUESTS PER SECOND ─────────────────
+// The other three venues publish a flat request rate. Aster does not, and
+// pacing it as though it did would be a guess in the one direction that gets
+// the hub IP-banned. Its ceiling is REQUEST_WEIGHT 2400 per minute per IP —
+// which the venue states TWICE, in its docs and in the `rateLimits` array of
+// its own /fapi/v1/exchangeInfo — and each kline request costs a weight that
+// depends on the `limit` asked for:
+//
+//     LIMIT      weight       rows/weight
+//     [1,100)      1              < 100
+//     [100,500)    2              < 250
+//     [500,1000]   5             up to 200      <- this adapter
+//     >1000       10             up to 150
+//
+// MEASURED against the live venue, not merely read: three identical requests at
+// each of limit=99/100/499/500/1000/1500 moved `x-mbx-used-weight-1m` by
+// 1/2/2/5/5/10 respectively. `limit=1501` is refused (-1130), so 1500 is the
+// documented and actual maximum.
+//
+// ── WHY THE PAGE IS 1000 AND NOT THE MAXIMUM 1500 ───────────────────────────
+// 1000 rows for 5 weight is 200 rows per weight unit; 1500 rows for 10 weight
+// is 150. The biggest page this venue allows is 25% WORSE VALUE than the one
+// below it, so the obvious "ask for the maximum" would cost a third more budget
+// for the same history. This is the same shape as the trap the bot repo's
+// v0.78.0 review found on Bitunix/Bitget — the intuitive page-size choice being
+// the wrong one — and the reason the arithmetic is written down here.
+const ASTER_BASE = "https://fapi.asterdex.com";
+const ASTER_PAGE_LIMIT = 1000;
+
+/** The venue's published REQUEST_WEIGHT ceiling, per IP, per minute. */
+export const ASTER_REQUEST_WEIGHT_PER_MINUTE = 2400;
+/** Response header carrying THIS IP's weight spend inside the current minute. */
+export const ASTER_WEIGHT_HEADER = "x-mbx-used-weight-1m";
+/** The share of that budget the collector paces itself to — half, matching the
+ *  convention the other three venues already use for their own limits. */
+export const ASTER_WEIGHT_SHARE = 0.5;
+/** The share at which the venue's own readout makes us back off anyway. Above
+ *  our steady state by a wide margin, so this only fires when something ELSE is
+ *  spending this IP's Aster budget (an operator's own bot on the same box, or
+ *  an operator who raised HUB_CANDLE_RPS past what the venue allows). Aster
+ *  bans repeat offenders for 2 minutes to 3 days, and an IP ban on the hub
+ *  takes history away from every install at once. */
+export const ASTER_WEIGHT_ALARM_SHARE = 0.8;
+
+/** The documented weight of one /fapi/v1/klines request at a given `limit`.
+ *  Exported because the rate this adapter runs at is DERIVED from it, and a
+ *  test that cannot see the arithmetic can only re-assert the answer. */
+export function asterKlineWeight(limit: number): number {
+  if (!Number.isFinite(limit) || limit < 100) return 1;
+  if (limit < 500) return 2;
+  if (limit <= 1000) return 5;
+  return 10;
+}
+
+/** Requests per second that spend `share` of the weight budget, at a page of
+ *  `pageLimit` rows. This is the ONE conversion between the venue's units and
+ *  the collector's; there is no second copy of these numbers to drift. */
+export function asterPacedRps(pageLimit: number, share = ASTER_WEIGHT_SHARE): number {
+  const perRequest = asterKlineWeight(pageLimit);
+  return (ASTER_REQUEST_WEIGHT_PER_MINUTE * share) / perRequest / 60;
+}
+
+/** The venue's own budget readout, turned into a refusal when it crosses the
+ *  alarm share. Undefined when the header is absent or unparseable — a missing
+ *  header must never be read as "budget exhausted", which would silence a
+ *  perfectly healthy collector. */
+function asterWeightPressure(res: { headers?: { get(name: string): string | null } }): RateLimitError | undefined {
+  const used = Number(res.headers?.get(ASTER_WEIGHT_HEADER));
+  if (!Number.isFinite(used) || used <= 0) return undefined;
+  const alarm = ASTER_REQUEST_WEIGHT_PER_MINUTE * ASTER_WEIGHT_ALARM_SHARE;
+  if (used < alarm) return undefined;
+  return new RateLimitError(
+    `aster reports ${used} of its published ${ASTER_REQUEST_WEIGHT_PER_MINUTE}/min request-weight budget spent on this IP ` +
+    `(over ${Math.round(ASTER_WEIGHT_ALARM_SHARE * 100)}%) — backing off before it refuses`,
+  );
+}
+
+/** Read one Aster route. Unlike the other three, this venue answers a bad
+ *  request with a 4xx AND a `{code,msg}` body, so its own words are one parse
+ *  away — and "HTTP 400" on a collector card tells an operator nothing. */
+async function asterGet(fetchLike: FetchLike, url: string): Promise<{ body: unknown; slowDown?: RateLimitError }> {
+  const res = await fetchLike(url);
+  const refused = httpRefusal(res);
+  if (refused) throw refused;
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const b = (await res.json()) as { code?: unknown; msg?: unknown };
+      if (b && typeof b === "object" && b.code !== undefined) {
+        detail = ` — aster code ${String(b.code)}: ${String(b.msg ?? "")}`;
+      }
+    } catch { /* not JSON; the status is all we have, which is what the others report */ }
+    throw new Error(`HTTP ${res.status}${detail}`);
+  }
+  return { body: await res.json(), slowDown: asterWeightPressure(res) };
+}
+
+const aster: VenueAdapter = {
+  id: "aster",
+  pageLimit: ASTER_PAGE_LIMIT,
+  // 4/s: 2400 weight/min x 0.5, at 5 weight a page, over 60 seconds. Derived,
+  // never typed in — see asterPacedRps. That is 240 pages a minute, so a
+  // ~530-pair roster warms 30 days of 1m history in roughly an hour and a half
+  // of paging while sitting on HALF of what the venue allows.
+  publicRequestsPerSecond: asterPacedRps(ASTER_PAGE_LIMIT),
+  klineEndpoint: "GET /fapi/v1/klines (interval=1m, limit=1000, weight 5)",
+  async listSymbols(fetchLike) {
+    // ~750 KB every symbolRefreshMs, for weight 1. The weight-pressure signal
+    // this answer carries is deliberately IGNORED: one request per quarter hour
+    // cannot be what overruns a 2400/min budget, the guard belongs on the path
+    // that does the spending, and the very next kline request reads the same
+    // header. Guarding here would mean throwing away a good instrument list.
+    const { body } = await asterGet(fetchLike, `${ASTER_BASE}/fapi/v1/exchangeInfo`);
+    const out: VenueSymbol[] = [];
+    for (const raw of asArray((body as { symbols?: unknown[] }).symbols)) {
+      const r = raw as { symbol?: unknown; quoteAsset?: unknown; contractType?: unknown; status?: unknown };
+      if (typeof r.symbol !== "string") continue;
+      if (r.quoteAsset !== "USDT") continue;
+      // PERPETUAL, strictly. A `PENDING_TRADING` row on this venue carries an
+      // EMPTY contractType — the venue has not said what the instrument is yet
+      // — so an announced-but-unlaunched listing is not tracked until it has
+      // one. It has no history to collect either way, and admitting an untyped
+      // row would silently admit a dated future the day one is listed.
+      if (r.contractType !== "PERPETUAL") continue;
+      // SETTLING pairs stay tracked and stop being polled, exactly like a
+      // delisting elsewhere: the candles that already happened stay true.
+      out.push({ symbol: r.symbol, tradable: r.status === "TRADING" });
+    }
+    return out;
+  },
+  async fetchKlines(fetchLike, symbol, startMs, endMs) {
+    // ── endTime + 59,999 ms, AND IT IS NOT A ROUNDING FUDGE ─────────────────
+    // The collector's window is a pair of OPEN TIMES, inclusive at both ends.
+    // Aster refuses `startTime === endTime` outright — measured: HTTP 400,
+    // `-1023 "Start time is greater than end time."` — so a one-minute window
+    // is an error on this venue and only on this venue. The collector CAN
+    // produce one: backfill's last step is `[max(horizon, endMs - pageSpan),
+    // digFrom - 60000]`, and those collapse to a single minute the pass that
+    // lands on the retention horizon.
+    //
+    // Widening the end to the last millisecond of that same minute cannot
+    // reach the next minute's open time, so every other window means exactly
+    // what it did before (verified live: a two-minute range returns both ends,
+    // a widened one-minute range returns exactly one row). This is the v0.2.6
+    // Bitget incident — odd-shaped ranges answered with HTTP 400, 298 failures
+    // in a row — headed off instead of repeated.
+    const url = `${ASTER_BASE}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=1m`
+      + `&startTime=${startMs}&endTime=${endMs + MINUTE_MS - 1}&limit=${this.pageLimit}`;
+    const { body, slowDown } = await asterGet(fetchLike, url);
+    const list = asArray(body);
+    const candles: Candle[] = [];
+    for (const raw of list) {
+      const r = raw as unknown[];
+      if (!Array.isArray(r) || r.length < 6) continue;
+      // [openMs, o, h, l, c, baseVolume, closeMs, quoteVolume, trades, ...]
+      // Index 5 is BASE volume, honestly named in this venue's docs — index 7
+      // is the quote turnover, and picking it would inflate volume by roughly
+      // the price of the coin. Same trap as Bitget's index 6, no name to warn
+      // you, so the index is the thing to check.
+      const c = candle(r[0], r[1], r[2], r[3], r[4], r[5]);
+      if (c) candles.push(c);
+    }
+    // Rows arrive oldest-first already; sorted anyway so no caller depends on
+    // this venue continuing to do that.
+    return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
+  },
+};
+
+export const ADAPTERS: Record<VenueId, VenueAdapter> = { bybit, bitunix, bitget, aster };
