@@ -42,10 +42,21 @@
 //
 //   BYBIT  wss://stream.bybit.com/v5/public/linear
 //     {"topic":"kline.1.BTCUSDT","data":[{"start":...,"confirm":true,...}]}
-//     The only one that states closure outright, and it is authoritative.
+//     States closure outright, and it is authoritative.
+//
+//   ASTER  wss://fstream.asterdex.com/ws
+//     {"e":"kline","E":1787004721172,"s":"BTCUSDT","k":{"t":1787004660000,
+//      "T":1787004719999,"i":"1m","o":"64292.7","c":"64289.4","h":"64292.7",
+//      "l":"64289.4","v":"1.638","n":36,"x":true,"q":"105308.1757",...}}
+//     CAPTURED LIVE, including the closing frame above: `x` is documented as
+//     "Is this kline closed?" and was observed flipping false -> true on the
+//     minute boundary. It also states the candle's own open time `t`, so
+//     nothing here is derived from a clock. That makes it the SECOND venue to
+//     state closure and the FIRST whose statement this repo has proved rather
+//     than inherited.
 //
 // ── THE CLOSURE RULE, AND WHY IT IS NOT A CLOCK READ ────────────────────────
-// For the two venues with no flag, a minute is published only once a tick for a
+// For the venues with no flag, a minute is published only once a tick for a
 // LATER minute has arrived. That is an ORDERING fact about the venue's own
 // stream — the exchange has moved on — rather than a comparison against this
 // machine's clock. `olb-venue-candles.ts` in the bot repo refuses the clock
@@ -218,7 +229,74 @@ const bybit: StreamAdapter = {
   },
 };
 
-export const STREAM_ADAPTERS: Record<VenueId, StreamAdapter> = { bybit, bitunix, bitget };
+const aster: StreamAdapter = {
+  id: "aster",
+  // The RAW-stream base plus an explicit SUBSCRIBE, not the `/stream?streams=`
+  // combined form. Both work (both were driven live), but the combined form
+  // puts the whole roster in the URL and would need a different socket per
+  // chunk built by string surgery; SUBSCRIBE is the shape this runner already
+  // has. The combined form's `{stream,data}` wrapper is still parsed below, so
+  // switching costs nothing later.
+  url: "wss://fstream.asterdex.com/ws",
+  maxTopicsPerConnection: 200, // documented: "a single connection can listen to a maximum of 200 streams"
+  // NO application-level ping, and that is deliberate. Aster sends a PROTOCOL
+  // ping frame every 5 minutes and drops a connection that has not sent a
+  // protocol pong within 15; Node's own WebSocket answers those itself. A JSON
+  // {"op":"ping"} here would be an unrecognised INCOMING message on a venue
+  // that caps those at 10/s and bans IPs it repeatedly disconnects.
+  //
+  // A connection is also only valid for 24 HOURS by the venue's own rule —
+  // expect a daily disconnect per socket. That needs no new mechanism: it
+  // arrives as an ordinary close and the runner's jittered backoff reopens it,
+  // losing at most the forming minute the REST tail then repairs.
+  subscribeFrames(symbols) {
+    // ONE frame for the whole chunk. A frame per symbol would be 200 incoming
+    // messages against a documented cap of 10 per second — the connection is
+    // dropped, and "IPs that are repeatedly disconnected may be banned".
+    return [{
+      method: "SUBSCRIBE",
+      // Stream names MUST be lowercase (documented, and an uppercase one is
+      // simply never delivered). The SYMBOL is read back off the payload's own
+      // `s`, which is the UPPERCASE spelling the REST collector stores under —
+      // this is the one venue here where the two differ, so neither side
+      // normalises the other.
+      params: symbols.map((s) => `${s.toLowerCase()}@kline_1m`),
+      id: 1,
+    }];
+  },
+  parse(frame) {
+    let m: {
+      e?: string; s?: string; k?: Record<string, unknown>;
+      stream?: string; data?: { e?: string; s?: string; k?: Record<string, unknown> };
+    };
+    try { m = JSON.parse(frame); } catch { return []; }
+    if (!m || typeof m !== "object") return [];
+    // Bare payload (raw stream) or `{stream,data}` (combined stream). Subscribe
+    // acks are `{"id":1,"result":null}` and fall out here with no `k`.
+    const p = m.data && typeof m.data === "object" ? m.data : m;
+    if (p.e !== "kline" || !p.k || typeof p.k !== "object") return [];
+    const k = p.k;
+    const symbol = String(k.s ?? p.s ?? "");
+    if (!symbol) return [];
+    const openMs = num(k.t);
+    const t: StreamTick = {
+      symbol,
+      openMs,
+      candle: {
+        openMs, open: num(k.o), high: num(k.h), low: num(k.l), close: num(k.c),
+        volume: num(k.v), // `v` is base asset volume; `q` is the quote turnover
+      },
+      // THE VENUE'S OWN ASSERTION, documented as "Is this kline closed?" and
+      // observed flipping on the minute boundary. `=== true` and not a truthy
+      // test: a venue that starts sending "true" as a string should fall back
+      // to the ordering rule, which is correct, rather than to a coercion.
+      closed: k.x === true,
+    };
+    return usable(t) ? [t] : [];
+  },
+};
+
+export const STREAM_ADAPTERS: Record<VenueId, StreamAdapter> = { bybit, bitunix, bitget, aster };
 
 // ── the closure buffer ──────────────────────────────────────────────────────
 

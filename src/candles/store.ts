@@ -26,9 +26,10 @@
 //      and repairs it; there is no append cursor to corrupt or resume.
 //
 // Cost: 48 bytes/candle, 69,120 bytes/symbol/day, ~2 MB per symbol-month, and
-// for the full ~2,100 venue-symbols about 4 GB raw at 30 days — as the brief
-// estimated, and it gzips to a fraction of that on the wire. Retention pruning
-// is `unlink` of whole day files, which is why the day is the chunk boundary.
+// for the full ~2,630 venue-symbols about 5 GB raw at 30 days (Aster added ~530
+// of those in v0.2.19) — in line with what the brief estimated, and it gzips to
+// a fraction of that on the wire. Retention pruning is `unlink` of whole day
+// files, which is why the day is the chunk boundary.
 //
 // RECORD LAYOUT — 48 bytes, little-endian:
 //   [ 0.. 7) BigInt64  openMs   0 = EMPTY SLOT. Never a valid candle: a real

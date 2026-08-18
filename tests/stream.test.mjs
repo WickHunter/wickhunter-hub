@@ -22,6 +22,7 @@
 import assert from "node:assert/strict";
 import { test, summary } from "./helpers.mjs";
 import { STREAM_ADAPTERS, ClosureBuffer, openMsFromTs } from "../dist/src/candles/stream.js";
+import { VENUE_IDS } from "../dist/src/candles/venues.js";
 
 const MIN = 60_000;
 
@@ -156,14 +157,23 @@ await test("symbols do not interfere with each other", () => {
 });
 
 await test("every venue states a topic cap and a reachable url", () => {
-  for (const v of ["bybit", "bitunix", "bitget"]) {
+  // Iterated over VENUE_IDS, not a typed-out list: a venue added to the
+  // registry with no stream adapter is a `streams.set(v, undefined)` and a
+  // socket runner reading fields off nothing, at the first tick after an
+  // operator names it in HUB_CANDLE_STREAM. A hardcoded list here would have
+  // been edited to add the venue and would never have asked the question.
+  for (const v of VENUE_IDS) {
     const a = STREAM_ADAPTERS[v];
+    assert.ok(a, `${v} has a stream adapter`);
     assert.equal(a.id, v);
     assert.ok(/^wss:\/\//.test(a.url), `${v} url is a websocket`);
     assert.ok(a.maxTopicsPerConnection > 0, `${v} states a topic cap`);
     const frames = a.subscribeFrames(["BTCUSDT", "ETHUSDT"]);
     assert.ok(Array.isArray(frames) && frames.length > 0, `${v} builds a subscribe frame`);
-    assert.ok(JSON.stringify(frames).includes("BTCUSDT"), `${v} names the symbol`);
+    // Case-insensitively: Aster's stream names must be lowercase, which is the
+    // venue's own rule and the one place a subscription is not spelled the way
+    // the store spells the symbol.
+    assert.match(JSON.stringify(frames).toUpperCase(), /BTCUSDT/, `${v} names the symbol`);
   }
 });
 

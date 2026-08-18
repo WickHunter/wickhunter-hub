@@ -471,13 +471,30 @@ await test("each venue collects at its OWN documented rate, not one global figur
   // Every venue must state a ceiling, and none may exceed its documented
   // public limit. These are the numbers the hub promises the operator it will
   // stay under, so they are asserted rather than left to a comment.
+  //
+  // v0.2.19 — Aster's published limit is not a request rate at all: it is
+  // REQUEST_WEIGHT 2400 per minute, and a kline page costs 5 of it. Its budget
+  // is therefore expressed in the venue's OWN units and converted, because a
+  // request-count entry here would be a number nobody at Aster ever published.
   const documented = { bybit: 120, bitunix: 10, bitget: 20 };
+  const weightBudgeted = { aster: { perMinute: 2400, weightPerRequest: 5 } };
   for (const v of VENUE_IDS) {
     const rps = ADAPTERS[v].publicRequestsPerSecond;
     assert.ok(rps > 0, `${v} states a ceiling`);
+    const w = weightBudgeted[v];
+    if (w) {
+      const allowedRps = w.perMinute / w.weightPerRequest / 60;
+      assert.ok(rps <= allowedRps / 2,
+        `${v} sits at or below HALF the ${allowedRps.toFixed(1)}/s its ${w.perMinute} weight/min allows (got ${rps})`);
+      continue;
+    }
     assert.ok(rps <= documented[v] / 2,
       `${v} sits at or below HALF its documented ${documented[v]}/s (got ${rps})`);
   }
+  assert.ok(
+    VENUE_IDS.every((v) => documented[v] !== undefined || weightBudgeted[v] !== undefined),
+    "a venue added to the registry must state which published limit it is paced to",
+  );
 
   // With no operator override, the per-venue table is populated…
   const auto = collectorOptionsFromEnv({});

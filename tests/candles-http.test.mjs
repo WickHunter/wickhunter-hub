@@ -13,6 +13,7 @@ import { CandleStore, MINUTE_MS, newestClosedOpenMs } from "../dist/src/candles/
 import { VenueCollector, DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
 import { CandleService } from "../dist/src/candles/service.js";
 import { canonicalBytes } from "../dist/src/candles/seed.js";
+import { VENUE_IDS } from "../dist/src/candles/venues.js";
 
 const NOW = 1786410725631;
 const NEWEST_CLOSED = newestClosedOpenMs(NOW); // 1786410660000
@@ -398,7 +399,10 @@ await test("a venue with no collector says so instead of showing zeroes", async 
   const venue = stubVenue();
   const { svc } = serviceWith("bitget", venue.fetchLike);
   const all = svc.status(NOW);
-  assert.deepEqual(all.map((v) => v.venue), ["bybit", "bitunix", "bitget"], "every venue gets a card");
+  // Read off VENUE_IDS rather than typed out. A venue added to the registry and
+  // forgotten by the panel is precisely what this checks, and a hardcoded list
+  // would make that failure look like a test needing an edit.
+  assert.deepEqual(all.map((v) => v.venue), [...VENUE_IDS], "every venue gets a card");
   const bybit = all.find((v) => v.venue === "bybit");
   assert.equal(bybit.configured, false, "explicitly not configured");
   assert.equal(bybit.health, null, "and no health numbers that could be mistaken for a running collector");
@@ -990,8 +994,8 @@ await test("the admin candles route needs the admin token and reports every venu
   assert.equal(r.body.enabled, false, "this test hub runs no collector");
   assert.equal(r.body.keyId, "seed-1");
   assert.equal(r.body.requiresLicense, true);
-  assert.deepEqual(r.body.venues.map((v) => v.venue), ["bybit", "bitunix", "bitget"]);
-  assert.ok(r.body.venues.every((v) => v.configured === false), "all three say 'no collector configured'");
+  assert.deepEqual(r.body.venues.map((v) => v.venue), [...VENUE_IDS]);
+  assert.ok(r.body.venues.every((v) => v.configured === false), "every one says 'no collector configured'");
   assert.ok(typeof r.body.seedPublicKey === "string" && r.body.seedPublicKey.length > 0, "public key offered for pairing");
 });
 
