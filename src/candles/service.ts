@@ -8,7 +8,7 @@ import {
   DEFAULT_COLLECTOR_OPTIONS, VenueCollector, seedableMaxTailAgeMs,
   type CollectorOptions, type VenueHealth,
 } from "./collector.js";
-import { ADAPTERS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
+import { ADAPTERS, ASTER_BAN_MIN_MS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
 import { STREAM_ADAPTERS } from "./stream.js";
 import { VenueStreamRunner } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
@@ -411,6 +411,23 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     rateLimitMaxCooldownMs: Math.max(
       cooldown,
       numOr(env.HUB_CANDLE_MAX_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.rateLimitMaxCooldownMs),
+    ),
+    // ── v0.2.20 — THE BAN SCHEDULE IS ITS OWN PAIR OF KNOBS ─────────────────
+    // Not derived from the rate-limit cooldown, because the two answer
+    // different questions and an operator who shortens a rate-limit backoff
+    // (reasonable) must not silently shorten how long the hub waits out an IP
+    // ban (never reasonable). Floored, not merely defaulted: a ban wait below
+    // the venue's own documented MINIMUM ban is a wait that ends inside every
+    // ban there is, so the env var may LENGTHEN this and may not shorten it
+    // past the point where it stops being a ban wait at all.
+    banCooldownMs: Math.max(
+      ASTER_BAN_MIN_MS,
+      numOr(env.HUB_CANDLE_BAN_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.banCooldownMs),
+    ),
+    banMaxCooldownMs: Math.max(
+      ASTER_BAN_MIN_MS,
+      numOr(env.HUB_CANDLE_BAN_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.banCooldownMs),
+      numOr(env.HUB_CANDLE_BAN_MAX_COOLDOWN_MS, DEFAULT_COLLECTOR_OPTIONS.banMaxCooldownMs),
     ),
     tailFillMinutes: numOr(env.HUB_CANDLE_TAIL_FILL_MIN, DEFAULT_COLLECTOR_OPTIONS.tailFillMinutes),
     symbolRefreshMs: numOr(env.HUB_CANDLE_SYMBOL_REFRESH_MS, DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs),

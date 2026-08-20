@@ -446,7 +446,10 @@ await test("FAILING wins over STALLED, because it is the more actionable thing t
   const venue = stubVenue({ symbols: ["BTCUSDT"] });
   const { svc } = serviceWith("bitget", venue.fetchLike, { failingAfter: 1 });
   await svc.tickAll(NOW);
-  venue.state.failWith = "HTTP 418";
+  // NOT "HTTP 418": since v0.2.20 that status is a BAN with its own state, and
+  // a fixture that says 418 while asserting FAILING would read as the opposite
+  // of what this hub does. Any ordinary transport failure makes the same point.
+  venue.state.failWith = "HTTP 502 Bad Gateway";
   await svc.tickAll(NOW + MINUTE_MS);
   const s = svc.status(NOW + 90 * MINUTE_MS).find((v) => v.venue === "bitget");
   assert.equal(s.health.state, "failing", "stale AND erroring reports the error");

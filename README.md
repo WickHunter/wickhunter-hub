@@ -145,6 +145,9 @@ HUB_CANDLE_VENUES=bybit,bitunix,bitget,aster
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 `HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
 `HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_TICK_MS` (60s),
+`HUB_CANDLE_BAN_COOLDOWN_MS` (15m) and `HUB_CANDLE_BAN_MAX_COOLDOWN_MS` (3d) —
+how long the hub stays silent after an HTTP **418**, which is a different
+quantity from a rate-limit cooldown; see **When a venue bans the IP** below,
 `HUB_CANDLE_TAIL_FILL_MIN` (150 — how much backlog a tail request waits for),
 `HUB_CANDLE_SIGNER` (`license`) and `HUB_CANDLE_KEY_ID` (derived from the
 signer) — both covered under **Signing key** above; read the four-step order
@@ -160,6 +163,43 @@ in a backoff reads **COOLING** on the exchanges panel with the seconds
 remaining — that is the collector working, not a fault; **STALLED** is the one
 that wants investigating. The panel also states the live rate and how many
 refusals a venue has issued, so "slow" and "broken" are never the same picture.
+
+### When a venue bans the IP
+
+**HTTP 418 is not a heavier 429, and the hub stopped treating it as one in
+v0.2.20.** On a Binance-family venue — which is what Aster is — `429` means "you
+are going too fast" and `418` means *this IP is already banned*, for a period
+Aster's own manual gives as **2 minutes to 3 days**, and that manual is explicit
+that continuing to send requests is what lengthens it.
+
+So a 418 gets its own everything:
+
+- **Its own wait.** 15 minutes, doubling per ban, up to the venue's documented
+  3-day maximum — not the rate limiter's 60-second-to-15-minute ladder, which
+  would have resumed inside the great majority of bans. When the venue names a
+  deadline (`Retry-After`, or `banned until …` in its own error body) that
+  number is used instead **whenever it is longer**; a venue can never talk the
+  hub into probing its ban early.
+- **Its own silence.** Nothing is sent at all, not even the 15-minute instrument
+  list. The list is a request too, and a request is the thing that extends a ban.
+- **Its own state.** The card reads **BANNED**, in red, and says what it is,
+  how long is left, and that the fix is not to wait it out and carry on. It
+  outranks COOLING, STALLED and FAILING, because those three send an operator
+  looking for the wrong thing — and COOLING in particular reads as routine.
+- **Its own counter,** which stays on the card after the ban lifts. An expired
+  ban otherwise leaves no trace at exactly the moment nobody would think to
+  look for one.
+- **A lowered ceiling.** The rate goes to the floor and the ceiling it may creep
+  back to is halved, so hundreds of clean requests cannot walk the collector
+  back to the rate that earned the ban. The escalation and the lowered ceiling
+  are cleared by **restarting the service** — an operator deciding they have
+  dealt with the cause — never by a request that happened to succeed.
+
+**A ban almost certainly is not the collector.** It paces itself to half of
+Aster's published budget and reads that venue's own spend meter on every
+response; the likely cause is something *else* on the same IP — an operator's
+own bot trading Aster from the same box, or an `HUB_CANDLE_RPS` set past what
+the venue allows. That is what to go and look for.
 
 Each venue runs at **its own** published ceiling when `HUB_CANDLE_RPS` is unset
 — Bybit 15/s, Bitget 10/s, Bitunix 5/s, Aster 4/s, each about half what that
@@ -381,6 +421,51 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.2.20 — **HTTP 418 was being handled as a heavy 429, and that is the one
+  mistake that turns a rate limit into a multi-day outage.** `httpRefusal` folded
+  the two statuses into one `RateLimitError`, so a 418 bought the rate-limit
+  treatment: halve the rate, go quiet for 60 seconds (doubling, capped at
+  fifteen minutes), resume. On a Binance-family venue — which is what Aster is —
+  429 means *you are going too fast* and **418 means this IP is ALREADY BANNED**,
+  for a period Aster's own manual gives as **2 minutes to 3 days**, and the
+  manual is explicit that continuing to send requests is what lengthens it. The
+  hub therefore resumed inside the ban, on a one-minute tick, extending it, for
+  as long as the service was left running — and the panel called that
+  **COOLING**, which this README tells the operator in as many words is "the
+  collector working, not a fault". **An IP ban looked like health**, on the one
+  venue where an IP ban takes history away from every install at once.
+  **The bot repo had already settled this question the other way and written
+  down why** (liqhunter `src/venues/rate-limited.ts`, v0.86.80: *"418 is
+  deliberately NOT treated as a slow-down: by then the venue is refusing the
+  address outright and a caller that reads it as 'retry shortly' would keep
+  hammering a ban"*). The hub and a bot share one IP whenever they share a box;
+  they may not disagree about what a ban is.
+  **`VenueBanError` EXTENDS `RateLimitError` rather than replacing it**, and that
+  is load-bearing in both directions. Every existing caller asks `isRateLimit`
+  and keeps its "stop the pass, do not count this as FAILING" handling, which
+  was always right for a ban too — so nothing had to be found and updated. It is
+  also the trap: the ban flag is the NARROWER question, so a collector that asks
+  the wider one first classifies every ban as a slow-down and the fix does
+  nothing. That ordering is asserted through the collector, not read off the
+  source, and mutation-verified by swapping the two branches.
+  **418 is a ban on all four venues, not only Aster.** The other three do not
+  document sending it, so a 418 from one of them is a status this hub does not
+  understand — and the safe reading of a status we do not understand is the one
+  that makes the hub go quiet.
+  **The venue's own deadline is used, and only ever to LENGTHEN the wait.**
+  `Retry-After` on a 418 names when the ban ends; a Binance-family error body
+  also carries `banned until <epoch>`, which is parsed defensively —
+  **unverified against a live Aster ban, because this box has never been banned
+  by this venue and will not arrange to be**, so an unparseable body is worth
+  nothing rather than being wrong, and a shorter number is discarded. A
+  hallucinated timestamp cannot talk the hub into probing an active ban, which
+  is the only direction that costs anything.
+  Also: the ban schedule gets its **own** two env knobs rather than borrowing the
+  rate-limit pair — shortening a rate-limit backoff is reasonable and must not
+  silently shorten how long an IP ban is waited out — and they are **floored at
+  the venue's documented minimum ban**, because a wait under that ends inside
+  every ban there is. New `tests/venue-ban.test.mjs`, 24 checks, every one of the
+  eight mutations tried caught by name.
 - v0.2.19 — **AsterDex collects, and it is the first venue whose limit is not a
   request rate.** Aster is a Binance USD-M clone: `https://fapi.asterdex.com`,
   `GET /fapi/v1/klines`, `wss://fstream.asterdex.com`. **Mainnet only** — there
