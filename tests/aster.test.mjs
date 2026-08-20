@@ -227,7 +227,14 @@ function stubStatus(status, body = {}, headers = {}) {
   });
 }
 
-await test("429 and 418 are rate limits here too — 418 is the last warning before an IP ban", async () => {
+await test("429 and 418 both stop the pass — and 418 is a BAN, handled in tests/venue-ban.test.mjs", async () => {
+  // Both satisfy `isRateLimit`, which is what makes every existing caller's
+  // "stop the pass, do not count this as FAILING" handling correct for both.
+  // They are NOT the same thing: since v0.2.20 a 418 is a `VenueBanError` — the
+  // venue has banned this IP for 2 minutes to 3 days and every further request
+  // lengthens it — and it gets its own wait, its own state and its own counter.
+  // That split is pinned in tests/venue-ban.test.mjs; this check only holds the
+  // inheritance that keeps the shared handling intact.
   for (const code of [429, 418]) {
     const err = await aster.fetchKlines(stubStatus(code), "BTCUSDT", 0, 0).then(() => null, (e) => e);
     assert.equal(isRateLimit(err), true, `HTTP ${code}`);

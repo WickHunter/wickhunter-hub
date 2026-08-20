@@ -31,7 +31,10 @@ import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import {
   CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, settledOpenMs, type Candle, type SymbolCoverage,
 } from "./store.js";
-import { ADAPTERS, dropUnclosed, isRateLimit, type FetchLike, type VenueId } from "./venues.js";
+import {
+  ADAPTERS, ASTER_BAN_MAX_MS, dropUnclosed, isRateLimit, isVenueBan,
+  type FetchLike, type VenueId,
+} from "./venues.js";
 
 export interface CollectorOptions {
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
@@ -48,6 +51,22 @@ export interface CollectorOptions {
    *  refusal up to `rateLimitMaxCooldownMs`. */
   rateLimitCooldownMs: number;
   rateLimitMaxCooldownMs: number;
+  /** ── v0.2.20 — THE BAN SCHEDULE, WHICH IS NOT THE RATE-LIMIT SCHEDULE ─────
+   *
+   *  A 418 says the address is ALREADY banned (see `VenueBanError`). The wait
+   *  that follows is a different quantity from a rate-limit cooldown and must
+   *  not be derived from one: Aster documents its bans as 2 minutes to 3 days,
+   *  so a 15-minute ceiling — the rate-limit maximum — would resume inside the
+   *  great majority of them and every such request lengthens the ban.
+   *
+   *  The FIRST wait is deliberately well past the documented MINIMUM rather
+   *  than at it. When the venue names a deadline we use the venue's number
+   *  (longer always wins); when it does not, we cannot tell a 2-minute ban from
+   *  a 3-day one, and the only way to find out is the one request that must not
+   *  be sent. The hub has no deadline — this is the argument the whole
+   *  collector is built on — so it waits. */
+  banCooldownMs: number;
+  banMaxCooldownMs: number;
   /** ── v0.2.4 — HOW MUCH BACKLOG A TAIL REQUEST SHOULD CARRY ────────────────
    *
    *  MEASURED on the operator's box: 202 requests returned 5,768 candles — 28.6
@@ -97,6 +116,12 @@ export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
   minRequestsPerSecond: 0.5,
   rateLimitCooldownMs: 60_000,
   rateLimitMaxCooldownMs: 15 * 60_000,
+  // 15 minutes is 7.5x Aster's documented MINIMUM ban and costs a hub with no
+  // deadline fifteen minutes of collecting; doubling per ban reaches the
+  // documented 3-day MAXIMUM, which is the longest the venue says it ever bans
+  // for and therefore the longest silence that can be justified by its docs.
+  banCooldownMs: 15 * 60_000,
+  banMaxCooldownMs: ASTER_BAN_MAX_MS,
   // ── 100 MINUTES, AND THE SECOND CONSTRAINT THAT SET IT (v0.2.9) ───────────
   // Page utilisation wants this HIGH: at 200 rows, 150 minutes filled three
   // quarters of a page. The seed CROSS-CHECK wants it LOW, and it is the
@@ -153,7 +178,7 @@ interface SymbolsFile {
   symbols: Record<string, TrackedSymbol>;
 }
 
-export type VenueState = "starting" | "running" | "cooling" | "stalled" | "failing";
+export type VenueState = "starting" | "running" | "cooling" | "banned" | "stalled" | "failing";
 
 export interface VenueHealth {
   venue: VenueId;
@@ -177,6 +202,21 @@ export interface VenueHealth {
   rateLimitHits: number;
   /** While this is in the future the collector is deliberately not asking. */
   cooldownUntil: number | null;
+  /** ── v0.2.20 ──────────────────────────────────────────────────────────────
+   *  Lifetime count of 418s — the venue refusing this ADDRESS, not this rate.
+   *  Reported separately from `rateLimitHits` because they call for opposite
+   *  responses: a rate limit is the collector working, a ban is something to
+   *  go and look at. A hub that has ever been banned once should be examined;
+   *  one that is banned twice has a rate that is wrong. */
+  bans: number;
+  /** While this is in the future the venue has BANNED this IP and the hub is
+   *  saying nothing at all to it. Null when there is no ban in force. */
+  banUntil: number | null;
+  /** The ceiling the adaptive rate is allowed to climb back to. Equal to
+   *  `configuredRps` until a ban halves it — the rate that earned a ban is not
+   *  a rate to return to, and the operator should be able to see that the hub
+   *  has lowered its own ceiling rather than wonder why it never speeds up. */
+  ceilingRps: number;
 }
 
 export class VenueCollector {
@@ -206,6 +246,19 @@ export class VenueCollector {
   private consecutiveRateLimits = 0;
   private rateLimitHits = 0;
   private successStreak = 0;
+  // ── BAN STATE (v0.2.20), kept apart from the rate state on purpose ────────
+  // `consecutiveBans` NEVER resets while the process lives. A single successful
+  // request after a ban expires proves only that the ban expired; it says
+  // nothing about whether the cause was fixed, and letting it reset the
+  // escalation would return a twice-banned hub to a 15-minute first wait. The
+  // escalation is cleared by a RESTART, which is an operator deciding they have
+  // dealt with it — see health(), which says so in as many words.
+  private banUntil = 0;
+  private consecutiveBans = 0;
+  private bans = 0;
+  /** The ceiling `noteSuccess` may creep back to. Starts at the configured
+   *  rate and is halved by each ban. */
+  private ceilingRps: number;
 
   constructor(
     readonly venue: VenueId,
@@ -217,6 +270,7 @@ export class VenueCollector {
     this.symbolsFile = path.join(stateDir, venue, "symbols.json");
     this.startedAt = now;
     this.effectiveRps = opts.requestsPerSecond;
+    this.ceilingRps = opts.requestsPerSecond;
     const file = readJson<SymbolsFile>(this.symbolsFile, { symbols: {} });
     for (const [sym, rec] of Object.entries(file.symbols ?? {})) {
       if (rec && typeof rec.symbol === "string") this.tracked.set(sym, rec);
@@ -447,6 +501,15 @@ export class VenueCollector {
     return clockNow < this.cooldownUntil;
   }
 
+  /** True while the VENUE has banned this IP. A strictly stronger statement
+   *  than `cooling`, and every ban also cools — `noteBanned` folds the ban
+   *  deadline into `cooldownUntil` so that every path already written to
+   *  respect a cooldown respects a ban too, without a second silence rule to
+   *  keep in step with the first. */
+  bannedNow(clockNow: number): boolean {
+    return clockNow < this.banUntil;
+  }
+
   /** Wait until this collector's next request is due. The gap is derived from
    *  the CURRENT effective rate, and `nextRequestAt` carries across ticks — which
    *  is the whole point. The old code issued its entire per-minute budget in one
@@ -478,10 +541,57 @@ export class VenueCollector {
     // rate it just refused.
     const asked = (err as { retryAfterMs?: number }).retryAfterMs;
     const wait = Math.max(backoff, Number.isFinite(asked) ? (asked as number) : 0);
-    this.cooldownUntil = clockNow + wait;
+    // A rate-limit cooldown may LENGTHEN the silence and may never shorten it.
+    // Unreachable today (a banned collector sends nothing, so it cannot collect
+    // a 429), and written anyway: this assignment used to be unconditional, and
+    // the day some path issues a request during a ban is not the day to
+    // discover that the request also cancelled the ban.
+    this.cooldownUntil = Math.max(this.banUntil, clockNow + wait);
     this.nextRequestAt = this.cooldownUntil;
     this.lastError = {
       message: `${label}: ${(err as Error).message} — backing off ${Math.round(wait / 1000)}s, rate now ${this.effectiveRps.toFixed(2)}/s`,
+      at,
+    };
+  }
+
+  /** ── v0.2.20 — THE VENUE HAS BANNED THIS ADDRESS ──────────────────────────
+   *
+   *  Not a heavier version of `noteRateLimited`, and the differences are the
+   *  whole point:
+   *
+   *   · the rate goes to the FLOOR, not to half — a ban is not evidence that we
+   *     were slightly too fast;
+   *   · the CEILING is halved too, so the creep-back in `noteSuccess` cannot
+   *     return the collector to the rate that was banned;
+   *   · the wait comes from the ban schedule, which reaches Aster's documented
+   *     3-day maximum rather than the rate-limiter's 15-minute one;
+   *   · the venue's own deadline WINS when it is longer, and is ignored when it
+   *     is shorter — a venue cannot talk us into probing a ban early;
+   *   · the escalation counter does not reset (see the field note).
+   *
+   *  It is deliberately NOT counted toward `consecutiveFailures`. A ban is not
+   *  the collector failing, and FAILING would bury the one fact that explains
+   *  everything the panel is showing. It gets its own state instead. */
+  private noteBanned(err: unknown, clockNow: number, at: number, label: string): void {
+    this.bans++;
+    this.consecutiveBans++;
+    this.successStreak = 0;
+    this.effectiveRps = this.opts.minRequestsPerSecond;
+    this.ceilingRps = Math.max(this.opts.minRequestsPerSecond, this.ceilingRps / 2);
+    const scheduled = Math.min(
+      this.opts.banMaxCooldownMs,
+      this.opts.banCooldownMs * 2 ** (this.consecutiveBans - 1),
+    );
+    const asked = (err as { retryAfterMs?: number }).retryAfterMs;
+    const wait = Math.max(scheduled, Number.isFinite(asked) ? (asked as number) : 0);
+    this.banUntil = clockNow + wait;
+    // Every existing silence check reads `cooldownUntil`; a ban raises it and
+    // never lowers it.
+    this.cooldownUntil = Math.max(this.cooldownUntil, this.banUntil);
+    this.nextRequestAt = this.cooldownUntil;
+    this.lastError = {
+      message: `${label}: ${(err as Error).message} — SILENT for ${Math.round(wait / 60_000)}m `
+        + `(ban ${this.consecutiveBans} of this process), ceiling lowered to ${this.ceilingRps.toFixed(2)}/s`,
       at,
     };
   }
@@ -491,9 +601,12 @@ export class VenueCollector {
   private noteSuccess(): void {
     this.consecutiveRateLimits = 0;
     this.successStreak++;
-    if (this.successStreak >= RATE_RECOVER_AFTER_SUCCESSES && this.effectiveRps < this.opts.requestsPerSecond) {
+    // Toward `ceilingRps`, NOT `opts.requestsPerSecond`: a ban halves the
+    // ceiling, and a creep-back that read the configured number would undo that
+    // within a few minutes of clean requests and walk straight back into it.
+    if (this.successStreak >= RATE_RECOVER_AFTER_SUCCESSES && this.effectiveRps < this.ceilingRps) {
       this.successStreak = 0;
-      this.effectiveRps = Math.min(this.opts.requestsPerSecond, this.effectiveRps * RATE_RECOVER_FACTOR);
+      this.effectiveRps = Math.min(this.ceilingRps, this.effectiveRps * RATE_RECOVER_FACTOR);
     }
   }
 
@@ -514,7 +627,9 @@ export class VenueCollector {
     const startedAt = clock();
 
     // Cooling: say nothing to the venue at all, not even the symbol list. The
-    // point of a cooldown is silence.
+    // point of a cooldown is silence — and under a BAN that silence is the
+    // whole remedy, since `noteBanned` raises `cooldownUntil` to the ban
+    // deadline precisely so this one check covers both.
     if (this.cooling(clock())) {
       this.lastPollAt = now;
       return { requests: 0, written: 0 };
@@ -531,6 +646,10 @@ export class VenueCollector {
         this.consecutiveFailures = 0;
         this.noteSuccess();
       } catch (err) {
+        if (isVenueBan(err)) {
+          this.noteBanned(err, clock(), now, "symbol list");
+          return { requests: 0, written: 0 };
+        }
         if (isRateLimit(err)) {
           this.noteRateLimited(err, clock(), now, "symbol list");
           return { requests: 0, written: 0 };
@@ -601,11 +720,22 @@ export class VenueCollector {
         // Backing off one notch early is how the 429 -> 418 -> multi-day IP ban
         // ladder is never climbed at all.
         if (page.slowDown) {
+          // Never a ban: this is the venue's own budget READOUT on a request it
+          // answered, which is the opposite of a refusal. It is the notch
+          // before 429, two notches before 418.
           this.noteRateLimited(page.slowDown, clock(), now, item.symbol);
           break;
         }
         this.noteSuccess();
       } catch (err) {
+        // A BAN IS TESTED FIRST, and `isVenueBan` is a strictly narrower test
+        // than `isRateLimit` — the ban error inherits the rate-limit flag, so
+        // asking in the other order would classify every ban as a slow-down and
+        // resume inside it. The narrower question always goes first.
+        if (isVenueBan(err)) {
+          this.noteBanned(err, clock(), now, item.symbol);
+          break;
+        }
         if (isRateLimit(err)) {
           // Stop the pass dead. Spending the rest of the budget on requests the
           // venue is already refusing is how a rate limit becomes a ban, and it
@@ -647,7 +777,28 @@ export class VenueCollector {
       configuredRps: this.opts.requestsPerSecond,
       rateLimitHits: this.rateLimitHits,
       cooldownUntil: this.cooldownUntil > now ? this.cooldownUntil : null,
+      bans: this.bans,
+      banUntil: this.banUntil > now ? this.banUntil : null,
+      ceilingRps: this.ceilingRps,
     };
+    // ── BANNED OUTRANKS EVERYTHING, INCLUDING FAILING (v0.2.20) ─────────────
+    // A banned collector is also, truthfully, not polling and not succeeding —
+    // so without this it would report COOLING (which the README tells the
+    // operator to leave alone) or STALLED (which sends them hunting a fault
+    // that is not there). Neither says the one thing that matters: the venue
+    // has refused this ADDRESS, and the fix is not to wait it out and carry on
+    // at the same rate.
+    if (this.bannedNow(now)) {
+      const mins = Math.max(1, Math.round((this.banUntil - now) / 60_000));
+      return {
+        ...base, state: "banned",
+        detail: `HTTP 418 — the venue has BANNED this IP. Silent for another ${mins}m, then resuming at `
+          + `${this.effectiveRps.toFixed(2)}/s under a lowered ceiling of ${this.ceilingRps.toFixed(2)}/s `
+          + `(configured ${this.opts.requestsPerSecond}/s). Ban ${this.consecutiveBans} of this process; each one `
+          + `doubles the wait and every request sent during a ban lengthens it. This is NOT the collector working `
+          + `— find what is spending this IP's budget, then restart the service to clear the escalation.`,
+      };
+    }
     // FAILING beats STALLED: if requests are actively erroring, that is the
     // more specific and more actionable thing to say.
     if (this.consecutiveFailures >= this.opts.failingAfter) {

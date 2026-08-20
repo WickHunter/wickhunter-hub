@@ -42,6 +42,11 @@
   .v-running { color: #2a7; } .v-stalled { color: #b80; }
   .v-failing { color: #c33; } .v-starting { color: #78c; } .v-off { color: #999; }
   .v-cooling { color: #59c; }
+  /* BANNED is not a shade of COOLING. Same weight as FAILING and a filled
+     badge, because it is the one collector state an operator must not scroll
+     past: the venue has refused this IP and every request extends it. */
+  .v-banned { color: #fff; background: #c33; border-color: #c33; }
+  .banct { color: #c33; }
   .venue dl { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; margin: .5rem 0 0; font-size: .88rem; }
   .venue dt { opacity: .65; } .venue dd { margin: 0; }
   .venue .detail { font-size: .85rem; margin: .1rem 0 .3rem; }
@@ -516,6 +521,15 @@ async function cdRefresh() {
       + "<dt>Request rate</dt><dd>" + h.effectiveRps.toFixed(2) + "/s"
         + (h.effectiveRps < h.configuredRps - 1e-9 ? " <span class=\"muted\">(throttled from " + h.configuredRps + "/s)</span>" : "")
         + (h.rateLimitHits ? " · " + h.rateLimitHits.toLocaleString() + " rate-limit refusals" : "")
+        // A ban is counted SEPARATELY from a rate limit and stays on the card
+        // after it lifts. The two ask for opposite responses — a rate limit is
+        // the collector working, a ban is something to go and look at — and a
+        // ban that has expired leaves no other trace once the state returns to
+        // RUNNING, which is exactly when nobody would think to check.
+        + (h.bans ? ' · <b class="banct">' + h.bans.toLocaleString() + " IP ban" + (h.bans === 1 ? "" : "s") + "</b>" : "")
+        + (h.ceilingRps < h.configuredRps - 1e-9
+            ? " <span class=\"muted\">(ceiling lowered to " + h.ceilingRps.toFixed(2) + "/s after a ban — restart to clear)</span>"
+            : "")
         + "</dd>"
       + "</dl>";
 

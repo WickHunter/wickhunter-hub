@@ -104,6 +104,47 @@ export function isRateLimit(err: unknown): err is RateLimitError {
   return !!err && typeof err === "object" && (err as RateLimitError).rateLimited === true;
 }
 
+/** ── v0.2.20 — A BAN IS NOT A SLOW-DOWN, AND READING IT AS ONE EXTENDS IT ───
+ *
+ *  HTTP 418 is not a heavier 429. On a Binance-family venue — which is what
+ *  Aster is — 429 means "you are going too fast, ease off" and 418 means "this
+ *  IP is already banned", for a period the venue documents as **2 minutes to 3
+ *  days**, and *the one thing that lengthens it is another request*.
+ *
+ *  Until now this hub folded the two into one `RateLimitError`, so a 418 bought
+ *  a 60-second cooldown (doubling, capped at 15 minutes) and then the collector
+ *  resumed — straight into an active ban, extending it, on a 1-minute tick. The
+ *  admin panel called that COOLING, which the README tells the operator is "the
+ *  collector working, not a fault". An IP ban therefore looked like health.
+ *
+ *  The bot repo settled this same question the other way and wrote it down
+ *  (liqhunter `src/venues/rate-limited.ts`, v0.86.80): *"418 is deliberately
+ *  NOT treated as a slow-down: by then the venue is refusing the address
+ *  outright and a caller that reads it as 'retry shortly' would keep hammering
+ *  a ban."* The two repos share one IP whenever the hub and a bot sit on one
+ *  box; they may not disagree about what a ban is.
+ *
+ *  STILL A `RateLimitError` BY INHERITANCE, deliberately: every existing caller
+ *  that asks `isRateLimit` keeps its "stop the pass, do not count this as
+ *  FAILING" handling, which remains exactly right. The ban is the STRICTER
+ *  reading layered on top, never a reclassification that some call site could
+ *  miss. A `banned` flag rather than `instanceof` for the same reason
+ *  `rateLimited` is: this error is re-thrown and re-wrapped on the way up. */
+export class VenueBanError extends RateLimitError {
+  readonly banned = true;
+  constructor(message: string, retryAfterMs?: number) {
+    super(message, retryAfterMs);
+    this.name = "VenueBanError";
+  }
+}
+
+/** True only for a venue that has refused the ADDRESS, not the request rate.
+ *  A caller that cannot tell them apart must treat everything as a ban — the
+ *  conservative direction is silence, never a probe. */
+export function isVenueBan(err: unknown): err is VenueBanError {
+  return !!err && typeof err === "object" && (err as VenueBanError).banned === true;
+}
+
 /** OBSERVED, not guessed. `bitunix code 10006: request too frequently` and a
  *  bare `HTTP 429` on the same venue are both from the operator's own collector
  *  log; Bybit's `retCode 10006` ("Too many visits") is its documented v5 code.
@@ -200,12 +241,25 @@ function retryAfterMs(res: { headers?: { get(name: string): string | null } }): 
 }
 
 /** THE http-status refusal rule, in ONE place because two venue readers now
- *  need it. 429 is the standard refusal; 418 is what several exchanges escalate
- *  to when a client keeps pushing after 429s, and it is the last warning before
- *  an IP ban. Both mean stop, not fail. */
+ *  need it. 429 is the standard refusal — slow down. 418 is what a
+ *  Binance-family venue answers once it has ALREADY banned the address, and it
+ *  is handled as a ban on EVERY venue here, not only on Aster: no other venue
+ *  in this hub documents sending it, so a 418 from one of them means something
+ *  we do not understand, and the safe reading of a status we do not understand
+ *  is the one that makes the hub go quiet.
+ *
+ *  `Retry-After` is carried on both. On a 418 the venue is naming when the ban
+ *  ENDS, which is the most authoritative number available — the collector takes
+ *  the longer of that and its own schedule, never the shorter. */
 function httpRefusal(res: { status: number; headers?: { get(name: string): string | null } }): RateLimitError | null {
-  if (res.status === 429 || res.status === 418) {
-    return new RateLimitError(`HTTP ${res.status} (rate limited)`, retryAfterMs(res));
+  if (res.status === 418) {
+    return new VenueBanError(
+      `HTTP 418 — this IP is BANNED by the venue, not merely rate limited; the ban lengthens on every further request`,
+      retryAfterMs(res),
+    );
+  }
+  if (res.status === 429) {
+    return new RateLimitError(`HTTP 429 (rate limited)`, retryAfterMs(res));
   }
   return null;
 }
@@ -446,13 +500,70 @@ function asterWeightPressure(res: { headers?: { get(name: string): string | null
   );
 }
 
+/** ── THE VENUE'S OWN DOCUMENTED BAN BOUNDS ──────────────────────────────────
+ *  From Aster's rate-limit manual, read 2026-08-18: an automated IP ban
+ *  "scal[es] from 2 minutes to 3 days". Exported because the collector's ban
+ *  schedule is justified against these two numbers and a schedule whose bounds
+ *  live only in a comment is a schedule nobody can check. */
+export const ASTER_BAN_MIN_MS = 2 * 60_000;
+export const ASTER_BAN_MAX_MS = 3 * 24 * 60 * 60_000;
+
+/** A Binance-family ban body names the instant the ban ENDS, in its own `msg`:
+ *  `Way too many requests; IP(1.2.3.4) banned until 1234567890000.`
+ *
+ *  NOT VERIFIED AGAINST A LIVE ASTER BAN — this build environment has never
+ *  been banned by this venue and deliberately will not arrange to be. So it is
+ *  written to be worthless rather than wrong when it does not match: an
+ *  unparseable body returns `undefined` and the collector uses its own
+ *  schedule, and the caller only ever lets this LENGTHEN a wait, never shorten
+ *  one. A hallucinated timestamp therefore cannot talk the hub into probing an
+ *  active ban, which is the only direction that costs anything.
+ *
+ *  Seconds are accepted as well as milliseconds because "banned until" is an
+ *  epoch and the two are one factor of 1000 apart; a value that lands more than
+ *  a year away in either direction is refused as not-an-epoch. */
+export function asterBanUntilMs(msg: unknown, now = Date.now()): number | undefined {
+  if (typeof msg !== "string") return undefined;
+  const m = /banned until\s+(\d{10,16})/i.exec(msg);
+  if (!m) return undefined;
+  const raw = Number(m[1]);
+  if (!Number.isFinite(raw)) return undefined;
+  const YEAR = 365 * 24 * 60 * 60_000;
+  for (const candidate of [raw, raw * 1000]) {
+    if (candidate > now && candidate - now <= YEAR) return candidate;
+  }
+  return undefined;
+}
+
+/** Re-issue a 418 carrying the LONGER of the ban deadline the venue named in
+ *  its body and whatever `Retry-After` already gave us. Reading the body cannot
+ *  fail the request: a body that is missing, not JSON, or shaped differently
+ *  leaves the original refusal exactly as it was. */
+async function asterBanWithVenuesOwnDeadline(
+  res: { json: () => Promise<unknown> },
+  ban: RateLimitError,
+): Promise<RateLimitError> {
+  let until: number | undefined;
+  let said = "";
+  try {
+    const b = (await res.json()) as { code?: unknown; msg?: unknown };
+    until = asterBanUntilMs(b?.msg);
+    if (b && typeof b === "object" && b.code !== undefined) {
+      said = ` — aster code ${String(b.code)}: ${String(b.msg ?? "")}`;
+    }
+  } catch { /* the status alone is what the other venues give us anyway */ }
+  const fromBody = until === undefined ? 0 : until - Date.now();
+  const wait = Math.max(ban.retryAfterMs ?? 0, fromBody);
+  return new VenueBanError(`${ban.message}${said}`, wait > 0 ? wait : undefined);
+}
+
 /** Read one Aster route. Unlike the other three, this venue answers a bad
  *  request with a 4xx AND a `{code,msg}` body, so its own words are one parse
  *  away — and "HTTP 400" on a collector card tells an operator nothing. */
 async function asterGet(fetchLike: FetchLike, url: string): Promise<{ body: unknown; slowDown?: RateLimitError }> {
   const res = await fetchLike(url);
   const refused = httpRefusal(res);
-  if (refused) throw refused;
+  if (refused) throw isVenueBan(refused) ? await asterBanWithVenuesOwnDeadline(res, refused) : refused;
   if (!res.ok) {
     let detail = "";
     try {
