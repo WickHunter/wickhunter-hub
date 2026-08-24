@@ -14,8 +14,70 @@ import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS, DAY_MS, HOUR_MS, type Mar
 import { QUOTE_BATCH_SIZE } from "./budget.js";
 import { LEDGER_FILE_DEFAULT, OVERRIDES_FILE_DEFAULT, SNAPSHOT_FILE_DEFAULT } from "./store.js";
 
+/** WHICH KEY SIGNS A MARKET-CAP SNAPSHOT.
+ *
+ *  ⚠ `"license"` IS THE DEFAULT AND THAT IS NOT A PREFERENCE — IT IS THE ONLY
+ *  VALUE ANY SHIPPED BOT CAN VERIFY. `asset-market-cap.ts` pins exactly one
+ *  entry, `mcap-1` -> the LICENCE public key, and REFUSES an unknown keyId
+ *  rather than verifying it against a default.
+ *
+ *  The producer originally REQUIRED a self-generated key with an
+ *  operator-chosen keyId. The first operator to enable it published
+ *  `market-data-1`, every bot refused every snapshot, and the market-cap page
+ *  read "no snapshot has been read from the hub yet" — a live feature that
+ *  looked exactly like a feature nobody had switched on. The candle seed had
+ *  already solved this: see the rollout order in `candleSigningFromEnv`, whose
+ *  default is likewise the OLD key precisely so no bot in the field is
+ *  stranded. Market caps skipped that step; this restores it.
+ *
+ *  ROLLING FORWARD to the dedicated key is the candle order, verbatim:
+ *    (a) ship this — snapshots signed by the LICENCE key, labelled `mcap-1`.
+ *    (b) paste the dedicated public key into the bot's `MARKET_CAP_KEYS`,
+ *        keyed `market-data-1`, ALONGSIDE `mcap-1` — never instead of it.
+ *    (c) ship a bot build carrying that map and let it reach the testers.
+ *    (d) ONLY THEN set MARKET_CAP_SIGNER=market-data and restart. */
+export type MarketCapSigner = "license" | "market-data";
+export const MARKET_CAP_SIGNERS: readonly MarketCapSigner[] = ["license", "market-data"];
+export function isMarketCapSigner(v: unknown): v is MarketCapSigner {
+  return typeof v === "string" && (MARKET_CAP_SIGNERS as readonly string[]).includes(v);
+}
+
+/** keyId emitted when the LICENCE key signs — the one every shipped bot pins. */
+export const LICENSE_MARKET_CAP_KEY_ID = "mcap-1";
+/** keyId emitted when the DEDICATED market-data key signs. */
+export const MARKET_DATA_KEY_ID = "market-data-1";
+
+/** ⚠ A keyId that names one key while another does the signing produces
+ *  payloads nobody can verify, and the symptom lands in someone else's process
+ *  with no hint of the cause. The pairing is ENFORCED, not documented — the
+ *  candle seed's `RESERVED_KEY_IDS`, for its reason. */
+export const RESERVED_MARKET_CAP_KEY_IDS: Readonly<Record<string, MarketCapSigner>> = {
+  [LICENSE_MARKET_CAP_KEY_ID]: "license",
+  [MARKET_DATA_KEY_ID]: "market-data",
+};
+
+export function marketCapSigningFromEnv(env: NodeJS.ProcessEnv): { signer: MarketCapSigner; keyId: string } {
+  const raw = (env.MARKET_CAP_SIGNER ?? "license").trim().toLowerCase();
+  if (!isMarketCapSigner(raw)) {
+    throw new Error(`MARKET_CAP_SIGNER must be one of ${MARKET_CAP_SIGNERS.join(" | ")}: ${env.MARKET_CAP_SIGNER}`);
+  }
+  const signer: MarketCapSigner = raw;
+  const keyId = (env.MARKET_DATA_SIGNING_KEY_ID ?? "").trim()
+    || (signer === "market-data" ? MARKET_DATA_KEY_ID : LICENSE_MARKET_CAP_KEY_ID);
+  const owner = RESERVED_MARKET_CAP_KEY_IDS[keyId];
+  if (owner && owner !== signer) {
+    throw new Error(
+      `MARKET_DATA_SIGNING_KEY_ID=${keyId} is reserved for MARKET_CAP_SIGNER=${owner}, but the signer is ${signer} — `
+      + "a snapshot signed by one key and labelled another cannot be verified by anyone",
+    );
+  }
+  return { signer, keyId };
+}
+
 export interface MarketCapEnvConfig extends MarketCapConfig {
   apiKey: string;
+  /** Which key signs. See `marketCapSigningFromEnv`. */
+  signer: MarketCapSigner;
   coingeckoApiKey: string;
   signingKeyB64u: string;
   signingKeyId: string;
@@ -64,14 +126,17 @@ export function marketCapConfigFromEnv(env: NodeJS.ProcessEnv, dataDir: string):
     if (v && id && isVenueId(v) && Number.isInteger(Number(id)) && Number(id) > 0) exchangeIds[v] = Number(id);
   }
 
+  const signing = marketCapSigningFromEnv(env);
+
   return {
     venues,
     slugs,
     exchangeIds,
     apiKey: (env.CMC_PRO_API_KEY ?? "").trim(),
     coingeckoApiKey: (env.COINGECKO_PRO_API_KEY ?? "").trim(),
+    signer: signing.signer,
     signingKeyB64u: (env.MARKET_DATA_SIGNING_PRIVATE_KEY_B64U ?? "").trim(),
-    signingKeyId: (env.MARKET_DATA_SIGNING_KEY_ID ?? "").trim(),
+    signingKeyId: signing.keyId,
     hubKey: (env.MARKET_DATA_HUB_KEY ?? "").trim(),
     monthlyCeiling: numOr(env.CMC_MONTHLY_CREDIT_CEILING, CMC_MONTHLY_CREDIT_CEILING_DEFAULT),
     requestsPerMinute: numOr(env.CMC_REQUESTS_PER_MINUTE, CMC_REQUESTS_PER_MINUTE_DEFAULT),
@@ -109,7 +174,12 @@ export function marketCapStartupRefusals(cfg: MarketCapEnvConfig): string[] {
   const out: string[] = [];
   if (!cfg.venues.length) return out; // deliberately off; nothing to complain about
   if (!cfg.apiKey) out.push("CMC_PRO_API_KEY is not set — the market-cap producer cannot call the provider");
-  if (!cfg.signingKeyB64u) out.push("MARKET_DATA_SIGNING_PRIVATE_KEY_B64U is not set — an unsigned snapshot is not servable");
+  // ⚠ ONLY THE DEDICATED SIGNER NEEDS A PRIVATE KEY IN THE ENVIRONMENT. Under
+  // the default `license` signer the hub signs with the key it already has, so
+  // demanding this would refuse to start over a variable nobody needs to set.
+  if (cfg.signer === "market-data" && !cfg.signingKeyB64u) {
+    out.push("MARKET_DATA_SIGNING_PRIVATE_KEY_B64U is not set — an unsigned snapshot is not servable (or unset MARKET_CAP_SIGNER to sign with the licence key)");
+  }
   if (!cfg.signingKeyId) out.push("MARKET_DATA_SIGNING_KEY_ID is not set — a signature nobody can attribute is not a signature");
   if (cfg.monthlyCeiling <= 0) out.push("CMC_MONTHLY_CREDIT_CEILING is not a positive number of credits");
   return out;
