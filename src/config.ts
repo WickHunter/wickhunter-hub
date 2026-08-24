@@ -11,6 +11,7 @@ import {
   CANDLE_KEY_ID, CANDLE_SIGNERS, LICENSE_SEED_KEY_ID, RESERVED_KEY_IDS, isCandleSigner,
   type CandleSigner,
 } from "./candles/key.js";
+import { marketCapConfigFromEnv, type MarketCapEnvConfig } from "./marketcap/config.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +54,15 @@ export interface HubConfig {
   candleRequireLicense: boolean;
   candleTickMs: number;
   candleOptions: CollectorOptions;
+
+  // ── market-cap snapshot producer ──────────────────────────────────────────
+  /** OPTIONAL for the same reason `candleStreamVenues` is: `HubConfig` is built
+   *  by hand in tests and tools as well as by `configFromEnv`, and a required
+   *  field here reads fine and then throws at the one call site that filters
+   *  it — which is exactly what v0.2.17 records happening. Absent = the
+   *  producer does not exist, which is every install until an operator sets
+   *  MARKET_CAP_VENUES and a CMC key. */
+  marketCap?: MarketCapEnvConfig;
 }
 
 // ── THE SIGNING SWITCH, AND THE ORDER IT MUST BE THROWN IN ──────────────────
@@ -135,5 +145,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     candleRequireLicense: (env.HUB_CANDLE_REQUIRE_LICENSE ?? "1") !== "0",
     candleTickMs: Math.max(1000, Number(env.HUB_CANDLE_TICK_MS ?? 60_000) || 60_000),
     candleOptions: collectorOptionsFromEnv(env),
+    // Reads the same dataDir the rest of the hub uses, so a snapshot file with
+    // no explicit path lands beside licenses.json rather than in a second state
+    // root nobody remembers to back up.
+    marketCap: marketCapConfigFromEnv(env, env.HUB_DATA_DIR ?? path.join(ROOT, "data")),
   };
 }

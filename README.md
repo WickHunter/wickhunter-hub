@@ -230,6 +230,176 @@ button, explicitly labelled a public key that is safe to copy), and the
 four-step rollout order — because the one thing that must not happen is someone
 flipping `HUB_CANDLE_SIGNER` before a bot build knows `candle-1`.
 
+## Market-cap snapshot
+
+The bots want a market cap per tradeable pair — to size, to filter, to refuse a
+book that is too thin. The hub produces that once, for everybody, and serves it
+as one signed snapshot.
+
+**Three authorities, kept apart, and this is the whole design:**
+
+```
+exchange instrument API   -> which pairs EXIST and are tradeable
+CMC derivative pair map   -> exchange-native symbol -> stable canonical asset id
+CMC quotes by canonical id-> USD market cap, supply, price, timestamp
+```
+
+The provider never decides which pairs exist — a provider lagging a listing must
+not be able to delist a live market from under a bot — and a ticker never
+decides which coin it is about. There is no page-per-pair anywhere and no join
+on ticker text.
+
+### `1000PEPE` is not a coin
+
+It is a PEPE contract quoted in thousands and it takes **PEPE's market cap,
+unchanged**. Nothing in this service multiplies or divides a market cap by a
+contract multiplier. `1000SATS`, meanwhile, **is** its own listed asset and is
+not Bitcoin, however much the name looks like a Bitcoin denomination — and no
+parser can tell those two apart, because the difference is a fact about the
+world and not about the string.
+
+So identity comes from the pair map, always. `suggestMultiplier` exists and
+produces a **review suggestion for a human** looking at an unmapped row; it is
+wired to nothing that resolves anything, and the genuine numeric-leading tickers
+— `1INCH`, `0G`, `2Z`, `4`, `100X` — come out of it untouched.
+
+### The coverage invariant
+
+Checked on every refresh, and exported on the payload:
+
+```
+active exchange instruments = mapped + ambiguous + provider_untracked + not_applicable
+unique mapped assets requested = verified + fallback + missing + disputed + stale + not_applicable
+```
+
+For every batch call `requestedIds - returnedIds` is computed and each omitted
+id becomes an explicit `missing` fact with a reason. `skip_invalid=true` is what
+makes that necessary: it lets a batch of a hundred succeed while quietly
+dropping rows, and an id that vanished without leaving a fact behind would be
+indistinguishable from an id nobody asked for. **A pair with no cap still gets a
+row and a reason.**
+
+### Accepting a cap
+
+A strict figure needs all of: a proven canonical id; `market_cap`,
+`circulating_supply` and `price` all finite and > 0; a `last_updated` no more
+than **15 minutes** old (and no more than 2 minutes in the future, for clock
+skew); and `market_cap` agreeing with `price × circulating_supply` within
+**2%**. That last one is free evidence the provider hands us on the same row —
+the row proves its own claim rather than declaring it — and a disagreement is
+reported as `disputed` with the size of the gap, never silently corrected.
+
+Never substituted, each for its own reason: **fully-diluted valuation** (it
+prices tokens that do not exist), **`self_reported_market_cap`** (the issuer's
+own number, present on exactly the assets whose supply nobody could verify),
+**`total_supply × price`** (FDV with extra steps), **two providers averaged**
+(a figure neither would stand behind), **one provider's price with another's
+supply** (the same defect in a better costume, and it defeats the cross-check).
+**A null cap is never zero** — zero is a claim, and it passes every "is it a
+number" test on the way to a size filter. `is_market_cap_included_in_calc` is
+retained and surfaced rather than folded into a status word.
+
+All money is a **decimal string**, carried through exact BigInt arithmetic, so
+no threshold is ever decided by float rounding.
+
+### ⚠ The credit budget is the binding constraint
+
+The plan is **15,000 credits/month, 50 requests/minute**. Measured before
+anything was built: a 5-minute pair-map refresh is ~34,560 credits a month for
+the **mapping alone** — two to three times the whole plan, before a single
+market cap is fetched. The schedule is therefore:
+
+| stage | cadence | why |
+| --- | --- | --- |
+| derivative pair mapping | **daily** | which coin a ticker means changes when an exchange lists something, not every five minutes |
+| unseen symbol | immediate **targeted** refresh, then ~1/5/15/60 min | one exchange's pages, never a sweep |
+| cap facts | **hourly**, batched 100 ids per call | one request per coin is 528 credits an hour — 25× the plan for the same facts |
+
+That comes to **≈6,990 credits/month** (750 mapping + 1,200 targeted + 5,040
+caps), about 47% of the plan. The arithmetic is `estimateMonthlyCredits()` in
+`src/marketcap/budget.ts` — a function, not a paragraph, so the suite holds it
+to the plan and a cadence change moves the reported number instead of leaving a
+stale claim in a comment.
+
+**A refresh that would cross the ceiling does not start.** It is judged on the
+whole planned cost, not the next call, because a refresh that stops halfway
+publishes a snapshot with a third of the book missing. The refusal names the
+numbers, is counted, and reaches `GET /admin/api/market-caps`; the last known
+good snapshot keeps serving and states its own age.
+
+### Publishing is all-or-nothing
+
+Fetch every page → validate the shapes → compare each catalogue against the last
+good one → build a row for every active instrument → check both invariants →
+only then sign, write `tmp` + `fsync` + `rename`, and swap. A catalogue that
+collapses (below 80% of last time, or under 90% symbol overlap) is **refused**,
+because a truncated page and a mass delisting are the same bytes. Any failure
+leaves the previous snapshot exactly where it was and emits **one** feed-health
+error. Never a partial map that makes hundreds of live pairs look unmapped.
+
+### The signing key is its own
+
+`MARKET_DATA_SIGNING_PRIVATE_KEY_B64U` / `MARKET_DATA_SIGNING_KEY_ID` — **never
+the licence key and never the candle-seed key**. See *Signing key* above for
+what sharing one costs: a seed signature re-wrapped as a licence token passes
+the licence verifier's signature check and is refused only by a later shape
+test, so that separation rests on an ordering nobody can see. A third key
+removes the dependency entirely. The private half comes from the environment,
+is never written to a file by this service, never logged, and never appears in
+a payload — only `keyId` does.
+
+Signature bytes: remove the **entire** `signatures` field, RFC 8785
+canonicalise the rest, UTF-8 encode, Ed25519-sign. Removing the whole field
+(rather than blanking a `sig`) is what lets a second signature be added for key
+rotation without moving the bytes the first one covered. Unknown `alg`, unknown
+`keyId` and an expired `expiresAt` are all refusals — and expiry is checked
+**after** the signature, because an expiry read off an unverified payload is an
+expiry the sender chose.
+
+### Turning it on
+
+Off by default, and for a harder reason than the candle collectors: every call
+spends a credit against a plan the operator pays for. In
+`/etc/wickhunter-hub/env`:
+
+```
+MARKET_CAP_VENUES=bybit,aster,bitget,bitunix
+CMC_PRO_API_KEY=...
+MARKET_DATA_SIGNING_PRIVATE_KEY_B64U=...      # base64url: 32-byte seed or PKCS8
+MARKET_DATA_SIGNING_KEY_ID=market-data-1
+```
+
+Optional: `CMC_MONTHLY_CREDIT_CEILING` (15000), `CMC_REQUESTS_PER_MINUTE` (50),
+`MARKET_CAP_MAP_INTERVAL_MS` (24h), `MARKET_CAP_REFRESH_INTERVAL_MS` (1h),
+`MARKET_CAP_TICK_MS` (30s), `MARKET_CAP_TTL_MS` (3h),
+`MARKET_CAP_SNAPSHOT_FILE`, `ASSET_IDENTITY_OVERRIDES_FILE`,
+`MARKET_CAP_CREDIT_LEDGER_FILE` (all default into `data/`),
+`MARKET_CAP_SLUGS=aster:aster-pro,...` (an escape hatch for the day a provider
+renames one), `MARKET_DATA_HUB_KEY` (an `x-hub-key` shared secret for a console
+that holds no licence), `COINGECKO_PRO_API_KEY` (secondary provider, absent-safe
+and entirely optional).
+
+A missing key does **not** crash the hub: the producer refuses to start, prints
+why, and licensing and candle seeding carry on. It is not silent either —
+"configured and unable" is the one state that looks, from a client's side,
+exactly like a provider outage.
+
+### Identity overrides
+
+`data/asset-identity-overrides-v1.json`, re-read on every publish (no restart):
+
+```json
+{ "overrides": {
+  "bybit:CATUSDT":  { "cryptoId": 111, "note": "the map offers two ids; this is the one" },
+  "bybit:IDXUSDT":  { "notApplicable": true, "note": "a basket index, no single asset" }
+} }
+```
+
+An override outranks the pair map — it exists to correct it — and is the answer
+to an `ambiguous` row, which is refused rather than guessed at because guessing
+attaches one coin's market cap to another coin's book while every screen looks
+perfectly healthy.
+
 ## License format v1 (pinned)
 
 ```
@@ -360,9 +530,11 @@ anywhere private is enough; everything else is reproducible.
 | `GET /api/latest?key=` | valid token | `{version,file,sha256}` |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
 | `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
+| `GET /api/market-data/market-caps/v1` | valid token (`x-license` / `?key=`) or `x-hub-key` | signed market-cap snapshot (contract v1); ETag + gzip |
 | `GET /admin` | none (page holds no secrets) | static admin page |
 | `GET/POST /admin/api/licenses[/revoke]` | `x-hub-admin` header, constant-time | list / issue / revoke |
 | `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
+| `GET /admin/api/market-caps` | `x-hub-admin` header | market-cap producer health, credit spend and refusals |
 
 License keys travel in query strings by design (curl-pasteable); the hub never
 logs a URL's query, and the shipped nginx snippet sets `access_log off` for
@@ -380,6 +552,36 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.0 — **The market-cap snapshot producer.** One signed snapshot of every
+  tradeable pair's market cap, produced once for everybody. Three authorities
+  kept strictly apart: the exchange says which pairs exist, CMC's derivative
+  pair map says which canonical asset a venue-native symbol means, CMC's quotes
+  say what that asset is worth. **`1000PEPE` takes PEPE's cap unchanged** — the
+  multiplier is a contract size, and nothing here multiplies or divides a market
+  cap by one; **`1000SATS` is not Bitcoin**, which no parser could ever tell you,
+  which is why identity comes from the map and a ticker parser may only produce a
+  review suggestion (`1INCH`, `0G`, `2Z`, `4`, `100X` come out untouched).
+  **Both coverage invariants are checked on every refresh and exported on the
+  payload**, and every id a batch omits — `skip_invalid=true` drops rows while
+  the call succeeds — becomes an explicit `missing` fact with a reason rather
+  than a silence. A cap is accepted only when all three figures are positive, the
+  provider's stamp is under 15 minutes old, and the published cap agrees with
+  `price × circulating_supply` within 2%; FDV, `self_reported_market_cap`,
+  `total_supply × price`, averaged providers and one provider's price with
+  another's supply are all refused by name, and **a null cap is never zero**.
+  Money is a decimal string throughout, so no threshold is decided by float
+  rounding. **The credit budget is the binding constraint and it is enforced with
+  a refusal**: 15,000/month and 50/min, mapping DAILY and caps HOURLY batched 100
+  ids to a call — ≈6,990 credits a month against the ~34,560 the 5-minute
+  refresh would have cost for the mapping alone — and a refresh that would cross
+  the ceiling does not start, says so, and leaves the last known good serving.
+  Publishing is all-or-nothing behind a catalogue-sanity check, because a
+  truncated page and a mass delisting are the same bytes. **A third Ed25519 key**
+  (never the licence key, never the candle key), RFC 8785 canonicalisation with
+  the whole `signatures` field removed, `ETag`/`If-None-Match` and gzip on
+  `GET /api/market-data/market-caps/v1`. Off by default: every call spends a
+  credit against a plan the operator pays for.
 
 - v0.2.19 — **AsterDex collects, and it is the first venue whose limit is not a
   request rate.** Aster is a Binance USD-M clone: `https://fapi.asterdex.com`,
