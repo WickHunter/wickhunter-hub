@@ -22,6 +22,7 @@
 // Removing the whole field is what lets the payload carry more than one
 // signature later (key rotation) without the second signature changing the
 // bytes the first one covered.
+import { botWireFor } from "./bot-wire.js";
 import { createPublicKey, sign as edSign, verify as edVerify, createPrivateKey, type KeyObject } from "node:crypto";
 import { canonicalBytes } from "./jcs.js";
 import type { CapFact, CapCensus } from "./caps.js";
@@ -86,6 +87,14 @@ export interface SnapshotUnsigned {
   v: number;
   kind: "market-caps";
   generatedAt: number;
+  /** ⚠ THE BOT'S NAME FOR THE SAME INSTANT, carried beside the hub's own.
+   *  The consumer validates `generatedAtMs` and refuses on it FIRST; the hub's
+   *  own readers (`service.ts`'s republish check, `verifySnapshot` below, the
+   *  admin page) read `generatedAt`. Same value, written once, never derived
+   *  twice. Optional so a hand-built `SnapshotUnsigned` in a test or a tool
+   *  stays valid. */
+  generatedAtMs?: number;
+  expiresAtMs?: number;
   /** After this, a consumer must treat the snapshot as expired. Hourly cap
    *  refresh, so the default is comfortably longer than one refresh and far
    *  shorter than a day: a stale snapshot must age out on its own even if the
@@ -367,6 +376,36 @@ export function buildSnapshot(input: BuildInput): BuildOutcome {
     };
   }
 
+  /* ── ⚠ THE BOT'S VOCABULARY, MERGED IN RATHER THAN REPLACING ANYTHING ─────
+     The consumer validates a DIFFERENT shape and was never reconciled with this
+     producer: it reads `generatedAtMs`/`expiresAtMs`, an instrument row with a
+     nested `cap{}`, and a coverage census of {activeInstruments, byStatus}. It
+     refuses on the FIRST of those, which is why the operator saw only
+     "generatedAtMs is not a finite number".
+
+     ⚠ THE MERGE IS SAFE BECAUSE THE TWO VOCABULARIES DO NOT COLLIDE, checked
+     key by key: the row shapes share only `venue` and `symbol`, which mean the
+     same thing and carry the same value; the two censuses share NO key at all.
+     So one array and one census can carry both, and every existing reader —
+     `service.ts`, `verifySnapshot` below, the admin page — keeps reading its
+     own names.
+
+     The bot tolerates unknown fields at every level (it reads named keys and
+     never enumerates), and its canonicalizer copies every own key except
+     `signatures`, so these ride INSIDE the signature rather than beside it. */
+  const bot = botWireFor({
+    v: SNAPSHOT_WIRE_VERSION,
+    kind: "market-caps",
+    generatedAt: input.now,
+    expiresAt: input.now + input.ttlMs,
+    sources: input.sources,
+    instruments,
+    assets,
+    coverage,
+    credits: input.credits,
+    keyId: input.keyId,
+  });
+
   return {
     ok: true,
     snapshot: {
@@ -374,10 +413,15 @@ export function buildSnapshot(input: BuildInput): BuildOutcome {
       kind: "market-caps",
       generatedAt: input.now,
       expiresAt: input.now + input.ttlMs,
+      // The bot's names for the same two instants. Same values, no second
+      // source of truth.
+      generatedAtMs: input.now,
+      expiresAtMs: input.now + input.ttlMs,
       sources: input.sources,
-      instruments,
+      // One row per instrument carrying BOTH vocabularies.
+      instruments: instruments.map((r, i) => ({ ...r, ...bot.instruments[i] })),
       assets,
-      coverage,
+      coverage: { ...coverage, ...bot.coverage },
       credits: input.credits,
       keyId: input.keyId,
     },
