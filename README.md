@@ -321,6 +321,12 @@ caps), about 47% of the plan. The arithmetic is `estimateMonthlyCredits()` in
 to the plan and a cadence change moves the reported number instead of leaving a
 stale claim in a comment.
 
+The provider states what each call actually cost (`status.credit_count`) and
+that figure **outranks our own estimate upward only** — a higher number is
+charged and reported, a lower one refunds nothing, because handing back budget
+on a figure we cannot audit is the direction that overspends. Same asymmetry the
+candle collector applies to Aster's `x-mbx-used-weight-1m`.
+
 **A refresh that would cross the ceiling does not start.** It is judged on the
 whole planned cost, not the next call, because a refresh that stops halfway
 publishes a snapshot with a third of the book missing. The refusal names the

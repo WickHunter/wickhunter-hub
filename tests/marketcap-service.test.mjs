@@ -57,6 +57,36 @@ const QUOTE_ROWS = {
   24478: { id: 24478, symbol: "PEPE", name: "Pepe", circulating_supply: 420_690_000_000_000, is_market_cap_included_in_calc: 1, quote: { USD: { price: 0.00001, market_cap: 4_206_900_000 } } },
 };
 
+/** The stub provider, extracted so a check can WRAP it rather than restate it —
+ *  a second copy of a fixture is a second thing to keep true. */
+async function baseHttp(w, url) {
+  w.calls.push(url);
+  if (w.cmcThrows) throw new Error(w.cmcThrows);
+  const u = new URL(url);
+  if (u.pathname === "/v5/exchange/derivatives/list") {
+    const start = Number(u.searchParams.get("start") ?? 1);
+    return json({ status: { error_code: 0 }, data: start === 1 ? [{ id: 521, slug: "bybit", name: "Bybit" }] : [] });
+  }
+  if (u.pathname === "/v5/exchange/derivatives/market-pairs/list/latest") {
+    const start = Number(u.searchParams.get("start") ?? 1);
+    const page = start === 1 ? w.pairs : [];
+    return json({ status: { error_code: 0 }, data: { num_market_pairs: w.pairs.length, market_pairs: page } });
+  }
+  if (u.pathname === "/v2/cryptocurrency/quotes/latest") {
+    const asked = (u.searchParams.get("id") ?? "").split(",").map(Number);
+    const data = {};
+    for (const id of asked) {
+      // skip_invalid: an id the provider does not answer for simply is not in
+      // the response. That silence is the case the invariant catches.
+      if (w.quoteIds.includes(id) && QUOTE_ROWS[id]) {
+        data[id] = { ...QUOTE_ROWS[id], quote: { USD: { ...QUOTE_ROWS[id].quote.USD, last_updated: iso(w.now - 20_000) } } };
+      }
+    }
+    return json({ status: { error_code: 0 }, data });
+  }
+  return json({ status: { error_code: 400, error_message: "unexpected path" } }, 400);
+}
+
 function makeService(w, over = {}, depsOver = {}) {
   const dir = tmpDir("marketcap");
   const cfg = {
@@ -81,33 +111,7 @@ function makeService(w, over = {}, depsOver = {}) {
     now: () => w.now,
     sleep: async () => {},
     log: () => {},
-    http: async (url) => {
-      w.calls.push(url);
-      if (w.cmcThrows) throw new Error(w.cmcThrows);
-      const u = new URL(url);
-      if (u.pathname === "/v5/exchange/derivatives/list") {
-        const start = Number(u.searchParams.get("start") ?? 1);
-        return json({ status: { error_code: 0 }, data: start === 1 ? [{ id: 521, slug: "bybit", name: "Bybit" }] : [] });
-      }
-      if (u.pathname === "/v5/exchange/derivatives/market-pairs/list/latest") {
-        const start = Number(u.searchParams.get("start") ?? 1);
-        const page = start === 1 ? w.pairs : [];
-        return json({ status: { error_code: 0 }, data: { num_market_pairs: w.pairs.length, market_pairs: page } });
-      }
-      if (u.pathname === "/v2/cryptocurrency/quotes/latest") {
-        const asked = (u.searchParams.get("id") ?? "").split(",").map(Number);
-        const data = {};
-        for (const id of asked) {
-          // skip_invalid: an id the provider does not answer for simply is not
-          // in the response. That silence is the case the invariant catches.
-          if (w.quoteIds.includes(id) && QUOTE_ROWS[id]) {
-            data[id] = { ...QUOTE_ROWS[id], quote: { USD: { ...QUOTE_ROWS[id].quote.USD, last_updated: iso(w.now - 20_000) } } };
-          }
-        }
-        return json({ status: { error_code: 0 }, data });
-      }
-      return json({ status: { error_code: 400, error_message: "unexpected path" } }, 400);
-    },
+    http: (url) => baseHttp(w, url),
     venueFetch: async (url) => {
       w.calls.push(url);
       if (w.venueThrows) throw new Error(w.venueThrows);
@@ -174,6 +178,37 @@ await test("credits are charged per call, persisted, and reported on the payload
   const ledger = JSON.parse(fs.readFileSync(cfg.ledgerFile, "utf8"));
   assert.equal(ledger.used, 3, "the ledger survives a restart, so a crash loop cannot spend the month twice");
   assert.equal(svc.snapshot().payload.credits.used, 3);
+});
+
+await test("the provider's OWN credit figure outranks our estimate — upward only", async () => {
+  const w = world();
+  // Every response says it cost 5 credits; our model priced each call at 1. A
+  // price list is the provider's to change, so the difference is charged.
+  const { svc } = makeService(w, {}, {
+    http: async (url) => {
+      const base = await baseHttp(w, url);
+      const body = await base.json();
+      return { ...base, json: async () => ({ ...body, status: { ...(body.status ?? {}), error_code: 0, credit_count: 5 } }) };
+    },
+  });
+  await svc.tick();
+  // 3 calls at an estimated 1 each, reconciled to 5 each.
+  assert.equal(svc.health().credits.used, 15);
+  assert.ok(svc.health().errors.some((e) => e.stage === "budget" && /billed 5 credits/.test(e.message)),
+    "and the operator is told, because a price list that moved changes what the month costs");
+
+  // A LOWER figure refunds nothing: handing back budget on a number we cannot
+  // audit is the direction that overspends.
+  const w2 = world();
+  const cheap = makeService(w2, {}, {
+    http: async (url) => {
+      const base = await baseHttp(w2, url);
+      const body = await base.json();
+      return { ...base, json: async () => ({ ...body, status: { ...(body.status ?? {}), error_code: 0, credit_count: 0 } }) };
+    },
+  });
+  await cheap.svc.tick();
+  assert.equal(cheap.svc.health().credits.used, 3, "our own estimate stands");
 });
 
 // ── 2. the omission ─────────────────────────────────────────────────────────

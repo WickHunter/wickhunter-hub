@@ -613,6 +613,15 @@ export class MarketCapService {
         this.ledger = charge(this.ledger, kind, credits, at);
         this.persistLedger();
       },
+      settle: (kind, estimated, actual) => {
+        // UPWARD ONLY. See the note on FetchDeps.settle: a lower figure would
+        // hand back budget on the strength of a number we cannot audit.
+        const extra = actual - estimated;
+        if (extra <= 0) return;
+        this.ledger = charge(this.ledger, kind, extra, this.now());
+        this.persistLedger();
+        this.noteError("budget", `the provider billed ${actual} credits for a ${kind} call we priced at ${estimated} — the difference has been charged`);
+      },
     };
   }
 

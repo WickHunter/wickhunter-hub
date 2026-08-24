@@ -60,7 +60,13 @@ export function isProviderRefusal(err: unknown): boolean {
   return err.providerCode !== undefined && err.providerCode >= 1008 && err.providerCode <= 1011;
 }
 
-async function cmcGet(http: HttpLike, apiKey: string, path: string, params: Record<string, string>): Promise<unknown> {
+async function cmcGet(
+  http: HttpLike,
+  apiKey: string,
+  path: string,
+  params: Record<string, string>,
+  billed?: { deps: FetchDeps; kind: BilledKind; estimated: number },
+): Promise<unknown> {
   const url = new URL(path, CMC_BASE);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await http(url.toString(), { headers: { [CMC_KEY_HEADER]: apiKey, accept: "application/json" } });
@@ -79,6 +85,10 @@ async function cmcGet(http: HttpLike, apiKey: string, path: string, params: Reco
       status.errorCode ?? undefined,
     );
   }
+  // Reconciled only on a SUCCESSFUL, parsed response: a call that failed was
+  // already charged at our estimate by `spend`, and a body we could not read
+  // has no credit figure to believe.
+  if (billed && status.creditCount !== null) billed.deps.settle?.(billed.kind, billed.estimated, status.creditCount);
   return body;
 }
 
@@ -187,12 +197,26 @@ export function parseQuotes(body: unknown): { quotes: Map<number, ProviderQuote>
   return { quotes, returnedIds };
 }
 
+export type BilledKind = "derivative-exchange-list" | "derivative-pair-map" | "quotes";
+
 export interface FetchDeps {
   http: HttpLike;
   apiKey: string;
   /** Called BEFORE each request with what it will cost, so the ledger is
    *  charged for a call that was made even if its response never parses. */
-  spend(kind: "derivative-exchange-list" | "derivative-pair-map" | "quotes", credits: number): Promise<void>;
+  spend(kind: BilledKind, credits: number): Promise<void>;
+  /** ── THE PROVIDER'S OWN READOUT, AND IT OUTRANKS OUR ESTIMATE UPWARD ──────
+   *
+   *  Every response carries `status.credit_count`: what THIS call actually
+   *  cost. Our own model (1 per list/map page, 1 per 100 ids) is an estimate of
+   *  the provider's price list, and a price list is the provider's to change —
+   *  so when its number is higher than ours the difference is charged, and when
+   *  it is lower NOTHING IS REFUNDED. That asymmetry is the same one the candle
+   *  collector applies to Aster's `x-mbx-used-weight-1m`: adopting a lower
+   *  figure hands back budget on the strength of a number we cannot audit,
+   *  which is exactly the direction that overspends. Optional, so a caller that
+   *  does not care simply never reconciles. */
+  settle?(kind: BilledKind, estimated: number, actual: number): void;
 }
 
 export const EXCHANGE_LIST_PAGE = 100;
@@ -211,7 +235,7 @@ export async function fetchDerivativeExchanges(deps: FetchDeps, maxPages = 20): 
     const body = await cmcGet(deps.http, deps.apiKey, "/v5/exchange/derivatives/list", {
       start: String(page * EXCHANGE_LIST_PAGE + 1),
       limit: String(EXCHANGE_LIST_PAGE),
-    });
+    }, { deps, kind: "derivative-exchange-list", estimated: 1 });
     const rows = parseDerivativeExchanges(body);
     out.push(...rows);
     if (rows.length < EXCHANGE_LIST_PAGE) break;
@@ -243,7 +267,7 @@ export async function fetchDerivativePairs(
       category,
       start: String(page * PAIR_PAGE_LIMIT + 1),
       limit: String(PAIR_PAGE_LIMIT),
-    });
+    }, { deps, kind: "derivative-pair-map", estimated: 1 });
     const r = parseMarketPairs(body, slug);
     pages++;
     if (expected === null) expected = r.numMarketPairs;
@@ -266,7 +290,7 @@ export async function fetchQuotes(deps: FetchDeps, ids: readonly number[]): Prom
     convert: "USD",
     skip_invalid: "true",
     aux: "is_market_cap_included_in_calc,circulating_supply",
-  });
+  }, { deps, kind: "quotes", estimated: 1 });
   return parseQuotes(body);
 }
 
