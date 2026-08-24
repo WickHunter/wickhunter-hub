@@ -123,9 +123,21 @@ export function snapshotSigningBytes(snapshot: SnapshotUnsigned | SnapshotSigned
   return canonicalBytes(rest);
 }
 
+/** ⚠ A SIGNING FUNCTION AND A PUBLIC KEY — NOT A PRIVATE `KeyObject`.
+ *
+ *  It held `key: KeyObject`, which meant the ONLY thing that could sign a
+ *  snapshot was a key this module had been handed the private half of. The
+ *  licence key cannot be supplied that way: `LicenseStore.sign()` returns a
+ *  signature and NEVER key material, by that module's own rule.
+ *
+ *  This is the shape the candle seed already uses — `server.ts` picks a
+ *  `(bytes) => Buffer` and `seed.ts` calls `deps.sign(...)` — so the two
+ *  signing surfaces in this repo now work the same way. */
 export interface SignerKey {
   keyId: string;
-  key: KeyObject;
+  /** Public half only, for `publicKeyRawB64u` and the admin panel. */
+  publicKey: KeyObject;
+  sign(bytes: Buffer): Buffer;
 }
 
 /** Load the signing key from its base64url form. Accepts either the 32 raw
@@ -145,7 +157,7 @@ export function loadSigningKey(b64u: string, keyId: string): SignerKey {
     // A bare Ed25519 seed, wrapped into the PKCS8 the crypto API wants. The
     // 16-byte prefix is the fixed ASN.1 header for an Ed25519 private key.
     const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), bytes]);
-    return { keyId: id, key: createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" }) };
+    return signerFromPrivateKey(id, createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" }));
   }
   try {
     const key = raw.includes("PRIVATE KEY")
@@ -154,7 +166,7 @@ export function loadSigningKey(b64u: string, keyId: string): SignerKey {
     if (key.asymmetricKeyType !== "ed25519") {
       throw new Error(`the market-data signing key is ${key.asymmetricKeyType}, not ed25519`);
     }
-    return { keyId: id, key };
+    return signerFromPrivateKey(id, key);
   } catch (err) {
     throw new Error(`MARKET_DATA_SIGNING_PRIVATE_KEY_B64U is not a usable Ed25519 private key: ${(err as Error).message}`);
   }
@@ -163,12 +175,29 @@ export function loadSigningKey(b64u: string, keyId: string): SignerKey {
 /** The 32 raw PUBLIC bytes, base64url — what a client pins. Public material
  *  only; this module never returns or prints the private half. */
 export function publicKeyRawB64u(signer: SignerKey): string {
-  const spki = createPublicKey(signer.key).export({ type: "spki", format: "der" });
+  const spki = signer.publicKey.export({ type: "spki", format: "der" });
   return Buffer.from(spki.subarray(spki.length - 32)).toString("base64url");
 }
 
+/** Wrap a private key we DO hold. */
+export function signerFromPrivateKey(keyId: string, key: KeyObject): SignerKey {
+  return { keyId, publicKey: createPublicKey(key), sign: (bytes) => edSign(null, bytes, key) };
+}
+
+/** Wrap a signer we do NOT hold the private half of — the licence key, whose
+ *  store hands out signatures and never key material. */
+export function signerFromSignFn(
+  keyId: string,
+  publicKey: KeyObject,
+  sign: (bytes: Buffer) => Buffer,
+): SignerKey {
+  const id = String(keyId ?? "").trim();
+  if (!id) throw new Error("a market-cap signer needs a keyId — a signature nobody can attribute is not a signature");
+  return { keyId: id, publicKey, sign };
+}
+
 export function signSnapshot(unsigned: SnapshotUnsigned, signer: SignerKey): SnapshotSigned {
-  const sig = edSign(null, snapshotSigningBytes(unsigned), signer.key);
+  const sig = signer.sign(snapshotSigningBytes(unsigned));
   return { ...unsigned, signatures: [{ keyId: signer.keyId, alg: SNAPSHOT_ALG, sig: sig.toString("base64url") }] };
 }
 

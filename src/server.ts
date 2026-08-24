@@ -40,7 +40,7 @@
 // pathname only. The nginx snippet the installer emits does not add an access
 // log for /hub/ either; if the operator turns one on, that is on them.
 import fs from "node:fs";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual, createPublicKey } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
@@ -49,7 +49,7 @@ import { CandleService, type CandleServiceDeps } from "./candles/service.js";
 import { MarketCapService } from "./marketcap/service.js";
 import { marketCapStartupRefusals } from "./marketcap/config.js";
 import { CoinGeckoFallback } from "./marketcap/coingecko.js";
-import { loadSigningKey } from "./marketcap/snapshot.js";
+import { loadSigningKey, signerFromSignFn } from "./marketcap/snapshot.js";
 import type { HttpLike } from "./marketcap/cmc.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
@@ -168,7 +168,26 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return null;
     }
     try {
-      const signer = loadSigningKey(mc.signingKeyB64u, mc.signingKeyId);
+      /* ⚠ THE LICENCE KEY IS THE DEFAULT, AND IT IS THE ONLY ONE ANY SHIPPED
+         BOT CAN VERIFY. `asset-market-cap.ts` pins `mcap-1` -> the licence
+         public key and REFUSES an unknown keyId. The first operator to enable
+         this published `market-data-1`, every bot refused every snapshot, and
+         the page read "no snapshot has been read from the hub yet" — a live
+         feature indistinguishable from one nobody switched on. This is the
+         same two-line choice the candle seed makes ~30 lines above. */
+      /* ⚠ THE TEST FOR THE LICENCE BRANCH IS `=== "license"`, NEVER
+         `!== "market-data"`, AND THE HUB'S OWN SUITE CAUGHT THE DIFFERENCE.
+         `MarketCapEnvConfig` is built BY HAND in tests and tools as well as by
+         `configFromEnv` — config.ts says so in its own words — so an absent
+         `signer` is a real shape. Read as "not market-data" it took the LICENCE
+         key while still carrying a dedicated private key and labelling the
+         payload `market-data-1`: signed by one key, labelled another,
+         verifiable by nobody. `configFromEnv` always sets it explicitly, so
+         only a hand-built config reaches the fallback, and the honest fallback
+         is the key it actually supplied. */
+      const signer = mc.signer === "license"
+        ? signerFromSignFn(mc.signingKeyId, createPublicKey(store.publicKeyPem()), (bytes) => store.sign(bytes))
+        : loadSigningKey(mc.signingKeyB64u, mc.signingKeyId);
       return new MarketCapService(mc, {
         http: deps.marketCapHttp ?? realCmcHttp,
         apiKey: mc.apiKey,

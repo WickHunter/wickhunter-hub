@@ -305,3 +305,51 @@ await test("the signing key's PUBLIC half is readable from the admin surface", a
 });
 
 summary("marketcap-http");
+
+// ── THE keyId CONTRACT WITH THE BOT ────────────────────────────────────────
+// A live operator enabled the producer, it published keyId "market-data-1",
+// and EVERY BOT REFUSED EVERY SNAPSHOT: `asset-market-cap.ts` pins exactly one
+// entry — "mcap-1" -> the LICENCE public key — and refuses an unknown keyId
+// rather than verifying it against a default. The market-cap page then read
+// "no snapshot has been read from the hub yet", which is a live feature
+// indistinguishable from one nobody switched on.
+test("the default signer is the licence key, labelled mcap-1", async () => {
+  const { marketCapSigningFromEnv, LICENSE_MARKET_CAP_KEY_ID, MARKET_DATA_KEY_ID } =
+    await import("../dist/src/marketcap/config.js");
+
+  // The SHIPPED default — no variable set at all.
+  const dflt = marketCapSigningFromEnv({});
+  assert.deepStrictEqual(dflt, { signer: "license", keyId: LICENSE_MARKET_CAP_KEY_ID },
+    "the default must be the only keyId a shipped bot can verify");
+  assert.strictEqual(LICENSE_MARKET_CAP_KEY_ID, "mcap-1",
+    "this string is pinned in the bot's MARKET_CAP_KEYS — changing it strands every install");
+
+  // Opting in to the dedicated key gives the other id.
+  assert.deepStrictEqual(
+    marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "market-data" }),
+    { signer: "market-data", keyId: MARKET_DATA_KEY_ID });
+
+  // ⚠ A keyId RESERVED FOR THE OTHER SIGNER IS REFUSED AT STARTUP, not served.
+  // A payload signed by one key and labelled another verifies nowhere, and the
+  // symptom lands in someone else's process with no hint of the cause.
+  assert.throws(() => marketCapSigningFromEnv({ MARKET_DATA_SIGNING_KEY_ID: "market-data-1" }),
+    /reserved for MARKET_CAP_SIGNER=market-data/);
+  assert.throws(() => marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "market-data", MARKET_DATA_SIGNING_KEY_ID: "mcap-1" }),
+    /reserved for MARKET_CAP_SIGNER=license/);
+  assert.throws(() => marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "nonsense" }), /MARKET_CAP_SIGNER must be one of/);
+
+  // An unreserved id is the operator's to choose, under either signer.
+  assert.strictEqual(marketCapSigningFromEnv({ MARKET_DATA_SIGNING_KEY_ID: "mcap-2" }).keyId, "mcap-2");
+});
+
+test("the licence signer needs no private key in the environment", async () => {
+  const { marketCapStartupRefusals } = await import("../dist/src/marketcap/config.js");
+  const base = { venues: ["bybit"], apiKey: "k", signingKeyId: "mcap-1", signingKeyB64u: "", monthlyCeiling: 10000 };
+  // Under the default signer the hub signs with the key it already has, so
+  // demanding MARKET_DATA_SIGNING_PRIVATE_KEY_B64U would refuse to start over a
+  // variable nobody needs to set.
+  assert.deepStrictEqual(marketCapStartupRefusals({ ...base, signer: "license" }), []);
+  // The dedicated signer still requires one, and says so by name.
+  const refused = marketCapStartupRefusals({ ...base, signer: "market-data" });
+  assert.ok(refused.some((r) => /MARKET_DATA_SIGNING_PRIVATE_KEY_B64U/.test(r)), refused.join(" | "));
+});
