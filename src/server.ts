@@ -9,6 +9,7 @@
 //   keyed    GET  /api/latest?key=<token>        release metadata (version/file/sha256)
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
+//   keyed    GET  /api/market-data/market-caps/v1 signed market-cap snapshot (contract v1)
 //   keyed    GET  /api/hub/strategies            community Strat gallery
 //   keyed    POST /api/hub/strategies/publish    share 1..N bots as one Strat
 //   keyed    POST /api/hub/strategies/vote       one vote per LICENCE
@@ -18,6 +19,7 @@
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
 //   admin    POST /admin/api/licenses/expiry     {id, exp} -> re-minted command
 //   admin    POST /admin/api/licenses/revoke     {id}
+//   admin    GET  /admin/api/market-caps       producer health + credit spend
 //   admin    GET  /admin/api/flags                per-licence feature flags
 //   admin    POST /admin/api/flags                {id|"default", flag, state:true|false|null}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
@@ -44,6 +46,11 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { CandleService, type CandleServiceDeps } from "./candles/service.js";
+import { MarketCapService } from "./marketcap/service.js";
+import { marketCapStartupRefusals } from "./marketcap/config.js";
+import { CoinGeckoFallback } from "./marketcap/coingecko.js";
+import { loadSigningKey } from "./marketcap/snapshot.js";
+import type { HttpLike } from "./marketcap/cmc.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
@@ -58,6 +65,21 @@ import { LicenseStore, type LicensePayload } from "./license.js";
 import { HUB_VERSION } from "./version.js";
 import { spawn as nodeSpawn } from "node:child_process";
 
+/** The provider fetcher for the market-cap producer. A separate shape from the
+ *  candles' `FetchLike` because this one carries an API-key HEADER — which is
+ *  where a paid credential belongs, never in a query string that reaches a log. */
+const realCmcHttp: HttpLike = async (url, init) => {
+  const res = await fetch(url, { headers: init.headers });
+  return { ok: res.ok, status: res.status, json: () => res.json(), headers: res.headers };
+};
+
+/** The venues' own public endpoints, for the instrument catalogues. Same shape
+ *  the candle service uses; no key, no header. */
+const realVenueFetch: NonNullable<CandleServiceDeps["fetchLike"]> = async (url: string) => {
+  const res = await fetch(url, { headers: { accept: "application/json" } });
+  return { ok: res.ok, status: res.status, json: () => res.json(), headers: res.headers };
+};
+
 const MAX_BODY_BYTES = 64 * 1024; // largest legitimate body is a tiny JSON object
 // Feedback carries a bounded log tail (see feedback.ts caps) — its own limit:
 const MAX_FEEDBACK_BODY_BYTES = 256 * 1024;
@@ -66,6 +88,10 @@ export interface Hub {
   server: http.Server;
   store: LicenseStore;
   candles: CandleService;
+  /** Null when the producer is not configured (no venues, or no CMC key) —
+   *  which is every install by default, because every call it makes spends a
+   *  credit against a plan the operator pays for. */
+  marketCaps: MarketCapService | null;
   /** The dedicated candle-signing key. Exposed so main.ts can print its PUBLIC
    *  half at startup; it never yields private material to anyone. */
   candleKey: CandleKeyStore;
@@ -87,6 +113,12 @@ export interface HubDeps {
   candleFetch?: CandleServiceDeps["fetchLike"];
   /** Injectable so candle tests do not wait out the collector's request pacing. */
   candleSleep?: CandleServiceDeps["sleep"];
+  /** Injectable so market-cap tests never reach a paid provider. */
+  marketCapHttp?: HttpLike;
+  /** The venues' own public endpoints, for the instrument catalogues. */
+  marketCapVenueFetch?: CandleServiceDeps["fetchLike"];
+  marketCapSleep?: (ms: number) => Promise<void>;
+  marketCapNow?: () => number;
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -121,6 +153,41 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     },
     { sign: signSeed, fetchLike: deps.candleFetch, sleep: deps.candleSleep },
   );
+  // ── THE MARKET-CAP PRODUCER ───────────────────────────────────────────────
+  // Built only when it is configured AND usable. A refusal is PRINTED and the
+  // service stays null: the hub also does licensing and candle seeding, and a
+  // missing provider key must not take those down — but it must not be silent
+  // either, because "configured and unable" looks exactly like "the provider is
+  // down" from every client's side.
+  const marketCaps = ((): MarketCapService | null => {
+    const mc = cfg.marketCap;
+    if (!mc || !mc.venues.length) return null;
+    const refusals = marketCapStartupRefusals(mc);
+    if (refusals.length) {
+      for (const r of refusals) console.warn(`[marketcap] not starting: ${r}`);
+      return null;
+    }
+    try {
+      const signer = loadSigningKey(mc.signingKeyB64u, mc.signingKeyId);
+      return new MarketCapService(mc, {
+        http: deps.marketCapHttp ?? realCmcHttp,
+        apiKey: mc.apiKey,
+        venueFetch: deps.marketCapVenueFetch ?? realVenueFetch,
+        signer,
+        gecko: mc.coingeckoApiKey
+          ? new CoinGeckoFallback({ http: deps.marketCapHttp ?? realCmcHttp, apiKey: mc.coingeckoApiKey, idMap: {} })
+          : new CoinGeckoFallback(null),
+        now: deps.marketCapNow,
+        sleep: deps.marketCapSleep,
+      });
+    } catch (err) {
+      // A bad signing key is a startup refusal, not a publish-time surprise
+      // four hours later on a timer.
+      console.warn(`[marketcap] not starting: ${(err as Error).message}`);
+      return null;
+    }
+  })();
+
   let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
 
   const server = http.createServer((req, res) => {
@@ -148,6 +215,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
     if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
+    if (m === "GET" && p === "/api/market-data/market-caps/v1") return marketCapSnapshot(req, url, res);
     // ── the community Strat gallery ────────────────────────────────────────
     // These paths are the BOT's existing ones, deliberately: a liqhunter
     // install can also host a gallery (LIQHUNTER_HUB_KEY with no URL), and
@@ -474,6 +542,56 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     res.end(bytes);
   }
 
+  // ── the signed market-cap snapshot ────────────────────────────────────────
+  //
+  // AUTH IS THE SAME PATTERN THE REST OF THE HUB ALREADY USES, through the same
+  // one function: `x-license` (what a bot sends — a header keeps the token out
+  // of an access log) or `?key=`. `x-hub-key` is additionally accepted when the
+  // operator has configured one, for a hub-hosted console that holds no licence
+  // of its own; it is compared CONSTANT-TIME, like the admin token, and an
+  // unconfigured hub key can never match (an empty configured secret would
+  // otherwise make an empty header a valid credential).
+  function marketCapAuthorised(req: IncomingMessage, url: URL): boolean {
+    const configured = cfg.marketCap?.hubKey ?? "";
+    const offered = String(req.headers["x-hub-key"] ?? "");
+    if (configured && offered && sameSecret(offered, configured)) return true;
+    return store.verify(licenseTokenOf(req, url)).ok;
+  }
+
+  async function marketCapSnapshot(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    if (!marketCaps) {
+      return sendJson(res, 503, { ok: false, error: "the market-cap producer is not configured on this hub" });
+    }
+    if (!marketCapAuthorised(req, url)) {
+      return sendJson(res, 403, { ok: false, error: "a valid license is required for the market-cap snapshot" });
+    }
+    const current = marketCaps.snapshot();
+    // NEVER A 200 WITH AN EMPTY PAYLOAD, for the reason the candle seed never
+    // answers 200 with empty rows: "I have nothing yet" and "there is nothing"
+    // would become the same answer, and a consumer cannot tell a cold producer
+    // from a universe with no pairs in it.
+    if (!current) {
+      return sendJson(res, 503, { ok: false, error: "no market-cap snapshot has been produced yet" });
+    }
+    const inm = String(req.headers["if-none-match"] ?? "");
+    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+      return void res.end();
+    }
+    const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+    const bytes = wantsGzip ? gzipSync(current.body) : current.body;
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": bytes.length,
+      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+      etag: current.etag,
+      // Caps refresh hourly and the payload carries its own `expiresAt`; a
+      // minute of caching costs nothing and takes the repeat-poll load off.
+      "cache-control": "public, max-age=60",
+    });
+    res.end(bytes);
+  }
+
   // ── admin surface ─────────────────────────────────────────────────────────
 
   function adminPage(res: ServerResponse): void {
@@ -486,11 +604,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   function adminAuthorized(req: IncomingMessage): boolean {
     if (!cfg.adminToken) return false;
-    // Hash both sides so timingSafeEqual gets equal lengths and the compare
-    // leaks nothing about the token's length or bytes.
-    const given = createHash("sha256").update(String(req.headers["x-hub-admin"] ?? "")).digest();
-    const want = createHash("sha256").update(cfg.adminToken).digest();
-    return timingSafeEqual(given, want);
+    return sameSecret(String(req.headers["x-hub-admin"] ?? ""), cfg.adminToken);
   }
 
   async function adminApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -711,6 +825,26 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const file = setFlag(cfg.dataDir, body.id.slice(0, 64), body.flag, body.state);
       return sendJson(res, 200, { ok: true, flags: file });
     }
+    // ── market-cap producer health ──────────────────────────────────────────
+    // CREDIT CONSUMPTION IS EXPOSED, because a budget nobody can see is a
+    // budget nobody manages. Admin-gated: it names the venues, the slugs, the
+    // spend and the refusals. It carries NO key material and no snapshot rows
+    // — the snapshot itself has its own licensed route.
+    if (m === "GET" && p === "/admin/api/market-caps") {
+      if (!marketCaps) {
+        // configured:false, never a row of zeroes — zeroes read as a working
+        // producer that has found nothing, which is the opposite diagnosis.
+        return sendJson(res, 200, {
+          ok: true,
+          configured: false,
+          venues: cfg.marketCap?.venues ?? [],
+          // Named so the panel can say WHICH piece is missing rather than
+          // "not configured", which sends the operator to read source.
+          refusals: cfg.marketCap ? marketCapStartupRefusals(cfg.marketCap) : [],
+        });
+      }
+      return sendJson(res, 200, { ok: true, configured: true, health: marketCaps.health() });
+    }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.id !== "string" || !body.id) {
@@ -726,6 +860,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     server,
     store,
     candles,
+    marketCaps,
     candleKey,
     listen: () =>
       new Promise<number>((resolve, reject) => {
@@ -735,12 +870,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           // Collectors start only once the hub is actually serving, so a hub
           // that cannot bind never begins hammering three exchanges.
           candles.start();
+          // Same rule as the collectors: the producer starts only once the hub
+          // is actually serving, so a hub that cannot bind never spends a
+          // credit.
+          marketCaps?.start();
           resolve((server.address() as AddressInfo).port);
         });
       }),
     close: () =>
       new Promise<void>((resolve, reject) => {
         candles.stop();
+        marketCaps?.stop();
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),
@@ -760,6 +900,19 @@ function clientIp(req: IncomingMessage): string {
   const fwd = req.headers["x-forwarded-for"];
   const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
   return first || req.socket.remoteAddress || "unknown";
+}
+
+/** Constant-time secret comparison. ONE implementation, because there are now
+ *  two shared secrets on this server (the admin token and the market-data hub
+ *  key) and a second copy is where the next one gets a `===`.
+ *
+ *  Hashing both sides first is what lets `timingSafeEqual` see equal lengths,
+ *  so the compare leaks nothing about the secret's length or its bytes. */
+function sameSecret(given: string, want: string): boolean {
+  if (!want) return false; // an unconfigured secret can never be matched
+  const a = createHash("sha256").update(given).digest();
+  const b = createHash("sha256").update(want).digest();
+  return timingSafeEqual(a, b);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
