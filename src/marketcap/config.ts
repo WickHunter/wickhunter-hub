@@ -10,7 +10,7 @@
 // is `MARKET_CAP_VENUES=` and there is no default value that turns it on.
 import path from "node:path";
 import { isVenueId, type VenueId } from "../candles/venues.js";
-import { DEFAULT_EXCHANGE_SLUGS, DAY_MS, HOUR_MS, type MarketCapConfig } from "./service.js";
+import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS, DAY_MS, HOUR_MS, type MarketCapConfig } from "./service.js";
 import { QUOTE_BATCH_SIZE } from "./budget.js";
 import { LEDGER_FILE_DEFAULT, OVERRIDES_FILE_DEFAULT, SNAPSHOT_FILE_DEFAULT } from "./store.js";
 
@@ -55,9 +55,19 @@ export function marketCapConfigFromEnv(env: NodeJS.ProcessEnv, dataDir: string):
     if (v && slug && isVenueId(v)) slugs[v] = slug;
   }
 
+  // `MARKET_CAP_EXCHANGE_IDS=aster:1452,bybit:521` — the same escape hatch the
+  // slugs have, for the day the provider re-keys an exchange. Both are checked
+  // against each other at run time; see DEFAULT_EXCHANGE_IDS.
+  const exchangeIds: Partial<Record<VenueId, number>> = { ...DEFAULT_EXCHANGE_IDS };
+  for (const pair of (env.MARKET_CAP_EXCHANGE_IDS ?? "").split(",")) {
+    const [v, id] = pair.split(":").map((x) => x.trim());
+    if (v && id && isVenueId(v) && Number.isInteger(Number(id)) && Number(id) > 0) exchangeIds[v] = Number(id);
+  }
+
   return {
     venues,
     slugs,
+    exchangeIds,
     apiKey: (env.CMC_PRO_API_KEY ?? "").trim(),
     coingeckoApiKey: (env.COINGECKO_PRO_API_KEY ?? "").trim(),
     signingKeyB64u: (env.MARKET_DATA_SIGNING_PRIVATE_KEY_B64U ?? "").trim(),

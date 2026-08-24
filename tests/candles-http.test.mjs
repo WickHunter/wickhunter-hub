@@ -1007,8 +1007,14 @@ await test("the admin page carries the per-exchange panel and refreshes it with 
   for (const field of ["seedable", "backfilling", "gapped", "Oldest candle", "Newest candle", "Missing minutes", "Worst gaps", "New in 24h"]) {
     assert.ok(page.includes(field), `panel states ${field}`);
   }
-  assert.match(page, /document\.getElementById\("refresh"\)\.onclick = \(\) => \{ refresh\(\); cdRefresh\(\); fbRefresh\(\); \}/,
-    "the page's Refresh button refreshes the venue cards too");
+  // ANCHORED ON THE CLAIM, NOT ON THE WHOLE LINE. This used to pin the
+  // handler's exact contents, so ADDING a panel to the page broke a check about
+  // the candle panel — the over-anchored source scan this repo keeps relearning.
+  // What matters is that the button refreshes the venue cards; which OTHER
+  // panels it also refreshes is not this test's business.
+  const onclick = /document\.getElementById\("refresh"\)\.onclick = \(\) => \{([^}]*)\}/.exec(page);
+  assert.ok(onclick, "the page has a Refresh button handler");
+  assert.match(onclick[1], /\bcdRefresh\(\)/, "the page's Refresh button refreshes the venue cards too");
 });
 
 await h.close();

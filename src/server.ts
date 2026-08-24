@@ -832,7 +832,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // — the snapshot itself has its own licensed route.
     if (m === "GET" && p === "/admin/api/market-caps") {
       if (!marketCaps) {
-        return sendJson(res, 200, { ok: true, configured: false, venues: cfg.marketCap?.venues ?? [] });
+        // configured:false, never a row of zeroes — zeroes read as a working
+        // producer that has found nothing, which is the opposite diagnosis.
+        return sendJson(res, 200, {
+          ok: true,
+          configured: false,
+          venues: cfg.marketCap?.venues ?? [],
+          // Named so the panel can say WHICH piece is missing rather than
+          // "not configured", which sends the operator to read source.
+          refusals: cfg.marketCap ? marketCapStartupRefusals(cfg.marketCap) : [],
+        });
       }
       return sendJson(res, 200, { ok: true, configured: true, health: marketCaps.health() });
     }

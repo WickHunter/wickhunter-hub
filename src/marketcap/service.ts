@@ -31,11 +31,14 @@ import {
   planRefresh, QUOTE_BATCH_SIZE, rolled, type CallKind, type CreditLedger,
 } from "./budget.js";
 import { acceptCmcQuote, capCensus, missingForOmittedId, omittedIds, type CapFact } from "./caps.js";
-import { batchIds, fetchDerivativeExchanges, fetchDerivativePairs, fetchQuotes, isProviderRefusal, type FetchDeps, type HttpLike } from "./cmc.js";
+import {
+  batchIds, fetchDerivativeExchanges, fetchDerivativePairs, fetchQuotes, isProviderRefusal,
+  type DerivativeExchange, type FetchDeps, type HttpLike,
+} from "./cmc.js";
 import { CoinGeckoFallback } from "./coingecko.js";
 import { catalogueSanity, fetchInstruments } from "./exchanges.js";
 import { buildPairIndex, resolveUniverse, type ExchangeInstrument, type ProviderPair } from "./identity.js";
-import { buildSnapshot, signSnapshot, type SignerKey, type SnapshotSigned } from "./snapshot.js";
+import { buildSnapshot, publicKeyRawB64u, signSnapshot, type SignerKey, type SnapshotSigned } from "./snapshot.js";
 import { MarketCapStore } from "./store.js";
 import { createHash } from "node:crypto";
 
@@ -48,6 +51,26 @@ export const DEFAULT_EXCHANGE_SLUGS: Record<VenueId, string> = {
   aster: "aster-pro",
   bitget: "bitget",
   bitunix: "bitunix",
+};
+
+/** ── THE DURABLE KEY IS THE ID, NOT THE SLUG (verified live 2026-08-24) ──────
+ *
+ *  Confirmed against the provider's own derivative exchange list, with the
+ *  pair counts it published that day: bybit 521 (743 pairs), bitget 513 (698),
+ *  bitunix 7302 (671), aster-pro 1452 (572). See `CMC_ENDPOINT_CLAIM`.
+ *
+ *  Why the id is checked and not merely the slug: a slug is a LABEL the
+ *  provider owns. A slug that disappears is loud — every pair on that venue
+ *  reads `provider_untracked` and the refusal says so. A slug that is REUSED
+ *  for a different exchange is silent: the map still resolves, the census still
+ *  balances, and one venue's book quietly takes another venue's identities. The
+ *  id is what tells those apart, so it is compared and a mismatch is refused by
+ *  name. */
+export const DEFAULT_EXCHANGE_IDS: Record<VenueId, number> = {
+  bybit: 521,
+  bitget: 513,
+  bitunix: 7302,
+  aster: 1452,
 };
 
 export const DAY_MS = 24 * 3_600_000;
@@ -65,6 +88,11 @@ export interface MarketCapConfig {
    *  operator action and never something an upgrade starts doing. */
   venues: VenueId[];
   slugs: Record<VenueId, string>;
+  /** The provider's numeric exchange id per venue — the DURABLE key the slug is
+   *  validated against. OPTIONAL because `MarketCapConfig` is built by hand in
+   *  tests and tools as well as from env (the v0.2.17 lesson, one file along);
+   *  absent falls back to `DEFAULT_EXCHANGE_IDS`. */
+  exchangeIds?: Partial<Record<VenueId, number>>;
   monthlyCeiling: number;
   requestsPerMinute: number;
   mappingIntervalMs: number;
@@ -99,7 +127,23 @@ export interface FeedHealthEvent {
 export interface MarketCapHealth {
   enabled: boolean;
   venues: VenueId[];
-  slugs: Record<string, { slug: string; validated: boolean; pairs: number }>;
+  slugs: Record<string, {
+    slug: string;
+    /** What the provider's list says this slug's exchange id is, or null when
+     *  the list has not been read (or does not carry the slug). */
+    exchangeId: number | null;
+    /** What we expect it to be. A disagreement means the slug now names a
+     *  DIFFERENT exchange, which is the silent failure the id check exists for. */
+    expectedId: number;
+    validated: boolean;
+    /** Pair rows WE hold for this venue. */
+    pairs: number;
+    /** The provider's own `num_market_pairs` for it, for a magnitude check. */
+    providerPairs: number | null;
+  }>;
+  /** The snapshot signing key's PUBLIC half (base64url) and its keyId — what a
+   *  client pins. Public material only. */
+  signing: { keyId: string; publicKey: string | null };
   lastMappingAt: number | null;
   lastCapsAt: number | null;
   lastPublishAt: number | null;
@@ -136,6 +180,7 @@ export class MarketCapService {
   private pairs = new Map<VenueId, ProviderPair[]>();
   private pairPages = new Map<VenueId, number>();
   private validatedSlugs = new Set<string>();
+  private observedExchanges = new Map<string, DerivativeExchange>();
   private capFacts = new Map<number, CapFact>();
   private lastRequestedIds: number[] = [];
   private capOmissions: number[] = [];
@@ -197,12 +242,21 @@ export class MarketCapService {
     const slugs: MarketCapHealth["slugs"] = {};
     for (const v of this.cfg.venues) {
       const slug = this.cfg.slugs[v];
-      slugs[v] = { slug, validated: this.validatedSlugs.has(slug), pairs: this.pairs.get(v)?.length ?? 0 };
+      const seen = this.observedExchanges.get(slug) ?? null;
+      slugs[v] = {
+        slug,
+        exchangeId: seen?.id ?? null,
+        expectedId: this.expectedId(v),
+        validated: this.validatedSlugs.has(slug),
+        pairs: this.pairs.get(v)?.length ?? 0,
+        providerPairs: seen?.pairs ?? null,
+      };
     }
     return {
       enabled: this.enabled,
       venues: [...this.cfg.venues],
       slugs,
+      signing: { keyId: this.deps.signer.keyId, publicKey: this.publicKey() },
       lastMappingAt: this.lastMappingAt,
       lastCapsAt: this.lastCapsAt,
       lastPublishAt: this.lastPublishAt,
@@ -287,10 +341,24 @@ export class MarketCapService {
         const list = await fetchDerivativeExchanges(this.fetchDeps());
         if (list.length) {
           this.validatedSlugs = new Set(list.map((e) => e.slug));
+          this.observedExchanges = new Map(list.map((e) => [e.slug, e]));
           this.lastExchangeListAt = now;
           for (const v of venues) {
-            if (!this.validatedSlugs.has(this.cfg.slugs[v])) {
-              this.noteError("mapping", `the provider's derivative exchange list does not contain slug "${this.cfg.slugs[v]}" for ${v} — every ${v} pair will read provider_untracked until this is corrected`);
+            const slug = this.cfg.slugs[v];
+            const seen = this.observedExchanges.get(slug);
+            if (!seen) {
+              this.noteError("mapping", `the provider's derivative exchange list does not contain slug "${slug}" for ${v} — every ${v} pair will read provider_untracked until this is corrected`);
+              continue;
+            }
+            // ── THE QUIET ONE ──────────────────────────────────────────────
+            // A slug that vanished is loud. A slug REUSED for a different
+            // exchange resolves perfectly, balances every census, and hands one
+            // venue's book another venue's identities. Only the id says so.
+            const expected = this.expectedId(v);
+            if (expected && seen.id !== expected) {
+              this.noteError("mapping", `slug "${slug}" now names exchange id ${seen.id} ("${seen.name}"), not the ${expected} this hub serves as ${v} — `
+                + "refusing to treat it as that venue until MARKET_CAP_SLUGS or the expected id is corrected");
+              this.validatedSlugs.delete(slug);
             }
           }
         }
@@ -333,6 +401,17 @@ export class MarketCapService {
    *  full re-map. */
   private async refreshPairsFor(venue: VenueId): Promise<boolean> {
     const slug = this.cfg.slugs[venue];
+    // A slug we have SEEN and found to name the wrong exchange is not asked
+    // again: its rows would be another venue's book. A slug we have never
+    // managed to validate (the list call failed, or has not run yet) IS asked —
+    // refusing there would make one unreachable directory endpoint stop all
+    // mapping, which is the fail-closed direction on the wrong door.
+    const seen = this.observedExchanges.get(slug);
+    const expected = this.expectedId(venue);
+    if (seen && expected && seen.id !== expected) {
+      this.noteError("mapping", `${venue}: not reading pairs for slug "${slug}" — it names exchange id ${seen.id}, not ${expected}`);
+      return false;
+    }
     try {
       const r = await fetchDerivativePairs(this.fetchDeps(), slug);
       if (!r.pairs.length) {
@@ -581,6 +660,22 @@ export class MarketCapService {
       }
     }
     return changed;
+  }
+
+  /** The provider exchange id this hub serves as `venue`. */
+  private expectedId(venue: VenueId): number {
+    return this.cfg.exchangeIds?.[venue] ?? DEFAULT_EXCHANGE_IDS[venue];
+  }
+
+  /** The snapshot signing key's PUBLIC half, base64url — what a client pins.
+   *  Public material only; the private half is never returned, printed or
+   *  written to disk by this service. */
+  publicKey(): string | null {
+    try {
+      return publicKeyRawB64u(this.deps.signer);
+    } catch {
+      return null;
+    }
   }
 
   private isMapped(venue: VenueId, symbol: string): boolean {

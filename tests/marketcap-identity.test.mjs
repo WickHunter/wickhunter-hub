@@ -21,6 +21,8 @@ import {
   catalogueSanity, parseAsterInstruments, parseBitgetInstruments, parseBitunixInstruments,
   parseBybitInstruments,
 } from "../dist/src/marketcap/exchanges.js";
+import { CMC_ENDPOINT_CLAIM, parseDerivativeExchanges, parseMarketPairs } from "../dist/src/marketcap/cmc.js";
+import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS } from "../dist/src/marketcap/service.js";
 
 const inst = (over = {}) => ({
   venue: "bybit",
@@ -257,6 +259,60 @@ await test("a catalogue that collapses, or changes identity, is REFUSED", () => 
   const swapped = catalogueSanity(before, mk(["VUSDT", "WUSDT", "XUSDT", "YUSDT", "ZUSDT"]));
   assert.equal(swapped.ok, false);
   assert.match(swapped.reason, /overlap/);
+});
+
+// ── 6. the provider's wire, as verified live on 2026-08-24 ──────────────────
+
+await test("the exchange list parses the shape the provider ACTUALLY sends", () => {
+  // `data` is an OBJECT carrying `exchanges`, and rows are keyed `exchange_id`
+  // / `exchange_name` / `exchange_slug`. This is the arm that fires; the
+  // bare-array arm below is the tolerance, not the observation.
+  const live = parseDerivativeExchanges({
+    status: { error_code: 0, credit_count: 1 },
+    data: { exchanges: [
+      { exchange_id: 521, exchange_slug: "bybit", exchange_name: "Bybit", num_market_pairs: 743, rank: 1 },
+      { exchange_id: 1452, exchange_slug: "aster-pro", exchange_name: "Aster", num_market_pairs: 572 },
+      { exchange_slug: "no-id" },
+    ] },
+  });
+  assert.deepEqual(live.map((e) => [e.id, e.slug, e.pairs]), [[521, "bybit", 743], [1452, "aster-pro", 572]]);
+  assert.equal(parseDerivativeExchanges({ data: [{ id: 513, slug: "bitget" }] })[0].id, 513, "the tolerant arm still reads a bare array");
+
+  // The four slugs and their ids, from the live directory. Kept in the code as
+  // an evidence record rather than as a bare constant, so the next reader can
+  // see what was seen and when.
+  assert.equal(CMC_ENDPOINT_CLAIM.verifiedOn, "2026-08-24");
+  assert.equal(CMC_ENDPOINT_CLAIM.derivativeExchangeList.totalCountPublished, false,
+    "no total_count — which is why the paging loop stops on a short page AND on a page that adds nothing");
+  for (const e of CMC_ENDPOINT_CLAIM.exchanges) {
+    assert.equal(DEFAULT_EXCHANGE_IDS[e.venue], e.exchangeId, `${e.venue} id`);
+    assert.equal(DEFAULT_EXCHANGE_SLUGS[e.venue], e.slug, `${e.venue} slug`);
+  }
+});
+
+await test("a NULL market_pair label does not cost us the mapping", () => {
+  // Observed live: `market_pair` came back null on the aster-pro response. The
+  // join is base/quote `exchange_symbol`, which is populated — so a parser that
+  // had reached for the label would have mapped nothing at all.
+  const { pairs, numMarketPairs } = parseMarketPairs({
+    data: {
+      num_market_pairs: 572,
+      market_pairs: [
+        { market_pair: null, market_pair_base: { exchange_symbol: "BTC", crypto_id: 1, currency_symbol: "BTC", currency_name: "Bitcoin" }, market_pair_quote: { exchange_symbol: "USDT" } },
+        { market_pair: null, market_pair_base: { exchange_symbol: "SOL", crypto_id: 5426, currency_symbol: "SOL", currency_name: "Solana" }, market_pair_quote: { exchange_symbol: "USDT" } },
+        { market_pair: null, market_pair_base: { exchange_symbol: "GHOST" }, market_pair_quote: { exchange_symbol: "USDT" } },
+      ],
+    },
+  }, "aster-pro");
+  assert.equal(numMarketPairs, 572);
+  assert.equal(pairs.length, 2, "a row with no crypto_id is dropped — an id of 0 is not an identity");
+  assert.equal(pairs[0].marketPair, null);
+  // And the mapping still works end to end off those rows.
+  const r = resolveIdentity(
+    inst({ venue: "aster", symbol: "SOLUSDT", base: "SOL" }),
+    { slugOf: () => "aster-pro", index: buildPairIndex(pairs), overrides: {} },
+  );
+  assert.equal(r.cryptoId, 5426);
 });
 
 summary("marketcap-identity");

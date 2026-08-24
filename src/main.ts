@@ -27,6 +27,18 @@ try {
   console.warn(`[hub] could not read the candle signing key: ${(err as Error).message}`);
 }
 
+// The market-cap snapshot's signing key, PUBLIC half, printed once per start —
+// for the same reason the candle key is: a client has to pin it BY keyId, and a
+// snapshot signed by a key nobody wrote down verifies nowhere while looking
+// perfectly healthy from this side. Public material only.
+if (hub.marketCaps) {
+  const pub = hub.marketCaps.publicKey();
+  console.log(`[hub] market-cap snapshot signing key "${cfg.marketCap?.signingKeyId}" — PUBLIC key, safe to copy:`);
+  console.log(`[hub]   ${pub ?? "(unreadable — the producer will not start)"}`);
+} else if (cfg.marketCap?.venues.length) {
+  console.warn("[hub] the market-cap producer is configured but not running — see the refusal above");
+}
+
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, () => {
     console.log(`[hub] ${sig} — shutting down`);

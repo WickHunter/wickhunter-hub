@@ -124,6 +124,17 @@
 <div id="seedkey"><div class="muted">loading…</div></div>
 <div id="venues"><div class="muted">loading…</div></div>
 
+<h1 style="margin-top:2.2rem">Market caps <small>— the signed snapshot, and what it spends</small></h1>
+<div class="actions">
+  <button type="button" id="mcRefresh">Refresh</button>
+  <span id="mcMeta" class="muted"></span>
+</div>
+<!-- The snapshot signing key's PUBLIC half. A client pins it BY keyId, so both
+     halves of that pairing are shown together: a snapshot signed by a key
+     nobody wrote down verifies nowhere while looking perfectly healthy here. -->
+<div id="mckey"><div class="muted">loading…</div></div>
+<div id="mcbody"><div class="muted">loading…</div></div>
+
 <h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
 <div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
@@ -159,6 +170,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   document.getElementById("gate").style.display = "none";
   refresh();
   cdRefresh();
+  mcRefresh();
   fbRefresh();
 };
 
@@ -327,7 +339,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); cdRefresh(); fbRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -350,7 +362,7 @@ document.getElementById("upgradeHub").onclick = async () => {
     if (v && v !== before) {
       clearInterval(poll);
       note.textContent = "Hub upgraded: v" + before + " → v" + v + ".";
-      refresh(); cdRefresh(); fbRefresh();
+      refresh(); cdRefresh(); mcRefresh(); fbRefresh();
     } else if (Date.now() - t0 > 120000) {
       clearInterval(poll);
       err.textContent = "The hub did not report a new version after 2 minutes. If it is still on v" + before +
@@ -456,6 +468,112 @@ function cdRenderKey(data) {
       setTimeout(() => { copy.textContent = "Copy public key"; }, 1500);
     };
   }
+}
+
+// ── MARKET-CAP PRODUCER ─────────────────────────────────────────────────────
+// The numbers an operator wants when the first live run goes wrong: what it has
+// spent, whether the provider still agrees about who each slug is, and what it
+// last refused. Deliberately small — one key box, three lines of counts, a slug
+// table and the newest errors.
+async function mcRefresh() {
+  const err = document.getElementById("err");
+  let d;
+  try { d = await api("/admin/api/market-caps"); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+
+  const meta = document.getElementById("mcMeta");
+  const keyBox = document.getElementById("mckey");
+  const body = document.getElementById("mcbody");
+
+  if (!d.configured) {
+    // A producer that is OFF and one that is configured-but-unable are
+    // different states, and from a client's side the second looks exactly like
+    // a provider outage — so it is never reported as "off".
+    meta.textContent = (d.refusals && d.refusals.length)
+      ? "configured but NOT RUNNING"
+      : "off — set MARKET_CAP_VENUES and a CMC key to turn it on";
+    keyBox.innerHTML = "";
+    body.innerHTML = (d.refusals && d.refusals.length)
+      ? '<div class="venue"><div class="verr">' + d.refusals.map(esc).join("<br>") + "</div></div>"
+      : '<div class="muted">No market-cap venues are configured, so no snapshot is produced and '
+        + "<code>/api/market-data/market-caps/v1</code> answers 503. Every call this makes spends a "
+        + "credit against your CMC plan, so it is off until you ask for it.</div>";
+    return;
+  }
+
+  const h = d.health;
+  const pub = h.signing.publicKey;
+  meta.textContent = h.published
+    ? "published " + when(h.published.generatedAt) + " · " + h.published.instruments + " instruments · "
+      + h.published.assets + " assets · expires " + when(h.published.expiresAt)
+    : "nothing published yet";
+
+  let k = '<div class="muted">Clients pin this key <b>by keyId</b> and refuse an unknown one. '
+    + "Both halves of that pairing, together:</div>";
+  k += '<div class="muted" style="margin-top:.5rem">keyId <code>' + esc(h.signing.keyId) + "</code> — "
+    + '<span class="safe">PUBLIC KEY, safe to copy and paste anywhere</span>:</div>';
+  k += pub
+    ? '<div class="pub" id="mckeyPub">' + esc(pub) + '</div><button type="button" id="mckeyCopy">Copy public key</button>'
+    : '<div class="verr">The signing key could not be read — the producer will not publish.</div>';
+  keyBox.innerHTML = k;
+  const copy = document.getElementById("mckeyCopy");
+  if (copy) {
+    copy.onclick = async () => {
+      await navigator.clipboard.writeText(pub);
+      copy.textContent = "Copied!";
+      setTimeout(() => { copy.textContent = "Copy public key"; }, 1500);
+    };
+  }
+
+  const c = h.credits;
+  const pct = c.ceiling > 0 ? Math.round((c.used / c.ceiling) * 100) : 0;
+  let html = '<div class="venue"><h2><span class="id">credits</span>'
+    + '<span class="vstate v-' + (pct >= 90 ? "failing" : pct >= 70 ? "cooling" : "running") + '">'
+    + pct + "% USED</span></h2>";
+  html += '<div class="detail">' + c.used + " of " + c.ceiling + " credits this month (" + esc(c.month) + ")"
+    + " · " + c.refusals + " refusal" + (c.refusals === 1 ? "" : "s") + "</div>";
+  if (c.lastRefusal) {
+    // A refusal is the reason a snapshot is not moving. It is the first thing to
+    // read here, not a footnote.
+    html += '<div class="verr">last refusal: ' + esc(c.lastRefusal) + "</div>";
+  }
+  html += '<div class="buckets">';
+  for (const kind of Object.keys(c.byKind || {})) {
+    html += '<span class="bkt"><b>' + c.byKind[kind] + "</b> " + esc(kind) + "</span>";
+  }
+  html += "</div>";
+  html += '<dl><dt>last mapping</dt><dd>' + when(h.lastMappingAt) + "</dd>"
+    + "<dt>last caps</dt><dd>" + when(h.lastCapsAt) + "</dd>"
+    + "<dt>last publish</dt><dd>" + when(h.lastPublishAt) + "</dd>"
+    + "<dt>pending retries</dt><dd>" + h.pendingRetries + "</dd></dl>";
+  html += "</div>";
+
+  html += '<div class="venue"><h2><span class="id">exchanges</span></h2>';
+  html += '<div class="detail">The <b>id</b> is the durable key; the slug is a label the provider owns. '
+    + "A slug that names a different id is refused — that is the failure where one venue's book quietly "
+    + "takes another's identities.</div>";
+  html += '<table style="width:100%;font-size:.86rem"><thead><tr><th>venue</th><th>slug</th><th>id</th>'
+    + "<th>pairs held</th><th>provider says</th></tr></thead><tbody>";
+  for (const v of Object.keys(h.slugs)) {
+    const s = h.slugs[v];
+    const idCell = s.exchangeId === null
+      ? '<span class="muted">not read</span>'
+      : s.exchangeId === s.expectedId
+        ? String(s.exchangeId)
+        : '<span style="color:#c33">' + s.exchangeId + " (expected " + s.expectedId + ")</span>";
+    html += "<tr><td>" + esc(v) + "</td><td>" + esc(s.slug) + (s.validated ? "" : ' <span style="color:#c33">unvalidated</span>')
+      + "</td><td>" + idCell + "</td><td>" + s.pairs + "</td><td>" + (s.providerPairs === null ? "—" : s.providerPairs) + "</td></tr>";
+  }
+  html += "</tbody></table></div>";
+
+  if (h.errors.length) {
+    html += '<div class="venue"><h2><span class="id">recent errors</span></h2>';
+    for (const e of h.errors.slice(0, 8)) {
+      html += '<div class="verr">' + when(e.at) + " · " + esc(e.stage) + " · " + esc(e.message) + "</div>";
+    }
+    html += "</div>";
+  }
+  body.innerHTML = html;
 }
 
 async function cdRefresh() {

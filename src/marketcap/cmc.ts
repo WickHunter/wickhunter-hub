@@ -9,25 +9,72 @@
 // taking a parsed body; the fetchers only compose a URL, spend a credit and
 // hand the body over.
 //
-// ── WHAT WAS VERIFIED LIVE AGAINST THE OPERATOR'S KEY ───────────────────────
-//   · GET /v5/exchange/derivatives/list — works on this tier, paginates,
-//     DEFAULTS TO 100 rows, so it is paged explicitly.
-//   · GET /v5/exchange/derivatives/market-pairs/list/latest
-//        ?exchange_slug=aster-pro&category=perpetual
-//     answers `num_market_pairs: 572` with `market_pair_base.exchange_symbol`
-//     carrying the exchange's own base spelling and `market_pair_base.crypto_id`
-//     the canonical id (BTC 1, ETH 1027, SOL 5426).
+// ── WHAT WAS VERIFIED LIVE, AND HOW ─────────────────────────────────────────
+// `CMC_ENDPOINT_CLAIM` below is the record, in the style this codebase uses for
+// a venue fact that cost a live call to obtain: it states the OBSERVATION, not
+// just the conclusion. A claim that records how it was proved survives the next
+// reader; a constant that merely asserts an answer does not.
 //
-// So the tier includes derivatives and the mapping shape is confirmed. The
-// EXCHANGE SLUGS are a different matter: `bybit`, `aster-pro`, `bitget` and
-// `bitunix` are what we expect, and they are VALIDATED against the exchange
-// list at run time rather than trusted forever — a slug that silently stops
-// matching produces an entire venue of `provider_untracked` rows, which is a
-// failure that looks exactly like a provider outage.
+// The EXCHANGE IDENTITY is a stable numeric `exchange_id`, and the slug is a
+// LABEL that is validated against it. A slug is the provider's to rename, and a
+// slug that silently stops matching produces an entire venue of
+// `provider_untracked` rows — a failure that looks exactly like a provider
+// outage. See `DEFAULT_EXCHANGE_IDS` in service.ts.
 import type { ProviderPair } from "./identity.js";
 import type { ProviderQuote } from "./caps.js";
 
 export const CMC_BASE = "https://pro-api.coinmarketcap.com";
+
+/** ── THE LIVE OBSERVATIONS, WITH THEIR DATE AND THEIR METHOD ────────────────
+ *
+ *  Never a boolean and never a bare constant: what makes this trustworthy is
+ *  that a future reader can see WHAT WAS SEEN and decide whether it still
+ *  applies. Anything not listed here is still an assumption. */
+export const CMC_ENDPOINT_CLAIM = {
+  verifiedOn: "2026-08-24",
+  method: "live calls against the operator's own production key",
+  plan: { creditsPerMonth: 15_000, requestsPerMinute: 50, creditsUsedBefore: 0 },
+  derivativeExchangeList: {
+    endpoint: "GET /v5/exchange/derivatives/list",
+    /** ⚠ `data` is an OBJECT containing `exchanges`, NOT a bare array. The
+     *  tolerant parse below keeps both arms; this is the one that fires. */
+    shape: "data.exchanges[]",
+    rowKeys: [
+      "exchange_id", "exchange_name", "exchange_slug", "exchange_score", "fiats",
+      "last_updated", "liquidity_score", "num_market_pairs", "quotes", "rank", "traffic_score",
+    ],
+    /** Proved by OBSERVATION rather than by documentation: two overlapping
+     *  windows returned DISTINCT rows, which is what makes the parameter names
+     *  right rather than merely plausible. */
+    pagingProof: "start=1&limit=2 -> [binance, tapbit]; start=3&limit=2 -> [echobit, okx]",
+    creditCountPerCall: 1,
+    /** ⚠ NO `total_count` ON THIS ENDPOINT. End-of-pagination therefore cannot
+     *  be read off a declared total and has to be inferred from a short page —
+     *  which is why `fetchDerivativeExchanges` also stops on a page that adds
+     *  no new exchange, so a provider repeating a full page cannot spin it. */
+    totalCountPublished: false,
+    totalExchanges: 134,
+  },
+  /** The four venues, by their DURABLE numeric id. Pair counts are the
+   *  provider's own `num_market_pairs` on the day, kept as a magnitude check —
+   *  never as a threshold, since a venue legitimately lists and delists. */
+  exchanges: [
+    { venue: "bybit", slug: "bybit", exchangeId: 521, perpPairs: 743 },
+    { venue: "bitget", slug: "bitget", exchangeId: 513, perpPairs: 698 },
+    { venue: "bitunix", slug: "bitunix", exchangeId: 7302, perpPairs: 671 },
+    { venue: "aster", slug: "aster-pro", exchangeId: 1452, perpPairs: 572 },
+  ],
+  marketPairs: {
+    endpoint: "GET /v5/exchange/derivatives/market-pairs/list/latest?exchange_slug=aster-pro&category=perpetual",
+    numMarketPairs: 572,
+    join: "market_pair_base.exchange_symbol -> market_pair_base.crypto_id",
+    idsSeen: { BTC: 1, ETH: 1027, SOL: 5426 },
+    /** ⚠ `market_pair` CAME BACK NULL in that response. It is parsed for the
+     *  evidence trail and NOTHING joins on it — the join is base/quote
+     *  `exchange_symbol`, which is populated. */
+    marketPairLabelNull: true,
+  },
+} as const;
 
 /** The API key travels in a HEADER, never in a query string: this hub's own
  *  server.ts opens with the note that URLs reach access logs, and a provider
@@ -110,21 +157,35 @@ const asArray = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 export interface DerivativeExchange {
+  /** The DURABLE key. A slug is a label the provider may rename. */
   id: number;
   slug: string;
   name: string;
+  /** The provider's own count of tracked pairs, for a magnitude check. */
+  pairs: number | null;
 }
 
+/** Verified live 2026-08-24: `data` is an OBJECT carrying `exchanges`, and the
+ *  row keys are `exchange_id` / `exchange_name` / `exchange_slug` (see
+ *  `CMC_ENDPOINT_CLAIM`). The bare-array arm is kept because it costs one line
+ *  and this endpoint's envelope is the provider's to change — but the observed
+ *  arm is the object one, and that is which branch actually fires today. */
 export function parseDerivativeExchanges(body: unknown): DerivativeExchange[] {
   const out: DerivativeExchange[] = [];
   const data = (body as { data?: unknown })?.data;
   const rows = Array.isArray(data) ? data : asArray((data as { exchanges?: unknown[] })?.exchanges);
   for (const raw of rows) {
     const r = raw as Record<string, unknown>;
-    const slug = str(r.slug) || str(r.exchange_slug);
-    const id = Number(r.id ?? r.exchange_id);
-    if (!slug || !Number.isFinite(id)) continue;
-    out.push({ id, slug, name: str(r.name) || str(r.exchange_name) || slug });
+    const slug = str(r.exchange_slug) || str(r.slug);
+    const id = Number(r.exchange_id ?? r.id);
+    if (!slug || !Number.isFinite(id) || id <= 0) continue;
+    const pairs = Number(r.num_market_pairs);
+    out.push({
+      id,
+      slug,
+      name: str(r.exchange_name) || str(r.name) || slug,
+      pairs: Number.isFinite(pairs) ? pairs : null,
+    });
   }
   return out;
 }
@@ -151,6 +212,9 @@ export function parseMarketPairs(body: unknown, exchangeSlug: string): { pairs: 
       cryptoId,
       cryptoSymbol: str(b.currency_symbol),
       cryptoName: str(b.currency_name),
+      // ⚠ OBSERVED NULL on the live response (2026-08-24). Carried for the
+      // evidence trail; NOTHING joins on it — the join is the base/quote
+      // `exchange_symbol` above, which is populated.
       marketPair: str(r.market_pair) || null,
     });
   }
@@ -222,10 +286,22 @@ export interface FetchDeps {
 export const EXCHANGE_LIST_PAGE = 100;
 
 /** Every derivative exchange the provider knows, paged. Used to VALIDATE the
- *  slugs rather than to discover venues: which venues we serve is our decision,
- *  not the provider's. */
+ *  slugs and their ids rather than to discover venues: which venues we serve is
+ *  our decision, not the provider's.
+ *
+ *  ── TWO STOP CONDITIONS, AND THE SECOND IS NOT BELT-AND-BRACES ────────────
+ *  This endpoint publishes NO `total_count` (verified 2026-08-24), so the end
+ *  of the list can only be inferred from a SHORT PAGE. That inference fails in
+ *  exactly one way: a provider that answers a full page for a `start` past the
+ *  end — by clamping, by repeating, or by ignoring the parameter — would keep
+ *  the loop asking, one credit a time, until the page bound. So the loop also
+ *  stops the moment a page adds no exchange it has not already seen. 134
+ *  exchanges exist today and one page covers them; the paging stays because a
+ *  venue we serve could fall past the first page later, which is precisely the
+ *  failure this is here to prevent. */
 export async function fetchDerivativeExchanges(deps: FetchDeps, maxPages = 20): Promise<DerivativeExchange[]> {
   const out: DerivativeExchange[] = [];
+  const seen = new Set<number>();
   for (let page = 0; page < maxPages; page++) {
     await deps.spend("derivative-exchange-list", 1);
     // The endpoint verified live on the operator's key. IT DEFAULTS TO 100
@@ -237,8 +313,16 @@ export async function fetchDerivativeExchanges(deps: FetchDeps, maxPages = 20): 
       limit: String(EXCHANGE_LIST_PAGE),
     }, { deps, kind: "derivative-exchange-list", estimated: 1 });
     const rows = parseDerivativeExchanges(body);
-    out.push(...rows);
-    if (rows.length < EXCHANGE_LIST_PAGE) break;
+    let fresh = 0;
+    for (const r of rows) {
+      if (seen.has(r.id)) continue;
+      seen.add(r.id);
+      out.push(r);
+      fresh++;
+    }
+    // A short page ends the list; a full page that told us nothing new means
+    // the cursor is not advancing, and asking again costs a credit per attempt.
+    if (rows.length < EXCHANGE_LIST_PAGE || fresh === 0) break;
   }
   return out;
 }

@@ -48,7 +48,11 @@ const marketCapCfg = (over = {}) => ({
 const stubHttp = async (url) => {
   const u = new URL(url);
   if (u.pathname === "/v5/exchange/derivatives/list") {
-    return json({ status: { error_code: 0 }, data: Number(u.searchParams.get("start")) === 1 ? [{ id: 521, slug: "bybit", name: "Bybit" }] : [] });
+    // The verified shape: data.exchanges[], keyed exchange_id / exchange_slug.
+    return json({
+      status: { error_code: 0 },
+      data: { exchanges: Number(u.searchParams.get("start")) === 1 ? [{ exchange_id: 521, exchange_slug: "bybit", exchange_name: "Bybit", num_market_pairs: 743 }] : [] },
+    });
   }
   if (u.pathname === "/v5/exchange/derivatives/market-pairs/list/latest") {
     const first = Number(u.searchParams.get("start")) === 1;
@@ -244,6 +248,59 @@ await test("a hub with no producer says configured:false rather than a row of ze
   const r = await jsonReq(`${h.origin}/admin/api/market-caps`, { headers: { "x-hub-admin": "test-admin-token" } });
   assert.equal(r.status, 200);
   assert.equal(r.body.configured, false, "zeroes would read as a working producer that has found nothing");
+  await h.close();
+});
+
+await test("the admin page carries the producer panel, and it refreshes with the rest", async () => {
+  const h = await freshHub();
+  const page = await (await fetch(`${h.origin}/admin`)).text();
+  assert.match(page, /id="mcbody"/, "a container for the producer panel");
+  assert.match(page, /id="mckey"/, "and one for the signing key a client has to pin");
+  assert.match(page, /admin\/api\/market-caps/, "wired to the status route");
+  // The three things an operator needs when the first live run goes wrong.
+  for (const field of ["credits this month", "last refusal", "pending retries", "durable key"]) {
+    assert.ok(page.includes(field), `panel states ${field}`);
+  }
+  // Anchored on the claim rather than the whole line: which OTHER panels the
+  // button refreshes is not this test's business.
+  const onclick = /document\.getElementById\("refresh"\)\.onclick = \(\) => \{([^}]*)\}/.exec(page);
+  assert.ok(onclick && /\bmcRefresh\(\)/.test(onclick[1]), "the page's Refresh button refreshes the producer panel too");
+  // A producer that is OFF and one that is configured-but-unable are different
+  // states, and the panel must not report the second as the first: from a
+  // client's side "configured and unable" looks exactly like a provider outage.
+  assert.ok(page.includes("configured but NOT RUNNING"), "the unable state has its own words");
+  await h.close();
+});
+
+await test("a configured-but-unable producer NAMES the missing piece", async () => {
+  const tmp = await freshHub();
+  await tmp.close();
+  // Venues named, no CMC key: the hub keeps licensing and candle seeding, the
+  // producer refuses to start, and the refusal says WHICH piece is missing —
+  // "not configured" would send the operator to read source.
+  const h = await freshHub(
+    { marketCap: marketCapCfg(withPaths(tmp.dataDir, { apiKey: "" })) },
+    { marketCapHttp: stubHttp, marketCapVenueFetch: stubVenue, marketCapNow: () => NOW },
+  );
+  assert.equal(h.hub.marketCaps, null, "an unusable producer is not built at all");
+  assert.equal((await jsonReq(`${h.origin}/api/health`)).status, 200, "and the rest of the hub is unaffected");
+  const r = await jsonReq(`${h.origin}/admin/api/market-caps`, { headers: { "x-hub-admin": "test-admin-token" } });
+  assert.equal(r.body.configured, false);
+  assert.ok(r.body.refusals.some((x) => /CMC_PRO_API_KEY is not set/.test(x)), r.body.refusals.join("; "));
+  await h.close();
+});
+
+await test("the signing key's PUBLIC half is readable from the admin surface", async () => {
+  const tmp = await freshHub();
+  await tmp.close();
+  const h = await hubWithProducer(withPaths(tmp.dataDir));
+  const r = await jsonReq(`${h.origin}/admin/api/market-caps`, { headers: { "x-hub-admin": "test-admin-token" } });
+  // A client pins BY keyId, so both halves of that pairing are served together.
+  // Without this the first deploy produces snapshots that verify nowhere while
+  // looking perfectly healthy from the hub's side.
+  assert.equal(r.body.health.signing.keyId, "market-data-1");
+  assert.equal(r.body.health.signing.publicKey, PUB_B64U);
+  assert.equal(JSON.stringify(r.body).includes(PRIV_B64U), false, "and the private half is nowhere on this surface");
   await h.close();
 });
 

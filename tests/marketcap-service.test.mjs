@@ -48,6 +48,8 @@ function world() {
     quoteIds: [1, 24478],
     venueThrows: null,
     cmcThrows: null,
+    /** The provider's own id for this slug. Confirmed live: bybit is 521. */
+    exchangeId: 521,
     now: NOW0,
   };
 }
@@ -65,7 +67,13 @@ async function baseHttp(w, url) {
   const u = new URL(url);
   if (u.pathname === "/v5/exchange/derivatives/list") {
     const start = Number(u.searchParams.get("start") ?? 1);
-    return json({ status: { error_code: 0 }, data: start === 1 ? [{ id: 521, slug: "bybit", name: "Bybit" }] : [] });
+    // THE VERIFIED SHAPE (2026-08-24): `data` is an OBJECT carrying
+    // `exchanges`, rows are keyed `exchange_id` / `exchange_name` /
+    // `exchange_slug`, and there is NO `total_count` to end the paging on.
+    return json({
+      status: { error_code: 0 },
+      data: { exchanges: start === 1 ? [{ exchange_id: w.exchangeId, exchange_slug: "bybit", exchange_name: "Bybit", num_market_pairs: 743 }] : [] },
+    });
   }
   if (u.pathname === "/v5/exchange/derivatives/market-pairs/list/latest") {
     const start = Number(u.searchParams.get("start") ?? 1);
@@ -302,6 +310,57 @@ await test("a refresh that would cross the ceiling makes NO calls at all", async
   assert.ok(budget.length >= 1);
   assert.match(budget[0].message, /refusing to start a refresh/);
   assert.equal(svc.health().credits.refusals >= 1, true, "the refusal is counted, not merely logged");
+});
+
+// ── 4b. the exchange directory ──────────────────────────────────────────────
+
+await test("the DURABLE key is the exchange id: a reused slug is refused by name", async () => {
+  const w = world();
+  const { svc } = makeService(w);
+  await svc.tick();
+  assert.equal(svc.health().slugs.bybit.validated, true);
+  assert.equal(svc.health().slugs.bybit.exchangeId, 521);
+  assert.equal(svc.health().slugs.bybit.providerPairs, 743, "the provider's own count rides along as a magnitude check");
+  const mapped = svc.snapshot().payload.coverage.instruments.mapped;
+  assert.equal(mapped, 2);
+
+  // The slug now names a DIFFERENT exchange. This is the QUIET failure: the map
+  // still resolves and every census still balances, while one venue's book
+  // takes another venue's identities. Only the id can tell.
+  w.exchangeId = 999;
+  w.now += DAY_MS + 1;
+  const before = w.calls.length;
+  await svc.tick();
+  const err = svc.health().errors.find((e) => /now names exchange id 999/.test(e.message));
+  assert.ok(err, "the mismatch is refused BY NAME, with both ids in the sentence");
+  assert.equal(svc.health().slugs.bybit.validated, false);
+  assert.equal(
+    w.calls.slice(before).filter((c) => c.includes("market-pairs")).length, 0,
+    "and its pair map is not read at all — those rows would be another venue's book",
+  );
+  assert.equal(svc.snapshot().payload.coverage.instruments.mapped, mapped, "yesterday's map keeps resolving meanwhile");
+});
+
+await test("the exchange list cannot spin when a provider repeats a full page", async () => {
+  // Verified live: this endpoint publishes NO `total_count`, so the end of the
+  // list is inferred from a short page. A provider that clamps `start` and
+  // answers a FULL page forever would otherwise be asked one credit at a time
+  // until the page bound.
+  const w = world();
+  const page = Array.from({ length: 100 }, (_, i) => ({ exchange_id: i + 1, exchange_slug: `ex${i}`, exchange_name: `Ex ${i}` }));
+  const { svc } = makeService(w, {}, {
+    http: async (url) => {
+      const u = new URL(url);
+      if (u.pathname === "/v5/exchange/derivatives/list") {
+        w.calls.push(url);
+        return json({ status: { error_code: 0 }, data: { exchanges: page } }); // the SAME full page, always
+      }
+      return baseHttp(w, url);
+    },
+  });
+  await svc.tick();
+  const listCalls = w.calls.filter((c) => c.includes("derivatives/list")).length;
+  assert.equal(listCalls, 2, "one page, then one that adds nothing new — and it stops");
 });
 
 // ── 5. the unseen symbol ────────────────────────────────────────────────────

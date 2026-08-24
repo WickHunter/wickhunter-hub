@@ -249,6 +249,41 @@ not be able to delist a live market from under a bot — and a ticker never
 decides which coin it is about. There is no page-per-pair anywhere and no join
 on ticker text.
 
+**Verified live against the operator's key, 2026-08-24.** The record lives in
+`CMC_ENDPOINT_CLAIM` (`src/marketcap/cmc.ts`) and states the observation rather
+than the conclusion, so the next reader can judge whether it still holds:
+
+- `GET /v5/exchange/derivatives/list` answers **`data.exchanges[]`** — an object
+  carrying an array, not a bare array — with rows keyed `exchange_id`,
+  `exchange_name`, `exchange_slug`, `num_market_pairs` (and score/rank fields).
+  1 credit per call.
+- **`start`/`limit` paging is real**, proved by observation: `start=1&limit=2`
+  → `[binance, tapbit]`, `start=3&limit=2` → `[echobit, okx]` — distinct rows,
+  so the parameter names are right rather than merely plausible.
+- ⚠ **No `total_count` on that endpoint**, so the end of the list can only be
+  inferred from a short page. The loop therefore *also* stops on a page that
+  adds no exchange it has not already seen: a provider that clamps `start` and
+  answers a full page forever would otherwise be asked one credit at a time
+  until the page bound. 134 derivative exchanges exist today, so one page covers
+  it — the paging stays because a venue we serve could fall past the first page
+  later, which is exactly the failure it is there to prevent.
+- The four venues, **by their durable numeric id**: `bybit` 521 (743 pairs),
+  `bitget` 513 (698), `bitunix` 7302 (671), `aster-pro` 1452 (572).
+- `market-pairs/list/latest?exchange_slug=aster-pro&category=perpetual` →
+  `num_market_pairs: 572`, joining `market_pair_base.exchange_symbol` →
+  `market_pair_base.crypto_id` (BTC 1, ETH 1027, SOL 5426). ⚠ **`market_pair`
+  itself came back `null`** — it is parsed for the evidence trail and nothing
+  joins on it.
+
+**The id is the durable key; the slug is a label.** A slug that *disappears* is
+loud — every pair on that venue reads `provider_untracked` and says so. A slug
+*reused* for a different exchange is silent: the map still resolves, both
+censuses still balance, and one venue's book quietly takes another venue's
+identities. So the observed `exchange_id` is compared against
+`DEFAULT_EXCHANGE_IDS` on every mapping pass, a mismatch is refused **by name**,
+and that venue's pair map is not read at all until it is corrected
+(`MARKET_CAP_SLUGS` / `MARKET_CAP_EXCHANGE_IDS`).
+
 ### `1000PEPE` is not a coin
 
 It is a PEPE contract quoted in thousands and it takes **PEPE's market cap,
@@ -354,6 +389,29 @@ removes the dependency entirely. The private half comes from the environment,
 is never written to a file by this service, never logged, and never appears in
 a payload — only `keyId` does.
 
+**Generating it is a required deploy step, and skipping it is quiet.** Unlike
+the licence and candle keys this one is not self-generated — the spec puts it in
+the environment, so there is nothing on disk for the hub to find and nothing for
+it to invent:
+
+```
+npm run marketcapkey                 # or: npm run marketcapkey market-data-2
+```
+
+That prints the **private** line to paste into `/etc/wickhunter-hub/env` (once,
+there, and nowhere else) and the **public** half plus the `keyId` to give
+whoever builds the client. After a restart the public half is readable three
+ways, so that output never needs keeping: the **startup log**
+(`journalctl -u wickhunter-hub`), the admin page's **Market caps** panel with a
+copy button, and `GET /admin/api/market-caps` (`health.signing`). A hub started
+with no key refuses to run the producer and prints why; a hub started with a key
+nobody wrote down produces snapshots that verify **nowhere** while looking
+perfectly healthy from this side — the same failure shape as flipping
+`HUB_CANDLE_SIGNER` too early.
+
+**The client pins `keyId` → public key** and refuses an unknown one, exactly as
+the bot pins `OLB_SEED_KEYS`.
+
 Signature bytes: remove the **entire** `signatures` field, RFC 8785
 canonicalise the rest, UTF-8 encode, Ed25519-sign. Removing the whole field
 (rather than blanking a `sig`) is what lets a second signature be added for key
@@ -379,11 +437,19 @@ Optional: `CMC_MONTHLY_CREDIT_CEILING` (15000), `CMC_REQUESTS_PER_MINUTE` (50),
 `MARKET_CAP_MAP_INTERVAL_MS` (24h), `MARKET_CAP_REFRESH_INTERVAL_MS` (1h),
 `MARKET_CAP_TICK_MS` (30s), `MARKET_CAP_TTL_MS` (3h),
 `MARKET_CAP_SNAPSHOT_FILE`, `ASSET_IDENTITY_OVERRIDES_FILE`,
-`MARKET_CAP_CREDIT_LEDGER_FILE` (all default into `data/`),
+`MARKET_CAP_CREDIT_LEDGER_FILE`, `MARKET_CAP_EXCHANGE_IDS=bybit:521,...`,
 `MARKET_CAP_SLUGS=aster:aster-pro,...` (an escape hatch for the day a provider
 renames one), `MARKET_DATA_HUB_KEY` (an `x-hub-key` shared secret for a console
 that holds no licence), `COINGECKO_PRO_API_KEY` (secondary provider, absent-safe
 and entirely optional).
+
+⚠ **The state files default into the hub's own `data/` directory
+(`/opt/wickhunter-hub/data`), not the `/var/lib/liqhunter-hub/...` path the spec
+names.** Deliberate: this hub already owns one state root that is mode 700,
+excluded from the installer's rsync and backed up as a unit, and a second root
+is a second thing to permission, back up and remember. Each env var above
+honours an absolute path exactly when set, so the spec's layout is one line away
+if you want it.
 
 A missing key does **not** crash the hub: the producer refuses to start, prints
 why, and licensing and candle seeding carry on. It is not silent either —
@@ -587,7 +653,24 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
   (never the licence key, never the candle key), RFC 8785 canonicalisation with
   the whole `signatures` field removed, `ETag`/`If-None-Match` and gzip on
   `GET /api/market-data/market-caps/v1`. Off by default: every call spends a
-  credit against a plan the operator pays for.
+  credit against a plan the operator pays for. **The provider's own
+  `status.credit_count` outranks our estimate upward only** — a higher figure is
+  charged and reported, a lower one refunds nothing, because handing back budget
+  on a number we cannot audit is the direction that overspends (the asymmetry
+  the candle collector already applies to Aster's `x-mbx-used-weight-1m`).
+  **Endpoint shapes, paging and exchange ids verified live 2026-08-24** and
+  recorded as an observation in `CMC_ENDPOINT_CLAIM`: `data.exchanges[]` keyed
+  `exchange_id`/`exchange_slug`, `start`/`limit` proved by two overlapping
+  windows returning distinct rows, **no `total_count`** — so the loop stops on a
+  short page *and* on a page adding nothing new, which is what keeps a clamped
+  `start` from spending a credit per attempt. **The exchange id is the durable
+  key**, and a slug reused for a different id is refused by name and its pair map
+  is not read: a vanished slug is loud, a reused one is silent and hands one
+  venue's book another venue's identities. `market_pair` came back null on the
+  live response and nothing joins on it. Admin **Market caps** panel (spend,
+  refusals, slug/id agreement, recent errors, and the signing key's public half
+  with a copy button), and `npm run marketcapkey` as the documented,
+  one-time key-generation step.
 
 - v0.2.19 — **AsterDex collects, and it is the first venue whose limit is not a
   request rate.** Aster is a Binance USD-M clone: `https://fapi.asterdex.com`,
