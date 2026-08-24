@@ -319,24 +319,31 @@ test("the default signer is the licence key, labelled mcap-1", async () => {
 
   // The SHIPPED default — no variable set at all.
   const dflt = marketCapSigningFromEnv({});
-  assert.deepStrictEqual(dflt, { signer: "license", keyId: LICENSE_MARKET_CAP_KEY_ID },
-    "the default must be the only keyId a shipped bot can verify");
+  assert.deepStrictEqual(dflt, { signer: "license", keyId: LICENSE_MARKET_CAP_KEY_ID, refusal: null },
+    "the default must be the only keyId a shipped bot can verify, and must not refuse");
   assert.strictEqual(LICENSE_MARKET_CAP_KEY_ID, "mcap-1",
     "this string is pinned in the bot's MARKET_CAP_KEYS — changing it strands every install");
 
   // Opting in to the dedicated key gives the other id.
   assert.deepStrictEqual(
     marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "market-data" }),
-    { signer: "market-data", keyId: MARKET_DATA_KEY_ID });
+    { signer: "market-data", keyId: MARKET_DATA_KEY_ID, refusal: null });
 
   // ⚠ A keyId RESERVED FOR THE OTHER SIGNER IS REFUSED AT STARTUP, not served.
   // A payload signed by one key and labelled another verifies nowhere, and the
   // symptom lands in someone else's process with no hint of the cause.
-  assert.throws(() => marketCapSigningFromEnv({ MARKET_DATA_SIGNING_KEY_ID: "market-data-1" }),
-    /reserved for MARKET_CAP_SIGNER=market-data/);
-  assert.throws(() => marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "market-data", MARKET_DATA_SIGNING_KEY_ID: "mcap-1" }),
-    /reserved for MARKET_CAP_SIGNER=license/);
-  assert.throws(() => marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "nonsense" }), /MARKET_CAP_SIGNER must be one of/);
+  // ⚠ A MISMATCH IS A REFUSAL, NOT A THROW. See the production outage recorded
+  // on `marketCapSigningFromEnv`.
+  const crossed = marketCapSigningFromEnv({ MARKET_DATA_SIGNING_KEY_ID: "market-data-1" });
+  assert.match(crossed.refusal ?? "", /reserved for MARKET_CAP_SIGNER=market-data/);
+  const crossed2 = marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "market-data", MARKET_DATA_SIGNING_KEY_ID: "mcap-1" });
+  assert.match(crossed2.refusal ?? "", /reserved for MARKET_CAP_SIGNER=license/);
+  // An unreadable signer falls back to the SHIPPED default and says so — never
+  // to "market-data", which no bot in the field can verify.
+  const junk = marketCapSigningFromEnv({ MARKET_CAP_SIGNER: "nonsense" });
+  assert.strictEqual(junk.signer, "license");
+  assert.strictEqual(junk.keyId, LICENSE_MARKET_CAP_KEY_ID);
+  assert.match(junk.refusal ?? "", /MARKET_CAP_SIGNER must be one of/);
 
   // An unreserved id is the operator's to choose, under either signer.
   assert.strictEqual(marketCapSigningFromEnv({ MARKET_DATA_SIGNING_KEY_ID: "mcap-2" }).keyId, "mcap-2");
@@ -352,4 +359,45 @@ test("the licence signer needs no private key in the environment", async () => {
   // The dedicated signer still requires one, and says so by name.
   const refused = marketCapStartupRefusals({ ...base, signer: "market-data" });
   assert.ok(refused.some((r) => /MARKET_DATA_SIGNING_PRIVATE_KEY_B64U/.test(r)), refused.join(" | "));
+});
+
+// ── ⚠ THE OUTAGE CHECK ─────────────────────────────────────────────────────
+// `marketCapSigningFromEnv` threw, `configFromEnv` calls it, and `main.ts`
+// calls `configFromEnv` on its first line — so ONE STALE MARKET-CAP VARIABLE
+// stopped the hub building its config at all. Licences, check-ins, candle seeds
+// and the admin page went down together; nginx served 502. A market-cap
+// misconfiguration took down LICENSING.
+//
+// This is the check that would have caught it: no market-cap variable, however
+// wrong, may stop `configFromEnv` returning.
+test("no market-cap variable can stop the hub building its config", async () => {
+  const { configFromEnv } = await import("../dist/src/config.js");
+  const { marketCapStartupRefusals } = await import("../dist/src/marketcap/config.js");
+
+  const hostile = [
+    { MARKET_DATA_SIGNING_KEY_ID: "market-data-1" },                                  // the exact outage
+    { MARKET_CAP_SIGNER: "market-data", MARKET_DATA_SIGNING_KEY_ID: "mcap-1" },        // the mirror
+    { MARKET_CAP_SIGNER: "nonsense" },
+    { MARKET_CAP_SIGNER: "" },
+    { MARKET_CAP_SIGNER: "   " },
+    { MARKET_DATA_SIGNING_KEY_ID: "__proto__" },
+    { MARKET_DATA_SIGNING_KEY_ID: "" },
+    { MARKET_CAP_VENUES: "not-a-venue", MARKET_DATA_SIGNING_KEY_ID: "market-data-1" },
+    { MARKET_CAP_VENUES: "bybit", MARKET_CAP_SIGNER: "market-data" },                  // no private key
+  ];
+  for (const extra of hostile) {
+    const env = { ...extra };
+    let cfg = null, threw = null;
+    try { cfg = configFromEnv(env); } catch (e) { threw = e; }
+    assert.strictEqual(threw, null,
+      `configFromEnv threw for ${JSON.stringify(extra)} — a market-cap variable must never stop the hub booting: ${threw && threw.message}`);
+    assert.ok(cfg, "configFromEnv returned nothing");
+  }
+
+  // And the cross-labelled pairing still REFUSES THE PRODUCER, by name — the
+  // point is to move the failure, not to lose it.
+  const cfg = configFromEnv({ MARKET_CAP_VENUES: "bybit", CMC_PRO_API_KEY: "k", MARKET_DATA_SIGNING_KEY_ID: "market-data-1" });
+  const refusals = marketCapStartupRefusals(cfg.marketCap);
+  assert.ok(refusals.some((r) => /reserved for MARKET_CAP_SIGNER/.test(r)),
+    `the producer must still refuse by name: ${refusals.join(" | ")}`);
 });

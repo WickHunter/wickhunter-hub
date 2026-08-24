@@ -56,28 +56,68 @@ export const RESERVED_MARKET_CAP_KEY_IDS: Readonly<Record<string, MarketCapSigne
   [MARKET_DATA_KEY_ID]: "market-data",
 };
 
-export function marketCapSigningFromEnv(env: NodeJS.ProcessEnv): { signer: MarketCapSigner; keyId: string } {
+/** ⚠ THIS FUNCTION MUST NEVER THROW, AND THAT COST A PRODUCTION OUTAGE TO
+ *  LEARN. It DID throw, and `configFromEnv` calls it, and `main.ts` calls
+ *  `configFromEnv` on its first line — so one stale market-cap variable
+ *  (`MARKET_DATA_SIGNING_KEY_ID=market-data-1`, left behind by an earlier
+ *  setup script) stopped the hub constructing its config AT ALL. Licences,
+ *  check-ins, candle seeds and the admin page all went down: nginx served 502
+ *  and the operator had no way to tell why. A MARKET-CAP MISCONFIGURATION TOOK
+ *  DOWN LICENSING.
+ *
+ *  That is the opposite of how the rest of this file already worked.
+ *  `marketCapStartupRefusals` exists precisely so a producer that is
+ *  configured-and-unable NAMES the missing piece and the hub keeps serving —
+ *  `server.ts` logs each refusal and returns `null` instead of the service. The
+ *  throw was upstream of all of it.
+ *
+ *  So the refusal is DATA now. It is carried on the config, reported by
+ *  `marketCapStartupRefusals`, and the producer does not start. Nothing about a
+ *  market-cap variable can stop this function returning a value. */
+export function marketCapSigningFromEnv(
+  env: NodeJS.ProcessEnv,
+): { signer: MarketCapSigner; keyId: string; refusal: string | null } {
   const raw = (env.MARKET_CAP_SIGNER ?? "license").trim().toLowerCase();
+  // ⚠ AN UNREADABLE SIGNER FALLS BACK TO THE SHIPPED DEFAULT AND SAYS SO. It
+  // must not pick `market-data`: that is the value no bot in the field can
+  // verify, so a typo would silently dark every install rather than refuse.
   if (!isMarketCapSigner(raw)) {
-    throw new Error(`MARKET_CAP_SIGNER must be one of ${MARKET_CAP_SIGNERS.join(" | ")}: ${env.MARKET_CAP_SIGNER}`);
+    return {
+      signer: "license",
+      keyId: LICENSE_MARKET_CAP_KEY_ID,
+      refusal: `MARKET_CAP_SIGNER must be one of ${MARKET_CAP_SIGNERS.join(" | ")} — got ${JSON.stringify(env.MARKET_CAP_SIGNER ?? "")}`,
+    };
   }
   const signer: MarketCapSigner = raw;
   const keyId = (env.MARKET_DATA_SIGNING_KEY_ID ?? "").trim()
     || (signer === "market-data" ? MARKET_DATA_KEY_ID : LICENSE_MARKET_CAP_KEY_ID);
-  const owner = RESERVED_MARKET_CAP_KEY_IDS[keyId];
+  // `hasOwnProperty`, so `__proto__` is an unreserved id like any other rather
+  // than resolving through the prototype chain.
+  const owner = Object.prototype.hasOwnProperty.call(RESERVED_MARKET_CAP_KEY_IDS, keyId)
+    ? RESERVED_MARKET_CAP_KEY_IDS[keyId]
+    : undefined;
   if (owner && owner !== signer) {
-    throw new Error(
-      `MARKET_DATA_SIGNING_KEY_ID=${keyId} is reserved for MARKET_CAP_SIGNER=${owner}, but the signer is ${signer} — `
-      + "a snapshot signed by one key and labelled another cannot be verified by anyone",
-    );
+    return {
+      signer,
+      keyId,
+      refusal:
+        `MARKET_DATA_SIGNING_KEY_ID=${keyId} is reserved for MARKET_CAP_SIGNER=${owner}, but the signer is ${signer} — `
+        + "a snapshot signed by one key and labelled another cannot be verified by anyone. "
+        + `Unset MARKET_DATA_SIGNING_KEY_ID to use the default for this signer.`,
+    };
   }
-  return { signer, keyId };
+  return { signer, keyId, refusal: null };
 }
 
 export interface MarketCapEnvConfig extends MarketCapConfig {
   apiKey: string;
   /** Which key signs. See `marketCapSigningFromEnv`. */
   signer: MarketCapSigner;
+  /** Why this producer must not start, or `null`. ⚠ DATA, NEVER A THROW — see
+   *  the note on `marketCapSigningFromEnv`. Optional because `MarketCapEnvConfig`
+   *  is built BY HAND in tests and tools, and a required field here reads fine
+   *  and then breaks the one call site that does not set it. */
+  signerRefusal?: string | null;
   coingeckoApiKey: string;
   signingKeyB64u: string;
   signingKeyId: string;
@@ -135,6 +175,7 @@ export function marketCapConfigFromEnv(env: NodeJS.ProcessEnv, dataDir: string):
     apiKey: (env.CMC_PRO_API_KEY ?? "").trim(),
     coingeckoApiKey: (env.COINGECKO_PRO_API_KEY ?? "").trim(),
     signer: signing.signer,
+    signerRefusal: signing.refusal,
     signingKeyB64u: (env.MARKET_DATA_SIGNING_PRIVATE_KEY_B64U ?? "").trim(),
     signingKeyId: signing.keyId,
     hubKey: (env.MARKET_DATA_HUB_KEY ?? "").trim(),
@@ -181,6 +222,8 @@ export function marketCapStartupRefusals(cfg: MarketCapEnvConfig): string[] {
     out.push("MARKET_DATA_SIGNING_PRIVATE_KEY_B64U is not set — an unsigned snapshot is not servable (or unset MARKET_CAP_SIGNER to sign with the licence key)");
   }
   if (!cfg.signingKeyId) out.push("MARKET_DATA_SIGNING_KEY_ID is not set — a signature nobody can attribute is not a signature");
+  // The signer/keyId pairing, as a refusal rather than as a dead hub.
+  if (cfg.signerRefusal) out.push(cfg.signerRefusal);
   if (cfg.monthlyCeiling <= 0) out.push("CMC_MONTHLY_CREDIT_CEILING is not a positive number of credits");
   return out;
 }
