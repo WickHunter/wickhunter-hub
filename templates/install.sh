@@ -13,6 +13,8 @@ set -Eeuo pipefail
 
 HUB="__HUB_ORIGIN__"
 KEY="__LICENSE_KEY__"
+RELEASE_KEYS_B64U="__RELEASE_KEYS_B64U__"
+RELEASE_MAX_AGE_MS="__RELEASE_MAX_AGE_MS__"
 
 APP_DIR=/opt/wickhunter
 ENV_FILE=/etc/wickhunter/env
@@ -42,6 +44,7 @@ ask() { # ask VAR "prompt" [--secret]
 
 [ "$(id -u)" -eq 0 ] || die "run as root: curl -fsS \"...\" | sudo bash"
 command -v systemctl >/dev/null || die "systemd is required (Ubuntu 22.04+ VPS)"
+case "$HUB" in https://*) ;; *) die "the WickHunter Hub must use HTTPS" ;; esac
 
 say "Installing prerequisites"
 export DEBIAN_FRONTEND=noninteractive
@@ -60,18 +63,89 @@ ok "node $(node -v)"
 
 # ── Fetch + verify the latest beta build ────────────────────────────────────
 say "Fetching the latest Wick Hunter beta"
-meta=$(curl -fsS "$HUB/api/latest?key=$KEY") \
-  || die "could not reach the hub (or your key is expired/revoked) — contact the operator"
-REL_VERSION=$(node -pe 'JSON.parse(process.argv[1]).version' "$meta")
-REL_FILE=$(node -pe 'JSON.parse(process.argv[1]).file' "$meta")
-REL_SHA=$(node -pe 'JSON.parse(process.argv[1]).sha256' "$meta")
-ok "latest is v$REL_VERSION"
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+meta=$(curl -fsS "$HUB/api/latest?key=$KEY") \
+  || die "could not reach the hub (or your key is expired/revoked) — contact the operator"
+printf '%s' "$meta" > "$work/latest.json"
+
+# Verify the offline Ed25519 release authority before trusting even the file
+# name. The Hub has only this public keyring; it cannot mint a release. `ok` is
+# an unsigned compatibility envelope and is deliberately excluded from the
+# canonical manifest bytes.
+if ! node - "$work/latest.json" "$work/verified.json" "$RELEASE_KEYS_B64U" "$RELEASE_MAX_AGE_MS" "$APP_DIR" <<'VERIFY_RELEASE'
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const [manifestPath, verifiedPath, keysB64u, maxAgeRaw, appDir] = process.argv.slice(2);
+const fail = (message) => { throw new Error(message); };
+const write = (value, out, depth = 0) => {
+  if (depth > 64) fail("manifest nests too deeply");
+  if (value === null) { out.push("null"); return; }
+  if (typeof value === "string") { out.push(JSON.stringify(value)); return; }
+  if (typeof value === "boolean") { out.push(value ? "true" : "false"); return; }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Object.is(value, -0)) fail("non-canonical number");
+    out.push(JSON.stringify(value)); return;
+  }
+  if (!value || typeof value !== "object") fail("unsupported manifest value");
+  if (Array.isArray(value)) {
+    out.push("["); value.forEach((entry, i) => { if (i) out.push(","); write(entry, out, depth + 1); }); out.push("]"); return;
+  }
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
+  out.push("{"); keys.forEach((key, i) => { if (i) out.push(","); out.push(JSON.stringify(key), ":"); write(value[key], out, depth + 1); }); out.push("}");
+};
+const decode = (value, size, label) => {
+  const raw = String(value ?? "");
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) fail(`${label} is not base64url`);
+  const bytes = Buffer.from(raw, "base64url");
+  if (bytes.length !== size || bytes.toString("base64url") !== raw) fail(`${label} has wrong length`);
+  return bytes;
+};
+const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+const publicKeys = JSON.parse(Buffer.from(keysB64u, "base64url").toString("utf8"));
+if (!manifest || manifest.schema !== "wickhunter.release.v1") fail("unsupported release schema");
+for (const field of ["product","channel","platform","arch","version","buildId","file","sha256","issuedAt"]) {
+  if (typeof manifest[field] !== "string" || !manifest[field]) fail(`missing ${field}`);
+}
+if (manifest.product !== "wickhunter" || manifest.channel !== "beta" || manifest.platform !== "linux" || manifest.arch !== process.arch) fail("release target mismatch");
+if (!/^\d+\.\d+\.\d+$/.test(manifest.version) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(manifest.file) || !/^[0-9a-f]{64}$/.test(manifest.sha256)) fail("malformed release identity");
+if (!Number.isInteger(manifest.minUpdateProtocol) || manifest.minUpdateProtocol < 1 || manifest.minUpdateProtocol > 1) fail("unsupported update protocol");
+const issued = Date.parse(manifest.issuedAt), now = Date.now(), maxAge = Number(maxAgeRaw);
+if (!Number.isFinite(issued) || issued > now + 300000 || !Number.isFinite(maxAge) || maxAge <= 0 || now - issued > maxAge) fail("stale or future release manifest");
+let current = null;
+try { current = JSON.parse(fs.readFileSync(`${appDir}/package.json`, "utf8")).version; } catch {}
+const parts = (value) => { const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value ?? "")); return m && m.slice(1).map(Number); };
+if (current) {
+  const a = parts(manifest.version), b = parts(current);
+  if (!a || !b) fail("malformed installed version");
+  let order = 0; for (let i = 0; i < 3 && !order; i++) order = Math.sign(a[i] - b[i]);
+  if (order < 0) fail("release would downgrade this install");
+}
+const unsigned = { ...manifest }; delete unsigned.signatures; delete unsigned.ok;
+const out = []; write(unsigned, out); const bytes = Buffer.from(out.join(""), "utf8");
+let verified = false, known = false;
+for (const signature of Array.isArray(manifest.signatures) ? manifest.signatures : []) {
+  if (!signature || signature.alg !== "Ed25519" || !Object.hasOwn(publicKeys, signature.kid)) continue;
+  known = true;
+  const spki = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), decode(publicKeys[signature.kid], 32, "public key")]);
+  const key = crypto.createPublicKey({ key: spki, format: "der", type: "spki" });
+  try { if (crypto.verify(null, bytes, key, decode(signature.sig, 64, "signature"))) { verified = true; break; } } catch {}
+}
+if (!verified) fail(known ? "invalid release signature" : "unknown release key id");
+fs.writeFileSync(verifiedPath, JSON.stringify(manifest), { mode: 0o600 });
+VERIFY_RELEASE
+then
+  die "release manifest authentication failed — continuing to run the current version"
+fi
+
+REL_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' "$work/verified.json")
+REL_FILE=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).file' "$work/verified.json")
+REL_SHA=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).sha256' "$work/verified.json")
+ok "latest is v$REL_VERSION"
+
 curl -fsS -o "$work/$REL_FILE" "$HUB/download/$REL_FILE?key=$KEY" || die "download failed"
 echo "$REL_SHA  $work/$REL_FILE" | sha256sum -c --quiet - || die "sha256 mismatch — corrupt download, try again"
-ok "downloaded and verified $REL_FILE"
+ok "signature and artifact hash verified for $REL_FILE"
 
 # ── Unpack: tarball root is the app dir; data/ always survives ──────────────
 say "Installing to $APP_DIR"
@@ -83,7 +157,7 @@ if [ ! -f "$src/package.json" ]; then
   src=$(find "$work/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)
   [ -n "$src" ] && [ -f "$src/package.json" ] || die "unexpected tarball layout (no package.json)"
 fi
-rsync -a --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
+rsync -a --checksum --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
 
 # The beta artifact runs on Node builtins + what is bundled into server.js;

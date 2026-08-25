@@ -1,11 +1,12 @@
 // tests/server.test.mjs — the tester-facing surface over real HTTP on a
 // loopback ephemeral port: health, check-ins, keyed downloads, install.sh.
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, sign as edSign } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { readRoster } from "../dist/src/checkins.js";
+import { releaseSigningBytes } from "../dist/src/release-manifest.js";
 
 const h = await freshHub();
 const { token } = h.store.issue("Valid Tester", 30);
@@ -14,9 +15,30 @@ const { token } = h.store.issue("Valid Tester", 30);
 const tarball = Buffer.from("not really gzip but the hub does not care\n");
 const relName = "wickhunter-beta-0.9.0.tar.gz";
 fs.writeFileSync(path.join(h.releasesDir, relName), tarball);
+const unsignedRelease = {
+  schema: "wickhunter.release.v1",
+  product: "wickhunter",
+  channel: "beta",
+  platform: "linux",
+  arch: "x64",
+  version: "0.9.0",
+  buildId: "test-build-000900",
+  file: relName,
+  sha256: createHash("sha256").update(tarball).digest("hex"),
+  issuedAt: new Date().toISOString(),
+  minUpdateProtocol: 1,
+};
+const signedRelease = {
+  ...unsignedRelease,
+  signatures: [{
+    kid: h.releaseSigner.kid,
+    alg: "Ed25519",
+    sig: edSign(null, releaseSigningBytes(unsignedRelease), h.releaseSigner.privateKey).toString("base64url"),
+  }],
+};
 fs.writeFileSync(
   path.join(h.releasesDir, "latest.json"),
-  JSON.stringify({ version: "0.9.0", file: relName, sha256: createHash("sha256").update(tarball).digest("hex") }),
+  JSON.stringify(signedRelease),
 );
 
 await test("HUB_VERSION, package.json and the changelog agree — nothing drifts on a comment", async () => {
@@ -117,6 +139,8 @@ await test("api/latest returns the release metadata", async () => {
   assert.equal(r.body.version, "0.9.0");
   assert.equal(r.body.file, relName);
   assert.match(r.body.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(r.body.schema, "wickhunter.release.v1");
+  assert.equal(r.body.signatures[0].kid, h.releaseSigner.kid);
 });
 
 await test("download without / with a bad key is 403", async () => {
@@ -159,6 +183,9 @@ await test("install.sh is templated with the hub origin and the key", async () =
   assert.ok(script.includes(`HUB="${h.cfg.publicOrigin}"`), "origin substituted");
   assert.ok(script.includes(`KEY="${token}"`), "key substituted");
   assert.ok(!script.includes("__HUB_ORIGIN__") && !script.includes("__LICENSE_KEY__"), "no placeholders left");
+  assert.ok(!script.includes("__RELEASE_KEYS_B64U__") && !script.includes("__RELEASE_MAX_AGE_MS__"), "release trust placeholders substituted");
+  assert.ok(script.includes("wickhunter.release.v1") && script.includes("crypto.verify"), "installer verifies the release signature locally");
+  assert.ok(script.indexOf("crypto.verify") < script.indexOf('tar -xzf "$work/$REL_FILE"'), "signature verification precedes extraction");
 });
 
 await test("install.sh with a bad key is 403", async () => {
@@ -169,6 +196,18 @@ await test("install.sh with a bad key is 403", async () => {
 await test("unknown routes are 404", async () => {
   const r = await jsonReq(`${h.origin}/api/nope`);
   assert.equal(r.status, 404);
+});
+
+await test("unsigned old metadata is never served as an authenticated release", async () => {
+  fs.writeFileSync(path.join(h.releasesDir, "latest.json"), JSON.stringify({
+    version: unsignedRelease.version,
+    file: unsignedRelease.file,
+    sha256: unsignedRelease.sha256,
+  }));
+  const latest = await jsonReq(`${h.origin}/api/latest?key=${token}`);
+  assert.equal(latest.status, 404);
+  const installer = await jsonReq(`${h.origin}/install.sh?key=${token}`);
+  assert.equal(installer.status, 503);
 });
 
 await h.close();

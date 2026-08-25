@@ -6,7 +6,7 @@
 //   keyed    POST /api/license/checkin           bot phone-home; answers revoked
 //   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
-//   keyed    GET  /api/latest?key=<token>        release metadata (version/file/sha256)
+//   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   keyed    GET  /api/market-data/market-caps/v1 signed market-cap snapshot (contract v1)
@@ -64,6 +64,11 @@ import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
 import { HUB_VERSION } from "./version.js";
 import { spawn as nodeSpawn } from "node:child_process";
+import {
+  verifyReleaseArtifact,
+  verifyReleaseManifest,
+  type SignedReleaseManifest,
+} from "./release-manifest.js";
 
 /** The provider fetcher for the market-cap producer. A separate shape from the
  *  candles' `FetchLike` because this one carries an API-key HEADER — which is
@@ -98,12 +103,6 @@ export interface Hub {
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
-}
-
-interface LatestJson {
-  version: string;
-  file: string;
-  sha256: string;
 }
 
 export interface HubDeps {
@@ -427,20 +426,33 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   async function installScript(url: URL, res: ServerResponse): Promise<void> {
     if (!requireKey(url, res)) return;
+    if (!readLatest()) {
+      return sendJson(res, 503, { ok: false, error: "no authenticated release is available" });
+    }
     const template = fs.readFileSync(path.join(cfg.templatesDir, "install.sh"), "utf8");
     const script = template
       .replaceAll("__HUB_ORIGIN__", cfg.publicOrigin)
-      .replaceAll("__LICENSE_KEY__", url.searchParams.get("key")!);
+      .replaceAll("__LICENSE_KEY__", url.searchParams.get("key")!)
+      .replaceAll("__RELEASE_KEYS_B64U__", Buffer.from(JSON.stringify(cfg.releasePublicKeys), "utf8").toString("base64url"))
+      .replaceAll("__RELEASE_MAX_AGE_MS__", String(cfg.releaseMaxAgeMs));
     res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8" });
     res.end(script);
   }
 
-  function readLatest(): LatestJson | null {
+  function readLatest(): SignedReleaseManifest | null {
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(cfg.releasesDir, "latest.json"), "utf8"));
-      if (typeof raw.version === "string" && typeof raw.file === "string" && typeof raw.sha256 === "string") {
-        return raw as LatestJson;
-      }
+      const manifest = verifyReleaseManifest(raw, {
+        publicKeys: cfg.releasePublicKeys,
+        now: Date.now(),
+        maxAgeMs: cfg.releaseMaxAgeMs,
+        channel: cfg.releaseChannel,
+        platform: cfg.releasePlatform,
+        arch: cfg.releaseArch,
+      });
+      const artifact = fs.readFileSync(path.join(cfg.releasesDir, manifest.file));
+      verifyReleaseArtifact(manifest, artifact);
+      return manifest;
     } catch {
       /* fall through */
     }
@@ -451,6 +463,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!requireKey(url, res)) return;
     const latest = readLatest();
     if (!latest) return sendJson(res, 404, { ok: false, error: "no release published" });
+    // Additive response: old clients keep reading version/file/sha256; new
+    // clients remove the unsigned `ok` envelope and verify every manifest field.
     sendJson(res, 200, { ok: true, ...latest });
   }
 

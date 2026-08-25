@@ -5,11 +5,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { generateSigningKey, LicenseStore } from "../dist/src/license.js";
 import { createHub } from "../dist/src/server.js";
 import { DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `wickhub-${prefix}-`));
@@ -27,6 +29,11 @@ export function freshStore() {
 export async function freshHub(overrides = {}, deps = undefined) {
   const { store, dataDir } = freshStore();
   const releasesDir = tmpDir("releases");
+  const releasePair = generateKeyPairSync("ed25519");
+  const releaseKid = "release-test-1";
+  const releasePublicKeys = {
+    [releaseKid]: releasePair.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("base64url"),
+  };
   const cfg = {
     dataDir,
     releasesDir,
@@ -37,6 +44,11 @@ export async function freshHub(overrides = {}, deps = undefined) {
     adminToken: "test-admin-token",
     publicOrigin: "https://hub.test/hub",
     srcDir: "/nonexistent/hub-src",
+    releasePublicKeys,
+    releaseMaxAgeMs: 30 * 24 * 60 * 60 * 1000,
+    releaseChannel: "beta",
+    releasePlatform: "linux",
+    releaseArch: "x64",
     // Candle collectors are OFF unless a suite asks for them: a test hub must
     // never make an outbound venue request. Suites that exercise the collector
     // pass their own venue list plus a stub fetch through `deps`.
@@ -63,6 +75,7 @@ export async function freshHub(overrides = {}, deps = undefined) {
     cfg,
     dataDir,
     releasesDir,
+    releaseSigner: { kid: releaseKid, privateKey: releasePair.privateKey, publicKeys: releasePublicKeys },
     origin: `http://127.0.0.1:${port}`,
     close: () => hub.close(),
   };
