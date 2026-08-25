@@ -18,6 +18,7 @@ import {
   marketplaceStatusBridgeFromEnv,
   type MarketplaceStatusBridgeConfig,
 } from "./marketplace-status.js";
+import type { MarketplaceInputsConfig } from "./marketplace-inputs.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +52,9 @@ export interface HubConfig {
    * never receives its credential and this public repository imports no
    * Marketplace execution/payment code. */
   marketplaceStatus?: MarketplaceStatusBridgeConfig;
+  /** Root-owned EnvironmentFile managed by the authenticated Hub admin input
+   * plane. The request can change allowlisted values, never this path. */
+  marketplaceInputs?: MarketplaceInputsConfig;
 
   // ── candle seed service ───────────────────────────────────────────────────
   /** Venues that run a 1m collector. EMPTY BY DEFAULT: collecting is hours of
@@ -181,6 +185,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       defaultMaxMachines: Number(env.HUB_LICENSE_LEASE_DEFAULT_MAX_MACHINES ?? 1),
     },
     marketplaceStatus: marketplaceStatusBridgeFromEnv(env),
+    marketplaceInputs: {
+      envFile: env.HUB_MARKETPLACE_ENV_FILE ?? "/etc/liqhunter/marketplace.env",
+      hubBridgeEnvFile: env.HUB_MARKETPLACE_BRIDGE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace.env",
+    },
     candleVenues: (env.HUB_CANDLE_VENUES ?? "")
       .split(",")
       .map((s) => s.trim().toLowerCase())

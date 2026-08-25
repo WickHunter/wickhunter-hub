@@ -18,6 +18,8 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 HUB_DIR=${HUB_DIR:-/opt/wickhunter-hub}
 ENV_FILE=${HUB_ENV_FILE:-/etc/wickhunter-hub/env}
+MARKETPLACE_ENV_FILE=/etc/liqhunter/marketplace.env
+MARKETPLACE_BRIDGE_ENV_FILE=/etc/wickhunter-hub/marketplace.env
 SERVICE=wickhunter-hub
 UNIT_FILE=/etc/systemd/system/${SERVICE}.service
 PORT=8091
@@ -97,6 +99,31 @@ if ! grep -q '^HUB_RELEASE_PUBLIC_KEYS_JSON=' "$ENV_FILE"; then
   die "HUB_RELEASE_PUBLIC_KEYS_JSON is required. Generate the dedicated OFFLINE release key in the app repo, paste only its public keyring JSON into $ENV_FILE, sign the current release, then re-run. Never copy the private release key to this Hub."
 fi
 
+# The Hub admin can persist only the exact Marketplace input allowlist here.
+# systemd reads EnvironmentFile as root before dropping into the private
+# services, so 0600 is sufficient and keeps every credential root-only. A
+# symlink or special file is never followed or replaced by an install.
+marketplace_env_dir=$(dirname "$MARKETPLACE_ENV_FILE")
+mkdir -p "$marketplace_env_dir"
+if [ -L "$marketplace_env_dir" ] || [ ! -d "$marketplace_env_dir" ]; then
+  die "$marketplace_env_dir must be a real directory, not a symlink or special file"
+fi
+if [ -L "$MARKETPLACE_ENV_FILE" ] || { [ -e "$MARKETPLACE_ENV_FILE" ] && [ ! -f "$MARKETPLACE_ENV_FILE" ]; }; then
+  die "$MARKETPLACE_ENV_FILE must be a regular file, not a symlink or special file"
+fi
+touch "$MARKETPLACE_ENV_FILE"
+chmod 600 "$MARKETPLACE_ENV_FILE"
+ok "Marketplace admin inputs persist root-only at $MARKETPLACE_ENV_FILE"
+
+# Only the three status-bridge values ever enter the public Hub process. The
+# private EnvironmentFile above is deliberately NOT loaded by this service.
+if [ -L "$MARKETPLACE_BRIDGE_ENV_FILE" ] || { [ -e "$MARKETPLACE_BRIDGE_ENV_FILE" ] && [ ! -f "$MARKETPLACE_BRIDGE_ENV_FILE" ]; }; then
+  die "$MARKETPLACE_BRIDGE_ENV_FILE must be a regular file, not a symlink or special file"
+fi
+touch "$MARKETPLACE_BRIDGE_ENV_FILE"
+chmod 600 "$MARKETPLACE_BRIDGE_ENV_FILE"
+ok "Marketplace status bridge persists separately at $MARKETPLACE_BRIDGE_ENV_FILE"
+
 # Machine leases are additive. A missing/corrupt lease authority must never
 # prevent a legacy LHK1 Hub upgrade. Read only the one exact env assignment we
 # need; never `source` an operator-owned file into this root shell.
@@ -139,6 +166,7 @@ printf '%s\n' \
   '[Service]' \
   "WorkingDirectory=$HUB_DIR" \
   "EnvironmentFile=$ENV_FILE" \
+  "EnvironmentFile=-$MARKETPLACE_BRIDGE_ENV_FILE" \
   'Environment=NODE_ENV=production' \
   "ExecStart=$(command -v node) dist/src/main.js" \
   'Restart=always' \

@@ -20,6 +20,8 @@
 //   admin    POST /admin/api/licenses/expiry     {id, exp} -> re-minted command
 //   admin    POST /admin/api/licenses/revoke     {id}
 //   admin    GET  /admin/api/market-caps       producer health + credit spend
+//   admin    GET  /admin/api/marketplace-config masked allowlisted input state
+//   admin    POST /admin/api/marketplace-config atomic private-service config + restart
 //   admin    GET  /admin/api/flags                per-licence feature flags
 //   admin    POST /admin/api/flags                {id|"default", flag, state:true|false|null}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
@@ -80,6 +82,16 @@ import {
   marketplaceStatusBridgeFromEnv,
   type MarketplaceStatusFetch,
 } from "./marketplace-status.js";
+import {
+  applyMarketplaceInputUpdate,
+  marketplaceBridgeEnvironment,
+  marketplaceInputSnapshot,
+  MARKETPLACE_CSRF_HEADER,
+  MARKETPLACE_CSRF_VALUE,
+  MarketplaceInputError,
+  type MarketplaceInputsConfig,
+  type MarketplaceInputUpdate,
+} from "./marketplace-inputs.js";
 import {
   readBuildRecord,
   probeSourceCheckout,
@@ -174,6 +186,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const response = await fetch(url, init);
     return { ok: response.ok, status: response.status, text: () => response.text() };
   });
+  let marketplaceStatusConfig = cfg.marketplaceStatus ?? marketplaceStatusBridgeFromEnv({});
+  const marketplaceInputsConfig: MarketplaceInputsConfig = cfg.marketplaceInputs
+    ?? {
+      envFile: "/etc/liqhunter/marketplace.env",
+      hubBridgeEnvFile: "/etc/wickhunter-hub/marketplace.env",
+    };
   const candleKey = new CandleKeyStore(cfg.dataDir);
   // ── WHICH KEY SIGNS A SEED ────────────────────────────────────────────────
   // One expression picks BOTH halves — `cfg.candleKeyId` was derived from the
@@ -829,9 +847,46 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, ...operationsStatus(true) }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p === "/admin/api/marketplace-status") {
-      const config = cfg.marketplaceStatus ?? marketplaceStatusBridgeFromEnv({});
-      const status = await fetchMarketplaceStatus(config, marketplaceStatusFetch);
+      const status = await fetchMarketplaceStatus(marketplaceStatusConfig, marketplaceStatusFetch);
       return sendJson(res, 200, { ok: true, marketplace: status }, { "cache-control": "no-store" });
+    }
+    if (m === "GET" && p === "/admin/api/marketplace-config") {
+      try {
+        return sendJson(res, 200, { ok: true, config: marketplaceInputSnapshot(marketplaceInputsConfig) }, { "cache-control": "no-store" });
+      } catch (err) {
+        const message = err instanceof MarketplaceInputError ? err.message : "Marketplace configuration state is unavailable";
+        return sendJson(res, 503, { ok: false, error: message }, { "cache-control": "no-store" });
+      }
+    }
+    if (m === "POST" && p === "/admin/api/marketplace-config") {
+      // `x-hub-admin` is the authentication bearer. This second fixed custom
+      // header is the CSRF contract: ordinary cross-origin HTML forms cannot
+      // produce either header or an application/json body, and this service
+      // never opts into credentialed CORS.
+      const csrf = req.headers[MARKETPLACE_CSRF_HEADER];
+      const site = req.headers["sec-fetch-site"];
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      if (csrf !== MARKETPLACE_CSRF_VALUE || !/^application\/json(?:\s*;|$)/.test(contentType) || site === "cross-site") {
+        return sendJson(res, 403, { ok: false, error: "Marketplace configuration requires the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      }
+      const body = await readJsonBody(req);
+      if (body === null) return sendJson(res, 400, { ok: false, error: "expected a Marketplace configuration update" }, { "cache-control": "no-store" });
+      try {
+        const config = await applyMarketplaceInputUpdate(
+          marketplaceInputsConfig,
+          body as unknown as MarketplaceInputUpdate,
+          spawn,
+        );
+        // The shared EnvironmentFile is also read by the Hub unit on its next
+        // restart. Update this process's status bridge only AFTER both private
+        // services accepted the same file, so the UI works immediately without
+        // restarting itself halfway through this response.
+        marketplaceStatusConfig = marketplaceStatusBridgeFromEnv(marketplaceBridgeEnvironment(marketplaceInputsConfig));
+        return sendJson(res, 200, { ok: true, config }, { "cache-control": "no-store" });
+      } catch (err) {
+        const message = err instanceof MarketplaceInputError ? err.message : "Marketplace configuration update failed closed";
+        return sendJson(res, err instanceof MarketplaceInputError ? 400 : 500, { ok: false, error: message }, { "cache-control": "no-store" });
+      }
     }
     if (m === "POST" && p === "/admin/api/license-leases/seat-override") {
       if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
