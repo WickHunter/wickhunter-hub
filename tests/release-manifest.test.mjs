@@ -1,9 +1,10 @@
 // Security Phase 1: the Hub validates and serves, but cannot sign, releases.
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   releaseSigningBytes,
   verifyReleaseArtifact,
@@ -103,8 +104,89 @@ await test("the exact installer verifier accepts valid metadata and rejects tamp
   const args = [input, output, Buffer.from(JSON.stringify(publicKeys)).toString("base64url"), String(policy.maxAgeMs), appDir];
   execFileSync(process.execPath, [verifier, ...args]);
   assert.equal(JSON.parse(fs.readFileSync(output, "utf8")).buildId, manifest.buildId);
+  fs.writeFileSync(input, gzipSync(JSON.stringify({ ok: true, ...installerManifest })));
+  execFileSync(process.execPath, [verifier, ...args]);
+  assert.equal(JSON.parse(fs.readFileSync(output, "utf8")).buildId, manifest.buildId);
   fs.writeFileSync(input, JSON.stringify({ ok: true, ...installerManifest, file: "tampered.tar.gz" }));
   assert.throws(() => execFileSync(process.execPath, [verifier, ...args], { stdio: "pipe" }), /Command failed/);
+});
+
+await test("installer fetch is deterministic and binary transport errors are sanitized", async () => {
+  const template = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  assert.match(template, /curl -q --fail --silent --show-error/);
+  assert.doesNotMatch(template, /--compressed/);
+  assert.match(template, /Accept-Encoding: identity/);
+  assert.match(template, /head -c "\$\(\(fetch_max \+ 1\)\)"/);
+  assert.ok(!template.includes("meta=$(curl"), "manifest bytes never pass through a shell variable");
+
+  const match = /<<'VERIFY_RELEASE'\n([\s\S]*?)\nVERIFY_RELEASE/.exec(template);
+  assert.ok(match);
+  const dir = tmpDir("installer-corrupt-transport");
+  const verifier = path.join(dir, "verify.cjs");
+  const input = path.join(dir, "latest.json");
+  const output = path.join(dir, "verified.json");
+  const appDir = path.join(dir, "app");
+  fs.mkdirSync(appDir);
+  fs.writeFileSync(path.join(appDir, "sentinel"), "running-version-untouched");
+  fs.writeFileSync(verifier, match[1]);
+  fs.writeFileSync(input, Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xff, 0x00]));
+  const args = [input, output, Buffer.from(JSON.stringify(publicKeys)).toString("base64url"), String(policy.maxAgeMs), appDir];
+  let stderr = "";
+  try { execFileSync(process.execPath, [verifier, ...args], { stdio: "pipe" }); }
+  catch (error) { stderr = String(error.stderr ?? ""); }
+  assert.match(stderr, /not UTF-8 JSON|not valid JSON/);
+  assert.doesNotMatch(stderr, /Unexpected token/);
+  assert.ok(!fs.existsSync(output), "corrupt transport never creates a verified manifest");
+  assert.equal(fs.readFileSync(path.join(appDir, "sentinel"), "utf8"), "running-version-untouched");
+});
+
+await test("the exact fetch pipeline hard-caps chunked and unknown-length bodies", async () => {
+  const template = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const from = template.indexOf("curl_hub() {");
+  const to = template.indexOf("\nif fetch_bounded ", from);
+  assert.ok(from >= 0 && to > from, "installer fetch helpers are extractable");
+  const helpers = template.slice(from, to);
+  const dir = tmpDir("installer-bounded-fetch");
+  const fakeBin = path.join(dir, "bin");
+  fs.mkdirSync(fakeBin);
+  const fakeCurl = path.join(fakeBin, "curl");
+  fs.writeFileSync(fakeCurl, "#!/usr/bin/env bash\ncat \"$FAKE_CURL_PAYLOAD\"\nexit \"${FAKE_CURL_EXIT:-0}\"\n", { mode: 0o755 });
+  const runner = path.join(dir, "fetch.sh");
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\nset -Eeuo pipefail\n${helpers}\nfetch_bounded 'https://hub.invalid/api/latest?key=fake' "$1" "$2" 'application/json'\n`, { mode: 0o755 });
+
+  const small = path.join(dir, "small.input");
+  const smallOut = path.join(dir, "small.out");
+  fs.writeFileSync(small, "{\"ok\":true}");
+  const baseEnv = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` };
+  const okRun = spawnSync("bash", [runner, smallOut, "1048576"], {
+    env: { ...baseEnv, FAKE_CURL_PAYLOAD: small }, encoding: "utf8",
+  });
+  assert.equal(okRun.status, 0, okRun.stderr);
+  assert.equal(fs.readFileSync(smallOut, "utf8"), "{\"ok\":true}");
+
+  const exact = path.join(dir, "exact.input");
+  const exactOut = path.join(dir, "exact.out");
+  fs.writeFileSync(exact, Buffer.alloc(1024 * 1024, 0x42));
+  const exactRun = spawnSync("bash", [runner, exactOut, "1048576"], {
+    env: { ...baseEnv, FAKE_CURL_PAYLOAD: exact }, encoding: "utf8",
+  });
+  assert.equal(exactRun.status, 0, exactRun.stderr);
+  assert.equal(fs.statSync(exactOut).size, 1048576, "MAX bytes are accepted exactly");
+
+  const partialOut = path.join(dir, "partial.out");
+  const partial = spawnSync("bash", [runner, partialOut, "1048576"], {
+    env: { ...baseEnv, FAKE_CURL_PAYLOAD: small, FAKE_CURL_EXIT: "7" }, encoding: "utf8",
+  });
+  assert.equal(partial.status, 1, "partial bytes plus a curl failure are never accepted");
+
+  const huge = path.join(dir, "huge.input");
+  const hugeOut = path.join(dir, "huge.out");
+  fs.writeFileSync(huge, Buffer.alloc(2 * 1024 * 1024, 0x41));
+  const capped = spawnSync("bash", [runner, hugeOut, "1048576"], {
+    env: { ...baseEnv, FAKE_CURL_PAYLOAD: huge }, encoding: "utf8",
+  });
+  assert.equal(capped.status, 65, capped.stderr);
+  assert.equal(fs.statSync(hugeOut).size, 1048577, "MAX+1 is refused and is all that reaches disk");
 });
 
 summary("release-manifest");

@@ -141,7 +141,11 @@ await test("download/latest resolves through latest.json", async () => {
 });
 
 await test("api/latest returns the release metadata", async () => {
-  const r = await jsonReq(`${h.origin}/api/latest?key=${token}`);
+  const raw = await fetch(`${h.origin}/api/latest?key=${token}`);
+  assert.equal(raw.headers.get("content-encoding"), null);
+  assert.equal(raw.headers.get("cache-control"), "no-store, no-transform");
+  assert.equal(raw.headers.get("x-content-type-options"), "nosniff");
+  const r = { status: raw.status, body: JSON.parse(await raw.text()) };
   assert.equal(r.status, 200);
   assert.equal(r.body.version, "0.9.0");
   assert.equal(r.body.file, relName);

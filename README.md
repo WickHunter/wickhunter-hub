@@ -646,7 +646,7 @@ personalised command):
 > one command:
 >
 > ```
-> curl -fsS "https://<vps-ip>/hub/install.sh?key=<TOKEN>" | sudo bash
+> curl -q -fsS "https://<vps-ip>/hub/install.sh?key=<TOKEN>" | sudo bash
 > ```
 >
 > It installs Node, the bot, and HTTPS, then prints your dashboard URL and
@@ -779,6 +779,16 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.6 — **Installer manifest transport is deterministic on home servers and
+  managed networks.** Hub metadata is non-cacheable and marked no-transform.
+  The installer ignores machine-local curl configuration, requests an identity
+  response, streams response bytes through a hard cap, and tolerates bounded
+  declared or undeclared gzip from a
+  broken reverse proxy. Corrupt, non-UTF-8, or non-JSON responses now fail
+  closed with a useful network/proxy message instead of printing binary symbols
+  and a raw JSON parser excerpt. The installed Wick Hunter version remains
+  untouched on every failure.
 
 - v0.3.5 — **Alpha client readiness is visible without exposing deployment
   material.** The public Hub now allowlists and renders the private service's
