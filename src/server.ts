@@ -601,7 +601,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!latest) return sendJson(res, 404, { ok: false, error: "no release published" });
     // Additive response: old clients keep reading version/file/sha256; new
     // clients remove the unsigned `ok` envelope and verify every manifest field.
-    sendJson(res, 200, { ok: true, ...latest });
+    // Pin identity at the origin so nginx/CDNs do not transform this tiny,
+    // signature-bearing document. The installer can decode a declared
+    // transport encoding, but the simplest and safest wire format is UTF-8.
+    sendJson(res, 200, { ok: true, ...latest }, {
+      "cache-control": "no-store, no-transform",
+      "x-content-type-options": "nosniff",
+    });
   }
 
   async function download(url: URL, res: ServerResponse): Promise<void> {
@@ -811,7 +817,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         ok: true,
         license: issued.payload,
         token: issued.token,
-        installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
+        installCommand: `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
       });
     }
     if (m === "GET" && p === "/admin/api/license-leases") {
@@ -1002,7 +1008,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (!token) return sendJson(res, 404, { ok: false, error: "unknown or revoked license id" });
       return sendJson(res, 200, {
         ok: true,
-        installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash`,
+        installCommand: `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash`,
       });
     }
     // ── CHANGE AN ISSUED LICENSE'S EXPIRY ──────────────────────────────────
@@ -1026,7 +1032,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, {
         ok: true,
         exp: payload.exp,
-        installCommand: token ? `curl -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
+        installCommand: token ? `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
       });
     }
     if (m === "GET" && p === "/admin/api/flags") {

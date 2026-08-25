@@ -3,7 +3,7 @@
 # placeholders below are substituted per-tester at download time.
 #
 # One command on a fresh Ubuntu VPS:
-#   curl -fsS "<hub>/install.sh?key=<your key>" | sudo bash
+#   curl -q -fsS "<hub>/install.sh?key=<your key>" | sudo bash
 #
 # What it does: Node 22, fetch + verify the latest beta build, unpack to
 # /opt/wickhunter (your data/ survives re-runs), systemd unit, license key,
@@ -42,7 +42,7 @@ ask() { # ask VAR "prompt" [--secret]
   printf -v "$__var" '%s' "$__val"
 }
 
-[ "$(id -u)" -eq 0 ] || die "run as root: curl -fsS \"...\" | sudo bash"
+[ "$(id -u)" -eq 0 ] || die "run as root: curl -q -fsS \"...\" | sudo bash"
 command -v systemctl >/dev/null || die "systemd is required (Ubuntu 22.04+ VPS)"
 case "$HUB" in https://*) ;; *) die "the WickHunter Hub must use HTTPS" ;; esac
 
@@ -55,7 +55,7 @@ apt-get install -y -qq curl ca-certificates rsync tar openssl
 node_major() { node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/'; }
 if ! command -v node >/dev/null || [ "$(node_major)" -lt "$NODE_MAJOR_WANTED" ]; then
   say "Installing Node ${NODE_MAJOR_WANTED} (nodesource)"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_WANTED}.x" | bash - >/dev/null
+  curl -q -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_WANTED}.x" | bash - >/dev/null
   apt-get install -y -qq nodejs
 fi
 [ "$(node_major)" -ge "$NODE_MAJOR_WANTED" ] || die "Node ${NODE_MAJOR_WANTED}+ required, found $(node -v)"
@@ -65,9 +65,40 @@ ok "node $(node -v)"
 say "Fetching the latest Wick Hunter beta"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-meta=$(curl -fsS "$HUB/api/latest?key=$KEY") \
-  || die "could not reach the hub (or your key is expired/revoked) — contact the operator"
-printf '%s' "$meta" > "$work/latest.json"
+# Ignore a machine-local curlrc and request an identity response. Never ask
+# curl to decompress: Ubuntu 22.04's curl can expand a tiny response past its
+# size limit before the caller gets control. The bounded verifier below handles
+# the one safe compatibility exception (a gzip response) itself.
+curl_hub() {
+  curl -q --fail --silent --show-error \
+    --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \
+    --retry 2 --retry-delay 1 \
+    --header 'Accept-Encoding: identity' "$@"
+}
+# `curl --max-filesize` did not bound unknown-length bodies on the oldest curl
+# we support. Stream through `head` and retain MAX+1 bytes instead: disk and
+# memory stay bounded even for a hostile/chunked response. Return 65 when the
+# response crossed the cap, or 1 for a transport failure.
+fetch_bounded() {
+  fetch_url=$1 fetch_out=$2 fetch_max=$3 fetch_accept=$4
+  set +e
+  curl_hub --header "Accept: $fetch_accept" "$fetch_url" \
+    | head -c "$((fetch_max + 1))" > "$fetch_out"
+  fetch_status=("${PIPESTATUS[@]}")
+  set -e
+  fetch_bytes=$(wc -c < "$fetch_out")
+  if [ "$fetch_bytes" -gt "$fetch_max" ]; then return 65; fi
+  [ "${fetch_status[0]:-1}" -eq 0 ] && [ "${fetch_status[1]:-1}" -eq 0 ]
+}
+if fetch_bounded "$HUB/api/latest?key=$KEY" "$work/latest.json" 1048576 'application/json'; then
+  :
+else
+  fetch_code=$?
+  if [ "$fetch_code" -eq 65 ]; then
+    die "release manifest response exceeded 1 MiB — proxy or network corruption"
+  fi
+  die "could not reach the hub (or your key is expired/revoked) — contact the operator"
+fi
 
 # Verify the offline Ed25519 release authority before trusting even the file
 # name. The Hub has only this public keyring; it cannot mint a release. `ok` is
@@ -76,6 +107,8 @@ printf '%s' "$meta" > "$work/latest.json"
 if ! node - "$work/latest.json" "$work/verified.json" "$RELEASE_KEYS_B64U" "$RELEASE_MAX_AGE_MS" "$APP_DIR" <<'VERIFY_RELEASE'
 const fs = require("node:fs");
 const crypto = require("node:crypto");
+const zlib = require("node:zlib");
+const { TextDecoder } = require("node:util");
 const [manifestPath, verifiedPath, keysB64u, maxAgeRaw, appDir] = process.argv.slice(2);
 const fail = (message) => { throw new Error(message); };
 const write = (value, out, depth = 0) => {
@@ -101,8 +134,26 @@ const decode = (value, size, label) => {
   if (bytes.length !== size || bytes.toString("base64url") !== raw) fail(`${label} has wrong length`);
   return bytes;
 };
-const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-const publicKeys = JSON.parse(Buffer.from(keysB64u, "base64url").toString("utf8"));
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+const wire = fs.readFileSync(manifestPath);
+if (!wire.length || wire.length > MAX_MANIFEST_BYTES) fail("release manifest response has invalid size");
+let body = wire;
+// A correctly configured Hub sends identity. Curl deliberately leaves any
+// transport encoding intact, and this bounded decoder handles gzip whether a
+// proxy declared it correctly or forgot Content-Encoding.
+if (wire.length >= 2 && wire[0] === 0x1f && wire[1] === 0x8b) {
+  try { body = zlib.gunzipSync(wire, { maxOutputLength: MAX_MANIFEST_BYTES }); }
+  catch { fail("release manifest transport used invalid or oversized gzip"); }
+}
+let manifestText;
+try { manifestText = new TextDecoder("utf-8", { fatal: true }).decode(body); }
+catch { fail("release manifest response is not UTF-8 JSON (proxy or network corruption)"); }
+let manifest;
+try { manifest = JSON.parse(manifestText); }
+catch { fail("release manifest response is not valid JSON (proxy or network corruption)"); }
+let publicKeys;
+try { publicKeys = JSON.parse(Buffer.from(keysB64u, "base64url").toString("utf8")); }
+catch { fail("embedded release public keyring is invalid"); }
 if (!manifest || manifest.schema !== "wickhunter.release.v1") fail("unsupported release schema");
 for (const field of ["product","channel","platform","arch","version","buildId","file","sha256","issuedAt"]) {
   if (typeof manifest[field] !== "string" || !manifest[field]) fail(`missing ${field}`);
@@ -143,7 +194,13 @@ REL_FILE=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8
 REL_SHA=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).sha256' "$work/verified.json")
 ok "latest is v$REL_VERSION"
 
-curl -fsS -o "$work/$REL_FILE" "$HUB/download/$REL_FILE?key=$KEY" || die "download failed"
+if fetch_bounded "$HUB/download/$REL_FILE?key=$KEY" "$work/$REL_FILE" 268435456 'application/gzip'; then
+  :
+else
+  fetch_code=$?
+  [ "$fetch_code" -eq 65 ] && die "release artifact exceeded the 256 MiB safety limit"
+  die "download failed"
+fi
 echo "$REL_SHA  $work/$REL_FILE" | sha256sum -c --quiet - || die "sha256 mismatch — corrupt download, try again"
 ok "signature and artifact hash verified for $REL_FILE"
 
@@ -263,7 +320,7 @@ systemctl restart "$SERVICE"
 say "Waiting for the bot to come up"
 health=""
 for _try in 1 2 3 4 5 6 7 8 9; do
-  health=$(curl -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null) && break
+  health=$(curl -q -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null) && break
   sleep 5
 done
 [ -n "$health" ] || die "the bot did not answer on 127.0.0.1:$PORT after 45s; inspect: journalctl -u $SERVICE -n 50"
