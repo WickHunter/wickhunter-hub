@@ -174,6 +174,7 @@ await test("an absent private service yields an exact static operator checklist 
     "MOONPAY_COMMERCE_RECIPIENTS_JSON", "MOONPAY_COMMERCE_MONTHLY_INTERVAL",
     "MOONPAY_COMMERCE_YEARLY_INTERVAL", "LIQHUNTER_MARKETPLACE_URL",
     "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED",
+    "MARKETPLACE_ALPHA_LICENCES",
   ];
   for (const required of ["HUB_MARKETPLACE_STATUS_ORIGIN", "HUB_MARKETPLACE_STATUS_CREDENTIAL", ...privateNames]) {
     assert.ok(names.includes(required), required);
@@ -182,6 +183,7 @@ await test("an absent private service yields an exact static operator checklist 
   }
   assert.equal(new Set(names).size, names.length, "the checklist has no duplicate variable rows");
   assert.equal(absent.requiredInputs.find((value) => value.name === "MARKETPLACE_ADMIN_LICENCES").secret, true);
+  assert.equal(absent.requiredInputs.find((value) => value.name === "MARKETPLACE_ALPHA_LICENCES").secret, true);
   assert.equal(absent.requiredInputs.find((value) => value.name === "MOONPAY_COMMERCE_PUBLIC_KEY").secret, true);
   assert.ok(absent.readinessBlockers.length > 0);
 });

@@ -85,6 +85,7 @@ const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boole
   { name: "LIQHUNTER_MARKETPLACE_URL", secret: false, action: "Set the exact public HTTPS Marketplace origin distributed to every alpha app install." },
   { name: "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", secret: false, action: "Ship the Marketplace intent verification keyring to alpha app installs and verify it matches the live signer before enabling signals." },
   { name: "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED", secret: false, action: "Set to 1 only after the Marketplace feature grant is live for the alpha licence cohort." },
+  { name: "MARKETPLACE_ALPHA_LICENCES", secret: true, action: "Set the exact server-enforced alpha licence cohort; removing an id becomes exit-only after private-service restart." },
 ]);
 
 function parseTimeout(raw: string | undefined): { value: number; refusal: string | null } {

@@ -590,8 +590,13 @@ visible instead of looking like a successful current checkout.
 ### Marketplace operations bridge (alpha only)
 
 Marketplace trading, payments, Demo credentials, and subscription persistence
-remain in the private service; none are copied into this public Hub. To show its
-sanitized operator contract in the Hub admin page, set on this Hub:
+remain in the private service; none are copied into this public Hub. The admin
+page now provides an allowlisted configuration form for every required input.
+Secrets are write-only, persist in `/etc/liqhunter/marketplace.env` with mode
+0600, and are never returned to the browser. The public Hub loads only a
+separate `/etc/wickhunter-hub/marketplace.env` containing the three status
+bridge values; database, signer, Bybit, vault and MoonPay credentials never
+enter the Hub process. To configure the status bridge manually instead, set:
 
 ```
 HUB_MARKETPLACE_STATUS_ORIGIN=http://127.0.0.1:<private-marketplace-port>
@@ -760,6 +765,8 @@ anywhere private is enough; everything else is reproducible.
 | `POST /admin/api/license-leases/deactivate` | `x-hub-admin` header | reason-required recovery for a lost machine key |
 | `GET /admin/api/operations` | `x-hub-admin` header | exact running/source/upgrade facts plus a redacted bounded log tail |
 | `GET /admin/api/marketplace-status` | `x-hub-admin` header | sanitized alpha Marketplace readiness and exact operator-input checklist; upstream credential stays server-side |
+| `GET /admin/api/marketplace-config` | `x-hub-admin` header | masked state for the exact Marketplace input allowlist; secret values are never returned |
+| `POST /admin/api/marketplace-config` | `x-hub-admin`, fixed CSRF header, JSON | atomically writes root-only private/bridge environment files and restarts only the private API/worker; restores both files on failure |
 | `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
 | `GET /admin/api/market-caps` | `x-hub-admin` header | market-cap producer health, credit spend and refusals |
 
@@ -779,6 +786,17 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.7 — **Every Marketplace operator input has a safe Hub-admin home.** The
+  authenticated admin form exposes the exact alpha, PostgreSQL, signer, Bybit
+  Demo and crypto-only MoonPay variable names, with server-side generation only
+  for internal status/vault/worker credentials. Vendor keys remain explicit
+  operator inputs. Secrets are write-only and masked; validated changes are
+  fsynced into root-only EnvironmentFiles and private API/worker restart is an
+  allowlisted transaction with byte-for-byte rollback. The public Hub receives
+  only a separate three-value status bridge file—never database, signing,
+  exchange, vault or payment credentials. Alpha remains centrally allowlisted;
+  this UI does not enable Marketplace for beta users.
 
 - v0.3.6 — **Installer manifest transport is deterministic on home servers and
   managed networks.** Hub metadata is non-cacheable and marked no-transform.

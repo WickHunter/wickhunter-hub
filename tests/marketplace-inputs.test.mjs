@@ -1,0 +1,237 @@
+// Hostile coverage for the Hub-admin Marketplace configuration plane. The
+// public Hub persists validated inputs but owns no trading/payment behavior.
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { EventEmitter } from "node:events";
+import { freshHub, jsonReq, test, summary, tmpDir } from "./helpers.mjs";
+import {
+  applyMarketplaceInputUpdate,
+  MARKETPLACE_INPUT_DEFINITIONS,
+  MARKETPLACE_RESTART_UNITS,
+  MarketplaceInputError,
+  marketplaceInputSnapshot,
+} from "../dist/src/marketplace-inputs.js";
+
+function fakeSpawner(outcomes = [0]) {
+  const calls = [];
+  const spawn = (command, args, options) => {
+    calls.push({ command, args, options });
+    const child = new EventEmitter();
+    const code = outcomes.length ? outcomes.shift() : 0;
+    queueMicrotask(() => child.emit("exit", code));
+    return child;
+  };
+  return { calls, spawn };
+}
+
+function config(prefix = "marketplace-inputs") {
+  const dir = tmpDir(prefix);
+  return {
+    dir,
+    cfg: {
+      envFile: path.join(dir, "marketplace.env"),
+      hubBridgeEnvFile: path.join(dir, "hub-marketplace.env"),
+    },
+  };
+}
+
+const secretStatus = "status-secret-that-is-long-enough-123456789";
+const vendorSecret = "bybit-vendor-secret-that-must-never-return";
+
+await test("schema exposes every API/config input, separates public alpha material, and marks vendor values non-generated", () => {
+  const byName = new Map(MARKETPLACE_INPUT_DEFINITIONS.map((field) => [field.name, field]));
+  for (const name of [
+    "HUB_MARKETPLACE_STATUS_ORIGIN", "HUB_MARKETPLACE_STATUS_CREDENTIAL",
+    "MARKETPLACE_DATABASE_URL", "MARKETPLACE_INTENT_KEY_ID", "MARKETPLACE_INTENT_SIGNING_SEED",
+    "MARKETPLACE_ALPHA_LICENCES", "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED",
+    "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
+    "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
+    "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
+    "MOONPAY_COMMERCE_RECIPIENTS_JSON", "MOONPAY_COMMERCE_MONTHLY_INTERVAL",
+  ]) assert.ok(byName.has(name), name);
+  assert.equal(byName.get("LIQHUNTER_MARKETPLACE_URL").secret, false);
+  assert.equal(byName.get("LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS").secret, false);
+  assert.equal(byName.get("MARKETPLACE_ALPHA_LICENCES").secret, true);
+  assert.equal(byName.get("MARKETPLACE_DEMO_VAULT_KEY").generated, "vault");
+  assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_CREDENTIAL").generated, "worker");
+  assert.equal(byName.get("MARKETPLACE_DEMO_MASTER_API_KEY").generated, undefined);
+  assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").generated, undefined);
+});
+
+await test("a successful update is atomic, 0600, masked, and restarts only the exact hardcoded private units", async () => {
+  const { cfg } = config("marketplace-success");
+  const fake = fakeSpawner();
+  const snapshot = await applyMarketplaceInputUpdate(cfg, {
+    changes: {
+      HUB_MARKETPLACE_STATUS_ORIGIN: "http://127.0.0.1:8099",
+      MARKETPLACE_ENABLED: "1",
+      MARKETPLACE_STORE: "postgres",
+      MARKETPLACE_DEMO_MASTER_API_SECRET: vendorSecret,
+      LIQHUNTER_MARKETPLACE_URL: "https://alpha-marketplace.example.com",
+      LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS: JSON.stringify({ "marketplace-1": Buffer.alloc(32, 7).toString("base64url") }),
+      MARKETPLACE_ALPHA_LICENCES: "alpha-one,alpha-two",
+      MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED: "1",
+    },
+    generate: [
+      "HUB_MARKETPLACE_STATUS_CREDENTIAL", "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL",
+      "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
+    ],
+  }, fake.spawn);
+  assert.equal(fs.statSync(cfg.envFile).mode & 0o777, 0o600);
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0].command, "systemctl");
+  assert.deepEqual(fake.calls[0].args, ["restart", ...MARKETPLACE_RESTART_UNITS]);
+  assert.equal(fake.calls[0].options.shell, false);
+  const argv = JSON.stringify(fake.calls);
+  assert.equal(argv.includes(vendorSecret), false, "a secret reached argv/options");
+  const bytes = fs.readFileSync(cfg.envFile, "utf8");
+  assert.ok(bytes.includes(vendorSecret), "the validated secret was not persisted");
+  assert.match(bytes, /HUB_MARKETPLACE_STATUS_CREDENTIAL="([^"]+)"/);
+  const hubStatus = bytes.match(/HUB_MARKETPLACE_STATUS_CREDENTIAL="([^"]+)"/)[1];
+  const privateStatus = bytes.match(/MARKETPLACE_OPERATOR_STATUS_CREDENTIAL="([^"]+)"/)[1];
+  assert.equal(hubStatus, privateStatus, "status pair drifted");
+  const bridgeBytes = fs.readFileSync(cfg.hubBridgeEnvFile, "utf8");
+  assert.ok(bridgeBytes.includes(hubStatus), "the bridge credential was not persisted for the Hub");
+  for (const forbidden of [vendorSecret, "MARKETPLACE_DATABASE_URL", "MARKETPLACE_INTENT_SIGNING_SEED", "MOONPAY_COMMERCE_SECRET_KEY"]) {
+    assert.equal(bridgeBytes.includes(forbidden), false, `private material crossed into the Hub bridge file: ${forbidden}`);
+  }
+  const serialized = JSON.stringify(snapshot);
+  for (const secret of [vendorSecret, hubStatus]) assert.equal(serialized.includes(secret), false, secret);
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_MASTER_API_SECRET").state, "configured");
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_MASTER_API_SECRET").safeValue, undefined);
+  assert.equal(snapshot.fields.find((field) => field.name === "LIQHUNTER_MARKETPLACE_URL").safeValue, "https://alpha-marketplace.example.com");
+});
+
+await test("unknown keys, short secrets, newline injection and vendor-key generation fail before write/restart without echo", async () => {
+  for (const [changes, generate, forbidden, updateOverride] of [
+    [{ NOT_A_MARKETPLACE_KEY: "hidden-unknown-value" }, [], "hidden-unknown-value"],
+    [{ MARKETPLACE_DEMO_MASTER_API_SECRET: "short" }, [], "short"],
+    [{ MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN: "tiny" }, [], "tiny"],
+    [{ MARKETPLACE_DATABASE_URL: "postgres://u:secret@db/name\nSYSTEMD_UNIT=evil" }, [], "SYSTEMD_UNIT=evil"],
+    [{}, ["MARKETPLACE_DEMO_MASTER_API_KEY"], "MARKETPLACE_DEMO_MASTER_API_KEY"],
+    [{}, ["MOONPAY_COMMERCE_SECRET_KEY"], "MOONPAY_COMMERCE_SECRET_KEY"],
+    [{}, [], "ignored", { ignored: "silent-typo" }],
+  ]) {
+    const { cfg } = config("marketplace-refuse");
+    const fake = fakeSpawner();
+    let thrown;
+    try { await applyMarketplaceInputUpdate(cfg, updateOverride || { changes, generate }, fake.spawn); }
+    catch (error) { thrown = error; }
+    assert.ok(thrown instanceof MarketplaceInputError);
+    assert.equal(fs.existsSync(cfg.envFile), false);
+    assert.equal(fs.existsSync(cfg.hubBridgeEnvFile), false);
+    assert.equal(fake.calls.length, 0);
+    assert.equal(thrown.message.includes(forbidden), false, `error echoed ${forbidden}`);
+  }
+});
+
+await test("symlink, symlink-directory and nonregular destinations are refused", () => {
+  const real = config("marketplace-path-real");
+  fs.writeFileSync(real.cfg.envFile, "", { mode: 0o600 });
+  const linked = config("marketplace-path-link");
+  const linkFile = path.join(linked.dir, "linked.env");
+  fs.symlinkSync(real.cfg.envFile, linkFile);
+  assert.throws(() => marketplaceInputSnapshot({ envFile: linkFile }), /regular file.*symlink/);
+
+  const linkParentRoot = tmpDir("marketplace-parent-link");
+  const linkParent = path.join(linkParentRoot, "linked-parent");
+  fs.symlinkSync(real.dir, linkParent);
+  assert.throws(() => marketplaceInputSnapshot({ envFile: path.join(linkParent, "marketplace.env") }), /real directory/);
+
+  const odd = config("marketplace-path-odd");
+  fs.mkdirSync(odd.cfg.envFile);
+  assert.throws(() => marketplaceInputSnapshot(odd.cfg), /regular file/);
+});
+
+await test("existing malformed values are invalid and never echoed as configured", () => {
+  const { cfg } = config("marketplace-existing-invalid");
+  fs.writeFileSync(cfg.envFile, 'MARKETPLACE_HTTP_PORT="not-a-port"\nMOONPAY_COMMERCE_SECRET_KEY="tiny"\n', { mode: 0o600 });
+  const snapshot = marketplaceInputSnapshot(cfg);
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_HTTP_PORT").state, "invalid");
+  assert.equal(snapshot.fields.find((field) => field.name === "MOONPAY_COMMERCE_SECRET_KEY").state, "invalid");
+  assert.equal(JSON.stringify(snapshot).includes("not-a-port"), false);
+  assert.equal(JSON.stringify(snapshot).includes("tiny"), false);
+});
+
+await test("restart failure restores exact prior bytes and recovery uses the same unit allowlist", async () => {
+  const { cfg } = config("marketplace-rollback");
+  await applyMarketplaceInputUpdate(cfg, {
+    changes: {
+      HUB_MARKETPLACE_STATUS_ORIGIN: "http://127.0.0.1:8099",
+      HUB_MARKETPLACE_STATUS_CREDENTIAL: secretStatus,
+      MARKETPLACE_OPERATOR_STATUS_CREDENTIAL: secretStatus,
+      MARKETPLACE_ENABLED: "1",
+    },
+  }, fakeSpawner().spawn);
+  const before = fs.readFileSync(cfg.envFile);
+  const beforeBridge = fs.readFileSync(cfg.hubBridgeEnvFile);
+  const fake = fakeSpawner([1, 0]);
+  await assert.rejects(
+    applyMarketplaceInputUpdate(cfg, { changes: { MARKETPLACE_HTTP_PORT: "8100" } }, fake.spawn),
+    /previous root-only environment file was restored/,
+  );
+  assert.deepEqual(fs.readFileSync(cfg.envFile), before);
+  assert.deepEqual(fs.readFileSync(cfg.hubBridgeEnvFile), beforeBridge);
+  assert.equal(fs.statSync(cfg.envFile).mode & 0o777, 0o600);
+  assert.equal(fake.calls.length, 2);
+  for (const call of fake.calls) assert.deepEqual(call.args, ["restart", ...MARKETPLACE_RESTART_UNITS]);
+});
+
+await test("admin config endpoint enforces auth plus JSON/CSRF and returns only masked state", async () => {
+  const { cfg } = config("marketplace-http");
+  const fake = fakeSpawner();
+  const h = await freshHub({ marketplaceInputs: cfg }, { spawn: fake.spawn });
+  try {
+    assert.equal((await jsonReq(`${h.origin}/admin/api/marketplace-config`)).status, 401);
+    const auth = { "x-hub-admin": h.cfg.adminToken };
+    const get = await jsonReq(`${h.origin}/admin/api/marketplace-config`, { headers: auth });
+    assert.equal(get.status, 200);
+    assert.equal(get.body.config.fields.some((field) => field.name === "MARKETPLACE_ALPHA_LICENCES"), true);
+    const noCsrf = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
+      method: "POST", headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ generate: ["MARKETPLACE_DEMO_VAULT_KEY"] }),
+    });
+    assert.equal(noCsrf.status, 403);
+    assert.equal(fake.calls.length, 0);
+    const crossSite = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
+      method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json", "sec-fetch-site": "cross-site" },
+      body: JSON.stringify({ generate: ["MARKETPLACE_DEMO_VAULT_KEY"] }),
+    });
+    assert.equal(crossSite.status, 403);
+    const secret = "worker-credential-that-stays-server-side-123";
+    const saved = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
+      method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
+      body: JSON.stringify({ changes: { MARKETPLACE_DEMO_WORKER_CREDENTIAL: secret } }),
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(JSON.stringify(saved.body).includes(secret), false);
+    assert.equal(saved.body.config.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_CREDENTIAL").state, "configured");
+    assert.equal(fake.calls.length, 1);
+  } finally { await h.close(); }
+});
+
+await test("desktop/mobile admin workflow renders every field, generation actions and no secret persistence", () => {
+  const html = fs.readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
+  assert.match(html, /id="mktConfigForm"/);
+  assert.match(html, /\/admin\/api\/marketplace-config/);
+  assert.match(html, /Save and restart private Marketplace/);
+  assert.match(html, /Generate shared status credential/);
+  assert.match(html, /Generate Demo vault key/);
+  assert.match(html, /Generate Demo worker credential/);
+  assert.match(html, /MoonPay Commerce — crypto only, no revenue share/);
+  assert.match(html, /\.configfields \{ grid-template-columns:1fr; \}/);
+  assert.match(html, /field\.state !== "missing"/);
+  assert.ok(!/localStorage|sessionStorage|document\.cookie/.test(html));
+});
+
+await test("the public Hub unit loads only the status bridge file, never the private credential file", () => {
+  const installer = fs.readFileSync(new URL("../install-hub.sh", import.meta.url), "utf8");
+  const unit = installer.slice(installer.indexOf('say "Installing the systemd service"'));
+  assert.match(unit, /EnvironmentFile=-\$MARKETPLACE_BRIDGE_ENV_FILE/);
+  assert.doesNotMatch(unit, /EnvironmentFile=-?\$MARKETPLACE_ENV_FILE/);
+  assert.match(installer, /chmod 600 "\$MARKETPLACE_ENV_FILE"/);
+  assert.match(installer, /chmod 600 "\$MARKETPLACE_BRIDGE_ENV_FILE"/);
+});
+
+summary("marketplace-inputs");

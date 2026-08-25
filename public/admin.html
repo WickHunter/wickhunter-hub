@@ -42,6 +42,19 @@
   .logtail { white-space:pre-wrap; overflow:auto; max-height:18rem; font:12px/1.45 ui-monospace,monospace;
              background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
   .setupcopy { white-space:normal; min-width:18rem; }
+  .configgroups { display:grid; gap:.8rem; margin-top:.8rem; }
+  .configgroup { border:1px solid #8884; border-radius:8px; padding:.8rem .9rem; }
+  .configgroup h2 { font-size:1rem; margin:0 0 .55rem; }
+  .configfields { display:grid; grid-template-columns:repeat(auto-fit,minmax(19rem,1fr)); gap:.65rem; }
+  .configfield { min-width:0; border-top:1px solid #8883; padding-top:.55rem; }
+  .configfield label { display:block; font-weight:650; }
+  .configfield code { display:block; font-size:.7rem; opacity:.62; overflow-wrap:anywhere; }
+  .configfield input, .configfield select, .configfield textarea { width:100%; margin-top:.35rem; font-size:16px; }
+  .configfield textarea { min-height:5.2rem; resize:vertical; }
+  .confighelp { font-size:.78rem; opacity:.68; margin-top:.25rem; overflow-wrap:anywhere; }
+  .configstate { font-size:.7rem; margin-left:.35rem; text-transform:uppercase; }
+  .configclear { margin-top:.3rem; min-height:2rem; padding:.25rem .55rem; }
+  #mktConfigNote { overflow-wrap:anywhere; }
   .leasepub { font:12px/1.5 ui-monospace,monospace; overflow-wrap:anywhere;
               border:1px solid #8884; border-radius:6px; padding:.5rem .6rem; margin:.45rem 0; }
   /* per-exchange collector cards */
@@ -96,6 +109,9 @@
                                        font-weight:700; opacity:.58; text-transform:uppercase;
                                        letter-spacing:.035em; }
     #mktInputs .copySetup { margin-top:.35rem; }
+    .configfields { grid-template-columns:1fr; }
+    .configgroup { padding:.7rem; }
+    #mktConfigActions button, #mktConfigForm > button { width:100%; }
   }
 </style>
 </head>
@@ -140,6 +156,19 @@
   <thead><tr><th>Required input</th><th>State</th><th>Safe value/detail</th><th>Operator action</th></tr></thead>
   <tbody><tr><td colspan="4">loading…</td></tr></tbody>
 </table></div>
+
+<h2 style="margin:1.2rem 0 .2rem">Enter Marketplace configuration</h2>
+<p class="muted" style="margin:.2rem 0">Secrets are write-only: a configured secret comes back only as <b>configured</b>, never as its value. Saving writes one root-only 0600 file and restarts only the private API and worker; either both accept it or the previous file is restored.</p>
+<div class="actions" id="mktConfigActions">
+  <button type="button" data-generate="HUB_MARKETPLACE_STATUS_CREDENTIAL,MARKETPLACE_OPERATOR_STATUS_CREDENTIAL">Generate shared status credential</button>
+  <button type="button" data-generate="MARKETPLACE_DEMO_VAULT_KEY">Generate Demo vault key</button>
+  <button type="button" data-generate="MARKETPLACE_DEMO_WORKER_CREDENTIAL">Generate Demo worker credential</button>
+</div>
+<form id="mktConfigForm" style="display:block">
+  <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
+  <button type="submit" style="margin-top:.8rem">Save and restart private Marketplace</button>
+  <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
+</form>
 
 <form id="issueForm">
   <input name="name" placeholder="Tester name" required>
@@ -219,6 +248,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   opsRefresh();
   leaseRefresh();
   mktRefresh();
+  mktConfigRefresh();
   cdRefresh();
   mcRefresh();
   fbRefresh();
@@ -226,7 +256,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
 
 async function api(path, opts) {
   const res = await fetch(base + path, Object.assign({}, opts, {
-    headers: Object.assign({ "x-hub-admin": token, "content-type": "application/json" },
+    headers: Object.assign({ "x-hub-admin": token, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
                            (opts && opts.headers) || {}),
   }));
   const body = await res.json().catch(() => ({ ok: false, error: "bad response" }));
@@ -389,7 +419,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -535,7 +565,161 @@ async function mktRefresh() {
   }
   if (!body.children.length) body.innerHTML = '<tr><td colspan="4">No input status was returned.</td></tr>';
 }
-document.getElementById("mktRefresh").onclick = mktRefresh;
+
+const mktGroupLabels = {
+  bridge: "Hub ↔ private status bridge",
+  service: "Private Marketplace API and worker",
+  alpha: "Alpha distribution and licence cohort (not beta)",
+  "bybit-demo": "WickHunter-owned Bybit Demo",
+  moonpay: "MoonPay Commerce — crypto only, no revenue share",
+};
+let mktPendingGenerate = new Set();
+
+function mktRenderConfig(config) {
+  const wrap = document.getElementById("mktConfigFields");
+  wrap.innerHTML = "";
+  const groups = new Map();
+  for (const field of config.fields || []) {
+    let group = groups.get(field.group);
+    if (!group) {
+      group = document.createElement("section");
+      group.className = "configgroup";
+      const heading = document.createElement("h2");
+      heading.textContent = mktGroupLabels[field.group] || field.group;
+      const fields = document.createElement("div");
+      fields.className = "configfields";
+      group.append(heading, fields);
+      wrap.appendChild(group);
+      groups.set(field.group, group);
+    }
+    const card = document.createElement("div");
+    card.className = "configfield";
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    const state = document.createElement("span");
+    state.className = "configstate " + stateClass(field.state);
+    state.textContent = field.state + (field.secret ? " · secret" : " · public/config");
+    label.appendChild(state);
+    const variable = document.createElement("code");
+    variable.textContent = field.name;
+    label.appendChild(variable);
+
+    let input;
+    if (field.kind === "textarea") input = document.createElement("textarea");
+    else if (field.kind === "select") {
+      input = document.createElement("select");
+      const empty = document.createElement("option");
+      empty.value = ""; empty.textContent = field.placeholder || "Choose…";
+      input.appendChild(empty);
+      for (const choice of field.options || []) {
+        const option = document.createElement("option");
+        option.value = choice; option.textContent = choice;
+        input.appendChild(option);
+      }
+    } else {
+      input = document.createElement("input");
+      input.type = field.secret ? "password" : (field.kind === "number" ? "number" : "text");
+    }
+    input.name = field.name;
+    input.dataset.marketplaceName = field.name;
+    input.dataset.secret = field.secret ? "1" : "0";
+    input.dataset.original = field.safeValue || "";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.addEventListener("input", () => { delete input.dataset.clear; });
+    if (field.placeholder) input.placeholder = field.placeholder;
+    if (!field.secret && field.safeValue !== undefined) input.value = field.safeValue;
+    if (field.secret && field.state === "configured") input.placeholder = "Configured — leave blank to keep";
+
+    // The bridge credential is one value under two exact variable names. A
+    // manual edit mirrors in page memory; generated values never reach JS.
+    if (field.name === "HUB_MARKETPLACE_STATUS_CREDENTIAL" || field.name === "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL") {
+      input.oninput = () => {
+        const otherName = field.name === "HUB_MARKETPLACE_STATUS_CREDENTIAL"
+          ? "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL" : "HUB_MARKETPLACE_STATUS_CREDENTIAL";
+        const other = wrap.querySelector('[data-marketplace-name="' + otherName + '"]');
+        if (other && other.value !== input.value) other.value = input.value;
+      };
+    }
+
+    const help = document.createElement("div");
+    help.className = "confighelp";
+    help.textContent = field.help + (field.required ? " Required for readiness." : " Optional/defaultable.");
+    card.append(label, input, help);
+    if (field.state !== "missing") {
+      const clear = document.createElement("button");
+      clear.type = "button"; clear.className = "configclear"; clear.textContent = "Clear on save";
+      clear.onclick = () => {
+        const names = (field.name === "HUB_MARKETPLACE_STATUS_CREDENTIAL" || field.name === "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL")
+          ? ["HUB_MARKETPLACE_STATUS_CREDENTIAL", "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL"] : [field.name];
+        for (const name of names) {
+          const target = wrap.querySelector('[data-marketplace-name="' + name + '"]');
+          if (target) { target.dataset.clear = "1"; target.value = ""; }
+        }
+        clear.textContent = "Will clear";
+      };
+      card.appendChild(clear);
+    }
+    group.querySelector(".configfields").appendChild(card);
+  }
+  if (!wrap.children.length) wrap.innerHTML = '<div class="opscard ops-bad">No allowlisted configuration fields were returned.</div>';
+  document.getElementById("mktConfigNote").textContent = config.requiredMissing && config.requiredMissing.length
+    ? config.requiredMissing.length + " required input(s) are still missing."
+    : "All required input names are configured; readiness still depends on private status validation.";
+}
+
+async function mktConfigRefresh() {
+  const wrap = document.getElementById("mktConfigFields");
+  try {
+    const data = await api("/admin/api/marketplace-config");
+    mktPendingGenerate = new Set();
+    mktRenderConfig(data.config);
+  } catch (e) {
+    if (e.message !== "unauthorized") wrap.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>';
+  }
+}
+
+for (const button of document.querySelectorAll("#mktConfigActions [data-generate]")) {
+  button.onclick = () => {
+    for (const name of button.dataset.generate.split(",")) mktPendingGenerate.add(name);
+    button.textContent = "Queued for secure generation";
+    document.getElementById("mktConfigNote").textContent = "Generated values stay server-side and will never be shown. Save to apply them.";
+  };
+}
+
+document.getElementById("mktConfigForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const changes = {};
+  for (const input of document.querySelectorAll("#mktConfigFields [data-marketplace-name]")) {
+    const name = input.dataset.marketplaceName;
+    if (input.dataset.clear === "1") changes[name] = null;
+    else if (input.dataset.secret === "1") {
+      if (input.value !== "") changes[name] = input.value;
+    } else if (input.value !== input.dataset.original) {
+      changes[name] = input.value === "" ? null : input.value;
+    }
+  }
+  if (!Object.keys(changes).length && !mktPendingGenerate.size) {
+    document.getElementById("mktConfigNote").textContent = "No changes are queued.";
+    return;
+  }
+  if (!confirm("Write the root-only Marketplace environment and restart exactly the private API and worker? A failed restart restores the previous file.")) return;
+  const note = document.getElementById("mktConfigNote");
+  note.textContent = "Saving atomically and verifying both private service restarts…";
+  try {
+    const data = await api("/admin/api/marketplace-config", {
+      method: "POST",
+      body: JSON.stringify({ changes, generate: Array.from(mktPendingGenerate) }),
+    });
+    mktPendingGenerate = new Set();
+    mktRenderConfig(data.config);
+    note.textContent = "Saved to the root-only environment; private API and worker restarted. Secret values remain masked.";
+    mktRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+};
+document.getElementById("mktRefresh").onclick = () => { mktRefresh(); mktConfigRefresh(); };
 
 // ── per-exchange collector status ───────────────────────────────────────────
 // One card per venue. The numbers are stated plainly and never rolled into a
