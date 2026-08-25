@@ -188,5 +188,15 @@ await test("legacy LHK1 check-in remains unchanged after lease activation", asyn
   assert.equal(Object.hasOwn(legacy.body, "lease"), false);
 });
 
+await test("admin UI exposes only the full public lease verifier and rollout status", async () => {
+  const html = await (await fetch(`${h.origin}/admin`)).text();
+  assert.match(html, /id="leaseSummary"/);
+  assert.match(html, /\/admin\/api\/license-leases/);
+  assert.match(html, /Copy PUBLIC key/);
+  assert.match(html, /Safe rollout order/);
+  assert.match(html, /Private key<\/dt><dd>never returned or rendered/);
+  assert.equal(html.includes(issued.token), false);
+});
+
 await h.close();
 summary("license-leases-http");
