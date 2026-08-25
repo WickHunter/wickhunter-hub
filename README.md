@@ -485,6 +485,62 @@ v1 is never mutated. The private key lives at `data/license-signing.key`
 (mode 600, written only by keygen, never logged); the paired public key is
 baked into the bot.
 
+## Machine-bound lease v1 (additive)
+
+LHK1 remains the bootstrap entitlement for old clients. A lease-aware install
+generates its own Ed25519 keypair, asks the Hub for a five-minute nonce, and
+signs the exact challenge bytes returned by the Hub. Successful activation
+binds one licence seat to that public key and returns:
+
+```
+WHL1.<base64url(payload-json)>.<base64url(signature)>
+```
+
+The dedicated lease key signs domain-separated bytes and is never the LHK1,
+release, candle, or market-data key. The signed payload carries the key id,
+licence/activation ids, install public key, current features, Hub-issued time,
+not-before/expiry, monotonic activation sequence, and the offline policy:
+cached entitlement only through the signed grace instant, then exit-only.
+Revocation is likewise exit-only. A licensing outage or refusal must never
+prevent position reduction, reconciliation, or cleanup.
+
+The activation ledger is append-only, fsynced, hash-chained, and each record is
+Ed25519 signed. A separately fsynced, signed head anchors the expected event
+count and final hash. Missing/zeroed/truncated/edited state fails the lease
+service closed while legacy LHK1/check-in stays online. Only malformed bytes
+after the signed head (an interrupted, never-checkpointed append) are repaired;
+a complete final JSON line is never discarded merely for lacking a newline.
+Machine binding means possession of a software private key—not hardware
+identity. Root access or cloning that private key can clone the machine.
+
+### Required rollout order
+
+1. Deploy Hub 0.3.3. It creates `lease-1` without changing LHK1 or check-in.
+2. Run `npm run leasekey` and pin the printed PUBLIC `lease-1` key in an app
+   release. Do not trust a key fetched dynamically by the app.
+3. Ship that app while legacy LHK1 remains accepted. Let installs create their
+   local private key and activate; watch `/admin/api/license-leases`.
+4. Only after recovery/deactivation has been exercised should a later app
+   release make the signed lease the local new-exposure authority. Exits remain
+   allowed without a valid lease.
+5. To rotate, run `npm run leasekey -- lease-2`, ship both public keys, wait for
+   adoption, then set `HUB_LICENSE_LEASE_KEY_ID=lease-2`. Runtime startup and
+   the ordinary installer will not invent a named rotation key. Retain every
+   old **public** key for as long as any retained audit line names its kid
+   (normally indefinitely); the old private signer may go offline after the
+   cutover unless an intentional rollback remains possible.
+
+This Hub release intentionally does not globally disable LHK1: no lease-aware
+app has shipped yet, and doing so would strand every existing user. It provides
+the complete Hub issuance/seat/recovery half for that staged migration.
+An already-issued WHL1 token is offline-verifiable until its signed grace
+instant, so a rebind/revocation cannot erase that window from an offline copy.
+New-entry authority must become exit-only immediately when an online check sees
+revocation, and always after grace; exits and cleanup remain allowed. An admin
+lost-key deactivation recovery-locks that licence against a copied-LHK1
+first-claim race. Rebind with both keys before loss, or reissue the LHK1 after
+loss—ordinary activation cannot silently take the freed seat.
+
 ## Operator runbook
 
 ### 1. Install the hub (once, on the VPS)
@@ -500,6 +556,35 @@ keygen on first install (**copy the printed public key into the bot** — it is
 what tokens verify against), generates `HUB_ADMIN_TOKEN` (echoed exactly
 once; afterwards read it from `/etc/wickhunter-hub/env`), installs the
 `wickhunter-hub` systemd unit, and health-checks with a retry loop.
+
+The admin page's top panel shows the running package version, full installed
+commit/branch/build time, configured checkout HEAD and locally fetched
+`origin/main`, source-versus-runtime relation, dirty-worktree refusal, and the
+last upgrade outcome/time/log tail. **Upgrade hub** now refuses a dirty or
+non-`main` checkout, fetches `origin/main`, permits only a fast-forward, verifies
+the exact commit, and records the build only after the restarted service answers
+with the compiled package version. A failed or stale v0.3.0 runtime is therefore
+visible instead of looking like a successful current checkout.
+
+### Marketplace operations bridge (alpha only)
+
+Marketplace trading, payments, Demo credentials, and subscription persistence
+remain in the private service; none are copied into this public Hub. To show its
+sanitized operator contract in the Hub admin page, set on this Hub:
+
+```
+HUB_MARKETPLACE_STATUS_ORIGIN=http://127.0.0.1:<private-marketplace-port>
+HUB_MARKETPLACE_STATUS_CREDENTIAL=<dedicated-32+-character-status-secret>
+```
+
+Set the same `HUB_MARKETPLACE_STATUS_CREDENTIAL` on the private Marketplace
+service. The bridge accepts only an exact loopback origin, always uses the fixed
+`GET /api/marketplace/operator/status` path and server-side bearer, and never
+sends that credential to the browser. The panel shows exact required variable
+names plus configured/missing/invalid/defaulted state, service/migration/worker,
+Bybit Demo evidence and crypto-only MoonPay readiness, and confirms the feature
+is alpha-only (`betaIncluded:false`). If the private service is absent, it says
+unavailable and renders the static setup checklist without claiming readiness.
 
 **One manual step**: it never edits the live nginx config. Add inside the
 existing `server { listen 443 ssl; ... }` block:
@@ -607,6 +692,12 @@ artifact before it expires if no new build is planned.
 | Path | What | Loss means |
 | --- | --- | --- |
 | `data/license-signing.key` | Ed25519 private key, mode 600 | **every issued token orphaned** — back this up offline |
+| `data/license-lease-signing.<kid>.key` | dedicated Ed25519 lease private key(s), mode 600 | that kid can no longer renew/sign leases; retain old kids through rotation overlap |
+| `data/license-lease-public-keys.v1.json` | lease verifier keyring | old signed audit/lease records cannot be verified by kid |
+| `data/license-lease-audit.v1.jsonl` | signed activation, nonce, seat/rebind and revocation audit/state | machine bindings and monotonic sequences are lost; do not re-enrol blindly |
+| `data/license-lease-audit-head.v1.json` | independently signed expected ledger count/hash | deletion, truncation and interrupted state cannot be distinguished safely; restore with the ledger from one backup |
+| `data/hub-build.v1.json` | installed package/commit/branch/build time | runtime identity becomes explicitly unknown until the next verified install |
+| `data/upgrade-status.v1.json`, `data/upgrade.log` | last self-upgrade outcome and bounded diagnostic log | upgrade remains possible, but the admin loses the previous audit trail |
 | `data/candle-signing.key` | Ed25519 candle-seed private key, mode 600 | a new key is generated, so every bot pinned to the old `candle-1` public key refuses every seed until re-pasted — back this up too |
 | `data/licenses.json` | registry of issued licenses | can't tell known ids from foreign ones |
 | `data/revoked.json` | durable revocations | revoked keys work again |
@@ -624,8 +715,13 @@ anywhere private is enough; everything else is reproducible.
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `GET /api/health` | none | `{ok:true,version}` |
+| `GET /api/health` | none | version plus installed build, source checkout comparison and last upgrade outcome (no log tail) |
 | `POST /api/license/checkin` | none (records everything) | bot phone-home; answers `revoked:true` for revoked/unknown ids |
+| `POST /api/license/lease/challenge` | active LHK1 in `x-license` (lapsed genuine LHK1 only for deactivation) | one-time purpose/key-bound nonce and exact proof bytes |
+| `POST /api/license/lease/activate` | LHK1 + install Ed25519 proof | consume nonce, enforce seat limit, create binding and WHL1 lease |
+| `POST /api/license/lease/renew` | LHK1 + bound install proof | increment sequence and issue a short lease |
+| `POST /api/license/lease/deactivate` | genuine known LHK1 + bound install proof | release a seat even after expiry/revocation |
+| `POST /api/license/lease/rebind` | active LHK1 + old and replacement key proofs | atomically move one activation to a new install key |
 | `GET /install.sh?key=` | valid token | personalised tester installer |
 | `GET /api/latest?key=` | valid token | signed `wickhunter.release.v1` manifest; legacy `{version,file,sha256}` remain top-level |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
@@ -633,6 +729,11 @@ anywhere private is enough; everything else is reproducible.
 | `GET /api/market-data/market-caps/v1` | valid token (`x-license` / `?key=`) or `x-hub-key` | signed market-cap snapshot (contract v1); ETag + gzip |
 | `GET /admin` | none (page holds no secrets) | static admin page |
 | `GET/POST /admin/api/licenses[/revoke]` | `x-hub-admin` header, constant-time | list / issue / revoke |
+| `GET /admin/api/license-leases` | `x-hub-admin` header | public keyring, activations, seat overrides and bounded audit view |
+| `POST /admin/api/license-leases/seat-override` | `x-hub-admin` header | reason-required, audited machine limit override |
+| `POST /admin/api/license-leases/deactivate` | `x-hub-admin` header | reason-required recovery for a lost machine key |
+| `GET /admin/api/operations` | `x-hub-admin` header | exact running/source/upgrade facts plus a redacted bounded log tail |
+| `GET /admin/api/marketplace-status` | `x-hub-admin` header | sanitized alpha Marketplace readiness and exact operator-input checklist; upstream credential stays server-side |
 | `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
 | `GET /admin/api/market-caps` | `x-hub-admin` header | market-cap producer health, credit spend and refusals |
 
@@ -652,6 +753,30 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.3 — **Exact Hub operations, alpha Marketplace status, and staged
+  machine-bound licensing without breaking LHK1.** The admin now makes a stale
+  deployment unmistakable: package/build commit/branch, checkout HEAD and
+  `origin/main`, runtime comparison, last upgrade outcome and redacted log are
+  visible together; upgrade is a shell-free, clean-main, verified fast-forward.
+  A loopback-only server credential exposes the private Marketplace's sanitized
+  migration/worker/Demo-evidence/crypto-payment/input readiness in this public
+  Hub without importing trading/payment code or exposing secrets, and labels it
+  alpha-only. The Hub also supports a future lease-aware install that generates
+  an Ed25519 key and proves possession against a
+  purpose-bound, five-minute Hub nonce before it can claim a licence seat.
+  Activate, renew, deactivate and dual-proof rebind operations are durable in
+  an append-only, fsynced, hash-chained and signed audit ledger plus independently
+  signed head; every signed
+  WHL1 lease carries the exact install public key, features, Hub time window,
+  monotonic activation sequence, and cached-offline/exit-only facts. Default is
+  one machine, with reason-required audited admin overrides and recovery
+  deactivation locked against copied-bearer reclaim. Stale pre-rebind challenges,
+  ledger loss/truncation, concurrent writers and unprovisioned rotation kids all
+  fail closed. The signer/keyring is a fourth, dedicated Ed25519 authority and
+  supports explicitly staged overlapping kids. LHK1 bytes, unauthenticated legacy
+  check-in, install/download behavior and existing users remain unchanged while
+  the public lease key and lease-aware app roll out in the documented order.
 
 - v0.3.2 — **Offline-authenticated releases.** The beta shelf now accepts only
   an RFC 8785-canonical `wickhunter.release.v1` manifest signed by a dedicated

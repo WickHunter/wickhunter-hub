@@ -22,6 +22,8 @@ SERVICE=wickhunter-hub
 UNIT_FILE=/etc/systemd/system/${SERVICE}.service
 PORT=8091
 SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_COMMIT=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || printf 'unknown')
+SOURCE_BRANCH=$(git -C "$SRC_DIR" branch --show-current 2>/dev/null || printf 'unknown')
 
 [ "$(id -u)" -eq 0 ] || die "run as root: sudo bash install-hub.sh"
 command -v systemctl >/dev/null || die "systemd is required"
@@ -29,6 +31,12 @@ command -v node >/dev/null || die "Node 22+ is required — install it first (no
 NODE_MAJOR=$(node -v | sed 's/^v\([0-9]*\).*/\1/')
 [ "$NODE_MAJOR" -ge 22 ] || die "Node 22+ required, found $(node -v)"
 [ -f "$SRC_DIR/package.json" ] || die "run this from a checkout of wickhunter-hub"
+if [ -n "${HUB_EXPECTED_SOURCE_COMMIT:-}" ] && [ "$SOURCE_COMMIT" != "$HUB_EXPECTED_SOURCE_COMMIT" ]; then
+  die "source checkout changed after upgrade verification (wanted $HUB_EXPECTED_SOURCE_COMMIT, found $SOURCE_COMMIT)"
+fi
+if [ -n "${HUB_EXPECTED_SOURCE_BRANCH:-}" ] && [ "$SOURCE_BRANCH" != "$HUB_EXPECTED_SOURCE_BRANCH" ]; then
+  die "source checkout branch changed after upgrade verification (wanted $HUB_EXPECTED_SOURCE_BRANCH, found $SOURCE_BRANCH)"
+fi
 
 say "Syncing the hub to $HUB_DIR"
 if [ "$SRC_DIR" != "$HUB_DIR" ]; then
@@ -82,8 +90,42 @@ fi
 grep -q '^HUB_PORT=' "$ENV_FILE" || printf 'HUB_PORT=%s\n' "$PORT" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 ok "origin: $(sed -n 's/^HUB_PUBLIC_ORIGIN=//p' "$ENV_FILE")"
+PORT=$(sed -n 's/^HUB_PORT=//p' "$ENV_FILE" | tail -n 1)
+printf '%s' "$PORT" | grep -Eq '^[0-9]+$' || die "HUB_PORT in $ENV_FILE must be digits"
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "HUB_PORT in $ENV_FILE must be from 1 through 65535"
 if ! grep -q '^HUB_RELEASE_PUBLIC_KEYS_JSON=' "$ENV_FILE"; then
   die "HUB_RELEASE_PUBLIC_KEYS_JSON is required. Generate the dedicated OFFLINE release key in the app repo, paste only its public keyring JSON into $ENV_FILE, sign the current release, then re-run. Never copy the private release key to this Hub."
+fi
+
+# Machine leases are additive. A missing/corrupt lease authority must never
+# prevent a legacy LHK1 Hub upgrade. Read only the one exact env assignment we
+# need; never `source` an operator-owned file into this root shell.
+LEASE_KID=$(sed -n 's/^HUB_LICENSE_LEASE_KEY_ID=//p' "$ENV_FILE" | tail -n 1)
+LEASE_KID=${LEASE_KID:-lease-1}
+if printf '%s' "$LEASE_KID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+  say "Checking the dedicated machine-lease signing key ($LEASE_KID)"
+  lease_key_file="$HUB_DIR/data/license-lease-signing.$LEASE_KID.key"
+  lease_ring_file="$HUB_DIR/data/license-lease-public-keys.v1.json"
+  # Only the first-install default may be generated as part of an ordinary
+  # upgrade. A rotated kid must be explicitly pre-provisioned, its public key
+  # shipped in a signed client release, and only then selected in the env.
+  if [ "$LEASE_KID" != "lease-1" ] && [ ! -f "$lease_key_file" ]; then
+    warn "rotated machine-lease kid $LEASE_KID is not pre-provisioned; it will NOT be generated or activated by this upgrade"
+    warn "run the leasekey CLI explicitly, ship its public key in a signed app release, then set HUB_LICENSE_LEASE_KEY_ID"
+  elif [ "$LEASE_KID" = "lease-1" ] || { [ -f "$lease_key_file" ] && [ -f "$lease_ring_file" ]; }; then
+    if HUB_DATA_DIR="$HUB_DIR/data" node dist/bin/leasekey.js "$LEASE_KID"; then
+    warn "PIN THE PUBLIC lease key in a signed app release before activating this kid in the Hub service."
+    warn "Back up every data/license-lease-signing.*.key, the complete public keyring, audit ledger, and checkpoint."
+    else
+      warn "machine-lease key preparation failed; continuing the core Hub upgrade with lease issuance disabled"
+      warn "restore/provision the named lease key and re-run after legacy licensing is healthy"
+    fi
+  else
+    warn "machine-lease key/ring state is incomplete; continuing the core Hub upgrade with lease issuance disabled"
+    warn "restore both files from the same backup rather than replacing published authority"
+  fi
+else
+  warn "HUB_LICENSE_LEASE_KEY_ID is invalid; continuing the core Hub upgrade with lease issuance disabled"
 fi
 
 say "Installing the systemd service"
@@ -124,7 +166,25 @@ done
 [ -n "$health" ] || die "hub did not answer after 45s; inspect: journalctl -u $SERVICE -n 50"
 printf '%s' "$health" | grep -q "\"version\":\"$WANT_VERSION\"" \
   || die "hub is up but on the wrong version (wanted $WANT_VERSION, got: $health) — stale dist?"
-ok "hub healthy: $health"
+
+# Record the commit only after the new service has actually answered with the
+# compiled package version. If restart failed, the old runtime keeps its old
+# record instead of being mislabeled as the source we merely attempted.
+node dist/bin/buildinfo.js \
+  --data "$HUB_DIR/data" \
+  --version "$WANT_VERSION" \
+  --commit "$SOURCE_COMMIT" \
+  --branch "$SOURCE_BRANCH"
+health=$(curl -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health") \
+  || die "hub stopped answering while its exact build identity was recorded"
+if printf '%s' "$SOURCE_COMMIT" | grep -Eq '^[a-f0-9]{40}$'; then
+  printf '%s' "$health" | grep -q "\"commit\":\"$SOURCE_COMMIT\"" \
+    || die "hub is healthy but did not read the installed source commit (got: $health)"
+else
+  printf '%s' "$health" | grep -q '"commit":null' \
+    || die "hub build origin is unknown but health did not say so explicitly (got: $health)"
+fi
+ok "hub healthy with exact build identity: $health"
 
 say "Nginx: ONE manual step (this installer never edits the live config)"
 cat <<EOF

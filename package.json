@@ -1,6 +1,6 @@
 {
   "name": "wickhunter-hub",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "type": "module",
   "description": "Wick Hunter beta admin hub: license issuing/revocation, beta build distribution, tester check-ins. Contains NO trading code.",
@@ -12,6 +12,7 @@
     "start": "node dist/src/main.js",
     "test": "node tests/run-all.mjs",
     "keygen": "node dist/bin/keygen.js",
+    "leasekey": "node dist/bin/leasekey.js",
     "candlekey": "node dist/bin/candlekey.js",
     "marketcapkey": "node dist/bin/marketcapkey.js",
     "issue": "node dist/bin/issue.js",
