@@ -9,9 +9,20 @@ import {
   LEASE_KEYRING_FILE,
   LicenseLeaseKeyStore,
   LicenseLeaseService,
+  challengeProofBytes,
   evaluateLicenseLease,
   verifyLicenseLease,
 } from "../dist/src/license-leases.js";
+
+await test("challenge proof v1 has a pinned cross-repository byte vector", () => {
+  const bytes = challengeProofBytes({
+    purpose: "rebind", licenseId: "lic-vector", activationId: "act-vector",
+    activationRevision: 7, installId: "install-old", installPublicKey: "pub-old",
+    newInstallId: "install-new", newInstallPublicKey: "pub-new",
+    issuedAtMs: 1_700_000_000_000, expiresAtMs: 1_700_000_300_000,
+  }, "nonce-vector");
+  assert.equal(bytes.toString("utf8"), '{"v":1,"domain":"wickhunter.license.challenge.v1","purpose":"rebind","nonce":"nonce-vector","licenseId":"lic-vector","activationId":"act-vector","activationRevision":7,"installId":"install-old","installPublicKey":"pub-old","newInstallId":"install-new","newInstallPublicKey":"pub-new","issuedAtMs":1700000000000,"expiresAtMs":1700000300000}');
+});
 
 function installKey() {
   const pair = generateKeyPairSync("ed25519");
@@ -390,6 +401,8 @@ await test("semantic verifier enforces machine, monotonic sequence, active, grac
   const key = installKey();
   const lease = activate(f, key).result.lease;
   const ring = f.service.keyStore.publicKeyring();
+  assert.equal(evaluateLicenseLease(lease.token, ring, { nowMs: lease.payload.notBeforeMs, installPublicKey: key.publicKey, minimumSequence: 1 }).state, "active");
+  assert.deepEqual(evaluateLicenseLease(lease.token, ring, { nowMs: lease.payload.notBeforeMs - 1, installPublicKey: key.publicKey, minimumSequence: 1 }), { state: "exit_only", payload: lease.payload, reason: "clock" });
   assert.equal(evaluateLicenseLease(lease.token, ring, { nowMs: lease.payload.issuedAtMs, installPublicKey: key.publicKey, minimumSequence: 1 }).state, "active");
   assert.equal(evaluateLicenseLease(lease.token, ring, { nowMs: lease.payload.expiresAtMs, installPublicKey: key.publicKey, minimumSequence: 1 }).state, "cached_grace");
   assert.equal(evaluateLicenseLease(lease.token, ring, { nowMs: lease.payload.policy.cachedGraceUntilMs + 1, installPublicKey: key.publicKey, minimumSequence: 1 }).state, "exit_only");

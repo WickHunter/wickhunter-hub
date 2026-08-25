@@ -513,9 +513,30 @@ a complete final JSON line is never discarded merely for lacking a newline.
 Machine binding means possession of a software private key—not hardware
 identity. Root access or cloning that private key can clone the machine.
 
+### Pinned lease protocol bytes
+
+The app must never guess or reserialize either signed object. A lease signature
+is Ed25519 over these exact bytes:
+
+```text
+UTF-8("WICKHUNTER\\0LICENSE_LEASE\\0V1\\0") || raw payload JSON bytes from WHL1
+```
+
+Challenge responses carry `proofBytesB64u`; the install decodes and validates
+those exact bytes before signing them. The v1 decoded JSON key order is:
+
+```text
+{"v":1,"domain":"wickhunter.license.challenge.v1","purpose":...,"nonce":...,"licenseId":...,"activationId":...,"activationRevision":...,"installId":...,"installPublicKey":...,"newInstallId":...,"newInstallPublicKey":...,"issuedAtMs":...,"expiresAtMs":...}
+```
+
+`tests/license-leases.test.mjs` pins a complete rebind vector byte-for-byte so
+the Hub and the app cannot silently drift. Public Ed25519 keys are canonical
+base64url raw 32-byte values; signatures are canonical base64url 64-byte values.
+
 ### Required rollout order
 
-1. Deploy Hub 0.3.3. It creates `lease-1` without changing LHK1 or check-in.
+1. Deploy Hub 0.3.4. It creates `lease-1` without changing LHK1 or check-in
+   and exposes only its PUBLIC verifier in the authenticated admin UI.
 2. Run `npm run leasekey` and pin the printed PUBLIC `lease-1` key in an app
    release. Do not trust a key fetched dynamically by the app.
 3. Ship that app while legacy LHK1 remains accepted. Let installs create their
@@ -753,6 +774,16 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.4 — **Mobile Marketplace setup is actionable.** At phone widths, each
+  required Marketplace input now stacks its state, safe detail and exact
+  operator action under the variable name. Critical setup instructions no
+  longer live off-screen behind horizontal table scrolling. Lease verification
+  also applies the signed `notBeforeMs` boundary exactly once, rather than
+  accidentally doubling the configured clock-skew tolerance.
+  The admin also shows the active machine-lease key id and full copyable PUBLIC
+  key, activation/seat/recovery status, and the non-breaking rollout order;
+  private keys and lease tokens never enter the browser response.
 
 - v0.3.3 — **Exact Hub operations, alpha Marketplace status, and staged
   machine-bound licensing without breaking LHK1.** The admin now makes a stale

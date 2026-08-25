@@ -664,7 +664,9 @@ export function evaluateLicenseLease(
   if (!Number.isSafeInteger(input.minimumSequence) || verified.payload.sequence < input.minimumSequence) {
     return { state: "refused", reason: "sequence" };
   }
-  if (!Number.isSafeInteger(input.nowMs) || input.nowMs < verified.payload.notBeforeMs - verified.payload.policy.maxClockSkewMs) {
+  // `notBeforeMs` is already issuedAt minus the allowed skew. Subtracting the
+  // policy again here would silently double the advertised tolerance.
+  if (!Number.isSafeInteger(input.nowMs) || input.nowMs < verified.payload.notBeforeMs) {
     return { state: "exit_only", payload: verified.payload, reason: "clock" };
   }
   if (input.nowMs < verified.payload.expiresAtMs) return { state: "active", payload: verified.payload };

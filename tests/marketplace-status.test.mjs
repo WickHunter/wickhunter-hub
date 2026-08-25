@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import {
   fetchMarketplaceStatus,
@@ -123,6 +124,15 @@ await test("an absent private service yields an exact static operator checklist 
     "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "LIQHUNTER_MARKETPLACE_URL",
   ]) assert.ok(names.includes(required), required);
   assert.ok(absent.readinessBlockers.length > 0);
+});
+
+await test("mobile checklist keeps state, detail and operator action visible without horizontal discovery", () => {
+  const html = readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
+  assert.match(html, /#mktInputs td\[data-label\]::before/);
+  assert.match(html, /data-label="Required input"/);
+  assert.match(html, /data-label="State"/);
+  assert.match(html, /data-label="Safe value or detail"/);
+  assert.match(html, /data-label="Operator action"/);
 });
 
 await test("a private credential refusal is distinguished from a network outage without echoing vendor text", async () => {
