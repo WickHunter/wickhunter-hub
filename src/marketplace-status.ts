@@ -61,8 +61,11 @@ const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boole
   { name: "MARKETPLACE_DATABASE_URL", secret: true, action: "Set the private PostgreSQL connection string in the Marketplace service environment." },
   { name: "MARKETPLACE_INTENT_KEY_ID", secret: false, action: "Configure the id of the Ed25519 key that signs follower intents." },
   { name: "MARKETPLACE_INTENT_SIGNING_SEED", secret: true, action: "Configure the 32-byte base64url Ed25519 signing seed in the private service only." },
+  { name: "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", secret: true, action: "Set the same dedicated value as HUB_MARKETPLACE_STATUS_CREDENTIAL on the public Hub." },
+  { name: "MARKETPLACE_RUNTIME_DIRECTORY", secret: false, action: "Use the shared API/worker StateDirectory created by the Marketplace service units." },
+  { name: "MARKETPLACE_BUILD_COMMIT", secret: false, action: "Stamp the exact hexadecimal source commit installed in both the API and worker." },
   { name: "LIQHUNTER_HUB_KEY", secret: true, action: "Configure the private Hub principal used by Marketplace admin routes." },
-  { name: "MARKETPLACE_ADMIN_LICENCES", secret: false, action: "Optionally list additional alpha operator licence ids; the Hub principal remains administrator." },
+  { name: "MARKETPLACE_ADMIN_LICENCES", secret: true, action: "Set the approved Marketplace administrator licence principals." },
   { name: "MARKETPLACE_DEMO_MASTER_API_KEY", secret: true, action: "Set the WickHunter-owned Bybit Demo master API key." },
   { name: "MARKETPLACE_DEMO_MASTER_API_SECRET", secret: true, action: "Set the WickHunter-owned Bybit Demo master API secret." },
   { name: "MARKETPLACE_DEMO_VAULT_PATH", secret: false, action: "Set the private encrypted Demo credential vault location." },
@@ -71,7 +74,7 @@ const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boole
   { name: "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", secret: false, action: "Set or accept the documented Demo evidence collection cadence." },
   { name: "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", secret: false, action: "Set the maximum evidence age used by Marketplace sellability gates." },
   { name: "MOONPAY_COMMERCE_ENVIRONMENT", secret: false, action: "Choose development or production explicitly for the crypto-only rail." },
-  { name: "MOONPAY_COMMERCE_PUBLIC_KEY", secret: false, action: "Set the MoonPay Commerce public API key." },
+  { name: "MOONPAY_COMMERCE_PUBLIC_KEY", secret: true, action: "Set the MoonPay Commerce account public bearer key in the private service only." },
   { name: "MOONPAY_COMMERCE_SECRET_KEY", secret: true, action: "Set the MoonPay Commerce server secret in the private service only." },
   { name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", secret: true, action: "Set the dedicated raw-webhook authentication token." },
   { name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", secret: false, action: "Set the vendor currency id used for subscription pricing." },
@@ -79,8 +82,9 @@ const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boole
   { name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", secret: true, action: "Set exactly one crypto recipient; revenue splits and card payments are unsupported." },
   { name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", secret: false, action: "Set the vendor's exact monthly subscription interval word." },
   { name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", secret: false, action: "Set the vendor's exact yearly subscription interval word." },
-  { name: "LIQHUNTER_MARKETPLACE_URL", secret: false, action: "Point each alpha app install's server-side proxy at the private Marketplace origin." },
-  { name: "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", secret: false, action: "Ship the Marketplace intent verification keyring to alpha app installs before enabling signals." },
+  { name: "LIQHUNTER_MARKETPLACE_URL", secret: false, action: "Set the exact public HTTPS Marketplace origin distributed to every alpha app install." },
+  { name: "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", secret: false, action: "Ship the Marketplace intent verification keyring to alpha app installs and verify it matches the live signer before enabling signals." },
+  { name: "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED", secret: false, action: "Set to 1 only after the Marketplace feature grant is live for the alpha licence cohort." },
 ]);
 
 function parseTimeout(raw: string | undefined): { value: number; refusal: string | null } {
@@ -204,9 +208,68 @@ function inputOf(value: unknown, explicitSecrets: readonly string[]): Marketplac
 }
 
 const UPSTREAM_FIELDS = [
-  "schemaVersion", "generatedAtMs", "build", "service", "feature", "api", "worker",
+  "schemaVersion", "generatedAtMs", "build", "service", "feature", "api", "alphaClient", "worker",
   "storage", "outbox", "bybitDemo", "moonPay", "readiness",
 ] as const;
+
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+function memberOf<const T extends readonly string[]>(value: unknown, values: T): T[number] | undefined {
+  return typeof value === "string" && (values as readonly string[]).includes(value) ? value as T[number] : undefined;
+}
+
+/**
+ * Alpha distribution proof is deliberately an exact state-only allowlist.
+ * A compromised or newer private service cannot make the public Hub echo its
+ * raw origin, verifier keyring, probe error, or credentials through this card.
+ */
+function sanitizeAlphaClient(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  const row = recordOf(value);
+  if (row === null) return undefined;
+  const state = memberOf(row.state, ["ready", "blocked"] as const);
+  const audience = memberOf(row.audience, ["alpha"] as const);
+  const origin = recordOf(row.origin);
+  const originState = memberOf(origin?.state, ["configured", "missing", "invalid"] as const);
+  const reachability = memberOf(origin?.reachability, ["healthy", "blocked", "unknown"] as const);
+  const keyDistribution = recordOf(row.intentPublicKeyDistribution);
+  const keyState = memberOf(keyDistribution?.state, ["aligned", "missing", "invalid", "mismatched"] as const);
+  const licenceFeature = recordOf(row.licenceFeature);
+  const licenceState = memberOf(licenceFeature?.state, ["confirmed", "missing", "invalid"] as const);
+  if (state === undefined || audience === undefined || originState === undefined || reachability === undefined
+    || keyState === undefined || licenceState === undefined) return undefined;
+  const factsReady = originState === "configured" && reachability === "healthy"
+    && keyState === "aligned" && licenceState === "confirmed";
+  if ((state === "ready") !== factsReady) return undefined;
+  return {
+    state, audience,
+    origin: { state: originState, reachability },
+    intentPublicKeyDistribution: { state: keyState },
+    licenceFeature: { state: licenceState },
+  };
+}
+
+function sanitizeService(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  const row = recordOf(value);
+  return row?.name === "wickhunter-marketplace" && row.audience === "alpha"
+    && row.enabled === true && row.betaIncluded === false
+    ? { name: "wickhunter-marketplace", audience: "alpha", enabled: true, betaIncluded: false }
+    : undefined;
+}
+
+function sanitizeStorage(value: unknown, explicitSecrets: readonly string[]): unknown {
+  const clean = sanitized(value, explicitSecrets, 0, "storage");
+  const storage = recordOf(clean);
+  const migrations = recordOf(storage?.migrations);
+  if (migrations === null) return clean;
+  const invalidEntries = migrations.invalidEntries;
+  if (!(Number.isSafeInteger(invalidEntries) && Number(invalidEntries) >= 0 && Number(invalidEntries) <= 1_000_000)) {
+    delete migrations.invalidEntries;
+  }
+  return clean;
+}
 
 export async function fetchMarketplaceStatus(
   config: MarketplaceStatusBridgeConfig,
@@ -253,7 +316,10 @@ export async function fetchMarketplaceStatus(
     const explicitSecrets = [config.credential];
     const upstream: Record<string, unknown> = {};
     for (const field of UPSTREAM_FIELDS) {
-      const clean = sanitized(row[field], explicitSecrets, 0, field);
+      const clean = field === "alphaClient" ? sanitizeAlphaClient(row[field])
+        : field === "service" ? sanitizeService(row[field])
+        : field === "storage" ? sanitizeStorage(row[field], explicitSecrets)
+          : sanitized(row[field], explicitSecrets, 0, field);
       if (clean !== undefined) upstream[field] = clean;
     }
     const remoteInputs = Array.isArray(row.requiredInputs)
@@ -265,13 +331,24 @@ export async function fetchMarketplaceStatus(
       ? readiness.blockers.filter((v): v is string => typeof v === "string").slice(0, 100)
         .map((v) => redactText(v, explicitSecrets, true))
       : [];
+    if (upstream.service === undefined) {
+      blockers.push("The private Marketplace status did not prove an alpha-only service with beta excluded.");
+    }
+    if (upstream.alphaClient === undefined) {
+      blockers.push("The private Marketplace status did not provide a valid alpha-client readiness proof.");
+    }
+    const rawMigrations = recordOf(recordOf(row.storage)?.migrations);
+    if (rawMigrations !== null && Object.hasOwn(rawMigrations, "invalidEntries")
+      && recordOf(recordOf(upstream.storage)?.migrations)?.invalidEntries === undefined) {
+      blockers.push("The private Marketplace status returned an invalid migration-history count.");
+    }
     return {
       schemaVersion: 1,
       generatedAtMs,
       bridge: { state: "connected", originConfigured: true, credentialConfigured: true, refusal: null },
       upstream,
       requiredInputs: [...localInputs, ...remoteInputs],
-      readinessBlockers: blockers,
+      readinessBlockers: [...new Set(blockers)],
     };
   } catch {
     const credentialRefused = upstreamStatus === 401 || upstreamStatus === 403 || upstreamStatus === 503;

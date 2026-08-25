@@ -512,7 +512,7 @@ async function mktRefresh() {
   meta.textContent = "bridge " + (bridge.state || "unknown") + " · refreshed " + fmt(d.generatedAtMs) + " UTC";
   let cards = '<div class="opscard"><h2>Private bridge</h2><p class="' + stateClass(bridge.state) + '">' + esc(bridge.state || "unknown") + '</p><p>' + esc(bridge.refusal || "Dedicated loopback credential accepted; only sanitized status is rendered.") + '</p></div>';
   if (upstream) {
-    for (const name of ["build", "service", "feature", "api", "worker", "storage", "outbox", "bybitDemo", "moonPay", "readiness"]) {
+    for (const name of ["build", "service", "feature", "api", "alphaClient", "worker", "storage", "outbox", "bybitDemo", "moonPay", "readiness"]) {
       if (upstream[name] !== undefined) cards += renderStatusCard(name, upstream[name]);
     }
   } else {

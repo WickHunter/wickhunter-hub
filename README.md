@@ -535,7 +535,7 @@ base64url raw 32-byte values; signatures are canonical base64url 64-byte values.
 
 ### Required rollout order
 
-1. Deploy Hub 0.3.4. It creates `lease-1` without changing LHK1 or check-in
+1. Deploy Hub 0.3.4 or later. It creates `lease-1` without changing LHK1 or check-in
    and exposes only its PUBLIC verifier in the authenticated admin UI.
 2. Run `npm run leasekey` and pin the printed PUBLIC `lease-1` key in an app
    release. Do not trust a key fetched dynamically by the app.
@@ -603,9 +603,14 @@ service. The bridge accepts only an exact loopback origin, always uses the fixed
 `GET /api/marketplace/operator/status` path and server-side bearer, and never
 sends that credential to the browser. The panel shows exact required variable
 names plus configured/missing/invalid/defaulted state, service/migration/worker,
-Bybit Demo evidence and crypto-only MoonPay readiness, and confirms the feature
-is alpha-only (`betaIncluded:false`). If the private service is absent, it says
-unavailable and renders the static setup checklist without claiming readiness.
+Bybit Demo evidence and crypto-only MoonPay readiness. It also shows state-only
+proof that the public alpha origin is reachable, the distributed intent verifier
+matches the live signer, and the Marketplace feature grant is confirmed for the
+alpha licence cohort. Raw origins, keyrings and credentials never cross the
+bridge. The feature remains alpha-only (`betaIncluded:false`). If the private
+service is absent, it says unavailable and renders the static setup checklist,
+including all three alpha-client inputs, without claiming readiness. Older
+private status responses remain readable while the additive proof is absent.
 
 **One manual step**: it never edits the live nginx config. Add inside the
 existing `server { listen 443 ssl; ... }` block:
@@ -774,6 +779,16 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.5 — **Alpha client readiness is visible without exposing deployment
+  material.** The public Hub now allowlists and renders the private service's
+  state-only proof for the public HTTPS origin, matching distributed intent
+  verifier, and alpha licence feature grant. Migration corruption counts are
+  displayed as bounded integers, every new required input and operator action
+  remains usable in the responsive checklist, and old private-status responses
+  continue to render. Raw origins, public keyrings, credentials, paths and
+  hostile additive fields are discarded at the bridge boundary; Marketplace
+  remains excluded from beta.
 
 - v0.3.4 — **Mobile Marketplace setup is actionable.** At phone widths, each
   required Marketplace input now stacks its state, safe detail and exact
