@@ -569,10 +569,38 @@ are also answered `revoked:true` — fail safe.
 
 ### 6. Publish a beta release
 
-Copy the built bot tarball + `latest.json` into `/opt/wickhunter-hub/releases/`
-— tarball first, `latest.json` last (it is the pointer). Full contract and a
-copy-paste publish snippet: [`releases/README.md`](releases/README.md).
+Copy the built bot tarball + offline-signed `latest.json` into
+`/opt/wickhunter-hub/releases/` — tarball first, `latest.json` last (it is the
+pointer). The Hub holds only the dedicated release PUBLIC keyring in
+`HUB_RELEASE_PUBLIC_KEYS_JSON`; never copy the private release key here and
+never reuse the licence/candle/market-data keys. Full signed contract, rollout
+order and publish snippet: [`releases/README.md`](releases/README.md).
 Testers upgrade by re-running their install command.
+
+### Signed-release rollout (mandatory order)
+
+1. Generate the dedicated Ed25519 release key offline with the app repository's
+   `scripts/generate-release-key.mjs`. Keep the private PEM offline.
+2. Use `scripts/sign-release-manifest.mjs` there to sign the artifact currently
+   published by the old Hub. Publish that artifact first and the signed
+   `latest.json` last/atomically.
+3. Put only the public keyring in `/etc/wickhunter-hub/env`, quoted so systemd
+   preserves its JSON: `HUB_RELEASE_PUBLIC_KEYS_JSON='{"release-2026-01":"…"}'`.
+4. Deploy this Hub. Production startup requires HTTPS and the public keyring;
+   release/install endpoints refuse unsigned, stale, wrong-target, badly
+   signed, or hash-mismatched metadata. The Hub has no release signing API or
+   private-key configuration.
+5. Publish the first signed-aware app. Old clients accept it because
+   `version`, `file`, and `sha256` are unchanged top-level fields. After that
+   bootstrap, updates run the verifier already installed on the client and do
+   not execute a downloaded Hub script.
+
+Compatibility is intentionally asymmetric: old client + new signed Hub works;
+new client + old/unsigned Hub refuses only the update and continues running its
+current version. Licence (`LHK1`) and trading protection/exit behavior are not
+part of this release authority and remain unchanged. The default manifest
+freshness window is 30 days (`HUB_RELEASE_MAX_AGE_MS`); re-sign an unchanged
+artifact before it expires if no new build is planned.
 
 ### Where the data lives (and backup)
 
@@ -586,7 +614,7 @@ Testers upgrade by re-running their install command.
 | `data/checkins.jsonl` | append-only check-in ledger | history gone |
 | `data/candles/` | collected 1m candles, per venue per symbol | seeds go cold until re-collected (hours, not fatal) |
 | `releases/` | beta tarballs + `latest.json` | republish from the bot repo |
-| `/etc/wickhunter-hub/env` | `HUB_ADMIN_TOKEN`, origin, port | regenerate via `install-hub.sh` |
+| `/etc/wickhunter-hub/env` | `HUB_ADMIN_TOKEN`, origin, port, release PUBLIC keyring | regenerate token/configure public keys; no release private key belongs here |
 
 Backup = the `data/` directory plus the env file. A nightly
 `tar -czf - /opt/wickhunter-hub/data /etc/wickhunter-hub/env` shipped
@@ -599,7 +627,7 @@ anywhere private is enough; everything else is reproducible.
 | `GET /api/health` | none | `{ok:true,version}` |
 | `POST /api/license/checkin` | none (records everything) | bot phone-home; answers `revoked:true` for revoked/unknown ids |
 | `GET /install.sh?key=` | valid token | personalised tester installer |
-| `GET /api/latest?key=` | valid token | `{version,file,sha256}` |
+| `GET /api/latest?key=` | valid token | signed `wickhunter.release.v1` manifest; legacy `{version,file,sha256}` remain top-level |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
 | `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
 | `GET /api/market-data/market-caps/v1` | valid token (`x-license` / `?key=`) or `x-hub-key` | signed market-cap snapshot (contract v1); ETag + gzip |
@@ -624,6 +652,17 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.2 — **Offline-authenticated releases.** The beta shelf now accepts only
+  an RFC 8785-canonical `wickhunter.release.v1` manifest signed by a dedicated
+  offline Ed25519 release key and matching the artifact's SHA-256. The Hub has
+  public keys only: production requires HTTPS and
+  `HUB_RELEASE_PUBLIC_KEYS_JSON`, and it refuses unsigned, unknown-key,
+  stale, wrong-target, tampered, or hash-mismatched releases. The fresh
+  installer independently verifies that signature and hash before extracting
+  the app. Legacy `version`/`file`/`sha256` remain top-level so existing clients
+  can bootstrap the first signed-aware app. Licence `LHK1`, entitlement and
+  trading-protection behavior are unchanged.
 
 - v0.3.1 — **The snapshot the bot can actually read, and a producer fault that
   can no longer take the hub down.** Three fixes to v0.3.0, all found by

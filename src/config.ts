@@ -12,6 +12,7 @@ import {
   type CandleSigner,
 } from "./candles/key.js";
 import { marketCapConfigFromEnv, type MarketCapEnvConfig } from "./marketcap/config.js";
+import { DEFAULT_RELEASE_MAX_AGE_MS, parseReleasePublicKeys } from "./release-manifest.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,13 @@ export interface HubConfig {
   adminToken: string;   // HUB_ADMIN_TOKEN; empty = the whole admin surface answers 503
   publicOrigin: string; // what testers paste, e.g. https://45.76.105.174/hub
   srcDir: string;       // git checkout the self-upgrade pulls + reinstalls from
+  /** Dedicated RELEASE public keys only. The Hub never accepts a release
+   *  private key and never reuses its licence/candle/market-data authorities. */
+  releasePublicKeys: Record<string, string>;
+  releaseMaxAgeMs: number;
+  releaseChannel: string;
+  releasePlatform: string;
+  releaseArch: string;
 
   // ── candle seed service ───────────────────────────────────────────────────
   /** Venues that run a 1m collector. EMPTY BY DEFAULT: collecting is hours of
@@ -115,6 +123,24 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     throw new Error(`HUB_PORT is not a valid port: ${env.HUB_PORT}`);
   }
   const signing = candleSigningFromEnv(env);
+  const publicOrigin = env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`;
+  if (env.NODE_ENV === "production") {
+    let url: URL;
+    try { url = new URL(publicOrigin); } catch { throw new Error("HUB_PUBLIC_ORIGIN must be a valid HTTPS URL in production"); }
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+      throw new Error("HUB_PUBLIC_ORIGIN must use HTTPS without credentials, query or fragment in production");
+    }
+  }
+  const releasePublicKeys = env.HUB_RELEASE_PUBLIC_KEYS_JSON
+    ? parseReleasePublicKeys(env.HUB_RELEASE_PUBLIC_KEYS_JSON)
+    : {};
+  if (env.NODE_ENV === "production" && !Object.keys(releasePublicKeys).length) {
+    throw new Error("HUB_RELEASE_PUBLIC_KEYS_JSON is required in production; the Hub must not receive the private release key");
+  }
+  const releaseMaxAgeMs = Number(env.HUB_RELEASE_MAX_AGE_MS ?? DEFAULT_RELEASE_MAX_AGE_MS);
+  if (!Number.isFinite(releaseMaxAgeMs) || releaseMaxAgeMs <= 0) {
+    throw new Error("HUB_RELEASE_MAX_AGE_MS must be a positive number");
+  }
   return {
     dataDir: env.HUB_DATA_DIR ?? path.join(ROOT, "data"),
     releasesDir: env.HUB_RELEASES_DIR ?? path.join(ROOT, "releases"),
@@ -123,8 +149,13 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     host: env.HUB_HOST ?? "127.0.0.1",
     port,
     adminToken: env.HUB_ADMIN_TOKEN ?? "",
-    publicOrigin: env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`,
+    publicOrigin,
     srcDir: env.HUB_SRC_DIR ?? "/root/dev/wickhunter-hub",
+    releasePublicKeys,
+    releaseMaxAgeMs,
+    releaseChannel: (env.HUB_RELEASE_CHANNEL ?? "beta").trim(),
+    releasePlatform: (env.HUB_RELEASE_PLATFORM ?? "linux").trim(),
+    releaseArch: (env.HUB_RELEASE_ARCH ?? "x64").trim(),
     candleVenues: (env.HUB_CANDLE_VENUES ?? "")
       .split(",")
       .map((s) => s.trim().toLowerCase())

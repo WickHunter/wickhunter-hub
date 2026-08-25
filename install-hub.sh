@@ -82,6 +82,9 @@ fi
 grep -q '^HUB_PORT=' "$ENV_FILE" || printf 'HUB_PORT=%s\n' "$PORT" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 ok "origin: $(sed -n 's/^HUB_PUBLIC_ORIGIN=//p' "$ENV_FILE")"
+if ! grep -q '^HUB_RELEASE_PUBLIC_KEYS_JSON=' "$ENV_FILE"; then
+  die "HUB_RELEASE_PUBLIC_KEYS_JSON is required. Generate the dedicated OFFLINE release key in the app repo, paste only its public keyring JSON into $ENV_FILE, sign the current release, then re-run. Never copy the private release key to this Hub."
+fi
 
 say "Installing the systemd service"
 unit_tmp=$(mktemp)
@@ -94,6 +97,7 @@ printf '%s\n' \
   '[Service]' \
   "WorkingDirectory=$HUB_DIR" \
   "EnvironmentFile=$ENV_FILE" \
+  'Environment=NODE_ENV=production' \
   "ExecStart=$(command -v node) dist/src/main.js" \
   'Restart=always' \
   'RestartSec=5' \
