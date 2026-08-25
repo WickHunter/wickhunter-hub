@@ -57,6 +57,62 @@ await test("schema exposes every API/config input, separates public alpha materi
   assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_CREDENTIAL").generated, "worker");
   assert.equal(byName.get("MARKETPLACE_DEMO_MASTER_API_KEY").generated, undefined);
   assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").generated, undefined);
+  assert.deepEqual(
+    MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.setup === "operator").map((field) => field.name),
+    [
+      "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
+      "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
+      "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
+      "MOONPAY_COMMERCE_RECIPIENTS_JSON",
+    ],
+    "the normal Hub form must contain only Bybit and MoonPay facts the operator has to supply",
+  );
+});
+
+await test("automatic setup fills defaults, derives the public signer, mirrors the explicit alpha flags and preserves vendor inputs", async () => {
+  const { cfg } = config("marketplace-automatic");
+  cfg.publicMarketplaceOrigin = "https://alpha.wickhunter.example";
+  let alphaLicences = ["lic_z", "lic_a", "lic_z"];
+  cfg.alphaLicences = () => alphaLicences;
+  const fake = fakeSpawner();
+  const vendorKey = "bybit-key-from-the-operator";
+  const snapshot = await applyMarketplaceInputUpdate(cfg, {
+    automatic: true,
+    changes: { MARKETPLACE_DEMO_MASTER_API_KEY: vendorKey },
+  }, fake.spawn);
+  assert.equal(snapshot.operatorMissing.includes("MARKETPLACE_DEMO_MASTER_API_KEY"), false);
+  assert.deepEqual([...snapshot.deploymentMissing].sort(), ["LIQHUNTER_HUB_KEY", "MARKETPLACE_BUILD_COMMIT", "MARKETPLACE_DATABASE_URL"].sort());
+  const bytes = fs.readFileSync(cfg.envFile, "utf8");
+  for (const expected of [
+    'HUB_MARKETPLACE_STATUS_ORIGIN="http://127.0.0.1:8099"',
+    'MARKETPLACE_ENABLED="1"', 'MARKETPLACE_HTTP_HOST="127.0.0.1"',
+    'MARKETPLACE_HTTP_PORT="8099"', 'MARKETPLACE_STORE="postgres"',
+    'MARKETPLACE_RUNTIME_DIRECTORY="/var/lib/liqhunter/marketplace"',
+    'LIQHUNTER_MARKETPLACE_URL="https://alpha.wickhunter.example"',
+    'MARKETPLACE_ALPHA_LICENCES="lic_a,lic_z"',
+    'MARKETPLACE_ADMIN_LICENCES="lic_a,lic_z"',
+    'MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED="1"',
+    'MOONPAY_COMMERCE_ENVIRONMENT="production"',
+    'MOONPAY_COMMERCE_PRICING_ASSET="USDT"',
+    'MOONPAY_COMMERCE_MONTHLY_INTERVAL="MONTH"',
+    'MOONPAY_COMMERCE_YEARLY_INTERVAL="YEAR"',
+    `MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`,
+  ]) assert.ok(bytes.includes(expected), expected);
+  const seed = JSON.parse(bytes.match(/^MARKETPLACE_INTENT_SIGNING_SEED=(.*)$/m)[1]);
+  const ring = JSON.parse(JSON.parse(bytes.match(/^LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS=(.*)$/m)[1]));
+  assert.equal(Buffer.from(seed, "base64url").length, 32);
+  assert.equal(Buffer.from(ring["marketplace-1"], "base64url").length, 32);
+  assert.equal(JSON.stringify(snapshot).includes(seed), false, "the generated signing seed crossed the masked response");
+  const bridge = fs.readFileSync(cfg.hubBridgeEnvFile, "utf8");
+  assert.match(bridge, /HUB_MARKETPLACE_STATUS_CREDENTIAL=/);
+  assert.doesNotMatch(bridge, /MARKETPLACE_INTENT|BYBIT|MOONPAY|DATABASE/);
+
+  alphaLicences = [];
+  const removed = await applyMarketplaceInputUpdate(cfg, { automatic: true }, fake.spawn);
+  assert.ok(removed.automaticMissing.includes("MARKETPLACE_ALPHA_LICENCES"));
+  const afterRemoval = fs.readFileSync(cfg.envFile, "utf8");
+  assert.doesNotMatch(afterRemoval, /MARKETPLACE_(?:ALPHA|ADMIN)_LICENCES=/);
+  assert.ok(afterRemoval.includes(`MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`), "vendor input was not preserved during alpha sync");
 });
 
 await test("a successful update is atomic, 0600, masked, and restarts only the exact hardcoded private units", async () => {
@@ -211,15 +267,21 @@ await test("admin config endpoint enforces auth plus JSON/CSRF and returns only 
   } finally { await h.close(); }
 });
 
-await test("desktop/mobile admin workflow renders every field, generation actions and no secret persistence", () => {
+await test("desktop/mobile admin workflow shows only vendor inputs and keeps technical facts collapsed", () => {
   const html = fs.readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
   assert.match(html, /id="mktConfigForm"/);
   assert.match(html, /\/admin\/api\/marketplace-config/);
-  assert.match(html, /Save and restart private Marketplace/);
-  assert.match(html, /Generate shared status credential/);
-  assert.match(html, /Generate Demo vault key/);
-  assert.match(html, /Generate Demo worker credential/);
-  assert.match(html, /MoonPay Commerce — crypto only, no revenue share/);
+  assert.match(html, /Save setup and configure everything else/);
+  assert.match(html, /Advanced technical diagnostics/);
+  assert.match(html, /field\.setup === "operator"/);
+  assert.match(html, /Bybit Demo account creation/);
+  assert.match(html, /MoonPay crypto payments/);
+  assert.match(html, /data-moonpay-recipient-part/);
+  assert.match(html, /Enable Marketplace for this licence only/);
+  assert.match(html, /flag: "marketplace"/);
+  assert.doesNotMatch(html, /Generate shared status credential/);
+  assert.doesNotMatch(html, /Generate Demo vault key/);
+  assert.doesNotMatch(html, /Generate Demo worker credential/);
   assert.match(html, /\.configfields \{ grid-template-columns:1fr; \}/);
   assert.match(html, /field\.state !== "missing"/);
   assert.ok(!/localStorage|sessionStorage|document\.cookie/.test(html));

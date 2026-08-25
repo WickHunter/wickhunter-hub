@@ -590,8 +590,11 @@ visible instead of looking like a successful current checkout.
 ### Marketplace operations bridge (alpha only)
 
 Marketplace trading, payments, Demo credentials, and subscription persistence
-remain in the private service; none are copied into this public Hub. The admin
-page now provides an allowlisted configuration form for every required input.
+remain in the private service; none are copied into this public Hub. The normal
+admin form asks only for Bybit and MoonPay facts the server cannot know. Safe
+localhost/storage/timing defaults, internal credentials, signing material,
+vault settings and alpha verifier data are generated or derived automatically;
+database/build/Hub identity facts are supplied by the private deployment.
 Secrets are write-only, persist in `/etc/liqhunter/marketplace.env` with mode
 0600, and are never returned to the browser. The public Hub loads only a
 separate `/etc/wickhunter-hub/marketplace.env` containing the three status
@@ -786,6 +789,16 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.8 — **Marketplace setup asks only for vendor facts.** The normal Hub
+  form now contains only the WickHunter-owned Bybit API pair and MoonPay
+  credentials/payout information. Saving fills safe service defaults and
+  generates the status pair, Ed25519 intent signer/public verifier, Demo vault
+  key and worker credential automatically; deployment supplies PostgreSQL,
+  build and central-Hub identity facts. Alpha membership is a per-licence
+  button on the existing roster and is mirrored into the central allowlist,
+  while beta remains excluded. The former wall of environment variables is
+  retained only inside collapsed, read-only advanced diagnostics.
 
 - v0.3.7 — **Every Marketplace operator input has a safe Hub-admin home.** The
   authenticated admin form exposes the exact alpha, PostgreSQL, signer, Bybit

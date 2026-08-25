@@ -56,6 +56,15 @@ await test("a fresh hub tells every licence: no flags — but tells them", async
   assert.ok(Object.prototype.hasOwnProperty.call(b, "flags"), "`flags` must be present even when empty");
 });
 
+await test("the licence roster exposes the explicit Marketplace alpha switch without enabling beta", async () => {
+  assert.equal((await setFlag(alpha, "marketplace", true)).status, 200);
+  const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
+  assert.equal(list.status, 200);
+  assert.equal(list.body.licenses.find((row) => row.id === alpha).marketplaceAlpha, true);
+  assert.equal(list.body.licenses.find((row) => row.id === beta).marketplaceAlpha, false);
+  await setFlag(alpha, "marketplace", null);
+});
+
 await test("a flag set for ONE licence reaches only that licence", async () => {
   const r = await setFlag(alpha, "dcaStyles", true);
   assert.equal(r.status, 200);

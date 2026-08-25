@@ -51,6 +51,9 @@
   .configfield code { display:block; font-size:.7rem; opacity:.62; overflow-wrap:anywhere; }
   .configfield input, .configfield select, .configfield textarea { width:100%; margin-top:.35rem; font-size:16px; }
   .configfield textarea { min-height:5.2rem; resize:vertical; }
+  .recipientfields { display:grid; grid-template-columns:1fr 1fr; gap:.45rem; margin-top:.35rem; }
+  .recipientfields label { font-size:.76rem; font-weight:600; }
+  .recipientfields input { margin-top:.18rem; }
   .confighelp { font-size:.78rem; opacity:.68; margin-top:.25rem; overflow-wrap:anywhere; }
   .configstate { font-size:.7rem; margin-left:.35rem; text-transform:uppercase; }
   .configclear { margin-top:.3rem; min-height:2rem; padding:.25rem .55rem; }
@@ -110,6 +113,7 @@
                                        letter-spacing:.035em; }
     #mktInputs .copySetup { margin-top:.35rem; }
     .configfields { grid-template-columns:1fr; }
+    .recipientfields { grid-template-columns:1fr; }
     .configgroup { padding:.7rem; }
     #mktConfigActions button, #mktConfigForm > button { width:100%; }
   }
@@ -152,21 +156,21 @@
 </div>
 <p class="muted">This public Hub contains no trading or payment code. It reads a sanitized status contract from the private Marketplace API over a dedicated loopback credential. Secret values are never returned to this page.</p>
 <div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
-<div class="tbl"><table id="mktInputs">
-  <thead><tr><th>Required input</th><th>State</th><th>Safe value/detail</th><th>Operator action</th></tr></thead>
-  <tbody><tr><td colspan="4">loading…</td></tr></tbody>
-</table></div>
+<details style="margin-top:.8rem">
+  <summary>Advanced technical diagnostics</summary>
+  <p class="muted">These are read-only service facts for troubleshooting. They are not a setup checklist for you.</p>
+  <div class="tbl"><table id="mktInputs">
+    <thead><tr><th>Service fact</th><th>State</th><th>Safe value/detail</th><th>Recovery detail</th></tr></thead>
+    <tbody><tr><td colspan="4">loading…</td></tr></tbody>
+  </table></div>
+</details>
 
-<h2 style="margin:1.2rem 0 .2rem">Enter Marketplace configuration</h2>
-<p class="muted" style="margin:.2rem 0">Secrets are write-only: a configured secret comes back only as <b>configured</b>, never as its value. Saving writes one root-only 0600 file and restarts only the private API and worker; either both accept it or the previous file is restored.</p>
-<div class="actions" id="mktConfigActions">
-  <button type="button" data-generate="HUB_MARKETPLACE_STATUS_CREDENTIAL,MARKETPLACE_OPERATOR_STATUS_CREDENTIAL">Generate shared status credential</button>
-  <button type="button" data-generate="MARKETPLACE_DEMO_VAULT_KEY">Generate Demo vault key</button>
-  <button type="button" data-generate="MARKETPLACE_DEMO_WORKER_CREDENTIAL">Generate Demo worker credential</button>
-</div>
+<h2 style="margin:1.2rem 0 .2rem">Finish Marketplace setup</h2>
+<p class="muted" style="margin:.2rem 0">Enter only vendor information the server cannot know. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Configured secrets are never shown again.</p>
 <form id="mktConfigForm" style="display:block">
   <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
-  <button type="submit" style="margin-top:.8rem">Save and restart private Marketplace</button>
+  <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
+  <button type="submit" style="margin-top:.8rem">Save setup and configure everything else</button>
   <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
 </form>
 
@@ -185,8 +189,8 @@
 <div id="err"></div>
 <div id="note"></div>
 <div class="tbl"><table>
-  <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th></th></tr></thead>
-  <tbody id="rows"><tr><td colspan="8">loading…</td></tr></tbody>
+  <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th>Marketplace</th><th></th></tr></thead>
+  <tbody id="rows"><tr><td colspan="9">loading…</td></tr></tbody>
 </table></div>
 
 <h1 style="margin-top:2.2rem">Exchanges <small>— 1m candle collectors feeding the seed</small></h1>
@@ -281,7 +285,7 @@ async function refresh() {
   const rows = document.getElementById("rows");
   rows.innerHTML = "";
   if (data.licenses.length === 0) {
-    rows.innerHTML = '<tr><td colspan="8">no licenses yet</td></tr>';
+    rows.innerHTML = '<tr><td colspan="9">no licenses yet</td></tr>';
     return;
   }
   for (const l of data.licenses) {
@@ -296,6 +300,7 @@ async function refresh() {
       "<td>" + esc(l.lastSeen ? vlabel(l.lastSeen.version) : "—") + "</td>" +
       "<td>" + esc(l.lastSeen ? l.lastSeen.ip : "—") + "</td>" +
       '<td class="instcell">' + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
+      '<td class="alphacell"></td>' +
       "<td></td>";
     // ── ONE KEY, MORE THAN ONE MACHINE ──────────────────────────────────────
     // Nothing binds a licence to an install, so a shared key runs everywhere at
@@ -370,7 +375,35 @@ async function refresh() {
       expCell.appendChild(input);
       expCell.appendChild(save);
     }
+    const alphaCell = tr.querySelector(".alphacell");
     if (!l.revoked) {
+      const alpha = document.createElement("button");
+      alpha.textContent = l.marketplaceAlpha ? "Alpha enabled" : "Enable alpha";
+      alpha.className = l.marketplaceAlpha ? "ops-ok" : "";
+      alpha.title = l.marketplaceAlpha
+        ? "This licence may use Marketplace alpha. Click to remove it; exits remain available."
+        : "Enable Marketplace for this licence only. Beta and every other licence stay excluded.";
+      alpha.onclick = async () => {
+        alpha.disabled = true;
+        try {
+          await api("/admin/api/flags", {
+            method: "POST",
+            body: JSON.stringify({ id: l.id, flag: "marketplace", state: !l.marketplaceAlpha }),
+          });
+          try {
+            await api("/admin/api/marketplace-config", { method: "POST", body: JSON.stringify({ automatic: true }) });
+            document.getElementById("note").textContent = l.marketplaceAlpha
+              ? "Marketplace alpha removed for " + l.name + "; its central access is now exit-only."
+              : "Marketplace alpha enabled and synchronized for " + l.name + ".";
+          } catch (syncError) {
+            document.getElementById("note").textContent = "The alpha switch was saved safely, but the private service is not ready to synchronize yet: " + syncError.message;
+          }
+        } catch (e) {
+          if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+        }
+        refresh();
+      };
+      alphaCell.appendChild(alpha);
       const copy = document.createElement("button");
       copy.textContent = "Copy install command";
       copy.onclick = async () => {
@@ -567,19 +600,19 @@ async function mktRefresh() {
 }
 
 const mktGroupLabels = {
-  bridge: "Hub ↔ private status bridge",
-  service: "Private Marketplace API and worker",
-  alpha: "Alpha distribution and licence cohort (not beta)",
-  "bybit-demo": "WickHunter-owned Bybit Demo",
-  moonpay: "MoonPay Commerce — crypto only, no revenue share",
+  "bybit-demo": "Bybit Demo account creation",
+  moonpay: "MoonPay crypto payments",
 };
-let mktPendingGenerate = new Set();
 
 function mktRenderConfig(config) {
   const wrap = document.getElementById("mktConfigFields");
   wrap.innerHTML = "";
+  const allFields = config.fields || [];
+  const operatorFields = allFields.filter((field) => field.setup === "operator");
+  const automaticFields = allFields.filter((field) => field.setup === "automatic");
+  const deploymentFields = allFields.filter((field) => field.setup === "deployment");
   const groups = new Map();
-  for (const field of config.fields || []) {
+  for (const field of operatorFields) {
     let group = groups.get(field.group);
     if (!group) {
       group = document.createElement("section");
@@ -605,7 +638,28 @@ function mktRenderConfig(config) {
     label.appendChild(variable);
 
     let input;
-    if (field.kind === "textarea") input = document.createElement("textarea");
+    let friendlyRecipient = null;
+    if (field.name === "MOONPAY_COMMERCE_RECIPIENTS_JSON") {
+      input = document.createElement("input");
+      input.type = "hidden";
+      friendlyRecipient = document.createElement("div");
+      friendlyRecipient.className = "recipientfields";
+      for (const [part, title, placeholder] of [
+        ["walletId", "Payout wallet ID", "MoonPay wallet ID"],
+        ["sourceBlockchainEngine", "Blockchain", "for example: solana"],
+      ]) {
+        const partLabel = document.createElement("label");
+        partLabel.textContent = title;
+        const partInput = document.createElement("input");
+        partInput.type = "password";
+        partInput.placeholder = field.state === "configured" ? "Configured — leave blank to keep" : placeholder;
+        partInput.dataset.moonpayRecipientPart = part;
+        partInput.autocomplete = "off";
+        partInput.spellcheck = false;
+        partLabel.appendChild(partInput);
+        friendlyRecipient.appendChild(partLabel);
+      }
+    } else if (field.kind === "textarea") input = document.createElement("textarea");
     else if (field.kind === "select") {
       input = document.createElement("select");
       const empty = document.createElement("option");
@@ -645,7 +699,9 @@ function mktRenderConfig(config) {
     const help = document.createElement("div");
     help.className = "confighelp";
     help.textContent = field.help + (field.required ? " Required for readiness." : " Optional/defaultable.");
-    card.append(label, input, help);
+    card.append(label, input);
+    if (friendlyRecipient) card.appendChild(friendlyRecipient);
+    card.appendChild(help);
     if (field.state !== "missing") {
       const clear = document.createElement("button");
       clear.type = "button"; clear.className = "configclear"; clear.textContent = "Clear on save";
@@ -662,34 +718,43 @@ function mktRenderConfig(config) {
     }
     group.querySelector(".configfields").appendChild(card);
   }
-  if (!wrap.children.length) wrap.innerHTML = '<div class="opscard ops-bad">No allowlisted configuration fields were returned.</div>';
-  document.getElementById("mktConfigNote").textContent = config.requiredMissing && config.requiredMissing.length
-    ? config.requiredMissing.length + " required input(s) are still missing."
-    : "All required input names are configured; readiness still depends on private status validation.";
+  if (!wrap.children.length) wrap.innerHTML = '<div class="opscard ops-ok">All Bybit and MoonPay information is configured.</div>';
+  document.getElementById("mktManagedSummary").textContent = automaticFields.length + " internal settings are managed automatically"
+    + (deploymentFields.length ? "; " + deploymentFields.length + " installation facts are supplied by deployment." : ".");
+  const operatorMissing = config.operatorMissing || [];
+  const deploymentMissing = config.deploymentMissing || [];
+  document.getElementById("mktConfigNote").textContent = operatorMissing.length
+    ? operatorMissing.length + " Bybit/MoonPay value(s) still need your input."
+    : deploymentMissing.length
+      ? "Vendor information is saved; deployment is finishing " + deploymentMissing.length + " internal prerequisite(s)."
+      : "Vendor information is saved. Readiness still depends on live service checks.";
 }
 
 async function mktConfigRefresh() {
   const wrap = document.getElementById("mktConfigFields");
   try {
     const data = await api("/admin/api/marketplace-config");
-    mktPendingGenerate = new Set();
     mktRenderConfig(data.config);
   } catch (e) {
     if (e.message !== "unauthorized") wrap.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>';
   }
 }
 
-for (const button of document.querySelectorAll("#mktConfigActions [data-generate]")) {
-  button.onclick = () => {
-    for (const name of button.dataset.generate.split(",")) mktPendingGenerate.add(name);
-    button.textContent = "Queued for secure generation";
-    document.getElementById("mktConfigNote").textContent = "Generated values stay server-side and will never be shown. Save to apply them.";
-  };
-}
-
 document.getElementById("mktConfigForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const changes = {};
+  const recipient = document.querySelector('[data-marketplace-name="MOONPAY_COMMERCE_RECIPIENTS_JSON"]');
+  const recipientParts = Array.from(document.querySelectorAll("[data-moonpay-recipient-part]"));
+  if (recipient && recipientParts.some((input) => input.value !== "")) {
+    const currency = document.querySelector('[data-marketplace-name="MOONPAY_COMMERCE_PRICING_CURRENCY_ID"]')?.value || "";
+    const wallet = recipientParts.find((input) => input.dataset.moonpayRecipientPart === "walletId")?.value || "";
+    const blockchain = recipientParts.find((input) => input.dataset.moonpayRecipientPart === "sourceBlockchainEngine")?.value || "";
+    if (!currency || !wallet || !blockchain) {
+      document.getElementById("mktConfigNote").textContent = "MoonPay currency ID, payout wallet ID and blockchain are all required together.";
+      return;
+    }
+    recipient.value = JSON.stringify([{ currencyId: currency, walletId: wallet, sourceBlockchainEngine: blockchain }]);
+  }
   for (const input of document.querySelectorAll("#mktConfigFields [data-marketplace-name]")) {
     const name = input.dataset.marketplaceName;
     if (input.dataset.clear === "1") changes[name] = null;
@@ -699,21 +764,16 @@ document.getElementById("mktConfigForm").onsubmit = async (ev) => {
       changes[name] = input.value === "" ? null : input.value;
     }
   }
-  if (!Object.keys(changes).length && !mktPendingGenerate.size) {
-    document.getElementById("mktConfigNote").textContent = "No changes are queued.";
-    return;
-  }
-  if (!confirm("Write the root-only Marketplace environment and restart exactly the private API and worker? A failed restart restores the previous file.")) return;
+  if (!confirm("Save the Bybit/MoonPay information and let the Hub configure all internal Marketplace settings automatically?")) return;
   const note = document.getElementById("mktConfigNote");
-  note.textContent = "Saving atomically and verifying both private service restarts…";
+  note.textContent = "Saving vendor information, applying safe defaults and verifying the private services…";
   try {
     const data = await api("/admin/api/marketplace-config", {
       method: "POST",
-      body: JSON.stringify({ changes, generate: Array.from(mktPendingGenerate) }),
+      body: JSON.stringify({ changes, automatic: true }),
     });
-    mktPendingGenerate = new Set();
     mktRenderConfig(data.config);
-    note.textContent = "Saved to the root-only environment; private API and worker restarted. Secret values remain masked.";
+    note.textContent = "Saved. Internal settings were configured automatically and secret values remain masked.";
     mktRefresh();
   } catch (e) {
     if (e.message !== "unauthorized") note.textContent = e.message;

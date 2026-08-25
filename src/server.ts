@@ -187,11 +187,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return { ok: response.ok, status: response.status, text: () => response.text() };
   });
   let marketplaceStatusConfig = cfg.marketplaceStatus ?? marketplaceStatusBridgeFromEnv({});
-  const marketplaceInputsConfig: MarketplaceInputsConfig = cfg.marketplaceInputs
+  const configuredMarketplaceInputs = cfg.marketplaceInputs
     ?? {
       envFile: "/etc/liqhunter/marketplace.env",
       hubBridgeEnvFile: "/etc/wickhunter-hub/marketplace.env",
     };
+  let publicMarketplaceOrigin: string | undefined;
+  try {
+    const origin = new URL(cfg.publicOrigin);
+    const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(origin.hostname.toLowerCase());
+    if (origin.protocol === "https:" && !loopback) publicMarketplaceOrigin = origin.origin;
+  } catch { /* the main config already owns public-origin validation */ }
+  const marketplaceInputsConfig: MarketplaceInputsConfig = {
+    ...configuredMarketplaceInputs,
+    publicMarketplaceOrigin: configuredMarketplaceInputs.publicMarketplaceOrigin ?? publicMarketplaceOrigin,
+    alphaLicences: configuredMarketplaceInputs.alphaLicences ?? (() => {
+      const flags = readFlags(cfg.dataDir);
+      return Object.entries(flags.byLicense)
+        .filter(([, row]) => row.marketplace === true)
+        .map(([licenseId]) => licenseId);
+    }),
+  };
   const candleKey = new CandleKeyStore(cfg.dataDir);
   // ── WHICH KEY SIGNS A SEED ────────────────────────────────────────────────
   // One expression picks BOTH halves — `cfg.candleKeyId` was derived from the
@@ -815,8 +831,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // each other there and nothing looks wrong; the ledger is where the
       // second one is visible.
       const sharing = sharingSignals(cfg.dataDir);
+      const featureFlags = readFlags(cfg.dataDir);
       const licenses = store.list().map((l) => ({
-        ...l, lastSeen: roster[l.id] ?? null, sharing: sharing[l.id] ?? null,
+        ...l,
+        // Marketplace is intentionally per-licence alpha. A global default is
+        // never treated as authorization here or in the private roster sync.
+        marketplaceAlpha: featureFlags.byLicense[l.id]?.marketplace === true,
+        lastSeen: roster[l.id] ?? null,
+        sharing: sharing[l.id] ?? null,
       }));
       return sendJson(res, 200, { ok: true, origin: cfg.publicOrigin, licenses });
     }
