@@ -33,6 +33,15 @@
   .expsave:disabled { opacity: .45; cursor: default; }
   .share { color: #c33; font-weight: 600; white-space: nowrap; }
   .muted { opacity: .6; }
+  .opsgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(18rem,1fr)); gap:.7rem; margin-top:.7rem; }
+  .opscard { border:1px solid #8884; border-radius:8px; padding:.75rem .9rem; min-width:0; }
+  .opscard h2 { font-size:.95rem; margin:0 0 .35rem; }
+  .opscard dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .6rem; margin:0; }
+  .opscard dt { opacity:.65; } .opscard dd { margin:0; overflow-wrap:anywhere; }
+  .ops-ok { color:#2a7; } .ops-warn { color:#b80; } .ops-bad { color:#c33; }
+  .logtail { white-space:pre-wrap; overflow:auto; max-height:18rem; font:12px/1.45 ui-monospace,monospace;
+             background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
+  .setupcopy { white-space:normal; min-width:18rem; }
   /* per-exchange collector cards */
   #venues { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: .8rem; margin-top: .6rem; }
   .venue { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; }
@@ -87,12 +96,26 @@
   </form>
 </div>
 
-<h1>Wick Hunter Hub <small>— beta licensing</small></h1>
+<h1>Wick Hunter Hub <small>— licensing &amp; operations</small></h1>
 <div class="actions">
   <button type="button" id="refresh">Refresh</button>
   <button type="button" id="upgradeHub">Upgrade hub</button>
   <span id="hubVer" class="muted"></span>
 </div>
+
+<div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
+
+<h1 style="margin-top:2.2rem">Marketplace operations <small>— alpha only; private service status</small></h1>
+<div class="actions">
+  <button type="button" id="mktRefresh">Refresh</button>
+  <span id="mktMeta" class="muted"></span>
+</div>
+<p class="muted">This public Hub contains no trading or payment code. It reads a sanitized status contract from the private Marketplace API over a dedicated loopback credential. Secret values are never returned to this page.</p>
+<div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
+<div class="tbl"><table id="mktInputs">
+  <thead><tr><th>Required input</th><th>State</th><th>Safe value/detail</th><th>Operator action</th></tr></thead>
+  <tbody><tr><td colspan="4">loading…</td></tr></tbody>
+</table></div>
 
 <form id="issueForm">
   <input name="name" placeholder="Tester name" required>
@@ -169,6 +192,8 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   if (!token) return;
   document.getElementById("gate").style.display = "none";
   refresh();
+  opsRefresh();
+  mktRefresh();
   cdRefresh();
   mcRefresh();
   fbRefresh();
@@ -339,15 +364,15 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); mktRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
-  try { return (await (await fetch(base + "/api/health")).json()).version || ""; }
-  catch { return ""; }
+  try { return await (await fetch(base + "/api/health")).json(); }
+  catch { return null; }
 }
 document.getElementById("upgradeHub").onclick = async () => {
-  if (!confirm("Upgrade the hub to the latest pushed version? It pulls the source checkout, reinstalls, and restarts itself (takes ~1 minute).")) return;
+  if (!confirm("Upgrade the hub from the exact verified origin/main commit? A dirty checkout, wrong branch, divergence, or failed build is refused and shown here.")) return;
   const note = document.getElementById("note");
   const err = document.getElementById("err");
   err.textContent = ""; note.textContent = "";
@@ -355,22 +380,99 @@ document.getElementById("upgradeHub").onclick = async () => {
   let started;
   try { started = await api("/admin/api/upgrade", { method: "POST" }); }
   catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
-  note.textContent = "Upgrading from v" + (before || started.version) + " — waiting for the hub to come back…";
+  const beforeVersion = before && before.version ? before.version : started.version;
+  const beforeCommit = before && before.build ? before.build.commit : null;
+  note.textContent = "Upgrading from v" + beforeVersion + " " + (beforeCommit ? beforeCommit.slice(0, 12) : "unknown commit") + " — verifying origin/main…";
   const t0 = Date.now();
   const poll = setInterval(async () => {
-    const v = await health();
-    if (v && v !== before) {
+    const h = await health();
+    const up = h && h.upgrade;
+    if (up && up.state === "failed") {
       clearInterval(poll);
-      note.textContent = "Hub upgraded: v" + before + " → v" + v + ".";
-      refresh(); cdRefresh(); mcRefresh(); fbRefresh();
+      err.textContent = "Hub upgrade failed: " + (up.message || "inspect the log below");
+      opsRefresh();
+    } else if (up && up.state === "succeeded" && (!beforeCommit || (h.build && h.build.commit !== beforeCommit) || up.completedAtMs >= t0)) {
+      clearInterval(poll);
+      note.textContent = "Hub upgrade verified: v" + beforeVersion + " → v" + h.version + ", commit " + ((h.build && h.build.commit) ? h.build.commit.slice(0, 12) : "unknown") + ".";
+      refresh(); opsRefresh(); mktRefresh(); cdRefresh(); mcRefresh(); fbRefresh();
     } else if (Date.now() - t0 > 120000) {
       clearInterval(poll);
-      err.textContent = "The hub did not report a new version after 2 minutes. If it is still on v" + before +
-        ", there may have been nothing new to pull, or the upgrade failed — check data/upgrade.log on the VPS.";
+      err.textContent = "The Hub has not recorded success after 2 minutes. The exact source/runtime comparison and log tail below show where it stopped.";
+      opsRefresh();
     }
   }, 3000);
 };
-health().then((v) => { document.getElementById("hubVer").textContent = v ? "hub v" + v : ""; });
+health().then((h) => { document.getElementById("hubVer").textContent = h && h.version ? "hub v" + h.version : ""; });
+
+function shortSha(v) { return v ? String(v).slice(0, 12) : "unknown"; }
+function stateClass(v) { return /^(connected|configured|current|matches|succeeded|ready|running)$/.test(String(v)) ? "ops-ok" : /^(missing|invalid|failed|unavailable|differs|diverged|behind)$/.test(String(v)) ? "ops-bad" : "ops-warn"; }
+
+async function opsRefresh() {
+  const box = document.getElementById("hubOps");
+  let d;
+  try { d = await api("/admin/api/operations"); }
+  catch (e) { if (e.message !== "unauthorized") box.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>'; return; }
+  const b = d.build || {}, s = d.source || {}, u = d.upgrade || {};
+  document.getElementById("hubVer").textContent = "hub v" + (d.packageVersion || "?") + " · " + shortSha(b.commit);
+  box.innerHTML =
+    '<div class="opscard"><h2>Running build</h2><dl>' +
+      '<dt>Package</dt><dd>' + esc(d.packageVersion || "unknown") + '</dd>' +
+      '<dt>Commit</dt><dd title="' + esc(b.commit || "") + '">' + esc(b.commit || "unknown — installed before build records") + '</dd>' +
+      '<dt>Branch</dt><dd>' + esc(b.branch || "unknown") + '</dd>' +
+      '<dt>Built</dt><dd>' + esc(b.builtAtMs ? fmt(b.builtAtMs) + " UTC" : "unknown") + '</dd></dl></div>' +
+    '<div class="opscard"><h2>Configured source checkout</h2><dl>' +
+      '<dt>Branch</dt><dd>' + esc(s.branch || "unavailable") + '</dd>' +
+      '<dt>HEAD</dt><dd title="' + esc(s.commit || "") + '">' + esc(s.commit || "unavailable") + '</dd>' +
+      '<dt>origin/main</dt><dd title="' + esc(s.originMainCommit || "") + '">' + esc(s.originMainCommit || "unavailable") + '</dd>' +
+      '<dt>Origin state</dt><dd class="' + stateClass(s.relationToOriginMain) + '">' + esc(s.relationToOriginMain || "unknown") + '</dd>' +
+      '<dt>Runtime</dt><dd class="' + stateClass(d.sourceVsRuntime) + '">' + esc(d.sourceVsRuntime || "unknown") + '</dd>' +
+      '<dt>Worktree</dt><dd class="' + (s.dirty ? "ops-bad" : "ops-ok") + '">' + (s.dirty === null ? "unknown" : s.dirty ? "DIRTY — upgrade refused" : "clean") + '</dd></dl></div>' +
+    '<div class="opscard"><h2>Last upgrade</h2><dl>' +
+      '<dt>Outcome</dt><dd class="' + stateClass(u.state) + '">' + esc(u.state || "never") + '</dd>' +
+      '<dt>Started</dt><dd>' + esc(u.startedAtMs ? fmt(u.startedAtMs) + " UTC" : "—") + '</dd>' +
+      '<dt>Finished</dt><dd>' + esc(u.completedAtMs ? fmt(u.completedAtMs) + " UTC" : "—") + '</dd>' +
+      '<dt>Target</dt><dd>' + esc(u.targetCommit || "—") + '</dd></dl><p>' + esc(u.message || "") + '</p></div>' +
+    '<div class="opscard"><h2>Upgrade log tail</h2><div class="logtail">' + esc(d.upgradeLogTail || "No upgrade log has been written.") + '</div></div>';
+}
+
+function renderStatusCard(title, value) {
+  return '<div class="opscard"><h2>' + esc(title) + '</h2><div class="logtail">' + esc(JSON.stringify(value, null, 2)) + '</div></div>';
+}
+
+async function mktRefresh() {
+  const summary = document.getElementById("mktSummary"), meta = document.getElementById("mktMeta");
+  const body = document.querySelector("#mktInputs tbody");
+  let d;
+  try { d = (await api("/admin/api/marketplace-status")).marketplace; }
+  catch (e) { if (e.message !== "unauthorized") summary.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>'; return; }
+  const bridge = d.bridge || {}, upstream = d.upstream || null;
+  meta.textContent = "bridge " + (bridge.state || "unknown") + " · refreshed " + fmt(d.generatedAtMs) + " UTC";
+  let cards = '<div class="opscard"><h2>Private bridge</h2><p class="' + stateClass(bridge.state) + '">' + esc(bridge.state || "unknown") + '</p><p>' + esc(bridge.refusal || "Dedicated loopback credential accepted; only sanitized status is rendered.") + '</p></div>';
+  if (upstream) {
+    for (const name of ["build", "service", "feature", "api", "worker", "storage", "outbox", "bybitDemo", "moonPay", "readiness"]) {
+      if (upstream[name] !== undefined) cards += renderStatusCard(name, upstream[name]);
+    }
+  } else {
+    cards += '<div class="opscard ops-bad"><h2>Private service unavailable</h2><p>No service, migration, worker, Demo evidence, or MoonPay readiness claim can be made. Use the exact checklist below.</p></div>';
+  }
+  if (d.readinessBlockers && d.readinessBlockers.length) cards += '<div class="opscard ops-bad"><h2>Readiness blockers</h2><ul>' + d.readinessBlockers.map((v) => '<li>' + esc(v) + '</li>').join("") + '</ul></div>';
+  summary.innerHTML = cards;
+  body.innerHTML = "";
+  for (const input of d.requiredInputs || []) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = '<td><code>' + esc(input.name) + '</code>' + (input.secret ? ' <span class="muted">secret</span>' : '') + '</td>' +
+      '<td class="' + stateClass(input.state) + '">' + esc(input.state) + '</td>' +
+      '<td class="setupcopy">' + esc(input.safeValue || input.detail || "—") + '</td>' +
+      '<td class="setupcopy">' + esc(input.action || "—") + ' <button type="button" class="copySetup">Copy</button></td>';
+    tr.querySelector(".copySetup").onclick = async (ev) => {
+      await navigator.clipboard.writeText(input.name + "\n" + (input.action || ""));
+      ev.target.textContent = "Copied";
+    };
+    body.appendChild(tr);
+  }
+  if (!body.children.length) body.innerHTML = '<tr><td colspan="4">No input status was returned.</td></tr>';
+}
+document.getElementById("mktRefresh").onclick = mktRefresh;
 
 // ── per-exchange collector status ───────────────────────────────────────────
 // One card per venue. The numbers are stated plainly and never rolled into a

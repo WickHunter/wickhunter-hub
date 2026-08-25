@@ -13,6 +13,11 @@ import {
 } from "./candles/key.js";
 import { marketCapConfigFromEnv, type MarketCapEnvConfig } from "./marketcap/config.js";
 import { DEFAULT_RELEASE_MAX_AGE_MS, parseReleasePublicKeys } from "./release-manifest.js";
+import type { LicenseLeaseConfig } from "./license-leases.js";
+import {
+  marketplaceStatusBridgeFromEnv,
+  type MarketplaceStatusBridgeConfig,
+} from "./marketplace-status.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +40,17 @@ export interface HubConfig {
   releaseChannel: string;
   releasePlatform: string;
   releaseArch: string;
+
+  // ── machine-bound licensing leases ──────────────────────────────────────
+  /** Additive WHL1 lease service. Old LHK1/check-in clients do not read this
+   * and retain their exact wire behavior during staged migration. */
+  licenseLease?: LicenseLeaseConfig;
+
+  // ── private Marketplace operations bridge ──────────────────────────────
+  /** Optional, server-to-server, loopback-only status bridge. The browser
+   * never receives its credential and this public repository imports no
+   * Marketplace execution/payment code. */
+  marketplaceStatus?: MarketplaceStatusBridgeConfig;
 
   // ── candle seed service ───────────────────────────────────────────────────
   /** Venues that run a 1m collector. EMPTY BY DEFAULT: collecting is hours of
@@ -156,6 +172,15 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     releaseChannel: (env.HUB_RELEASE_CHANNEL ?? "beta").trim(),
     releasePlatform: (env.HUB_RELEASE_PLATFORM ?? "linux").trim(),
     releaseArch: (env.HUB_RELEASE_ARCH ?? "x64").trim(),
+    licenseLease: {
+      activeKeyId: (env.HUB_LICENSE_LEASE_KEY_ID ?? "lease-1").trim(),
+      leaseDurationMs: Number(env.HUB_LICENSE_LEASE_DURATION_MS ?? 6 * 60 * 60 * 1_000),
+      cachedGraceMs: Number(env.HUB_LICENSE_LEASE_GRACE_MS ?? 72 * 60 * 60 * 1_000),
+      challengeTtlMs: Number(env.HUB_LICENSE_LEASE_CHALLENGE_TTL_MS ?? 5 * 60 * 1_000),
+      maxClockSkewMs: Number(env.HUB_LICENSE_LEASE_CLOCK_SKEW_MS ?? 5 * 60 * 1_000),
+      defaultMaxMachines: Number(env.HUB_LICENSE_LEASE_DEFAULT_MAX_MACHINES ?? 1),
+    },
+    marketplaceStatus: marketplaceStatusBridgeFromEnv(env),
     candleVenues: (env.HUB_CANDLE_VENUES ?? "")
       .split(",")
       .map((s) => s.trim().toLowerCase())

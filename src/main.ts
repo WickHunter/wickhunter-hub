@@ -17,6 +17,13 @@ if (!cfg.adminToken) {
 if (!hub.store.hasKey()) {
   console.warn("[hub] no signing key yet — run `npm run keygen`; keyed endpoints will reject everything");
 }
+if (hub.licenseLeases) {
+  const keys = hub.licenseLeases.keyStore.publicKeyring();
+  console.log(`[hub] machine-lease signing key "${hub.licenseLeases.keyStore.activeKeyId}" — PUBLIC key, pin before client rollout:`);
+  console.log(`[hub]   ${keys.keys[hub.licenseLeases.keyStore.activeKeyId]?.publicKey ?? "(missing)"}`);
+} else {
+  console.warn("[hub] machine-bound lease issuance is disabled; legacy LHK1/check-in remains available");
+}
 // The dedicated candle key, printed ONCE per start. Reading its public half is
 // what generates the key on a hub that has never had one, so the operator can
 // complete rollout step (b) without running anything. PUBLIC material only —

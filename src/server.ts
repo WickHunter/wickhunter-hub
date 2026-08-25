@@ -62,6 +62,12 @@ import {
 } from "./feedback.js";
 import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
+import {
+  LicenseLeaseService,
+  leaseRequestFailure,
+  type LeaseChallengeInput,
+  type LeasePurpose,
+} from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
@@ -69,6 +75,18 @@ import {
   verifyReleaseManifest,
   type SignedReleaseManifest,
 } from "./release-manifest.js";
+import {
+  fetchMarketplaceStatus,
+  marketplaceStatusBridgeFromEnv,
+  type MarketplaceStatusFetch,
+} from "./marketplace-status.js";
+import {
+  readBuildRecord,
+  probeSourceCheckout,
+  readUpgradeLogTail,
+  readUpgradeStatus,
+  writeUpgradeStatus,
+} from "./operations.js";
 
 /** The provider fetcher for the market-cap producer. A separate shape from the
  *  candles' `FetchLike` because this one carries an API-key HEADER — which is
@@ -100,6 +118,9 @@ export interface Hub {
   /** The dedicated candle-signing key. Exposed so main.ts can print its PUBLIC
    *  half at startup; it never yields private material to anyone. */
   candleKey: CandleKeyStore;
+  /** Null only when the additive lease authority could not initialize. Legacy
+   * LHK1 and check-in surfaces remain available in that case. */
+  licenseLeases: LicenseLeaseService | null;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
@@ -118,15 +139,41 @@ export interface HubDeps {
   marketCapVenueFetch?: CandleServiceDeps["fetchLike"];
   marketCapSleep?: (ms: number) => Promise<void>;
   marketCapNow?: () => number;
+  /** Injectable machine-lease clock/entropy for hermetic replay/clock tests. */
+  licenseLeaseNow?: () => number;
+  licenseLeaseMonotonicNow?: () => number;
+  licenseLeaseRandomBytes?: (size: number) => Buffer;
+  licenseLeaseRandomId?: () => string;
+  /** Injectable so Marketplace status tests never leave loopback. */
+  marketplaceStatusFetch?: MarketplaceStatusFetch;
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
+  let licenseLeases: LicenseLeaseService | null = null;
+  try {
+    licenseLeases = new LicenseLeaseService(cfg.dataDir, store, cfg.licenseLease, {
+      now: deps.licenseLeaseNow,
+      monotonicNow: deps.licenseLeaseMonotonicNow,
+      randomBytes: deps.licenseLeaseRandomBytes,
+      randomId: deps.licenseLeaseRandomId,
+      featuresFor: (licenseId) => Object.keys(flagsFor(cfg.dataDir, licenseId)),
+    });
+  } catch (err) {
+    // This is an additive migration. A missing/corrupt lease authority must
+    // fail lease issuance closed without taking old LHK1 installs, downloads,
+    // feedback, or exit-capable check-ins offline.
+    console.warn(`[license-lease] disabled: ${(err as Error).message}`);
+  }
   const community = new CommunityService(cfg.dataDir);
   /** A Strat body is bigger than a vote and smaller than a feedback log dump:
    *  ten bot configs, capped again inside the service regardless of this. */
   const STRAT_BODY_BYTES_MAX = 256 * 1024;
   const spawn = deps.spawn ?? nodeSpawn;
+  const marketplaceStatusFetch: MarketplaceStatusFetch = deps.marketplaceStatusFetch ?? (async (url, init) => {
+    const response = await fetch(url, init);
+    return { ok: response.ok, status: response.status, text: () => response.text() };
+  });
   const candleKey = new CandleKeyStore(cfg.dataDir);
   // ── WHICH KEY SIGNS A SEED ────────────────────────────────────────────────
   // One expression picks BOTH halves — `cfg.candleKeyId` was derived from the
@@ -206,7 +253,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
   })();
 
-  let upgradeStartedAt = 0; // single-flight; cleared only by process restart (the upgrade IS a restart)
+  let upgradeStartedAt = 0;
+  let sourceProbeCache: { readonly atMs: number; readonly runtimeKey: string; readonly source: ReturnType<typeof probeSourceCheckout> } | null = null;
+
+  function operationsStatus(includeLog: boolean): Record<string, unknown> {
+    const build = readBuildRecord(cfg.dataDir, HUB_VERSION);
+    const runtimeKey = `${build.packageVersion}:${build.commit ?? "unknown"}:${build.builtAtMs}`;
+    const now = Date.now();
+    if (!sourceProbeCache || sourceProbeCache.runtimeKey !== runtimeKey || now - sourceProbeCache.atMs >= 10_000) {
+      sourceProbeCache = { atMs: now, runtimeKey, source: probeSourceCheckout(cfg.srcDir, build) };
+    }
+    const source = sourceProbeCache.source;
+    const upgrade = readUpgradeStatus(cfg.dataDir);
+    return {
+      packageVersion: HUB_VERSION,
+      build,
+      source,
+      sourceVsRuntime: source.relationToRuntime,
+      upgrade,
+      ...(includeLog ? { upgradeLogTail: readUpgradeLogTail(cfg.dataDir) } : {}),
+    };
+  }
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -226,9 +293,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const m = req.method ?? "GET";
 
     if (m === "GET" && p === "/api/health") {
-      return sendJson(res, 200, { ok: true, version: HUB_VERSION });
+      return sendJson(res, 200, { ok: true, version: HUB_VERSION, ...operationsStatus(false) });
     }
     if (m === "POST" && p === "/api/license/checkin") return checkin(req, res);
+    if (m === "POST" && p === "/api/license/lease/challenge") return leaseChallenge(req, res);
+    if (m === "POST" && p === "/api/license/lease/activate") return leaseOperation(req, res, "activate");
+    if (m === "POST" && p === "/api/license/lease/renew") return leaseOperation(req, res, "renew");
+    if (m === "POST" && p === "/api/license/lease/deactivate") return leaseOperation(req, res, "deactivate");
+    if (m === "POST" && p === "/api/license/lease/rebind") return leaseOperation(req, res, "rebind");
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
@@ -302,6 +374,70 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ...(latest ? { latest } : {}),
       flags,
     });
+  }
+
+  // ── machine-bound lease surface ─────────────────────────────────────────
+  // New clients use an x-license bootstrap bearer and prove possession of an
+  // install-local Ed25519 key. These routes are additive; the historical
+  // unauthenticated check-in above is intentionally byte-for-byte unchanged.
+  function leaseBearer(req: IncomingMessage): string | null {
+    const value = req.headers["x-license"];
+    return typeof value === "string" && value.length <= 16_384 ? value : null;
+  }
+
+  function leaseError(res: ServerResponse, err: unknown): void {
+    const failure = leaseRequestFailure(err);
+    if (failure.operatorMessage) console.warn(`[license-lease] request failed closed: ${failure.operatorMessage}`);
+    sendLeaseJson(res, failure.status, { ok: false, error: failure.publicMessage, code: failure.kind });
+  }
+
+  function sendLeaseJson(res: ServerResponse, status: number, body: unknown): void {
+    sendJson(res, status, body, { "cache-control": "no-store" });
+  }
+
+  async function leaseChallenge(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
+    const token = leaseBearer(req);
+    if (!token) return sendLeaseJson(res, 401, { ok: false, error: "x-license is required" });
+    const body = await readJsonBody(req);
+    if (body === null) return sendLeaseJson(res, 400, { ok: false, error: "bad lease challenge body" });
+    const input: LeaseChallengeInput = {
+      purpose: body.purpose as LeasePurpose,
+      installId: body.installId as string,
+      installPublicKey: body.installPublicKey as string,
+      ...(typeof body.activationId === "string" ? { activationId: body.activationId } : {}),
+      ...(typeof body.newInstallId === "string" ? { newInstallId: body.newInstallId } : {}),
+      ...(typeof body.newInstallPublicKey === "string" ? { newInstallPublicKey: body.newInstallPublicKey } : {}),
+    };
+    try {
+      return sendLeaseJson(res, 200, { ok: true, challenge: licenseLeases.challenge(token, input) });
+    } catch (err) { return leaseError(res, err); }
+  }
+
+  async function leaseOperation(
+    req: IncomingMessage,
+    res: ServerResponse,
+    purpose: LeasePurpose,
+  ): Promise<void> {
+    if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
+    const token = leaseBearer(req);
+    if (!token) return sendLeaseJson(res, 401, { ok: false, error: "x-license is required" });
+    const body = await readJsonBody(req);
+    if (body === null || typeof body.nonce !== "string" || typeof body.signature !== "string") {
+      return sendLeaseJson(res, 400, { ok: false, error: "expected {nonce, signature}" });
+    }
+    try {
+      const result = purpose === "activate"
+        ? licenseLeases.activate(token, body.nonce, body.signature)
+        : purpose === "renew"
+          ? licenseLeases.renew(token, body.nonce, body.signature)
+          : purpose === "deactivate"
+            ? licenseLeases.deactivate(token, body.nonce, body.signature)
+            : typeof body.newSignature === "string"
+              ? licenseLeases.rebind(token, body.nonce, body.signature, body.newSignature)
+              : (() => { throw new Error("rebind requires newSignature"); })();
+      return sendLeaseJson(res, 200, { ok: true, ...result });
+    } catch (err) { return leaseError(res, err); }
   }
 
   // ── community Strat gallery ───────────────────────────────────────────────
@@ -678,33 +814,105 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         installCommand: `curl -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
       });
     }
+    if (m === "GET" && p === "/admin/api/license-leases") {
+      if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
+      const licenseId = url.searchParams.get("licenseId") || undefined;
+      return sendLeaseJson(res, 200, { ok: true, ...licenseLeases.adminSnapshot(licenseId) });
+    }
+    if (m === "GET" && p === "/admin/api/operations") {
+      return sendJson(res, 200, { ok: true, ...operationsStatus(true) }, { "cache-control": "no-store" });
+    }
+    if (m === "GET" && p === "/admin/api/marketplace-status") {
+      const config = cfg.marketplaceStatus ?? marketplaceStatusBridgeFromEnv({});
+      const status = await fetchMarketplaceStatus(config, marketplaceStatusFetch);
+      return sendJson(res, 200, { ok: true, marketplace: status }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p === "/admin/api/license-leases/seat-override") {
+      if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.licenseId !== "string"
+        || !(body.maxMachines === null || typeof body.maxMachines === "number")
+        || typeof body.expectedAuditRevision !== "number"
+        || typeof body.reason !== "string") {
+        return sendLeaseJson(res, 400, { ok: false, error: "expected {licenseId, maxMachines:number|null, expectedAuditRevision, reason}" });
+      }
+      try {
+        licenseLeases.setSeatOverride(body.licenseId, body.maxMachines, body.reason, body.expectedAuditRevision);
+        return sendLeaseJson(res, 200, { ok: true, ...licenseLeases.adminSnapshot(body.licenseId) });
+      } catch (err) { return leaseError(res, err); }
+    }
+    if (m === "POST" && p === "/admin/api/license-leases/deactivate") {
+      if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.licenseId !== "string"
+        || typeof body.activationId !== "string" || typeof body.expectedRevision !== "number"
+        || typeof body.reason !== "string") {
+        return sendLeaseJson(res, 400, { ok: false, error: "expected {licenseId, activationId, expectedRevision, reason}" });
+      }
+      try {
+        return sendLeaseJson(res, 200, { ok: true,
+          activation: licenseLeases.adminDeactivate(body.licenseId, body.activationId, body.expectedRevision, body.reason) });
+      } catch (err) { return leaseError(res, err); }
+    }
     if (m === "POST" && p === "/admin/api/upgrade") {
-      // Self-upgrade: pull the source checkout and re-run its installer. The
-      // installer restarts this very service, so the work MUST outlive us —
-      // a plain child dies with our cgroup on restart. systemd-run puts it in
-      // its own transient unit; the log lands beside the hub's data.
-      if (upgradeStartedAt) {
+      // The detached runner refuses dirty/wrong-branch source, fetches and
+      // fast-forwards exactly to origin/main, verifies HEAD, then invokes the
+      // installer without putting paths or credentials through a shell.
+      const prior = readUpgradeStatus(cfg.dataDir);
+      if (upgradeStartedAt && (prior.state === "failed" || prior.state === "succeeded")) upgradeStartedAt = 0;
+      if (upgradeStartedAt || ((prior.state === "queued" || prior.state === "running")
+        && prior.startedAtMs !== null && Date.now() - prior.startedAtMs < 30 * 60_000)) {
         return sendJson(res, 409, { ok: false, error: "an upgrade is already running — the hub will restart when it finishes" });
       }
       upgradeStartedAt = Date.now();
-      const log = path.join(cfg.dataDir, "upgrade.log");
-      const cmd = `cd ${JSON.stringify(cfg.srcDir)} && git pull --ff-only && bash install-hub.sh`;
+      const build = readBuildRecord(cfg.dataDir, HUB_VERSION);
+      writeUpgradeStatus(cfg.dataDir, {
+        state: "queued", startedAtMs: upgradeStartedAt, completedAtMs: null,
+        fromCommit: build.commit, targetCommit: null,
+        message: "Upgrade queued; waiting for the detached origin/main verifier.",
+      });
+      const entry = typeof process.argv[1] === "string" ? path.resolve(process.argv[1]) : path.join(process.cwd(), "dist/src/main.js");
+      const runner = path.resolve(path.dirname(entry), "../bin/upgrade-runner.js");
       try {
         const child = spawn(
           "systemd-run",
-          ["--unit", `wickhunter-hub-upgrade-${Date.now()}`, "--collect", "/bin/bash", "-lc", `(${cmd}) >> ${JSON.stringify(log)} 2>&1`],
+          ["--unit", `wickhunter-hub-upgrade-${Date.now()}`, "--collect", process.execPath, runner,
+            "--source", cfg.srcDir, "--data", cfg.dataDir],
           { stdio: "ignore", detached: true },
         );
-        child.on("error", () => { upgradeStartedAt = 0; });
+        child.on("error", (err) => {
+          writeUpgradeStatus(cfg.dataDir, {
+            state: "failed", startedAtMs: upgradeStartedAt || Date.now(), completedAtMs: Date.now(),
+            fromCommit: build.commit, targetCommit: null,
+            message: `The detached upgrade process could not start: ${err.message}`.slice(0, 1_000),
+          });
+          upgradeStartedAt = 0;
+        });
+        child.on("exit", (code) => {
+          if (code === 0 || code === null) return;
+          const latest = readUpgradeStatus(cfg.dataDir);
+          if (latest.state !== "queued") return;
+          writeUpgradeStatus(cfg.dataDir, {
+            state: "failed", startedAtMs: upgradeStartedAt || Date.now(), completedAtMs: Date.now(),
+            fromCommit: build.commit, targetCommit: null,
+            message: `systemd-run exited ${code} before the verified upgrade worker started.`,
+          });
+          upgradeStartedAt = 0;
+        });
         child.unref();
       } catch {
+        writeUpgradeStatus(cfg.dataDir, {
+          state: "failed", startedAtMs: upgradeStartedAt, completedAtMs: Date.now(),
+          fromCommit: build.commit, targetCommit: null,
+          message: "The detached upgrade process could not be started.",
+        });
         upgradeStartedAt = 0;
         return sendJson(res, 500, { ok: false, error: "could not start the upgrade (systemd-run unavailable?)" });
       }
       return sendJson(res, 200, {
         ok: true,
         version: HUB_VERSION,
-        note: "upgrade started — the hub restarts itself; watch /api/health for the new version. Log: data/upgrade.log",
+        note: "upgrade queued — origin/main will be fetched, verified, installed, and recorded in the Hub operations panel",
       });
     }
     // Per-exchange collector status: one card per venue on the admin page.
@@ -884,6 +1092,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         return sendJson(res, 400, { ok: false, error: "expected {id}" });
       }
       if (!store.revoke(body.id)) return sendJson(res, 404, { ok: false, error: "unknown license id" });
+      try { licenseLeases?.observeRevocation(body.id, "license revoked by Hub administrator"); }
+      catch (err) { console.warn(`[license-lease] could not audit revocation ${body.id}: ${(err as Error).message}`); }
       return sendJson(res, 200, { ok: true });
     }
     sendJson(res, 404, { ok: false, error: "not found" });
@@ -895,6 +1105,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     candles,
     marketCaps,
     candleKey,
+    licenseLeases,
     listen: () =>
       new Promise<number>((resolve, reject) => {
         server.once("error", reject);
@@ -948,9 +1159,18 @@ function sameSecret(given: string, want: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Readonly<Record<string, string>> = {},
+): void {
   const bytes = Buffer.from(JSON.stringify(body));
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": bytes.length });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": bytes.length,
+    ...extraHeaders,
+  });
   res.end(bytes);
 }
 

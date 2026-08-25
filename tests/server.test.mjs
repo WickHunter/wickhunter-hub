@@ -55,11 +55,18 @@ await test("HUB_VERSION, package.json and the changelog agree — nothing drifts
   assert.equal(newest[1], pkg.version, "the newest changelog entry must name this version");
 });
 
-await test("health reports ok + version", async () => {
+await test("health reports exact runtime, build, source comparison, and upgrade outcome", async () => {
   const r = await jsonReq(`${h.origin}/api/health`);
   assert.equal(r.status, 200);
   assert.equal(r.body.ok, true);
   assert.match(r.body.version, /^\d+\.\d+\.\d+$/);
+  assert.equal(r.body.packageVersion, r.body.version);
+  assert.equal(r.body.build.packageVersion, r.body.version);
+  assert.equal(r.body.build.commit, null, "an unrecorded test build is never presented as a known source commit");
+  assert.equal(r.body.source.available, false);
+  assert.equal(r.body.sourceVsRuntime, "unknown");
+  assert.equal(r.body.upgrade.state, "never");
+  assert.equal(Object.hasOwn(r.body, "upgradeLogTail"), false, "public liveness does not expose operator logs");
 });
 
 await test("checkin records to jsonl + roster and answers ok", async () => {
