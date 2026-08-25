@@ -625,6 +625,32 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.1 — **The snapshot the bot can actually read, and a producer fault that
+  can no longer take the hub down.** Three fixes to v0.3.0, all found by
+  enabling it on a live box for the first time.
+  **The keyId was one no bot could verify:** the producer required a
+  self-generated key and the operator's install published `market-data-1`,
+  while every shipped bot pins exactly one entry — `mcap-1` → the LICENCE
+  public key — and refuses an unknown keyId rather than verifying it against a
+  default. `MARKET_CAP_SIGNER` now defaults to `license`/`mcap-1`, mirroring
+  the candle seed's own staged rollout, whose default is likewise the OLD key
+  so no bot in the field is stranded.
+  **A market-cap variable took down licensing.** `marketCapSigningFromEnv`
+  threw, `configFromEnv` calls it, and `main.ts` calls that on its first line —
+  so one stale variable stopped the hub constructing its config at all and
+  nginx served 502. The signer refusal is DATA now: the producer refuses by
+  name and the hub keeps serving, which is what `marketCapStartupRefusals`
+  already existed to do.
+  **And the wire format was never reconciled with the consumer.** The bot
+  validates `generatedAtMs`/`expiresAtMs`, a nested `cap{}` on each row, and a
+  census of `{activeInstruments, byStatus}`. The hub now publishes those names
+  BESIDE its own — safe because the two vocabularies collide on nothing but
+  `venue` and `symbol`, which mean the same thing — so no existing reader
+  moves and no bot needs a redeploy to understand it.
+  Refresh cadence stays HOURLY: 805 assets is 9 provider credits a cycle,
+  ~8,365/month against a 15,000 ceiling, while a ten-minute cadence is
+  ~41,215 — 2.7x over the plan. The BOT's freshness ceiling moved instead.
+
 - v0.3.0 — **The market-cap snapshot producer.** One signed snapshot of every
   tradeable pair's market cap, produced once for everybody. Three authorities
   kept strictly apart: the exchange says which pairs exist, CMC's derivative
