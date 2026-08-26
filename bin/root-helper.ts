@@ -109,6 +109,31 @@ function decodeEnv(bytes: Buffer | null): Map<string, string> {
   return out;
 }
 
+/** Read one Hub-owned value without treating a duplicate unrelated systemd
+ * assignment as a Marketplace configuration failure. The requested value
+ * itself must still be unique and every active line must remain an assignment. */
+function oneEnvValue(bytes: Buffer | null, wanted: string): string | undefined {
+  if (bytes === null) return undefined;
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (/\0|\r/.test(text)) refuse();
+  let found: string | undefined;
+  for (const line of text.split("\n")) {
+    if (line === "" || /^\s*#/.test(line)) continue;
+    const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (match === null) refuse();
+    if (match[1] !== wanted) continue;
+    if (found !== undefined) refuse();
+    const raw = match[2];
+    let value = raw;
+    if (raw.startsWith('"')) {
+      try { value = JSON.parse(raw); } catch { refuse(); }
+    } else if (raw.startsWith("'") && raw.endsWith("'")) value = raw.slice(1, -1);
+    if (typeof value !== "string" || value.length < 1 || /[\0\r\n]/.test(value)) refuse();
+    found = value;
+  }
+  return found;
+}
+
 function quote(value: string): string { return JSON.stringify(value); }
 
 function serialized(values: ReadonlyMap<string, string>, names?: ReadonlySet<string>): Buffer {
@@ -140,7 +165,7 @@ function atomic(filename: string, bytes: Buffer, group: string | null, mode: num
 }
 
 function publicOrigin(): string | undefined {
-  const raw = decodeEnv(safeFile(HUB_ENV)).get("HUB_PUBLIC_ORIGIN");
+  const raw = oneEnvValue(safeFile(HUB_ENV), "HUB_PUBLIC_ORIGIN");
   if (raw === undefined) return undefined;
   try {
     const value = new URL(raw);
@@ -161,11 +186,13 @@ function directConfig(): MarketplaceInputsConfig {
 }
 
 function seedState(): void {
-  if (safeFile(STATE_ENV) !== null) return;
-  const values = new Map<string, string>();
+  const stateBytes = safeFile(STATE_ENV);
+  const values = decodeEnv(stateBytes);
+  const deployment = new Set(MARKETPLACE_INPUT_DEFINITIONS
+    .filter((field) => field.setup === "deployment").map((field) => field.name));
   for (const filename of [COMMON_ENV, API_ENV, WORKER_ENV, BRIDGE_ENV]) {
     for (const [name, value] of decodeEnv(safeFile(filename))) {
-      if (KNOWN.has(name)) values.set(name, value);
+      if (KNOWN.has(name) && (!values.has(name) || deployment.has(name))) values.set(name, value);
     }
   }
   const vault = values.get("MARKETPLACE_DEMO_VAULT_PATH");
@@ -173,7 +200,8 @@ function seedState(): void {
     values.set("MARKETPLACE_DEMO_MASTER_API_KEY", MASTER_KEY_MARKER);
     values.set("MARKETPLACE_DEMO_MASTER_API_SECRET", MASTER_SECRET_MARKER);
   }
-  atomic(STATE_ENV, serialized(values), null, 0o600);
+  const next = serialized(values);
+  if (stateBytes === null || !stateBytes.equals(next)) atomic(STATE_ENV, next, null, 0o600);
 }
 
 function publicKey(seedB64u: string): string {
@@ -230,9 +258,13 @@ function scheduleHubReload(): void {
 }
 
 function importMaster(apiKey: string, apiSecret: string): void {
-  const result = spawnSync("node", [`${APP_DIR}/dist/marketplace-hub/demo-vault-import-cli.js`], {
+  const result = spawnSync("runuser", [
+    "-u", "liqhunter-marketplace-worker", "--", "env",
+    `MARKETPLACE_WORKER_ENV_FILE=${WORKER_ENV}`,
+    "node", `${APP_DIR}/dist/marketplace-hub/demo-vault-import-cli.js`,
+  ], {
     input: Buffer.from(JSON.stringify({ apiKey, apiSecret }), "utf8"),
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", MARKETPLACE_WORKER_ENV_FILE: WORKER_ENV },
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     stdio: ["pipe", "ignore", "ignore"],
     maxBuffer: 128 * 1024,
     shell: false,
