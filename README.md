@@ -790,6 +790,14 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.9 — **The Hub is organized around the operator's real jobs.** The admin
+  UI opens on Licenses & installs, groups candle and market-cap operations on a
+  Market data page, gives Marketplace its own vendor-only setup page, and moves
+  build, lease and feedback detail to System & feedback. Automatic Marketplace
+  setup also keeps the optional five-part Bybit Demo credential group wholly
+  absent until both master API credentials are saved together, so a fresh
+  install can boot safely before vendor keys are entered.
+
 - v0.3.8 — **Marketplace setup asks only for vendor facts.** The normal Hub
   form now contains only the WickHunter-owned Bybit API pair and MoonPay
   credentials/payout information. Saving fills safe service defaults and

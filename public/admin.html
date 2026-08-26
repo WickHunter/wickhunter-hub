@@ -58,6 +58,9 @@
   .configstate { font-size:.7rem; margin-left:.35rem; text-transform:uppercase; }
   .configclear { margin-top:.3rem; min-height:2rem; padding:.25rem .55rem; }
   #mktConfigNote { overflow-wrap:anywhere; }
+  .hubnav { display:flex; gap:.45rem; flex-wrap:wrap; margin:1rem 0 .35rem; }
+  .hubnav button[aria-selected="true"] { border-color:#6c63ff; color:#fff; background:#5147d9; }
+  .hubpage[hidden] { display:none !important; }
   .leasepub { font:12px/1.5 ui-monospace,monospace; overflow-wrap:anywhere;
               border:1px solid #8884; border-radius:6px; padding:.5rem .6rem; margin:.45rem 0; }
   /* per-exchange collector cards */
@@ -139,6 +142,14 @@
   <span id="hubVer" class="muted"></span>
 </div>
 
+<nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
+  <button type="button" data-hub-page="licenses">Licenses &amp; installs</button>
+  <button type="button" data-hub-page="market-data">Market data</button>
+  <button type="button" data-hub-page="marketplace">Marketplace</button>
+  <button type="button" data-hub-page="system">System &amp; feedback</button>
+</nav>
+
+<section class="hubpage" data-hub-page-panel="system" hidden>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
 
 <h1 style="margin-top:2.2rem">Machine leases <small>— staged licensing rollout; public verifier only</small></h1>
@@ -148,7 +159,9 @@
 </div>
 <p class="muted">The key shown here is PUBLIC and is the exact value a signed app build must pin before lease enforcement can be enabled. Existing LHK1 installs and every exit remain unchanged during rollout.</p>
 <div class="opsgrid" id="leaseSummary"><div class="opscard muted">Loading machine-lease status…</div></div>
+</section>
 
+<section class="hubpage" data-hub-page-panel="marketplace" hidden>
 <h1 style="margin-top:2.2rem">Marketplace operations <small>— alpha only; private service status</small></h1>
 <div class="actions">
   <button type="button" id="mktRefresh">Refresh</button>
@@ -173,7 +186,10 @@
   <button type="submit" style="margin-top:.8rem">Save setup and configure everything else</button>
   <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
 </form>
+</section>
 
+<section class="hubpage" data-hub-page-panel="licenses">
+<h1 style="margin-top:2.2rem">Licenses &amp; install commands</h1>
 <form id="issueForm">
   <input name="name" placeholder="Tester name" required>
   <input name="days" type="number" value="30" min="1" max="3650" required> days
@@ -192,7 +208,9 @@
   <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th>Marketplace</th><th></th></tr></thead>
   <tbody id="rows"><tr><td colspan="9">loading…</td></tr></tbody>
 </table></div>
+</section>
 
+<section class="hubpage" data-hub-page-panel="market-data" hidden>
 <h1 style="margin-top:2.2rem">Exchanges <small>— 1m candle collectors feeding the seed</small></h1>
 <div class="actions">
   <button type="button" id="cdRefresh">Refresh</button>
@@ -214,7 +232,9 @@
      nobody wrote down verifies nowhere while looking perfectly healthy here. -->
 <div id="mckey"><div class="muted">loading…</div></div>
 <div id="mcbody"><div class="muted">loading…</div></div>
+</section>
 
+<section class="hubpage" data-hub-page-panel="system" hidden>
 <h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
 <div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
@@ -229,6 +249,7 @@
   <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th><th></th></tr></thead>
   <tbody id="fbRows"><tr><td colspan="8">loading…</td></tr></tbody>
 </table></div>
+</section>
 
 <script>
 "use strict";
@@ -236,6 +257,22 @@
 // strip the trailing /admin from wherever this page was served.
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
+
+const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "system"]);
+function showHubPage(wanted, remember) {
+  const page = HUB_PAGES.has(wanted) ? wanted : "licenses";
+  document.querySelectorAll("[data-hub-page-panel]").forEach((panel) => {
+    panel.hidden = panel.getAttribute("data-hub-page-panel") !== page;
+  });
+  document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
+    button.setAttribute("aria-selected", String(button.getAttribute("data-hub-page") === page));
+  });
+  if (remember && location.hash !== "#" + page) history.replaceState(null, "", "#" + page);
+}
+document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
+  button.onclick = () => showHubPage(button.getAttribute("data-hub-page"), true);
+});
+showHubPage(location.hash.slice(1), false);
 
 function showGate(msg) {
   document.getElementById("gateErr").textContent = msg || "";

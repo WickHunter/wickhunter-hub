@@ -503,7 +503,6 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     MARKETPLACE_WORKER_INTERVAL_MS: "1000",
     MARKETPLACE_OUTBOX_BATCH: "50",
     MARKETPLACE_SHUTDOWN_GRACE_MS: "10000",
-    MARKETPLACE_DEMO_VAULT_PATH: "/var/lib/liqhunter/marketplace/demo-credentials.vault",
     MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS: "60000",
     MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS: "180000",
     MOONPAY_COMMERCE_ENVIRONMENT: "production",
@@ -526,8 +525,19 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     next.set("HUB_MARKETPLACE_STATUS_CREDENTIAL", statusB);
   }
 
-  put("MARKETPLACE_DEMO_VAULT_KEY", randomBytes(32).toString("base64url"));
-  put("MARKETPLACE_DEMO_WORKER_CREDENTIAL", randomBytes(32).toString("base64url"));
+  const demoKey = next.get("MARKETPLACE_DEMO_MASTER_API_KEY");
+  const demoSecret = next.get("MARKETPLACE_DEMO_MASTER_API_SECRET");
+  if ((demoKey === undefined) !== (demoSecret === undefined)) {
+    throw new MarketplaceInputError(
+      demoKey === undefined ? "MARKETPLACE_DEMO_MASTER_API_KEY" : "MARKETPLACE_DEMO_MASTER_API_SECRET",
+      "both Bybit Demo master credentials must be saved together",
+    );
+  }
+  if (demoKey !== undefined && demoSecret !== undefined) {
+    put("MARKETPLACE_DEMO_VAULT_PATH", "/var/lib/liqhunter/marketplace/demo-credentials.vault");
+    put("MARKETPLACE_DEMO_VAULT_KEY", randomBytes(32).toString("base64url"));
+    put("MARKETPLACE_DEMO_WORKER_CREDENTIAL", randomBytes(32).toString("base64url"));
+  }
 
   const intentId = next.get("MARKETPLACE_INTENT_KEY_ID");
   const intentSeed = next.get("MARKETPLACE_INTENT_SIGNING_SEED");
