@@ -769,7 +769,9 @@ anywhere private is enough; everything else is reproducible.
 | `GET /admin/api/operations` | `x-hub-admin` header | exact running/source/upgrade facts plus a redacted bounded log tail |
 | `GET /admin/api/marketplace-status` | `x-hub-admin` header | sanitized alpha Marketplace readiness and exact operator-input checklist; upstream credential stays server-side |
 | `GET /admin/api/marketplace-config` | `x-hub-admin` header | masked state for the exact Marketplace input allowlist; secret values are never returned |
-| `POST /admin/api/marketplace-config` | `x-hub-admin`, fixed CSRF header, JSON | atomically writes root-only private/bridge environment files and restarts only the private API/worker; restores both files on failure |
+| `POST /admin/api/marketplace-config` | `x-hub-admin`, fixed CSRF header, JSON | asks one fixed root helper to write split least-privilege API/worker files, encrypt the Bybit master and restart only the private services; restores files on failure |
+| `GET /admin/api/marketplace-providers` | `x-hub-admin` header | sanitized provider application roster from the private API; its Hub identity stays behind the root helper |
+| `POST /admin/api/marketplace-providers/:id/decision` | `x-hub-admin`, fixed CSRF header, JSON | written-reason provider approval/rejection/suspension through the private audited service |
 | `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
 | `GET /admin/api/market-caps` | `x-hub-admin` header | market-cap producer health, credit spend and refusals |
 
@@ -789,6 +791,16 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.3.10 — **The public Hub is no longer root and no longer reads Marketplace
+  secrets.** A single fixed, root-owned, no-argument helper accepts bounded JSON
+  on stdin, writes the v0.89.43 split API/worker environment files, derives only
+  public verifier material, imports the Bybit master directly into the
+  encrypted worker vault, and restarts an exact service allowlist with rollback.
+  Self-upgrade uses the same narrow helper. The normal Marketplace page asks
+  only for the two required Bybit values; optional MoonPay inputs stay collapsed
+  while subscriptions are mocked. Provider applications can now be approved,
+  rejected or suspended from the Hub with a mandatory audited reason.
 
 - v0.3.9 — **The Hub is organized around the operator's real jobs.** The admin
   UI opens on Licenses & installs, groups candle and market-cap operations on a

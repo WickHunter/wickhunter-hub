@@ -4,13 +4,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import { freshHub, jsonReq, test, summary, tmpDir } from "./helpers.mjs";
 import {
   applyMarketplaceInputUpdate,
+  decidePrivilegedMarketplaceProvider,
+  listPrivilegedMarketplaceProviders,
   MARKETPLACE_INPUT_DEFINITIONS,
   MARKETPLACE_RESTART_UNITS,
   MarketplaceInputError,
   marketplaceInputSnapshot,
+  readMarketplaceInputSnapshot,
 } from "../dist/src/marketplace-inputs.js";
 
 function fakeSpawner(outcomes = [0]) {
@@ -91,15 +95,11 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
     'HUB_MARKETPLACE_STATUS_ORIGIN="http://127.0.0.1:8099"',
     'MARKETPLACE_ENABLED="1"', 'MARKETPLACE_HTTP_HOST="127.0.0.1"',
     'MARKETPLACE_HTTP_PORT="8099"', 'MARKETPLACE_STORE="postgres"',
-    'MARKETPLACE_RUNTIME_DIRECTORY="/var/lib/liqhunter/marketplace"',
+    'MARKETPLACE_RUNTIME_DIRECTORY="/run/liqhunter-marketplace"',
     'LIQHUNTER_MARKETPLACE_URL="https://alpha.wickhunter.example"',
     'MARKETPLACE_ALPHA_LICENCES="lic_a,lic_z"',
     'MARKETPLACE_ADMIN_LICENCES="lic_a,lic_z"',
     'MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED="1"',
-    'MOONPAY_COMMERCE_ENVIRONMENT="production"',
-    'MOONPAY_COMMERCE_PRICING_ASSET="USDT"',
-    'MOONPAY_COMMERCE_MONTHLY_INTERVAL="MONTH"',
-    'MOONPAY_COMMERCE_YEARLY_INTERVAL="YEAR"',
     `MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`,
   ]) assert.ok(bytes.includes(expected), expected);
   const seed = JSON.parse(bytes.match(/^MARKETPLACE_INTENT_SIGNING_SEED=(.*)$/m)[1]);
@@ -126,6 +126,7 @@ await test("automatic setup keeps the optional Bybit Demo group wholly absent un
   await applyMarketplaceInputUpdate(cfg, { automatic: true }, fake.spawn);
   const bytes = fs.readFileSync(cfg.envFile, "utf8");
   assert.doesNotMatch(bytes, /^MARKETPLACE_DEMO_(?:MASTER|VAULT|WORKER)_/m);
+  assert.doesNotMatch(bytes, /^MOONPAY_COMMERCE_/m, "mock subscription mode keeps the optional MoonPay group wholly absent");
   await assert.rejects(
     () => applyMarketplaceInputUpdate(cfg, {
       automatic: true,
@@ -230,6 +231,48 @@ await test("existing malformed values are invalid and never echoed as configured
   assert.equal(JSON.stringify(snapshot).includes("tiny"), false);
 });
 
+await test("the unprivileged client sends bounded stdin to one fixed helper and validates masked replies", async () => {
+  const direct = config("marketplace-helper-snapshot");
+  const snapshot = marketplaceInputSnapshot(direct.cfg);
+  const calls = [];
+  const responses = [
+    { ok: true, config: snapshot },
+    { ok: true, config: snapshot },
+    { ok: true, providers: [{ id: "prov_1", displayName: "Provider One", status: "submitted", createdAtMs: 1, updatedAtMs: 2 }] },
+    { ok: true, provider: { id: "prov_1", displayName: "Provider One", status: "approved", createdAtMs: 1, updatedAtMs: 3 } },
+  ];
+  const spawn = (command, args, options) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    const chunks = [];
+    child.stdin = new Writable({ write(chunk, _encoding, done) { chunks.push(Buffer.from(chunk)); done(); } });
+    child.stdin.on("finish", () => {
+      calls.push({ command, args, options, request: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      child.stdout.end(JSON.stringify(responses.shift()));
+      queueMicrotask(() => child.emit("exit", 0));
+    });
+    return child;
+  };
+  const helperCfg = { ...direct.cfg, rootHelper: "/usr/local/libexec/wickhunter-hub-root-helper" };
+  await readMarketplaceInputSnapshot(helperCfg, spawn);
+  await applyMarketplaceInputUpdate(helperCfg, { automatic: true }, spawn);
+  const providers = await listPrivilegedMarketplaceProviders(helperCfg, spawn);
+  const decided = await decidePrivilegedMarketplaceProvider(helperCfg, {
+    providerId: "prov_1", to: "approved", reason: "manual review passed", idempotencyKey: "provider-decision-1",
+  }, spawn);
+  assert.equal(providers[0].status, "submitted");
+  assert.equal(decided.status, "approved");
+  assert.equal(calls.length, 4);
+  for (const call of calls) {
+    assert.equal(call.command, "sudo");
+    assert.deepEqual(call.args, ["-n", "/usr/local/libexec/wickhunter-hub-root-helper"]);
+    assert.deepEqual(call.options.stdio, ["pipe", "pipe", "ignore"]);
+    assert.equal(call.options.shell, false);
+    assert.equal(JSON.stringify(call.args).includes("prov_1"), false, "request data crossed into argv");
+  }
+  assert.deepEqual(calls.map((call) => call.request.action), ["snapshot", "apply", "provider-list", "provider-decision"]);
+});
+
 await test("restart failure restores exact prior bytes and recovery uses the same unit allowlist", async () => {
   const { cfg } = config("marketplace-rollback");
   await applyMarketplaceInputUpdate(cfg, {
@@ -287,6 +330,54 @@ await test("admin config endpoint enforces auth plus JSON/CSRF and returns only 
   } finally { await h.close(); }
 });
 
+await test("Hub provider approval UI routes only through the fixed helper with written-reason CSRF", async () => {
+  const direct = config("marketplace-provider-http");
+  const requests = [];
+  const spawn = (command, args, options) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    const chunks = [];
+    child.stdin = new Writable({ write(chunk, _encoding, done) { chunks.push(Buffer.from(chunk)); done(); } });
+    child.stdin.on("finish", () => {
+      const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      requests.push({ command, args, options, request });
+      const provider = {
+        id: "prov_waiting", displayName: "Waiting Provider",
+        status: request.action === "provider-decision" ? "approved" : "submitted",
+        createdAtMs: 10, updatedAtMs: 20,
+      };
+      child.stdout.end(JSON.stringify(request.action === "provider-list"
+        ? { ok: true, providers: [provider] }
+        : { ok: true, provider }));
+      queueMicrotask(() => child.emit("exit", 0));
+    });
+    return child;
+  };
+  const h = await freshHub({ marketplaceInputs: {
+    ...direct.cfg, rootHelper: "/usr/local/libexec/wickhunter-hub-root-helper",
+  } }, { spawn });
+  const auth = { "x-hub-admin": h.cfg.adminToken };
+  try {
+    assert.equal((await jsonReq(`${h.origin}/admin/api/marketplace-providers`)).status, 401);
+    const listed = await jsonReq(`${h.origin}/admin/api/marketplace-providers`, { headers: auth });
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.providers[0].status, "submitted");
+    const noCsrf = await jsonReq(`${h.origin}/admin/api/marketplace-providers/prov_waiting/decision`, {
+      method: "POST", headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ to: "approved", reason: "manual review passed", idempotencyKey: "provider-decision-1" }),
+    });
+    assert.equal(noCsrf.status, 403);
+    const decided = await jsonReq(`${h.origin}/admin/api/marketplace-providers/prov_waiting/decision`, {
+      method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
+      body: JSON.stringify({ to: "approved", reason: "manual review passed", idempotencyKey: "provider-decision-1" }),
+    });
+    assert.equal(decided.status, 200);
+    assert.equal(decided.body.provider.status, "approved");
+    assert.deepEqual(requests.map((row) => row.request.action), ["provider-list", "provider-decision"]);
+    assert.equal(requests.every((row) => row.command === "sudo" && row.args.length === 2), true);
+  } finally { await h.close(); }
+});
+
 await test("desktop/mobile admin workflow shows only vendor inputs and keeps technical facts collapsed", () => {
   const html = fs.readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
   assert.match(html, /id="mktConfigForm"/);
@@ -295,9 +386,12 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.match(html, /Advanced technical diagnostics/);
   assert.match(html, /field\.setup === "operator"/);
   assert.match(html, /Bybit Demo account creation/);
-  assert.match(html, /MoonPay crypto payments/);
+  assert.match(html, /MoonPay crypto payments \(optional — mocked for now\)/);
   assert.match(html, /data-moonpay-recipient-part/);
   assert.match(html, /Enable Marketplace for this licence only/);
+  assert.match(html, /Provider approvals/);
+  assert.match(html, /\/admin\/api\/marketplace-providers/);
+  assert.match(html, /Required audit reason/);
   assert.match(html, /flag: "marketplace"/);
   assert.match(html, /data-hub-page="licenses"/);
   assert.match(html, /data-hub-page="market-data"/);
@@ -314,13 +408,23 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.ok(!/localStorage|sessionStorage|document\.cookie/.test(html));
 });
 
-await test("the public Hub unit loads only the status bridge file, never the private credential file", () => {
+await test("the public Hub is unprivileged and can invoke only the fixed root helper", () => {
   const installer = fs.readFileSync(new URL("../install-hub.sh", import.meta.url), "utf8");
-  const unit = installer.slice(installer.indexOf('say "Installing the systemd service"'));
+  const unit = installer.slice(installer.indexOf('say "Installing the unprivileged systemd service'));
   assert.match(unit, /EnvironmentFile=-\$MARKETPLACE_BRIDGE_ENV_FILE/);
-  assert.doesNotMatch(unit, /EnvironmentFile=-?\$MARKETPLACE_ENV_FILE/);
-  assert.match(installer, /chmod 600 "\$MARKETPLACE_ENV_FILE"/);
-  assert.match(installer, /chmod 600 "\$MARKETPLACE_BRIDGE_ENV_FILE"/);
+  assert.doesNotMatch(unit, /EnvironmentFile=-?\$MARKETPLACE_STATE_ENV_FILE/);
+  assert.match(unit, /User=\$SERVICE_USER/);
+  assert.match(unit, /Group=\$SERVICE_USER/);
+  assert.match(installer, /NOPASSWD: %s/);
+  assert.match(installer, /dist\/bin\/root-helper\.js/);
+  assert.match(installer, /for private_file in "\$MARKETPLACE_STATE_ENV_FILE" "\$MARKETPLACE_BRIDGE_ENV_FILE"/);
+  assert.match(installer, /chmod 600 "\$private_file"/);
+  const helper = fs.readFileSync(new URL("../bin/root-helper.ts", import.meta.url), "utf8");
+  assert.match(helper, /demo-vault-import-cli\.js/);
+  assert.match(helper, /input: Buffer\.from\(JSON\.stringify\(\{ apiKey, apiSecret \}\)/);
+  assert.doesNotMatch(helper, /args.*apiKey|args.*apiSecret/);
+  assert.match(helper, /provider-decision/);
+  assert.match(helper, /written reason|row\.reason\.length < 8/);
 });
 
 summary("marketplace-inputs");

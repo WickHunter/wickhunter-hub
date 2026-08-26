@@ -81,4 +81,13 @@ try {
   });
   log(`upgrade failed: ${message}`);
   process.exitCode = 1;
+} finally {
+  // The detached verifier runs as root while the HTTP Hub is deliberately
+  // unprivileged. Return its non-secret operations ledger/log to the service
+  // identity after every success or refusal so the next admin action can read
+  // and atomically replace them.
+  spawnSync("chown", ["-R", "wickhunter-hub:wickhunter-hub", statusDataDir], {
+    stdio: "ignore",
+    shell: false,
+  });
 }

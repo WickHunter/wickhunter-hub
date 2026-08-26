@@ -18,9 +18,12 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 HUB_DIR=${HUB_DIR:-/opt/wickhunter-hub}
 ENV_FILE=${HUB_ENV_FILE:-/etc/wickhunter-hub/env}
-MARKETPLACE_ENV_FILE=/etc/liqhunter/marketplace.env
+MARKETPLACE_STATE_ENV_FILE=/etc/wickhunter-hub/marketplace-state.env
 MARKETPLACE_BRIDGE_ENV_FILE=/etc/wickhunter-hub/marketplace.env
+ROOT_HELPER=/usr/local/libexec/wickhunter-hub-root-helper
+SUDOERS_FILE=/etc/sudoers.d/wickhunter-hub-root-helper
 SERVICE=wickhunter-hub
+SERVICE_USER=wickhunter-hub
 UNIT_FILE=/etc/systemd/system/${SERVICE}.service
 PORT=8091
 SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -99,30 +102,23 @@ if ! grep -q '^HUB_RELEASE_PUBLIC_KEYS_JSON=' "$ENV_FILE"; then
   die "HUB_RELEASE_PUBLIC_KEYS_JSON is required. Generate the dedicated OFFLINE release key in the app repo, paste only its public keyring JSON into $ENV_FILE, sign the current release, then re-run. Never copy the private release key to this Hub."
 fi
 
-# The Hub admin can persist only the exact Marketplace input allowlist here.
-# systemd reads EnvironmentFile as root before dropping into the private
-# services, so 0600 is sufficient and keeps every credential root-only. A
-# symlink or special file is never followed or replaced by an install.
-marketplace_env_dir=$(dirname "$MARKETPLACE_ENV_FILE")
-mkdir -p "$marketplace_env_dir"
-if [ -L "$marketplace_env_dir" ] || [ ! -d "$marketplace_env_dir" ]; then
-  die "$marketplace_env_dir must be a real directory, not a symlink or special file"
-fi
-if [ -L "$MARKETPLACE_ENV_FILE" ] || { [ -e "$MARKETPLACE_ENV_FILE" ] && [ ! -f "$MARKETPLACE_ENV_FILE" ]; }; then
-  die "$MARKETPLACE_ENV_FILE must be a regular file, not a symlink or special file"
-fi
-touch "$MARKETPLACE_ENV_FILE"
-chmod 600 "$MARKETPLACE_ENV_FILE"
-ok "Marketplace admin inputs persist root-only at $MARKETPLACE_ENV_FILE"
-
-# Only the three status-bridge values ever enter the public Hub process. The
-# private EnvironmentFile above is deliberately NOT loaded by this service.
-if [ -L "$MARKETPLACE_BRIDGE_ENV_FILE" ] || { [ -e "$MARKETPLACE_BRIDGE_ENV_FILE" ] && [ ! -f "$MARKETPLACE_BRIDGE_ENV_FILE" ]; }; then
-  die "$MARKETPLACE_BRIDGE_ENV_FILE must be a regular file, not a symlink or special file"
-fi
+# The public Hub never reads private Marketplace role files. Its fixed sudo
+# helper owns one root-only masked state file, writes split API/worker files,
+# and imports the Bybit master over stdin directly into the encrypted vault.
+install -d -m 0755 -o root -g root /etc/wickhunter-hub
+for private_file in "$MARKETPLACE_STATE_ENV_FILE" "$MARKETPLACE_BRIDGE_ENV_FILE"; do
+  if [ -L "$private_file" ] || { [ -e "$private_file" ] && [ ! -f "$private_file" ]; }; then
+    die "$private_file must be a regular file, not a symlink or special file"
+  fi
+  if [ -e "$private_file" ]; then
+    chown root:root "$private_file"
+    chmod 600 "$private_file"
+  fi
+done
 touch "$MARKETPLACE_BRIDGE_ENV_FILE"
+chown root:root "$MARKETPLACE_BRIDGE_ENV_FILE"
 chmod 600 "$MARKETPLACE_BRIDGE_ENV_FILE"
-ok "Marketplace status bridge persists separately at $MARKETPLACE_BRIDGE_ENV_FILE"
+ok "Marketplace masked state and status bridge persist root-only"
 
 # Machine leases are additive. A missing/corrupt lease authority must never
 # prevent a legacy LHK1 Hub upgrade. Read only the one exact env assignment we
@@ -155,7 +151,29 @@ else
   warn "HUB_LICENSE_LEASE_KEY_ID is invalid; continuing the core Hub upgrade with lease issuance disabled"
 fi
 
-say "Installing the systemd service"
+say "Installing the unprivileged systemd service and fixed root helper"
+getent group "$SERVICE_USER" >/dev/null || groupadd --system "$SERVICE_USER"
+id -u "$SERVICE_USER" >/dev/null 2>&1 \
+  || useradd --system --home /nonexistent --shell /usr/sbin/nologin --gid "$SERVICE_USER" "$SERVICE_USER"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$HUB_DIR/data" "$HUB_DIR/releases"
+chmod 700 "$HUB_DIR/data" "$HUB_DIR/releases"
+
+command -v sudo >/dev/null || { apt-get update -qq && apt-get install -y -qq sudo; }
+install -d -m 0755 -o root -g root "$(dirname "$ROOT_HELPER")"
+helper_tmp=$(mktemp)
+printf '%s\n' \
+  '#!/bin/sh' \
+  'exec /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/node /opt/wickhunter-hub/dist/bin/root-helper.js' \
+  > "$helper_tmp"
+install -o root -g root -m 0755 "$helper_tmp" "$ROOT_HELPER"
+rm -f "$helper_tmp"
+sudoers_tmp=$(mktemp)
+printf '%s ALL=(root) NOPASSWD: %s\n' "$SERVICE_USER" "$ROOT_HELPER" > "$sudoers_tmp"
+chmod 0440 "$sudoers_tmp"
+visudo -cf "$sudoers_tmp" >/dev/null || die "generated root-helper sudoers policy is invalid"
+install -o root -g root -m 0440 "$sudoers_tmp" "$SUDOERS_FILE"
+rm -f "$sudoers_tmp"
+
 unit_tmp=$(mktemp)
 printf '%s\n' \
   '[Unit]' \
@@ -164,6 +182,8 @@ printf '%s\n' \
   'Wants=network-online.target' \
   '' \
   '[Service]' \
+  "User=$SERVICE_USER" \
+  "Group=$SERVICE_USER" \
   "WorkingDirectory=$HUB_DIR" \
   "EnvironmentFile=$ENV_FILE" \
   "EnvironmentFile=-$MARKETPLACE_BRIDGE_ENV_FILE" \
@@ -171,7 +191,14 @@ printf '%s\n' \
   "ExecStart=$(command -v node) dist/src/main.js" \
   'Restart=always' \
   'RestartSec=5' \
-  'NoNewPrivileges=true' \
+  'UMask=0077' \
+  'PrivateTmp=true' \
+  'PrivateDevices=true' \
+  'ProtectKernelTunables=true' \
+  'ProtectKernelModules=true' \
+  'ProtectControlGroups=true' \
+  'LockPersonality=true' \
+  'RestrictRealtime=true' \
   '' \
   '[Install]' \
   'WantedBy=multi-user.target' \
