@@ -169,6 +169,14 @@
 </div>
 <p class="muted">This public Hub contains no trading or payment code. It reads a sanitized status contract from the private Marketplace API over a dedicated loopback credential. Secret values are never returned to this page.</p>
 <div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
+
+<h2 style="margin:1.2rem 0 .2rem">Provider approvals</h2>
+<p class="muted" style="margin:.2rem 0">Provider applications are approved here. Every decision requires a written reason and is durably audited by the private Marketplace service.</p>
+<div class="actions"><button type="button" id="mktProvidersRefresh">Refresh providers</button><span id="mktProvidersNote" class="muted"></span></div>
+<div class="tbl"><table>
+  <thead><tr><th>Provider</th><th>Status</th><th>Written reason</th><th>Decision</th></tr></thead>
+  <tbody id="mktProviderRows"><tr><td colspan="4">loading…</td></tr></tbody>
+</table></div>
 <details style="margin-top:.8rem">
   <summary>Advanced technical diagnostics</summary>
   <p class="muted">These are read-only service facts for troubleshooting. They are not a setup checklist for you.</p>
@@ -179,7 +187,7 @@
 </details>
 
 <h2 style="margin:1.2rem 0 .2rem">Finish Marketplace setup</h2>
-<p class="muted" style="margin:.2rem 0">Enter only vendor information the server cannot know. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Configured secrets are never shown again.</p>
+<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. MoonPay is optional and collapsed while subscriptions are mocked. Configured secrets are never shown again.</p>
 <form id="mktConfigForm" style="display:block">
   <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
   <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
@@ -290,6 +298,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   leaseRefresh();
   mktRefresh();
   mktConfigRefresh();
+  mktProvidersRefresh();
   cdRefresh();
   mcRefresh();
   fbRefresh();
@@ -641,6 +650,58 @@ const mktGroupLabels = {
   moonpay: "MoonPay crypto payments",
 };
 
+async function mktProvidersRefresh() {
+  const rows = document.getElementById("mktProviderRows");
+  const note = document.getElementById("mktProvidersNote");
+  note.textContent = "";
+  try {
+    const data = await api("/admin/api/marketplace-providers");
+    rows.innerHTML = "";
+    for (const provider of data.providers || []) {
+      const tr = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = provider.displayName + " (" + provider.id + ")";
+      const status = document.createElement("td");
+      status.textContent = provider.status;
+      status.className = provider.status === "approved" ? "ops-ok" : provider.status === "submitted" ? "ops-warn" : "ops-bad";
+      const reasonCell = document.createElement("td");
+      const reason = document.createElement("input");
+      reason.type = "text"; reason.placeholder = "Required audit reason"; reason.autocomplete = "off";
+      reason.maxLength = 1000; reasonCell.appendChild(reason);
+      const actions = document.createElement("td");
+      const targets = provider.status === "approved" ? ["suspended"] : ["approved", "rejected"];
+      for (const target of targets) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = target === "approved" ? "Approve" : target === "rejected" ? "Reject" : "Suspend";
+        button.onclick = async () => {
+          if (reason.value.trim().length < 8) { note.textContent = "Enter a written reason of at least 8 characters."; return; }
+          button.disabled = true;
+          try {
+            await api("/admin/api/marketplace-providers/" + encodeURIComponent(provider.id) + "/decision", {
+              method: "POST",
+              body: JSON.stringify({
+                to: target, reason: reason.value.trim(),
+                idempotencyKey: "hub-provider-" + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + "-" + provider.id),
+              }),
+            });
+            note.textContent = provider.displayName + " moved to " + target + ".";
+            await mktProvidersRefresh();
+          } catch (e) { note.textContent = e.message; button.disabled = false; }
+        };
+        actions.appendChild(button);
+      }
+      tr.append(name, status, reasonCell, actions);
+      rows.appendChild(tr);
+    }
+    if (!rows.children.length) rows.innerHTML = '<tr><td colspan="4">No provider applications yet.</td></tr>';
+  } catch (e) {
+    if (e.message !== "unauthorized") rows.innerHTML = '<tr><td colspan="4">' + esc(e.message) + '</td></tr>';
+  }
+}
+
+document.getElementById("mktProvidersRefresh").onclick = mktProvidersRefresh;
+
 function mktRenderConfig(config) {
   const wrap = document.getElementById("mktConfigFields");
   wrap.innerHTML = "";
@@ -652,10 +713,12 @@ function mktRenderConfig(config) {
   for (const field of operatorFields) {
     let group = groups.get(field.group);
     if (!group) {
-      group = document.createElement("section");
+      group = document.createElement(field.group === "moonpay" ? "details" : "section");
       group.className = "configgroup";
-      const heading = document.createElement("h2");
-      heading.textContent = mktGroupLabels[field.group] || field.group;
+      const heading = document.createElement(field.group === "moonpay" ? "summary" : "h2");
+      heading.textContent = field.group === "moonpay"
+        ? "MoonPay crypto payments (optional — mocked for now)"
+        : (mktGroupLabels[field.group] || field.group);
       const fields = document.createElement("div");
       fields.className = "configfields";
       group.append(heading, fields);
@@ -755,13 +818,13 @@ function mktRenderConfig(config) {
     }
     group.querySelector(".configfields").appendChild(card);
   }
-  if (!wrap.children.length) wrap.innerHTML = '<div class="opscard ops-ok">All Bybit and MoonPay information is configured.</div>';
+  if (!wrap.children.length) wrap.innerHTML = '<div class="opscard ops-ok">The required Bybit Demo information is configured.</div>';
   document.getElementById("mktManagedSummary").textContent = automaticFields.length + " internal settings are managed automatically"
     + (deploymentFields.length ? "; " + deploymentFields.length + " installation facts are supplied by deployment." : ".");
   const operatorMissing = config.operatorMissing || [];
   const deploymentMissing = config.deploymentMissing || [];
   document.getElementById("mktConfigNote").textContent = operatorMissing.length
-    ? operatorMissing.length + " Bybit/MoonPay value(s) still need your input."
+    ? operatorMissing.length + " required Bybit value(s) still need your input."
     : deploymentMissing.length
       ? "Vendor information is saved; deployment is finishing " + deploymentMissing.length + " internal prerequisite(s)."
       : "Vendor information is saved. Readiness still depends on live service checks.";
@@ -801,7 +864,7 @@ document.getElementById("mktConfigForm").onsubmit = async (ev) => {
       changes[name] = input.value === "" ? null : input.value;
     }
   }
-  if (!confirm("Save the Bybit/MoonPay information and let the Hub configure all internal Marketplace settings automatically?")) return;
+  if (!confirm("Save the vendor information and let the Hub configure all internal Marketplace settings automatically?")) return;
   const note = document.getElementById("mktConfigNote");
   note.textContent = "Saving vendor information, applying safe defaults and verifying the private services…";
   try {

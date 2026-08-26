@@ -84,8 +84,10 @@ import {
 } from "./marketplace-status.js";
 import {
   applyMarketplaceInputUpdate,
-  marketplaceBridgeEnvironment,
-  marketplaceInputSnapshot,
+  decidePrivilegedMarketplaceProvider,
+  listPrivilegedMarketplaceProviders,
+  readMarketplaceInputSnapshot,
+  startPrivilegedHubUpgrade,
   MARKETPLACE_CSRF_HEADER,
   MARKETPLACE_CSRF_VALUE,
   MarketplaceInputError,
@@ -874,7 +876,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "GET" && p === "/admin/api/marketplace-config") {
       try {
-        return sendJson(res, 200, { ok: true, config: marketplaceInputSnapshot(marketplaceInputsConfig) }, { "cache-control": "no-store" });
+        return sendJson(res, 200, { ok: true, config: await readMarketplaceInputSnapshot(marketplaceInputsConfig, spawn) }, { "cache-control": "no-store" });
       } catch (err) {
         const message = err instanceof MarketplaceInputError ? err.message : "Marketplace configuration state is unavailable";
         return sendJson(res, 503, { ok: false, error: message }, { "cache-control": "no-store" });
@@ -899,15 +901,45 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           body as unknown as MarketplaceInputUpdate,
           spawn,
         );
-        // The shared EnvironmentFile is also read by the Hub unit on its next
-        // restart. Update this process's status bridge only AFTER both private
-        // services accepted the same file, so the UI works immediately without
-        // restarting itself halfway through this response.
-        marketplaceStatusConfig = marketplaceStatusBridgeFromEnv(marketplaceBridgeEnvironment(marketplaceInputsConfig));
+        // Production's fixed root helper schedules a Hub reload only after the
+        // split API/worker files and private services accept the update. The
+        // helper response is masked, so the current public process never
+        // receives the bridge credential through this configuration route.
         return sendJson(res, 200, { ok: true, config }, { "cache-control": "no-store" });
       } catch (err) {
         const message = err instanceof MarketplaceInputError ? err.message : "Marketplace configuration update failed closed";
         return sendJson(res, err instanceof MarketplaceInputError ? 400 : 500, { ok: false, error: message }, { "cache-control": "no-store" });
+      }
+    }
+    if (m === "GET" && p === "/admin/api/marketplace-providers") {
+      try {
+        const providers = await listPrivilegedMarketplaceProviders(marketplaceInputsConfig, spawn);
+        return sendJson(res, 200, { ok: true, providers }, { "cache-control": "no-store" });
+      } catch {
+        return sendJson(res, 503, { ok: false, error: "the private Marketplace provider roster is unavailable" }, { "cache-control": "no-store" });
+      }
+    }
+    const providerDecision = /^\/admin\/api\/marketplace-providers\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/decision$/.exec(p);
+    if (m === "POST" && providerDecision !== null) {
+      const csrf = req.headers[MARKETPLACE_CSRF_HEADER];
+      const site = req.headers["sec-fetch-site"];
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      if (csrf !== MARKETPLACE_CSRF_VALUE || !/^application\/json(?:\s*;|$)/.test(contentType) || site === "cross-site") {
+        return sendJson(res, 403, { ok: false, error: "Marketplace provider decisions require the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      }
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.to !== "string" || typeof body.reason !== "string"
+        || typeof body.idempotencyKey !== "string") {
+        return sendJson(res, 400, { ok: false, error: "expected {to, reason, idempotencyKey}" }, { "cache-control": "no-store" });
+      }
+      try {
+        const provider = await decidePrivilegedMarketplaceProvider(marketplaceInputsConfig, {
+          providerId: providerDecision[1]!, to: body.to, reason: body.reason,
+          idempotencyKey: body.idempotencyKey,
+        }, spawn);
+        return sendJson(res, 200, { ok: true, provider }, { "cache-control": "no-store" });
+      } catch {
+        return sendJson(res, 503, { ok: false, error: "the private Marketplace provider decision was refused" }, { "cache-control": "no-store" });
       }
     }
     if (m === "POST" && p === "/admin/api/license-leases/seat-override") {
@@ -954,6 +986,24 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         fromCommit: build.commit, targetCommit: null,
         message: "Upgrade queued; waiting for the detached origin/main verifier.",
       });
+      if (marketplaceInputsConfig.rootHelper !== undefined) {
+        try {
+          await startPrivilegedHubUpgrade(marketplaceInputsConfig, spawn);
+        } catch {
+          writeUpgradeStatus(cfg.dataDir, {
+            state: "failed", startedAtMs: upgradeStartedAt, completedAtMs: Date.now(),
+            fromCommit: build.commit, targetCommit: null,
+            message: "The fixed privileged upgrade helper could not start the verified runner.",
+          });
+          upgradeStartedAt = 0;
+          return sendJson(res, 500, { ok: false, error: "could not start the privileged upgrade helper" });
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          version: HUB_VERSION,
+          note: "upgrade queued — origin/main will be fetched, verified, installed, and recorded in the Hub operations panel",
+        });
+      }
       const entry = typeof process.argv[1] === "string" ? path.resolve(process.argv[1]) : path.join(process.cwd(), "dist/src/main.js");
       const runner = path.resolve(path.dirname(entry), "../bin/upgrade-runner.js");
       try {

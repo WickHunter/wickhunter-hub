@@ -52,8 +52,8 @@ export interface HubConfig {
    * never receives its credential and this public repository imports no
    * Marketplace execution/payment code. */
   marketplaceStatus?: MarketplaceStatusBridgeConfig;
-  /** Root-owned EnvironmentFile managed by the authenticated Hub admin input
-   * plane. The request can change allowlisted values, never this path. */
+  /** Masked Marketplace configuration plane. Production names one fixed root
+   * helper; the unprivileged HTTP process never opens its state or role files. */
   marketplaceInputs?: MarketplaceInputsConfig;
 
   // ── candle seed service ───────────────────────────────────────────────────
@@ -186,8 +186,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     },
     marketplaceStatus: marketplaceStatusBridgeFromEnv(env),
     marketplaceInputs: {
-      envFile: env.HUB_MARKETPLACE_ENV_FILE ?? "/etc/liqhunter/marketplace.env",
+      envFile: env.HUB_MARKETPLACE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace-state.env",
       hubBridgeEnvFile: env.HUB_MARKETPLACE_BRIDGE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace.env",
+      rootHelper: env.HUB_ROOT_HELPER ?? "/usr/local/libexec/wickhunter-hub-root-helper",
     },
     candleVenues: (env.HUB_CANDLE_VENUES ?? "")
       .split(",")

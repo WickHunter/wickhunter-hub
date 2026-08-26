@@ -3,10 +3,11 @@
 // units that consume them. It contains no Marketplace execution, exchange,
 // order, subscription, payment or persistence logic.
 //
-// Secrets cross the authenticated request body once, are written to one
-// root-only EnvironmentFile, and are never returned. The browser receives
-// configured/missing state only. Applying a file and restarting both private
-// services is one transaction: a failed restart restores the previous bytes.
+// In production secrets cross the authenticated request body once and travel
+// on stdin to one fixed root helper. The public process cannot read any private
+// state file. The helper splits API/worker roles, encrypts the Bybit master and
+// returns configured/missing state only. The direct file seam below exists for
+// hermetic tests and for that root helper's own validator transaction.
 import fs from "node:fs";
 import path from "node:path";
 import { createPrivateKey, createPublicKey, randomBytes } from "node:crypto";
@@ -195,7 +196,7 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
   }),
   d({ name: "MARKETPLACE_INTENT_KEY_ID", label: "Intent signing key id", group: "service", setup: "automatic", secret: false, required: true, kind: "text", help: "Generated automatically with the private signer." }, identifier("MARKETPLACE_INTENT_KEY_ID", 64)),
   d({ name: "MARKETPLACE_INTENT_SIGNING_SEED", label: "Intent signing seed", group: "service", setup: "automatic", secret: true, required: true, kind: "password", help: "Generated automatically and never exposed to the browser." }, canonicalKey32("MARKETPLACE_INTENT_SIGNING_SEED")),
-  d({ name: "MARKETPLACE_RUNTIME_DIRECTORY", label: "Runtime directory", group: "service", setup: "automatic", secret: false, required: false, kind: "text", placeholder: "/var/lib/liqhunter/marketplace", help: "Fixed automatically to the private StateDirectory." }, (v) => exact(v, "MARKETPLACE_RUNTIME_DIRECTORY", ["/var/lib/liqhunter/marketplace"])),
+  d({ name: "MARKETPLACE_RUNTIME_DIRECTORY", label: "Runtime directory", group: "service", setup: "automatic", secret: false, required: false, kind: "text", placeholder: "/run/liqhunter-marketplace", help: "Fixed automatically to the shared non-secret heartbeat directory." }, (v) => exact(v, "MARKETPLACE_RUNTIME_DIRECTORY", ["/run/liqhunter-marketplace", "/var/lib/liqhunter/marketplace"])),
   d({ name: "MARKETPLACE_BUILD_COMMIT", label: "Installed build commit", group: "service", setup: "deployment", secret: false, required: true, kind: "text", help: "Stamped automatically by the private service installer." }, (v) => {
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(v)) refusal("MARKETPLACE_BUILD_COMMIT", "must be a full 40- or 64-character hexadecimal source revision");
     return v.toLowerCase();
@@ -213,22 +214,22 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
 
   d({ name: "MARKETPLACE_DEMO_MASTER_API_KEY", label: "Bybit Demo master API key", group: "bybit-demo", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the WickHunter-owned Bybit API key used to create and control Demo accounts." }, opaque("MARKETPLACE_DEMO_MASTER_API_KEY", 8, "Bybit API key")),
   d({ name: "MARKETPLACE_DEMO_MASTER_API_SECRET", label: "Bybit Demo master API secret", group: "bybit-demo", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the matching Bybit API secret." }, opaque("MARKETPLACE_DEMO_MASTER_API_SECRET", 16, "Bybit API secret")),
-  d({ name: "MARKETPLACE_DEMO_VAULT_PATH", label: "Demo credential vault path", group: "bybit-demo", setup: "automatic", secret: false, required: true, kind: "text", placeholder: "/var/lib/liqhunter/marketplace/demo-credentials.vault", help: "Fixed automatically inside the private StateDirectory." }, (v) => exact(v, "MARKETPLACE_DEMO_VAULT_PATH", ["/var/lib/liqhunter/marketplace/demo-credentials.vault"])),
+  d({ name: "MARKETPLACE_DEMO_VAULT_PATH", label: "Demo credential vault path", group: "bybit-demo", setup: "automatic", secret: false, required: true, kind: "text", placeholder: "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault", help: "Fixed automatically inside the worker-only StateDirectory." }, (v) => exact(v, "MARKETPLACE_DEMO_VAULT_PATH", ["/var/lib/liqhunter/marketplace-worker/demo-credentials.vault", "/var/lib/liqhunter/marketplace/demo-credentials.vault"])),
   d({ name: "MARKETPLACE_DEMO_VAULT_KEY", label: "Demo vault key", group: "bybit-demo", setup: "automatic", secret: true, required: true, kind: "password", generated: "vault", help: "Generated automatically and kept server-side." }, canonicalKey32("MARKETPLACE_DEMO_VAULT_KEY")),
   d({ name: "MARKETPLACE_DEMO_WORKER_CREDENTIAL", label: "Demo worker credential", group: "bybit-demo", setup: "automatic", secret: true, required: true, kind: "password", generated: "worker", help: "Generated automatically and kept server-side." }, opaque("MARKETPLACE_DEMO_WORKER_CREDENTIAL", 32, "worker credential")),
   d({ name: "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", label: "Demo evidence interval (ms)", group: "bybit-demo", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "60000", help: "Managed automatically." }, integer("MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", 5_000, 3_600_000)),
   d({ name: "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", label: "Demo evidence max age (ms)", group: "bybit-demo", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "180000", help: "Managed automatically." }, integer("MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", 10_000, 3_600_000)),
 
   d({ name: "MOONPAY_COMMERCE_ENVIRONMENT", label: "MoonPay environment", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "select", options: ["production", "development"], placeholder: "production", help: "Defaults automatically to production." }, (v) => exact(v, "MOONPAY_COMMERCE_ENVIRONMENT", ["production", "development"])),
-  d({ name: "MOONPAY_COMMERCE_PUBLIC_KEY", label: "MoonPay public bearer key", group: "moonpay", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the public/bearer key supplied by MoonPay Commerce." }, opaque("MOONPAY_COMMERCE_PUBLIC_KEY", 16, "MoonPay bearer key")),
-  d({ name: "MOONPAY_COMMERCE_SECRET_KEY", label: "MoonPay secret key", group: "moonpay", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the matching MoonPay Commerce secret key." }, opaque("MOONPAY_COMMERCE_SECRET_KEY", 16, "MoonPay secret")),
-  d({ name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", label: "MoonPay webhook token", group: "moonpay", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the webhook authentication token configured in MoonPay." }, opaque("MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", 32, "webhook token")),
-  d({ name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", label: "MoonPay USDT currency ID", group: "moonpay", setup: "operator", secret: false, required: true, kind: "text", help: "Paste MoonPay's currency identifier for the USDT settlement currency." }, identifier("MOONPAY_COMMERCE_PRICING_CURRENCY_ID", 128)),
+  d({ name: "MOONPAY_COMMERCE_PUBLIC_KEY", label: "MoonPay public bearer key", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the public/bearer key when MoonPay Commerce is enabled." }, opaque("MOONPAY_COMMERCE_PUBLIC_KEY", 16, "MoonPay bearer key")),
+  d({ name: "MOONPAY_COMMERCE_SECRET_KEY", label: "MoonPay secret key", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the matching secret when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_SECRET_KEY", 16, "MoonPay secret")),
+  d({ name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", label: "MoonPay webhook token", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the webhook token when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", 32, "webhook token")),
+  d({ name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", label: "MoonPay USDT currency ID", group: "moonpay", setup: "operator", secret: false, required: false, kind: "text", help: "Optional while subscriptions are mocked. Paste MoonPay's USDT identifier when enabled." }, identifier("MOONPAY_COMMERCE_PRICING_CURRENCY_ID", 128)),
   d({ name: "MOONPAY_COMMERCE_PRICING_ASSET", label: "Crypto pricing asset", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", placeholder: "USDT", help: "Fixed automatically to USDT." }, (v) => {
     if (!/^[A-Z0-9][A-Z0-9._-]{1,15}$/.test(v)) refusal("MOONPAY_COMMERCE_PRICING_ASSET", "must be a 2 through 16 character uppercase crypto asset id");
     return v;
   }),
-  d({ name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", label: "MoonPay payout wallet", group: "moonpay", setup: "operator", secret: true, required: true, kind: "textarea", placeholder: "[{\"currencyId\":\"...\",\"walletId\":\"...\",\"sourceBlockchainEngine\":\"...\"}]", help: "Paste the single MoonPay crypto recipient definition (currency ID, wallet ID and blockchain). No card or revenue-share fields are accepted." }, oneCryptoRecipient),
+  d({ name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", label: "MoonPay payout wallet", group: "moonpay", setup: "operator", secret: true, required: false, kind: "textarea", placeholder: "[{\"currencyId\":\"...\",\"walletId\":\"...\",\"sourceBlockchainEngine\":\"...\"}]", help: "Optional while subscriptions are mocked. When enabled, paste the single crypto recipient. Cards and revenue shares remain refused." }, oneCryptoRecipient),
   d({ name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", label: "Monthly interval word", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", help: "Fixed automatically to MONTH." }, identifier("MOONPAY_COMMERCE_MONTHLY_INTERVAL", 64)),
   d({ name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", label: "Yearly interval word", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", help: "Fixed automatically to YEAR." }, identifier("MOONPAY_COMMERCE_YEARLY_INTERVAL", 64)),
 ]);
@@ -276,6 +277,16 @@ export interface MarketplaceInputsConfig {
   /** Exact explicit per-licence alpha cohort from the Hub flag store. A global
    * default is intentionally never accepted for this alpha-only product. */
   readonly alphaLicences?: () => readonly string[];
+  /** Production privilege boundary. When present, the public Hub never opens
+   * a Marketplace environment or vault path. It sends one bounded JSON
+   * request on stdin to this fixed, root-owned helper and accepts only the
+   * masked snapshot on stdout. Tests and the helper itself omit this field and
+   * exercise the same validators through the direct local seam. */
+  readonly rootHelper?: string;
+  /** Root-helper-only direct seam. It lets the helper validate and atomically
+   * persist its private state before it distributes least-privilege role files
+   * and performs the one real service restart itself. Never set by the Hub. */
+  readonly helperOwnsRestart?: boolean;
 }
 
 export class MarketplaceInputError extends Error {
@@ -467,6 +478,175 @@ export function marketplaceInputSnapshot(config: MarketplaceInputsConfig): Marke
   });
 }
 
+function exactSnapshot(value: unknown): MarketplaceInputSnapshot {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid masked snapshot");
+  }
+  const row = value as Record<string, unknown>;
+  if (row.schemaVersion !== 1 || !Array.isArray(row.fields)
+    || typeof row.configuredCount !== "number" || !Number.isSafeInteger(row.configuredCount)
+    || !Array.isArray(row.requiredMissing) || !Array.isArray(row.operatorMissing)
+    || !Array.isArray(row.automaticMissing) || !Array.isArray(row.deploymentMissing)
+    || !Array.isArray(row.restartUnits)) {
+    throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid masked snapshot");
+  }
+  const expected = new Map(MARKETPLACE_INPUT_DEFINITIONS.map((field) => [field.name, field]));
+  if (row.fields.length !== expected.size) {
+    throw new MarketplaceInputError(null, "Marketplace root helper returned an incomplete masked snapshot");
+  }
+  const seen = new Set<string>();
+  for (const item of row.fields) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid field");
+    }
+    const field = item as Record<string, unknown>;
+    const definition = typeof field.name === "string" ? expected.get(field.name) : undefined;
+    if (definition === undefined || seen.has(definition.name)
+      || !["configured", "missing", "invalid"].includes(String(field.state))) {
+      throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid field");
+    }
+    if (definition.secret && Object.hasOwn(field, "safeValue")) {
+      throw new MarketplaceInputError(null, "Marketplace root helper attempted to return a secret value");
+    }
+    if (!definition.secret && Object.hasOwn(field, "safeValue") && typeof field.safeValue !== "string") {
+      throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid safe value");
+    }
+    seen.add(definition.name);
+  }
+  const exactNames = (item: unknown): boolean => Array.isArray(item)
+    && item.every((name) => typeof name === "string" && expected.has(name));
+  if (!exactNames(row.requiredMissing) || !exactNames(row.operatorMissing)
+    || !exactNames(row.automaticMissing) || !exactNames(row.deploymentMissing)
+    || row.restartUnits.length !== MARKETPLACE_RESTART_UNITS.length
+    || row.restartUnits.some((unit, index) => unit !== MARKETPLACE_RESTART_UNITS[index])) {
+    throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid masked summary");
+  }
+  return value as MarketplaceInputSnapshot;
+}
+
+type HelperRequest =
+  | { readonly action: "snapshot" }
+  | { readonly action: "apply"; readonly update: MarketplaceInputUpdate }
+  | { readonly action: "upgrade" }
+  | { readonly action: "provider-list" }
+  | { readonly action: "provider-decision"; readonly providerId: string; readonly to: string; readonly reason: string; readonly idempotencyKey: string };
+
+async function rootHelperEnvelope(config: MarketplaceInputsConfig, request: HelperRequest, spawn: Spawn): Promise<Record<string, unknown>> {
+  const command = config.rootHelper;
+  if (typeof command !== "string" || !path.isAbsolute(command) || path.normalize(command) !== command) {
+    throw new MarketplaceInputError(null, "Marketplace root helper path is unavailable");
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stdoutBytes = 0;
+    const stdout: Buffer[] = [];
+    const fail = (message: string): void => {
+      if (!settled) { settled = true; reject(new MarketplaceInputError(null, message)); }
+    };
+    try {
+      const child = spawn("sudo", ["-n", command], {
+        stdio: ["pipe", "pipe", "ignore"],
+        shell: false,
+      });
+      child.once("error", () => fail("Marketplace root helper is unavailable"));
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        stdoutBytes += value.length;
+        if (stdoutBytes > 2 * 1024 * 1024) {
+          child.kill();
+          fail("Marketplace root helper returned too much data");
+        } else stdout.push(value);
+      });
+      child.once("exit", (code) => {
+        if (settled) return;
+        if (code !== 0) return fail("Marketplace root helper refused the request");
+        let decoded: unknown;
+        try { decoded = JSON.parse(Buffer.concat(stdout).toString("utf8")); }
+        catch { return fail("Marketplace root helper returned invalid JSON"); }
+        try {
+          const envelope = decoded as Record<string, unknown>;
+          if (envelope === null || typeof envelope !== "object" || envelope.ok !== true) {
+            return fail("Marketplace root helper refused the request");
+          }
+          settled = true;
+          resolve(envelope);
+        } catch (err) {
+          if (!settled) { settled = true; reject(err); }
+        }
+      });
+      child.stdin?.end(Buffer.from(JSON.stringify(request), "utf8"));
+    } catch { fail("Marketplace root helper is unavailable"); }
+  });
+}
+
+async function rootHelper(config: MarketplaceInputsConfig, request: HelperRequest, spawn: Spawn): Promise<MarketplaceInputSnapshot> {
+  const envelope = await rootHelperEnvelope(config, request, spawn);
+  return exactSnapshot(envelope.config);
+}
+
+export async function startPrivilegedHubUpgrade(config: MarketplaceInputsConfig, spawn: Spawn = nodeSpawn): Promise<void> {
+  if (config.rootHelper === undefined) throw new MarketplaceInputError(null, "Hub root helper is unavailable");
+  const envelope = await rootHelperEnvelope(config, { action: "upgrade" }, spawn);
+  if (envelope.queued !== true) throw new MarketplaceInputError(null, "Hub root helper did not queue the upgrade");
+}
+
+export interface HubMarketplaceProvider {
+  readonly id: string;
+  readonly displayName: string;
+  readonly status: string;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+function exactProvider(value: unknown): HubMarketplaceProvider {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new MarketplaceInputError(null, "Marketplace provider helper returned an invalid row");
+  }
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  const expected = ["createdAtMs", "displayName", "id", "status", "updatedAtMs"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])
+    || typeof row.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(row.id)
+    || typeof row.displayName !== "string" || row.displayName.length < 1 || row.displayName.length > 256
+    || typeof row.status !== "string" || !["submitted", "approved", "rejected", "suspended"].includes(row.status)
+    || typeof row.createdAtMs !== "number" || !Number.isSafeInteger(row.createdAtMs)
+    || typeof row.updatedAtMs !== "number" || !Number.isSafeInteger(row.updatedAtMs)) {
+    throw new MarketplaceInputError(null, "Marketplace provider helper returned an invalid row");
+  }
+  return value as HubMarketplaceProvider;
+}
+
+export async function listPrivilegedMarketplaceProviders(
+  config: MarketplaceInputsConfig,
+  spawn: Spawn = nodeSpawn,
+): Promise<readonly HubMarketplaceProvider[]> {
+  if (config.rootHelper === undefined) throw new MarketplaceInputError(null, "Marketplace provider helper is unavailable");
+  const envelope = await rootHelperEnvelope(config, { action: "provider-list" }, spawn);
+  if (!Array.isArray(envelope.providers) || envelope.providers.length > 10_000) {
+    throw new MarketplaceInputError(null, "Marketplace provider helper returned an invalid roster");
+  }
+  return Object.freeze(envelope.providers.map(exactProvider));
+}
+
+export async function decidePrivilegedMarketplaceProvider(
+  config: MarketplaceInputsConfig,
+  input: { readonly providerId: string; readonly to: string; readonly reason: string; readonly idempotencyKey: string },
+  spawn: Spawn = nodeSpawn,
+): Promise<HubMarketplaceProvider> {
+  if (config.rootHelper === undefined) throw new MarketplaceInputError(null, "Marketplace provider helper is unavailable");
+  const envelope = await rootHelperEnvelope(config, { action: "provider-decision", ...input }, spawn);
+  return exactProvider(envelope.provider);
+}
+
+export async function readMarketplaceInputSnapshot(
+  config: MarketplaceInputsConfig,
+  spawn: Spawn = nodeSpawn,
+): Promise<MarketplaceInputSnapshot> {
+  return config.rootHelper === undefined
+    ? marketplaceInputSnapshot(config)
+    : rootHelper(config, { action: "snapshot" }, spawn);
+}
+
 function cleanSubmittedValue(name: string, value: string): string {
   if (value.length < 1 || value.length > 16_384) refusal(name, "must contain 1 through 16384 characters");
   if (value.trim() !== value) refusal(name, "must not contain leading or trailing whitespace");
@@ -499,16 +679,12 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     MARKETPLACE_HTTP_HOST: "127.0.0.1",
     MARKETPLACE_HTTP_PORT: "8099",
     MARKETPLACE_STORE: "postgres",
-    MARKETPLACE_RUNTIME_DIRECTORY: "/var/lib/liqhunter/marketplace",
+    MARKETPLACE_RUNTIME_DIRECTORY: "/run/liqhunter-marketplace",
     MARKETPLACE_WORKER_INTERVAL_MS: "1000",
     MARKETPLACE_OUTBOX_BATCH: "50",
     MARKETPLACE_SHUTDOWN_GRACE_MS: "10000",
     MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS: "60000",
     MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS: "180000",
-    MOONPAY_COMMERCE_ENVIRONMENT: "production",
-    MOONPAY_COMMERCE_PRICING_ASSET: "USDT",
-    MOONPAY_COMMERCE_MONTHLY_INTERVAL: "MONTH",
-    MOONPAY_COMMERCE_YEARLY_INTERVAL: "YEAR",
   })) put(name, value);
 
   put("LIQHUNTER_MARKETPLACE_URL", config.publicMarketplaceOrigin);
@@ -534,9 +710,30 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     );
   }
   if (demoKey !== undefined && demoSecret !== undefined) {
-    put("MARKETPLACE_DEMO_VAULT_PATH", "/var/lib/liqhunter/marketplace/demo-credentials.vault");
+    put("MARKETPLACE_DEMO_VAULT_PATH", "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault");
     put("MARKETPLACE_DEMO_VAULT_KEY", randomBytes(32).toString("base64url"));
     put("MARKETPLACE_DEMO_WORKER_CREDENTIAL", randomBytes(32).toString("base64url"));
+  }
+
+  const moonPayOperatorNames = [
+    "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
+    "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
+    "MOONPAY_COMMERCE_RECIPIENTS_JSON",
+  ];
+  const moonPayPresent = moonPayOperatorNames.filter((name) => next.has(name));
+  if (moonPayPresent.length !== 0 && moonPayPresent.length !== moonPayOperatorNames.length) {
+    throw new MarketplaceInputError("MOONPAY_COMMERCE_PUBLIC_KEY", "MoonPay is optional, but enabling it requires every MoonPay vendor field in one save");
+  }
+  if (moonPayPresent.length === moonPayOperatorNames.length) {
+    put("MOONPAY_COMMERCE_ENVIRONMENT", "production");
+    put("MOONPAY_COMMERCE_PRICING_ASSET", "USDT");
+    put("MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MONTH");
+    put("MOONPAY_COMMERCE_YEARLY_INTERVAL", "YEAR");
+  } else {
+    for (const name of [
+      "MOONPAY_COMMERCE_ENVIRONMENT", "MOONPAY_COMMERCE_PRICING_ASSET",
+      "MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MOONPAY_COMMERCE_YEARLY_INTERVAL",
+    ]) next.delete(name);
   }
 
   const intentId = next.get("MARKETPLACE_INTENT_KEY_ID");
@@ -658,6 +855,7 @@ export async function applyMarketplaceInputUpdate(
   update: MarketplaceInputUpdate,
   spawn: Spawn = nodeSpawn,
 ): Promise<MarketplaceInputSnapshot> {
+  if (config.rootHelper !== undefined) return rootHelper(config, { action: "apply", update }, spawn);
   const { filename, bytes: previous, values } = valuesFrom(config);
   const bridgeFilename = safePath(config.hubBridgeEnvFile);
   assertParentDirectory(bridgeFilename);
@@ -671,7 +869,7 @@ export async function applyMarketplaceInputUpdate(
     try { restore(bridgeFilename, previousBridge); } catch { /* preserve the original refusal */ }
     throw err;
   }
-  if (!await restart(spawn)) {
+  if (config.helperOwnsRestart !== true && !await restart(spawn)) {
     restore(filename, previous);
     restore(bridgeFilename, previousBridge);
     // Best-effort recovery restart uses the same hardcoded unit allowlist. Its
