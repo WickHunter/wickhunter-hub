@@ -792,6 +792,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.12 — Hydrate the masked Marketplace setup from the already-running
+  split service roles, tolerate duplicate unrelated Hub settings while reading
+  the one public origin, keep deferred MoonPay defaults out of readiness, and
+  import the Bybit master as the dedicated worker so its encrypted vault stays
+  worker-owned.
 - v0.3.11 — Return the root-written, non-secret build identity record to the
   unprivileged Hub service before the installer verifies the running commit.
   This preserves the v0.3.10 privilege boundary while making installs and the

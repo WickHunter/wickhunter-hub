@@ -225,13 +225,13 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
   d({ name: "MOONPAY_COMMERCE_SECRET_KEY", label: "MoonPay secret key", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the matching secret when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_SECRET_KEY", 16, "MoonPay secret")),
   d({ name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", label: "MoonPay webhook token", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the webhook token when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", 32, "webhook token")),
   d({ name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", label: "MoonPay USDT currency ID", group: "moonpay", setup: "operator", secret: false, required: false, kind: "text", help: "Optional while subscriptions are mocked. Paste MoonPay's USDT identifier when enabled." }, identifier("MOONPAY_COMMERCE_PRICING_CURRENCY_ID", 128)),
-  d({ name: "MOONPAY_COMMERCE_PRICING_ASSET", label: "Crypto pricing asset", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", placeholder: "USDT", help: "Fixed automatically to USDT." }, (v) => {
+  d({ name: "MOONPAY_COMMERCE_PRICING_ASSET", label: "Crypto pricing asset", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", placeholder: "USDT", help: "Fixed automatically to USDT when MoonPay is enabled." }, (v) => {
     if (!/^[A-Z0-9][A-Z0-9._-]{1,15}$/.test(v)) refusal("MOONPAY_COMMERCE_PRICING_ASSET", "must be a 2 through 16 character uppercase crypto asset id");
     return v;
   }),
   d({ name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", label: "MoonPay payout wallet", group: "moonpay", setup: "operator", secret: true, required: false, kind: "textarea", placeholder: "[{\"currencyId\":\"...\",\"walletId\":\"...\",\"sourceBlockchainEngine\":\"...\"}]", help: "Optional while subscriptions are mocked. When enabled, paste the single crypto recipient. Cards and revenue shares remain refused." }, oneCryptoRecipient),
-  d({ name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", label: "Monthly interval word", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", help: "Fixed automatically to MONTH." }, identifier("MOONPAY_COMMERCE_MONTHLY_INTERVAL", 64)),
-  d({ name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", label: "Yearly interval word", group: "moonpay", setup: "automatic", secret: false, required: true, kind: "text", help: "Fixed automatically to YEAR." }, identifier("MOONPAY_COMMERCE_YEARLY_INTERVAL", 64)),
+  d({ name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", label: "Monthly interval word", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", help: "Fixed automatically to MONTH when MoonPay is enabled." }, identifier("MOONPAY_COMMERCE_MONTHLY_INTERVAL", 64)),
+  d({ name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", label: "Yearly interval word", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", help: "Fixed automatically to YEAR when MoonPay is enabled." }, identifier("MOONPAY_COMMERCE_YEARLY_INTERVAL", 64)),
 ]);
 
 const BY_NAME = new Map(DEFINITIONS.map((definition) => [definition.name, definition]));

@@ -61,6 +61,9 @@ await test("schema exposes every API/config input, separates public alpha materi
   assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_CREDENTIAL").generated, "worker");
   assert.equal(byName.get("MARKETPLACE_DEMO_MASTER_API_KEY").generated, undefined);
   assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").generated, undefined);
+  assert.equal(byName.get("MOONPAY_COMMERCE_PRICING_ASSET").required, false);
+  assert.equal(byName.get("MOONPAY_COMMERCE_MONTHLY_INTERVAL").required, false);
+  assert.equal(byName.get("MOONPAY_COMMERCE_YEARLY_INTERVAL").required, false);
   assert.deepEqual(
     MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.setup === "operator").map((field) => field.name),
     [
@@ -127,6 +130,9 @@ await test("automatic setup keeps the optional Bybit Demo group wholly absent un
   const bytes = fs.readFileSync(cfg.envFile, "utf8");
   assert.doesNotMatch(bytes, /^MARKETPLACE_DEMO_(?:MASTER|VAULT|WORKER)_/m);
   assert.doesNotMatch(bytes, /^MOONPAY_COMMERCE_/m, "mock subscription mode keeps the optional MoonPay group wholly absent");
+  const emptyMoonPay = marketplaceInputSnapshot(cfg);
+  assert.equal(emptyMoonPay.requiredMissing.some((name) => name.startsWith("MOONPAY_COMMERCE_")), false,
+    "mock subscription mode must not manufacture MoonPay readiness blockers");
   await assert.rejects(
     () => applyMarketplaceInputUpdate(cfg, {
       automatic: true,
@@ -421,6 +427,9 @@ await test("the public Hub is unprivileged and can invoke only the fixed root he
   assert.match(installer, /chmod 600 "\$private_file"/);
   const helper = fs.readFileSync(new URL("../bin/root-helper.ts", import.meta.url), "utf8");
   assert.match(helper, /demo-vault-import-cli\.js/);
+  assert.match(helper, /oneEnvValue\(safeFile\(HUB_ENV\), "HUB_PUBLIC_ORIGIN"\)/);
+  assert.match(helper, /!values\.has\(name\) \|\| deployment\.has\(name\)/);
+  assert.match(helper, /runuser.*liqhunter-marketplace-worker/s);
   assert.match(helper, /input: Buffer\.from\(JSON\.stringify\(\{ apiKey, apiSecret \}\)/);
   assert.doesNotMatch(helper, /args.*apiKey|args.*apiSecret/);
   assert.match(helper, /provider-decision/);
