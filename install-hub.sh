@@ -230,6 +230,11 @@ node dist/bin/buildinfo.js \
   --version "$WANT_VERSION" \
   --commit "$SOURCE_COMMIT" \
   --branch "$SOURCE_BRANCH"
+# buildinfo runs in this privileged installer after the Hub has already
+# dropped to its service identity. Return the non-secret runtime record to the
+# unprivileged reader before asking health to prove the installed commit.
+chown "$SERVICE_USER:$SERVICE_USER" "$HUB_DIR/data/hub-build.v1.json"
+chmod 600 "$HUB_DIR/data/hub-build.v1.json"
 health=$(curl -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health") \
   || die "hub stopped answering while its exact build identity was recorded"
 if printf '%s' "$SOURCE_COMMIT" | grep -Eq '^[a-f0-9]{40}$'; then

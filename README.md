@@ -792,6 +792,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.11 — Return the root-written, non-secret build identity record to the
+  unprivileged Hub service before the installer verifies the running commit.
+  This preserves the v0.3.10 privilege boundary while making installs and the
+  Upgrade button finish cleanly when the source checkout lives under `/root`.
+
 - v0.3.10 — **The public Hub is no longer root and no longer reads Marketplace
   secrets.** A single fixed, root-owned, no-argument helper accepts bounded JSON
   on stdin, writes the v0.89.43 split API/worker environment files, derives only
