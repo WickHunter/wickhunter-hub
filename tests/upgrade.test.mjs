@@ -77,8 +77,12 @@ await test("upgrade implementation verifies origin/main and records identity onl
   const installer = fs.readFileSync(new URL("../install-hub.sh", import.meta.url), "utf8");
   const firstHealth = installer.indexOf('hub is up but on the wrong version');
   const record = installer.indexOf('node dist/bin/buildinfo.js');
+  const handoff = installer.indexOf('chown "$SERVICE_USER:$SERVICE_USER" "$HUB_DIR/data/hub-build.v1.json"');
+  const secondHealth = installer.indexOf('health=$(curl -fsS --max-time 10', record);
   assert.ok(firstHealth >= 0 && record > firstHealth,
     "an attempted source is not recorded as the runtime until the restarted package version answers");
+  assert.ok(handoff > record && secondHealth > handoff,
+    "the privileged writer returns the build record to the unprivileged Hub before commit verification");
   assert.match(installer, /rotated machine-lease kid .* is not pre-provisioned/);
   assert.match(installer, /continuing the core Hub upgrade with lease issuance disabled/);
 });
