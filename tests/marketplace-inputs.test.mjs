@@ -76,9 +76,13 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
   cfg.alphaLicences = () => alphaLicences;
   const fake = fakeSpawner();
   const vendorKey = "bybit-key-from-the-operator";
+  const vendorSecret = "bybit-secret-from-the-operator";
   const snapshot = await applyMarketplaceInputUpdate(cfg, {
     automatic: true,
-    changes: { MARKETPLACE_DEMO_MASTER_API_KEY: vendorKey },
+    changes: {
+      MARKETPLACE_DEMO_MASTER_API_KEY: vendorKey,
+      MARKETPLACE_DEMO_MASTER_API_SECRET: vendorSecret,
+    },
   }, fake.spawn);
   assert.equal(snapshot.operatorMissing.includes("MARKETPLACE_DEMO_MASTER_API_KEY"), false);
   assert.deepEqual([...snapshot.deploymentMissing].sort(), ["LIQHUNTER_HUB_KEY", "MARKETPLACE_BUILD_COMMIT", "MARKETPLACE_DATABASE_URL"].sort());
@@ -113,6 +117,22 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
   const afterRemoval = fs.readFileSync(cfg.envFile, "utf8");
   assert.doesNotMatch(afterRemoval, /MARKETPLACE_(?:ALPHA|ADMIN)_LICENCES=/);
   assert.ok(afterRemoval.includes(`MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`), "vendor input was not preserved during alpha sync");
+});
+
+await test("automatic setup keeps the optional Bybit Demo group wholly absent until both operator keys arrive", async () => {
+  const { cfg } = config("marketplace-automatic-without-bybit");
+  cfg.publicMarketplaceOrigin = "https://alpha.wickhunter.example";
+  const fake = fakeSpawner();
+  await applyMarketplaceInputUpdate(cfg, { automatic: true }, fake.spawn);
+  const bytes = fs.readFileSync(cfg.envFile, "utf8");
+  assert.doesNotMatch(bytes, /^MARKETPLACE_DEMO_(?:MASTER|VAULT|WORKER)_/m);
+  await assert.rejects(
+    () => applyMarketplaceInputUpdate(cfg, {
+      automatic: true,
+      changes: { MARKETPLACE_DEMO_MASTER_API_KEY: "only-one-half" },
+    }, fake.spawn),
+    /both Bybit Demo master credentials must be saved together/,
+  );
 });
 
 await test("a successful update is atomic, 0600, masked, and restarts only the exact hardcoded private units", async () => {
@@ -279,6 +299,13 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.match(html, /data-moonpay-recipient-part/);
   assert.match(html, /Enable Marketplace for this licence only/);
   assert.match(html, /flag: "marketplace"/);
+  assert.match(html, /data-hub-page="licenses"/);
+  assert.match(html, /data-hub-page="market-data"/);
+  assert.match(html, /data-hub-page="marketplace"/);
+  assert.match(html, /data-hub-page="system"/);
+  assert.match(html, /function showHubPage/);
+  assert.match(html, /Licenses &amp; installs/);
+  assert.match(html, /System &amp; feedback/);
   assert.doesNotMatch(html, /Generate shared status credential/);
   assert.doesNotMatch(html, /Generate Demo vault key/);
   assert.doesNotMatch(html, /Generate Demo worker credential/);
