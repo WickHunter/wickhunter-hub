@@ -12,6 +12,7 @@ import {
   listPrivilegedMarketplaceProviders,
   MARKETPLACE_INPUT_DEFINITIONS,
   MARKETPLACE_RESTART_UNITS,
+  MARKETPLACE_ROLE_INPUT_NAMES,
   MarketplaceInputError,
   marketplaceInputSnapshot,
   readMarketplaceInputSnapshot,
@@ -43,7 +44,7 @@ function config(prefix = "marketplace-inputs") {
 const secretStatus = "status-secret-that-is-long-enough-123456789";
 const vendorSecret = "bybit-vendor-secret-that-must-never-return";
 
-await test("schema exposes every API/config input, separates public alpha material, and marks vendor values non-generated", () => {
+await test("schema exposes the complete census but accepts only current external inputs", () => {
   const byName = new Map(MARKETPLACE_INPUT_DEFINITIONS.map((field) => [field.name, field]));
   for (const name of [
     "HUB_MARKETPLACE_STATUS_ORIGIN", "HUB_MARKETPLACE_STATUS_CREDENTIAL",
@@ -64,16 +65,41 @@ await test("schema exposes every API/config input, separates public alpha materi
   assert.equal(byName.get("MOONPAY_COMMERCE_PRICING_ASSET").required, false);
   assert.equal(byName.get("MOONPAY_COMMERCE_MONTHLY_INTERVAL").required, false);
   assert.equal(byName.get("MOONPAY_COMMERCE_YEARLY_INTERVAL").required, false);
+  assert.equal(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").setup, "automatic");
+  assert.deepEqual(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").options, ["mock"]);
+  assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").setup, "deferred");
   assert.deepEqual(
     MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.setup === "operator").map((field) => field.name),
     [
       "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
-      "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
-      "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
-      "MOONPAY_COMMERCE_RECIPIENTS_JSON",
     ],
-    "the normal Hub form must contain only Bybit and MoonPay facts the operator has to supply",
+    "the normal Hub form must contain only the two Bybit facts the operator has to supply",
   );
+  assert.equal(
+    MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.group === "moonpay")
+      .every((field) => field.setup === "deferred"),
+    true,
+    "mock mode must not accept any MoonPay field",
+  );
+});
+
+await test("role routing gives API no signer, vault, worker, master or bridge secret", () => {
+  const common = new Set(MARKETPLACE_ROLE_INPUT_NAMES.common);
+  const api = new Set(MARKETPLACE_ROLE_INPUT_NAMES.api);
+  const worker = new Set(MARKETPLACE_ROLE_INPUT_NAMES.worker);
+  assert.equal(common.has("MARKETPLACE_SUBSCRIPTION_MODE"), true);
+  assert.deepEqual([...worker].sort(), [
+    "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_VAULT_PATH",
+    "MARKETPLACE_DEMO_WORKER_CREDENTIAL", "MARKETPLACE_INTENT_SIGNING_SEED",
+  ].sort());
+  for (const forbidden of [
+    "MARKETPLACE_INTENT_SIGNING_SEED", "MARKETPLACE_DEMO_VAULT_KEY",
+    "MARKETPLACE_DEMO_VAULT_PATH", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
+    "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
+    "HUB_MARKETPLACE_STATUS_CREDENTIAL", "MARKETPLACE_DATABASE_URL", "LIQHUNTER_HUB_KEY",
+  ]) assert.equal(api.has(forbidden), false, forbidden);
+  for (const name of common) assert.equal(worker.has(name), false, `${name} crossed common/worker roles`);
+  for (const name of api) assert.equal(worker.has(name), false, `${name} crossed api/worker roles`);
 });
 
 await test("automatic setup fills defaults, derives the public signer, mirrors the explicit alpha flags and preserves vendor inputs", async () => {
@@ -96,7 +122,8 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
   const bytes = fs.readFileSync(cfg.envFile, "utf8");
   for (const expected of [
     'HUB_MARKETPLACE_STATUS_ORIGIN="http://127.0.0.1:8099"',
-    'MARKETPLACE_ENABLED="1"', 'MARKETPLACE_HTTP_HOST="127.0.0.1"',
+    'MARKETPLACE_ENABLED="1"', 'MARKETPLACE_SUBSCRIPTION_MODE="mock"',
+    'MARKETPLACE_HTTP_HOST="127.0.0.1"',
     'MARKETPLACE_HTTP_PORT="8099"', 'MARKETPLACE_STORE="postgres"',
     'MARKETPLACE_RUNTIME_DIRECTORY="/run/liqhunter-marketplace"',
     'LIQHUNTER_MARKETPLACE_URL="https://alpha.wickhunter.example"',
@@ -140,6 +167,30 @@ await test("automatic setup keeps the optional Bybit Demo group wholly absent un
     }, fake.spawn),
     /both Bybit Demo master credentials must be saved together/,
   );
+});
+
+await test("automatic setup purges deferred MoonPay and migrates the obsolete vault path", async () => {
+  const { cfg } = config("marketplace-legacy-config");
+  fs.writeFileSync(cfg.envFile, [
+    'MARKETPLACE_DEMO_MASTER_API_KEY="legacy-bybit-key"',
+    'MARKETPLACE_DEMO_MASTER_API_SECRET="legacy-bybit-secret-value"',
+    'MARKETPLACE_DEMO_VAULT_PATH="/var/lib/liqhunter/marketplace/demo-credentials.vault"',
+    'MOONPAY_COMMERCE_PUBLIC_KEY="legacy-moonpay-public"',
+    'MOONPAY_COMMERCE_SECRET_KEY="legacy-moonpay-secret"',
+    'MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN="legacy-webhook-token-that-is-long-enough"',
+    'MOONPAY_COMMERCE_PRICING_CURRENCY_ID="usdt-id"',
+    'MOONPAY_COMMERCE_PRICING_ASSET="USDT"',
+    'MOONPAY_COMMERCE_ENVIRONMENT="production"',
+    'MOONPAY_COMMERCE_RECIPIENTS_JSON="[{\\"currencyId\\":\\"usdt-id\\",\\"walletId\\":\\"wallet\\",\\"sourceBlockchainEngine\\":\\"tron\\"}]"',
+    'MOONPAY_COMMERCE_MONTHLY_INTERVAL="MONTH"',
+    'MOONPAY_COMMERCE_YEARLY_INTERVAL="YEAR"',
+    "",
+  ].join("\n"), { mode: 0o600 });
+  await applyMarketplaceInputUpdate(cfg, { automatic: true }, fakeSpawner().spawn);
+  const bytes = fs.readFileSync(cfg.envFile, "utf8");
+  assert.match(bytes, /^MARKETPLACE_SUBSCRIPTION_MODE="mock"$/m);
+  assert.match(bytes, /^MARKETPLACE_DEMO_VAULT_PATH="\/var\/lib\/liqhunter\/marketplace-worker\/demo-credentials\.vault"$/m);
+  assert.doesNotMatch(bytes, /^MOONPAY_COMMERCE_/m);
 });
 
 await test("a successful update is atomic, 0600, masked, and restarts only the exact hardcoded private units", async () => {
@@ -191,6 +242,7 @@ await test("unknown keys, short secrets, newline injection and vendor-key genera
     [{ NOT_A_MARKETPLACE_KEY: "hidden-unknown-value" }, [], "hidden-unknown-value"],
     [{ MARKETPLACE_DEMO_MASTER_API_SECRET: "short" }, [], "short"],
     [{ MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN: "tiny" }, [], "tiny"],
+    [{ MOONPAY_COMMERCE_SECRET_KEY: "valid-but-deferred-moonpay-secret" }, [], "valid-but-deferred-moonpay-secret"],
     [{ MARKETPLACE_DATABASE_URL: "postgres://u:secret@db/name\nSYSTEMD_UNIT=evil" }, [], "SYSTEMD_UNIT=evil"],
     [{}, ["MARKETPLACE_DEMO_MASTER_API_KEY"], "MARKETPLACE_DEMO_MASTER_API_KEY"],
     [{}, ["MOONPAY_COMMERCE_SECRET_KEY"], "MOONPAY_COMMERCE_SECRET_KEY"],
@@ -324,6 +376,14 @@ await test("admin config endpoint enforces auth plus JSON/CSRF and returns only 
       body: JSON.stringify({ generate: ["MARKETPLACE_DEMO_VAULT_KEY"] }),
     });
     assert.equal(crossSite.status, 403);
+    const deferredSecret = "moonpay-secret-must-not-cross-the-mock-boundary";
+    const deferred = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
+      method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
+      body: JSON.stringify({ changes: { MOONPAY_COMMERCE_SECRET_KEY: deferredSecret } }),
+    });
+    assert.equal(deferred.status, 400);
+    assert.equal(JSON.stringify(deferred.body).includes(deferredSecret), false);
+    assert.equal(fake.calls.length, 0);
     const secret = "worker-credential-that-stays-server-side-123";
     const saved = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
       method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
@@ -392,8 +452,9 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.match(html, /Advanced technical diagnostics/);
   assert.match(html, /field\.setup === "operator"/);
   assert.match(html, /Bybit Demo account creation/);
-  assert.match(html, /MoonPay crypto payments \(optional — mocked for now\)/);
-  assert.match(html, /data-moonpay-recipient-part/);
+  assert.match(html, /MoonPay is deferred and its credentials are neither requested nor stored/);
+  assert.doesNotMatch(html, /MoonPay crypto payments \(optional — mocked for now\)/);
+  assert.doesNotMatch(html, /data-moonpay-recipient-part/);
   assert.match(html, /Enable Marketplace for this licence only/);
   assert.match(html, /Provider approvals/);
   assert.match(html, /\/admin\/api\/marketplace-providers/);
@@ -427,11 +488,25 @@ await test("the public Hub is unprivileged and can invoke only the fixed root he
   assert.match(installer, /chmod 600 "\$private_file"/);
   const helper = fs.readFileSync(new URL("../bin/root-helper.ts", import.meta.url), "utf8");
   assert.match(helper, /demo-vault-import-cli\.js/);
+  assert.match(helper, /const LEGACY_ENV = "\/etc\/liqhunter\/marketplace\.env"/);
+  assert.match(helper, /const LEGACY_VAULT = "\/var\/lib\/liqhunter\/marketplace\/demo-credentials\.vault"/);
+  assert.match(helper, /const WORKER_VAULT = "\/var\/lib\/liqhunter\/marketplace-worker\/demo-credentials\.vault"/);
   assert.match(helper, /oneEnvValue\(safeFile\(HUB_ENV\), "HUB_PUBLIC_ORIGIN"\)/);
   assert.match(helper, /!values\.has\(name\) \|\| deployment\.has\(name\)/);
   assert.match(helper, /runuser.*liqhunter-marketplace-worker/s);
   assert.match(helper, /input: Buffer\.from\(JSON\.stringify\(\{ apiKey, apiSecret \}\)/);
   assert.doesNotMatch(helper, /args.*apiKey|args.*apiSecret/);
+  assert.match(helper, /name !== "MARKETPLACE_DEMO_MASTER_API_KEY"[\s\S]*name !== "MARKETPLACE_DEMO_MASTER_API_SECRET"/);
+  assert.match(helper, /changes\.MARKETPLACE_DEMO_MASTER_API_KEY = MASTER_KEY_MARKER/);
+  assert.match(helper, /tracked = \[[\s\S]*LEGACY_ENV, LEGACY_VAULT, WORKER_VAULT/);
+  assert.match(helper, /stageVaultMigration\(legacyVault, workerVault\)/);
+  assert.match(helper, /legacy !== null && worker !== null && !legacy\.equals\(worker\)\) refuse\(\)/);
+  assert.match(helper, /atomic\(WORKER_VAULT, legacy, "liqhunter-marketplace-worker", 0o600\)/);
+  assert.match(helper, /function exactValues\(filename: string, allowed: ReadonlySet<string>\)/);
+  assert.match(helper, /for \(const name of values\.keys\(\)\) if \(!allowed\.has\(name\)\) refuse\(\)/);
+  assert.match(helper, /serviceRestart\(\);[\s\S]*removeFile\(LEGACY_VAULT\);[\s\S]*removeFile\(LEGACY_ENV\)/);
+  assert.match(helper, /if \(bytes === null\) removeFile\(filename\)/);
+  assert.doesNotMatch(helper, /fs\.unlinkSync\(filename\); \} catch \{ \/\* absent or fail-closed \*\//);
   assert.match(helper, /provider-decision/);
   assert.match(helper, /written reason|row\.reason\.length < 8/);
 });

@@ -161,7 +161,7 @@ await test("an absent private service yields an exact static operator checklist 
   assert.equal(absent.upstream, null);
   const names = absent.requiredInputs.map((v) => v.name);
   const privateNames = [
-    "MARKETPLACE_ENABLED", "MARKETPLACE_HTTP_HOST", "MARKETPLACE_HTTP_PORT", "MARKETPLACE_STORE",
+    "MARKETPLACE_ENABLED", "MARKETPLACE_SUBSCRIPTION_MODE", "MARKETPLACE_HTTP_HOST", "MARKETPLACE_HTTP_PORT", "MARKETPLACE_STORE",
     "MARKETPLACE_WORKER_INTERVAL_MS", "MARKETPLACE_OUTBOX_BATCH", "MARKETPLACE_SHUTDOWN_GRACE_MS",
     "MARKETPLACE_DATABASE_URL", "MARKETPLACE_INTENT_KEY_ID", "MARKETPLACE_INTENT_SIGNING_SEED",
     "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", "MARKETPLACE_RUNTIME_DIRECTORY", "MARKETPLACE_BUILD_COMMIT",
@@ -185,6 +185,7 @@ await test("an absent private service yields an exact static operator checklist 
   assert.equal(absent.requiredInputs.find((value) => value.name === "MARKETPLACE_ADMIN_LICENCES").secret, true);
   assert.equal(absent.requiredInputs.find((value) => value.name === "MARKETPLACE_ALPHA_LICENCES").secret, true);
   assert.equal(absent.requiredInputs.find((value) => value.name === "MOONPAY_COMMERCE_PUBLIC_KEY").secret, true);
+  assert.match(absent.requiredInputs.find((value) => value.name === "MOONPAY_COMMERCE_PUBLIC_KEY").action, /Deferred in mock mode/);
   assert.ok(absent.readinessBlockers.length > 0);
 });
 

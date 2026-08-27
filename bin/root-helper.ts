@@ -9,13 +9,14 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   applyMarketplaceInputUpdate,
   marketplaceInputSnapshot,
   MARKETPLACE_INPUT_DEFINITIONS,
   MARKETPLACE_RESTART_UNITS,
+  MARKETPLACE_ROLE_INPUT_NAMES,
   type MarketplaceInputUpdate,
   type MarketplaceInputsConfig,
 } from "../src/marketplace-inputs.js";
@@ -30,36 +31,27 @@ const COMMON_ENV = "/etc/liqhunter/marketplace-common.env";
 const API_ENV = "/etc/liqhunter/marketplace-api.env";
 const WORKER_ENV = "/etc/liqhunter/marketplace-worker.env";
 const MIGRATE_ENV = "/etc/liqhunter/marketplace-migrate.env";
+const LEGACY_ENV = "/etc/liqhunter/marketplace.env";
+const LEGACY_VAULT = "/var/lib/liqhunter/marketplace/demo-credentials.vault";
+const WORKER_VAULT = "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault";
 const DATA_DIR = `${HUB_DIR}/data`;
 const MAX_STDIN = 128 * 1024;
 const MASTER_KEY_MARKER = "encrypted-in-worker-vault";
 const MASTER_SECRET_MARKER = "encrypted-in-worker-vault-secret";
 
-const COMMON = new Set([
-  "MARKETPLACE_ENABLED", "MARKETPLACE_HTTP_HOST", "MARKETPLACE_HTTP_PORT", "MARKETPLACE_STORE",
-  "MARKETPLACE_WORKER_INTERVAL_MS", "MARKETPLACE_OUTBOX_BATCH", "MARKETPLACE_SHUTDOWN_GRACE_MS",
-  "MARKETPLACE_DATABASE_URL", "MARKETPLACE_INTENT_KEY_ID", "MARKETPLACE_RUNTIME_DIRECTORY",
-  "MARKETPLACE_BUILD_COMMIT", "MARKETPLACE_ALPHA_LICENCES", "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS",
-  "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", "LIQHUNTER_MARKETPLACE_URL",
-  "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED",
-  "LIQHUNTER_HUB_KEY", "MARKETPLACE_ADMIN_LICENCES",
-]);
-const API = new Set([
-  "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", "MOONPAY_COMMERCE_ENVIRONMENT",
-  "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
-  "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
-  "MOONPAY_COMMERCE_PRICING_ASSET", "MOONPAY_COMMERCE_RECIPIENTS_JSON",
-  "MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MOONPAY_COMMERCE_YEARLY_INTERVAL",
-]);
-const WORKER = new Set([
-  "MARKETPLACE_INTENT_SIGNING_SEED", "MARKETPLACE_DEMO_VAULT_PATH",
-  "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
-]);
+const COMMON = new Set<string>(MARKETPLACE_ROLE_INPUT_NAMES.common);
+const API = new Set<string>(MARKETPLACE_ROLE_INPUT_NAMES.api);
+const WORKER = new Set<string>(MARKETPLACE_ROLE_INPUT_NAMES.worker);
 const BRIDGE = new Set([
   "HUB_MARKETPLACE_STATUS_ORIGIN", "HUB_MARKETPLACE_STATUS_CREDENTIAL",
   "HUB_MARKETPLACE_STATUS_TIMEOUT_MS",
 ]);
 const KNOWN = new Set(MARKETPLACE_INPUT_DEFINITIONS.map((field) => field.name));
+const LEGACY_DERIVED = new Set([
+  "MARKETPLACE_INTENT_PUBLIC_KEY",
+  "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256",
+  "MARKETPLACE_DEMO_MASTER_IMPORTED",
+]);
 
 function refuse(): never { throw new Error("privileged Marketplace request refused"); }
 
@@ -86,7 +78,12 @@ function safeFile(filename: string): Buffer | null {
   }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) refuse();
   const fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-  try { return fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size > 1024 * 1024
+      || opened.dev !== stat.dev || opened.ino !== stat.ino) refuse();
+    return fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
 }
 
 function decodeEnv(bytes: Buffer | null): Map<string, string> {
@@ -151,16 +148,37 @@ function atomic(filename: string, bytes: Buffer, group: string | null, mode: num
   const parentStat = fs.lstatSync(parent);
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) refuse();
   safeFile(filename);
-  const temp = path.join(parent, `.${path.basename(filename)}.${process.pid}.tmp`);
-  const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(temp, filename);
-  if (group !== null) {
-    const owned = spawnSync("chown", [`root:${group}`, filename], { stdio: "ignore", shell: false });
-    if (owned.status !== 0) refuse();
+  const temp = path.join(parent, `.${path.basename(filename)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    if (group !== null) {
+      const owned = spawnSync("chown", [`root:${group}`, temp], { stdio: "ignore", shell: false });
+      if (owned.status !== 0) refuse();
+    }
+    fs.chmodSync(temp, mode);
+    // The destination was checked above. Rename only after the temporary file
+    // already has its final owner/mode, so no secret role file is briefly
+    // root-readable under the wrong service contract.
+    fs.renameSync(temp, filename);
+    const dirFd = fs.openSync(parent, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+  } catch {
+    try { if (fd !== null) fs.closeSync(fd); } catch { /* continue cleanup */ }
+    try { fs.unlinkSync(temp); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") refuse();
+    }
+    refuse();
   }
-  fs.chmodSync(filename, mode);
-  const dirFd = fs.openSync(parent, fs.constants.O_RDONLY);
+}
+
+function removeFile(filename: string): void {
+  if (safeFile(filename) === null) return;
+  try { fs.unlinkSync(filename); } catch { refuse(); }
+  const dirFd = fs.openSync(path.dirname(filename), fs.constants.O_RDONLY);
   try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
 }
 
@@ -185,18 +203,65 @@ function directConfig(): MarketplaceInputsConfig {
   };
 }
 
+function legacyValues(): Map<string, string> {
+  const values = decodeEnv(safeFile(LEGACY_ENV));
+  for (const name of values.keys()) {
+    if (!KNOWN.has(name) && !LEGACY_DERIVED.has(name)) refuse();
+  }
+  return values;
+}
+
+function exactValues(filename: string, allowed: ReadonlySet<string>): Map<string, string> {
+  const values = decodeEnv(safeFile(filename));
+  for (const name of values.keys()) if (!allowed.has(name)) refuse();
+  return values;
+}
+
+function masterPair(values: ReadonlyMap<string, string>): { apiKey: string; apiSecret: string } | null {
+  const apiKey = values.get("MARKETPLACE_DEMO_MASTER_API_KEY");
+  const apiSecret = values.get("MARKETPLACE_DEMO_MASTER_API_SECRET");
+  if ((apiKey === undefined) !== (apiSecret === undefined)) refuse();
+  if (apiKey === undefined || apiSecret === undefined) return null;
+  if (apiKey === MASTER_KEY_MARKER && apiSecret === MASTER_SECRET_MARKER) return null;
+  if (apiKey.trim() !== apiKey || apiKey.length < 8 || /[\0\r\n]/.test(apiKey)
+    || apiSecret.trim() !== apiSecret || apiSecret.length < 16 || /[\0\r\n]/.test(apiSecret)) refuse();
+  return { apiKey, apiSecret };
+}
+
+function masterFromStoredSources(): { apiKey: string; apiSecret: string } | null {
+  return masterPair(exactValues(STATE_ENV, KNOWN)) ?? masterPair(legacyValues());
+}
+
 function seedState(): void {
   const stateBytes = safeFile(STATE_ENV);
-  const values = decodeEnv(stateBytes);
+  const values = new Map<string, string>();
+  // A pre-v0.89.45 monolithic file may be the only source on the first
+  // v0.3.13 apply. Hydrate only exact known non-master values. Raw Bybit
+  // master material is held in memory later and goes directly to the worker
+  // importer; it is never serialized into Hub state or any role env file.
+  for (const [name, value] of legacyValues()) {
+    if (KNOWN.has(name)
+      && name !== "MARKETPLACE_DEMO_MASTER_API_KEY"
+      && name !== "MARKETPLACE_DEMO_MASTER_API_SECRET") values.set(name, value);
+  }
+  for (const [name, value] of exactValues(STATE_ENV, KNOWN)) values.set(name, value);
   const deployment = new Set(MARKETPLACE_INPUT_DEFINITIONS
     .filter((field) => field.setup === "deployment").map((field) => field.name));
-  for (const filename of [COMMON_ENV, API_ENV, WORKER_ENV, BRIDGE_ENV]) {
-    for (const [name, value] of decodeEnv(safeFile(filename))) {
+  const roleSources = [
+    [COMMON_ENV, new Set([...COMMON, "MARKETPLACE_INTENT_PUBLIC_KEY"])],
+    [API_ENV, new Set([...API, "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256"])],
+    [WORKER_ENV, WORKER],
+    [BRIDGE_ENV, BRIDGE],
+  ] as const;
+  for (const [filename, allowed] of roleSources) {
+    for (const [name, value] of exactValues(filename, allowed)) {
       if (KNOWN.has(name) && (!values.has(name) || deployment.has(name))) values.set(name, value);
     }
   }
-  const vault = values.get("MARKETPLACE_DEMO_VAULT_PATH");
-  if (vault !== undefined && safeFile(vault) !== null) {
+  const declaredVault = values.get("MARKETPLACE_DEMO_VAULT_PATH");
+  const vault = declaredVault === WORKER_VAULT || declaredVault === LEGACY_VAULT
+    ? safeFile(declaredVault) : null;
+  if (vault !== null || safeFile(WORKER_VAULT) !== null || safeFile(LEGACY_VAULT) !== null) {
     values.set("MARKETPLACE_DEMO_MASTER_API_KEY", MASTER_KEY_MARKER);
     values.set("MARKETPLACE_DEMO_MASTER_API_SECRET", MASTER_SECRET_MARKER);
   }
@@ -272,6 +337,13 @@ function importMaster(apiKey: string, apiSecret: string): void {
   if (result.status !== 0) refuse();
 }
 
+function stageVaultMigration(legacy: Buffer | null, worker: Buffer | null): void {
+  if (legacy !== null && worker !== null && !legacy.equals(worker)) refuse();
+  if (legacy !== null && worker === null) {
+    atomic(WORKER_VAULT, legacy, "liqhunter-marketplace-worker", 0o600);
+  }
+}
+
 function sanitizedProvider(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) refuse();
   const row = value as Record<string, unknown>;
@@ -315,17 +387,23 @@ async function privateAdmin(pathname: string, method: "GET" | "POST", body?: Rec
 }
 
 function restoreFiles(previous: ReadonlyMap<string, Buffer | null>): void {
+  let failed = false;
   for (const [filename, bytes] of previous) {
-    if (bytes === null) { try { fs.unlinkSync(filename); } catch { /* absent or fail-closed */ } }
-    else {
-      const role = filename === COMMON_ENV ? ["liqhunter-marketplace-common", 0o640] as const
-        : filename === API_ENV ? ["liqhunter-marketplace-api", 0o640] as const
-          : filename === WORKER_ENV ? ["liqhunter-marketplace-worker", 0o640] as const
-            : filename === MIGRATE_ENV ? ["liqhunter-marketplace-migrate", 0o640] as const
-              : [null, 0o600] as const;
-      atomic(filename, bytes, role[0], role[1]);
-    }
+    try {
+      if (bytes === null) removeFile(filename);
+      else {
+        const role = filename === COMMON_ENV ? ["liqhunter-marketplace-common", 0o640] as const
+          : filename === API_ENV ? ["liqhunter-marketplace-api", 0o640] as const
+            : filename === WORKER_ENV ? ["liqhunter-marketplace-worker", 0o640] as const
+              : filename === MIGRATE_ENV ? ["liqhunter-marketplace-migrate", 0o640] as const
+                : filename === WORKER_VAULT || filename === LEGACY_VAULT
+                  ? ["liqhunter-marketplace-worker", 0o600] as const
+                  : [null, 0o600] as const;
+        atomic(filename, bytes, role[0], role[1]);
+      }
+    } catch { failed = true; }
   }
+  if (failed) refuse();
 }
 
 async function main(): Promise<void> {
@@ -367,6 +445,9 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify({ ok: true, provider: sanitizedProvider(result.provider) }));
     return;
   }
+  // Capture a pre-split master only for an apply transaction. Snapshot remains
+  // non-mutating with respect to the worker vault and never returns the value.
+  const storedMaster = row.action === "apply" ? masterFromStoredSources() : null;
   seedState();
   const cfg = directConfig();
   if (row.action === "snapshot") {
@@ -395,17 +476,37 @@ async function main(): Promise<void> {
     changes.MARKETPLACE_DEMO_MASTER_API_KEY = MASTER_KEY_MARKER;
     changes.MARKETPLACE_DEMO_MASTER_API_SECRET = MASTER_SECRET_MARKER;
   }
+  const legacyVault = safeFile(LEGACY_VAULT);
+  const workerVault = safeFile(WORKER_VAULT);
+  if (legacyVault !== null && workerVault !== null && !legacyVault.equals(workerVault)) refuse();
+  if (master === null && legacyVault === null && workerVault === null && storedMaster !== null) {
+    master = storedMaster;
+    changes.MARKETPLACE_DEMO_MASTER_API_KEY = MASTER_KEY_MARKER;
+    changes.MARKETPLACE_DEMO_MASTER_API_SECRET = MASTER_SECRET_MARKER;
+  }
   const transformed: MarketplaceInputUpdate = { ...update, changes };
-  const tracked = [STATE_ENV, BRIDGE_ENV, COMMON_ENV, API_ENV, WORKER_ENV, MIGRATE_ENV];
+  const tracked = [
+    STATE_ENV, BRIDGE_ENV, COMMON_ENV, API_ENV, WORKER_ENV, MIGRATE_ENV,
+    LEGACY_ENV, LEGACY_VAULT, WORKER_VAULT,
+  ];
   const previous = new Map(tracked.map((filename) => [filename, safeFile(filename)]));
   try {
     await applyMarketplaceInputUpdate(cfg, transformed);
     distribute();
+    stageVaultMigration(legacyVault, workerVault);
     if (master !== null) importMaster(master.apiKey, master.apiSecret);
     serviceRestart();
+    // Only after both services prove active may obsolete secret stores be
+    // retired. Cleanup remains inside the transaction: a failure restores the
+    // monolithic env and both vault paths before the old services are retried.
+    removeFile(LEGACY_VAULT);
+    removeFile(LEGACY_ENV);
   } catch {
-    restoreFiles(previous);
-    try { serviceRestart(); } catch { /* restored bytes remain the source of truth */ }
+    let restored = false;
+    try { restoreFiles(previous); restored = true; } catch { /* refuse below */ }
+    if (restored) {
+      try { serviceRestart(); } catch { /* restored bytes remain the source of truth */ }
+    }
     refuse();
   }
   const snapshot = marketplaceInputSnapshot(cfg);
