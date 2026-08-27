@@ -23,9 +23,37 @@ export const MARKETPLACE_RESTART_UNITS = Object.freeze([
   "liqhunter-marketplace-worker.service",
 ] as const);
 
+/** Exact least-privilege environment routing. These are names only: values
+ * remain inside the privileged helper. Derived public-key/digest values are
+ * appended there after their secret source has been routed to the worker. */
+export const MARKETPLACE_ROLE_INPUT_NAMES = Object.freeze({
+  common: Object.freeze([
+    "MARKETPLACE_ENABLED", "MARKETPLACE_SUBSCRIPTION_MODE", "MARKETPLACE_HTTP_HOST",
+    "MARKETPLACE_HTTP_PORT", "MARKETPLACE_STORE", "MARKETPLACE_WORKER_INTERVAL_MS",
+    "MARKETPLACE_OUTBOX_BATCH", "MARKETPLACE_SHUTDOWN_GRACE_MS", "MARKETPLACE_DATABASE_URL",
+    "MARKETPLACE_INTENT_KEY_ID", "MARKETPLACE_RUNTIME_DIRECTORY", "MARKETPLACE_BUILD_COMMIT",
+    "MARKETPLACE_ALPHA_LICENCES", "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS",
+    "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", "LIQHUNTER_MARKETPLACE_URL",
+    "LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED",
+    "LIQHUNTER_HUB_KEY", "MARKETPLACE_ADMIN_LICENCES",
+  ]),
+  api: Object.freeze([
+    "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", "MOONPAY_COMMERCE_ENVIRONMENT",
+    "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
+    "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
+    "MOONPAY_COMMERCE_PRICING_ASSET", "MOONPAY_COMMERCE_RECIPIENTS_JSON",
+    "MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MOONPAY_COMMERCE_YEARLY_INTERVAL",
+  ]),
+  worker: Object.freeze([
+    "MARKETPLACE_INTENT_SIGNING_SEED", "MARKETPLACE_DEMO_VAULT_PATH",
+    "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
+  ]),
+  migrate: Object.freeze([] as string[]),
+} as const);
+
 export type MarketplaceInputGroup = "bridge" | "service" | "alpha" | "bybit-demo" | "moonpay";
 export type MarketplaceInputKind = "text" | "password" | "number" | "select" | "textarea";
-export type MarketplaceInputSetup = "operator" | "automatic" | "deployment";
+export type MarketplaceInputSetup = "operator" | "automatic" | "deployment" | "deferred";
 
 export interface MarketplaceInputDefinition {
   readonly name: string;
@@ -36,7 +64,9 @@ export interface MarketplaceInputDefinition {
   readonly kind: MarketplaceInputKind;
   /** `operator` is shown in the normal form. `automatic` is owned by the Hub.
    * `deployment` is installed from the private service/runtime, never typed
-   * into a browser. All three remain in the masked diagnostic snapshot. */
+   * into a browser. `deferred` is a known future vendor input which is neither
+   * accepted nor persisted while its integration is disabled. Every class
+   * remains visible only as configured/missing state in diagnostics. */
   readonly setup: MarketplaceInputSetup;
   readonly help: string;
   readonly placeholder?: string;
@@ -186,6 +216,7 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
   d({ name: "HUB_MARKETPLACE_STATUS_TIMEOUT_MS", label: "Status timeout (ms)", group: "bridge", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "3000", help: "Managed automatically." }, integer("HUB_MARKETPLACE_STATUS_TIMEOUT_MS", 250, 15_000)),
 
   d({ name: "MARKETPLACE_ENABLED", label: "Marketplace enabled", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["1"], help: "Enabled automatically for the private alpha service only." }, (v) => exact(v, "MARKETPLACE_ENABLED", ["1"])),
+  d({ name: "MARKETPLACE_SUBSCRIPTION_MODE", label: "Subscription mode", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["mock"], help: "Fixed to mock while vendor billing is deferred; no payment route is enabled." }, (v) => exact(v, "MARKETPLACE_SUBSCRIPTION_MODE", ["mock"])),
   d({ name: "MARKETPLACE_HTTP_HOST", label: "Private API host", group: "service", setup: "automatic", secret: false, required: false, kind: "select", options: ["127.0.0.1", "::1"], placeholder: "127.0.0.1", help: "Fixed automatically to loopback." }, (v) => exact(v, "MARKETPLACE_HTTP_HOST", ["127.0.0.1", "::1"])),
   d({ name: "MARKETPLACE_HTTP_PORT", label: "Private API port", group: "service", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "8099", help: "Managed automatically." }, integer("MARKETPLACE_HTTP_PORT", 1, 65_535)),
   d({ name: "MARKETPLACE_STORE", label: "System of record", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["postgres"], help: "Fixed automatically to durable PostgreSQL." }, (v) => exact(v, "MARKETPLACE_STORE", ["postgres"])),
@@ -220,18 +251,18 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
   d({ name: "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", label: "Demo evidence interval (ms)", group: "bybit-demo", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "60000", help: "Managed automatically." }, integer("MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", 5_000, 3_600_000)),
   d({ name: "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", label: "Demo evidence max age (ms)", group: "bybit-demo", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "180000", help: "Managed automatically." }, integer("MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", 10_000, 3_600_000)),
 
-  d({ name: "MOONPAY_COMMERCE_ENVIRONMENT", label: "MoonPay environment", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "select", options: ["production", "development"], placeholder: "production", help: "Defaults automatically to production." }, (v) => exact(v, "MOONPAY_COMMERCE_ENVIRONMENT", ["production", "development"])),
-  d({ name: "MOONPAY_COMMERCE_PUBLIC_KEY", label: "MoonPay public bearer key", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the public/bearer key when MoonPay Commerce is enabled." }, opaque("MOONPAY_COMMERCE_PUBLIC_KEY", 16, "MoonPay bearer key")),
-  d({ name: "MOONPAY_COMMERCE_SECRET_KEY", label: "MoonPay secret key", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the matching secret when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_SECRET_KEY", 16, "MoonPay secret")),
-  d({ name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", label: "MoonPay webhook token", group: "moonpay", setup: "operator", secret: true, required: false, kind: "password", help: "Optional while subscriptions are mocked. Paste the webhook token when MoonPay is enabled." }, opaque("MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", 32, "webhook token")),
-  d({ name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", label: "MoonPay USDT currency ID", group: "moonpay", setup: "operator", secret: false, required: false, kind: "text", help: "Optional while subscriptions are mocked. Paste MoonPay's USDT identifier when enabled." }, identifier("MOONPAY_COMMERCE_PRICING_CURRENCY_ID", 128)),
-  d({ name: "MOONPAY_COMMERCE_PRICING_ASSET", label: "Crypto pricing asset", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", placeholder: "USDT", help: "Fixed automatically to USDT when MoonPay is enabled." }, (v) => {
+  d({ name: "MOONPAY_COMMERCE_ENVIRONMENT", label: "MoonPay environment", group: "moonpay", setup: "deferred", secret: false, required: false, kind: "select", options: ["production", "development"], placeholder: "production", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, (v) => exact(v, "MOONPAY_COMMERCE_ENVIRONMENT", ["production", "development"])),
+  d({ name: "MOONPAY_COMMERCE_PUBLIC_KEY", label: "MoonPay public bearer key", group: "moonpay", setup: "deferred", secret: true, required: false, kind: "password", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, opaque("MOONPAY_COMMERCE_PUBLIC_KEY", 16, "MoonPay bearer key")),
+  d({ name: "MOONPAY_COMMERCE_SECRET_KEY", label: "MoonPay secret key", group: "moonpay", setup: "deferred", secret: true, required: false, kind: "password", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, opaque("MOONPAY_COMMERCE_SECRET_KEY", 16, "MoonPay secret")),
+  d({ name: "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", label: "MoonPay webhook token", group: "moonpay", setup: "deferred", secret: true, required: false, kind: "password", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, opaque("MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", 32, "webhook token")),
+  d({ name: "MOONPAY_COMMERCE_PRICING_CURRENCY_ID", label: "MoonPay USDT currency ID", group: "moonpay", setup: "deferred", secret: false, required: false, kind: "text", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, identifier("MOONPAY_COMMERCE_PRICING_CURRENCY_ID", 128)),
+  d({ name: "MOONPAY_COMMERCE_PRICING_ASSET", label: "Crypto pricing asset", group: "moonpay", setup: "deferred", secret: false, required: false, kind: "text", placeholder: "USDT", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, (v) => {
     if (!/^[A-Z0-9][A-Z0-9._-]{1,15}$/.test(v)) refusal("MOONPAY_COMMERCE_PRICING_ASSET", "must be a 2 through 16 character uppercase crypto asset id");
     return v;
   }),
-  d({ name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", label: "MoonPay payout wallet", group: "moonpay", setup: "operator", secret: true, required: false, kind: "textarea", placeholder: "[{\"currencyId\":\"...\",\"walletId\":\"...\",\"sourceBlockchainEngine\":\"...\"}]", help: "Optional while subscriptions are mocked. When enabled, paste the single crypto recipient. Cards and revenue shares remain refused." }, oneCryptoRecipient),
-  d({ name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", label: "Monthly interval word", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", help: "Fixed automatically to MONTH when MoonPay is enabled." }, identifier("MOONPAY_COMMERCE_MONTHLY_INTERVAL", 64)),
-  d({ name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", label: "Yearly interval word", group: "moonpay", setup: "automatic", secret: false, required: false, kind: "text", help: "Fixed automatically to YEAR when MoonPay is enabled." }, identifier("MOONPAY_COMMERCE_YEARLY_INTERVAL", 64)),
+  d({ name: "MOONPAY_COMMERCE_RECIPIENTS_JSON", label: "MoonPay payout wallet", group: "moonpay", setup: "deferred", secret: true, required: false, kind: "textarea", placeholder: "[{\"currencyId\":\"...\",\"walletId\":\"...\",\"sourceBlockchainEngine\":\"...\"}]", help: "Deferred while subscription mode is mock. A future enablement will still allow only one crypto recipient and no revenue share." }, oneCryptoRecipient),
+  d({ name: "MOONPAY_COMMERCE_MONTHLY_INTERVAL", label: "Monthly interval word", group: "moonpay", setup: "deferred", secret: false, required: false, kind: "text", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, identifier("MOONPAY_COMMERCE_MONTHLY_INTERVAL", 64)),
+  d({ name: "MOONPAY_COMMERCE_YEARLY_INTERVAL", label: "Yearly interval word", group: "moonpay", setup: "deferred", secret: false, required: false, kind: "text", help: "Deferred while subscription mode is mock; not accepted or persisted by this setup workflow." }, identifier("MOONPAY_COMMERCE_YEARLY_INTERVAL", 64)),
 ]);
 
 const BY_NAME = new Map(DEFINITIONS.map((definition) => [definition.name, definition]));
@@ -686,6 +717,7 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS: "60000",
     MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS: "180000",
   })) put(name, value);
+  next.set("MARKETPLACE_SUBSCRIPTION_MODE", "mock");
 
   put("LIQHUNTER_MARKETPLACE_URL", config.publicMarketplaceOrigin);
 
@@ -710,31 +742,25 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     );
   }
   if (demoKey !== undefined && demoSecret !== undefined) {
-    put("MARKETPLACE_DEMO_VAULT_PATH", "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault");
+    // This is a migration as well as a default. v0.89.45 split the worker into
+    // its own StateDirectory; retaining the former shared path would quietly
+    // keep credentials in the wrong service boundary forever.
+    next.set("MARKETPLACE_DEMO_VAULT_PATH", "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault");
     put("MARKETPLACE_DEMO_VAULT_KEY", randomBytes(32).toString("base64url"));
     put("MARKETPLACE_DEMO_WORKER_CREDENTIAL", randomBytes(32).toString("base64url"));
   }
 
-  const moonPayOperatorNames = [
+  // MoonPay is explicitly deferred. Pinning mock mode is not sufficient if an
+  // old monolithic environment still leaves live vendor credentials in the
+  // API role, so automatic setup removes every known MoonPay value. Re-enabling
+  // the integration requires a future schema/release and fresh vendor entry.
+  for (const name of [
+    "MOONPAY_COMMERCE_ENVIRONMENT",
     "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
     "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
-    "MOONPAY_COMMERCE_RECIPIENTS_JSON",
-  ];
-  const moonPayPresent = moonPayOperatorNames.filter((name) => next.has(name));
-  if (moonPayPresent.length !== 0 && moonPayPresent.length !== moonPayOperatorNames.length) {
-    throw new MarketplaceInputError("MOONPAY_COMMERCE_PUBLIC_KEY", "MoonPay is optional, but enabling it requires every MoonPay vendor field in one save");
-  }
-  if (moonPayPresent.length === moonPayOperatorNames.length) {
-    put("MOONPAY_COMMERCE_ENVIRONMENT", "production");
-    put("MOONPAY_COMMERCE_PRICING_ASSET", "USDT");
-    put("MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MONTH");
-    put("MOONPAY_COMMERCE_YEARLY_INTERVAL", "YEAR");
-  } else {
-    for (const name of [
-      "MOONPAY_COMMERCE_ENVIRONMENT", "MOONPAY_COMMERCE_PRICING_ASSET",
-      "MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MOONPAY_COMMERCE_YEARLY_INTERVAL",
-    ]) next.delete(name);
-  }
+    "MOONPAY_COMMERCE_PRICING_ASSET", "MOONPAY_COMMERCE_RECIPIENTS_JSON",
+    "MOONPAY_COMMERCE_MONTHLY_INTERVAL", "MOONPAY_COMMERCE_YEARLY_INTERVAL",
+  ]) next.delete(name);
 
   const intentId = next.get("MARKETPLACE_INTENT_KEY_ID");
   const intentSeed = next.get("MARKETPLACE_INTENT_SIGNING_SEED");
@@ -798,8 +824,12 @@ function applyUpdate(current: ReadonlyMap<string, string>, update: MarketplaceIn
   }
   const next = new Map(current);
   for (const [name, raw] of Object.entries(changes)) {
-    if (!BY_NAME.has(name)) throw new MarketplaceInputError(name, "is not in the exact Marketplace configuration allowlist");
+    const definition = BY_NAME.get(name);
+    if (definition === undefined) throw new MarketplaceInputError(name, "is not in the exact Marketplace configuration allowlist");
     if (!(typeof raw === "string" || raw === null)) throw new MarketplaceInputError(name, "must be text or null to clear");
+    if (definition.setup === "deferred" && raw !== null) {
+      throw new MarketplaceInputError(name, "is deferred while subscription mode is mock");
+    }
     if (raw === null) next.delete(name);
     else next.set(name, cleanSubmittedValue(name, raw));
   }

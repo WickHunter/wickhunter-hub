@@ -187,7 +187,7 @@
 </details>
 
 <h2 style="margin:1.2rem 0 .2rem">Finish Marketplace setup</h2>
-<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. MoonPay is optional and collapsed while subscriptions are mocked. Configured secrets are never shown again.</p>
+<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Subscriptions remain in explicit mock mode; MoonPay is deferred and its credentials are neither requested nor stored. Configured secrets are never shown again.</p>
 <form id="mktConfigForm" style="display:block">
   <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
   <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
@@ -647,7 +647,6 @@ async function mktRefresh() {
 
 const mktGroupLabels = {
   "bybit-demo": "Bybit Demo account creation",
-  moonpay: "MoonPay crypto payments",
 };
 
 async function mktProvidersRefresh() {
@@ -713,12 +712,10 @@ function mktRenderConfig(config) {
   for (const field of operatorFields) {
     let group = groups.get(field.group);
     if (!group) {
-      group = document.createElement(field.group === "moonpay" ? "details" : "section");
+      group = document.createElement("section");
       group.className = "configgroup";
-      const heading = document.createElement(field.group === "moonpay" ? "summary" : "h2");
-      heading.textContent = field.group === "moonpay"
-        ? "MoonPay crypto payments (optional — mocked for now)"
-        : (mktGroupLabels[field.group] || field.group);
+      const heading = document.createElement("h2");
+      heading.textContent = mktGroupLabels[field.group] || field.group;
       const fields = document.createElement("div");
       fields.className = "configfields";
       group.append(heading, fields);
@@ -738,28 +735,7 @@ function mktRenderConfig(config) {
     label.appendChild(variable);
 
     let input;
-    let friendlyRecipient = null;
-    if (field.name === "MOONPAY_COMMERCE_RECIPIENTS_JSON") {
-      input = document.createElement("input");
-      input.type = "hidden";
-      friendlyRecipient = document.createElement("div");
-      friendlyRecipient.className = "recipientfields";
-      for (const [part, title, placeholder] of [
-        ["walletId", "Payout wallet ID", "MoonPay wallet ID"],
-        ["sourceBlockchainEngine", "Blockchain", "for example: solana"],
-      ]) {
-        const partLabel = document.createElement("label");
-        partLabel.textContent = title;
-        const partInput = document.createElement("input");
-        partInput.type = "password";
-        partInput.placeholder = field.state === "configured" ? "Configured — leave blank to keep" : placeholder;
-        partInput.dataset.moonpayRecipientPart = part;
-        partInput.autocomplete = "off";
-        partInput.spellcheck = false;
-        partLabel.appendChild(partInput);
-        friendlyRecipient.appendChild(partLabel);
-      }
-    } else if (field.kind === "textarea") input = document.createElement("textarea");
+    if (field.kind === "textarea") input = document.createElement("textarea");
     else if (field.kind === "select") {
       input = document.createElement("select");
       const empty = document.createElement("option");
@@ -800,7 +776,6 @@ function mktRenderConfig(config) {
     help.className = "confighelp";
     help.textContent = field.help + (field.required ? " Required for readiness." : " Optional/defaultable.");
     card.append(label, input);
-    if (friendlyRecipient) card.appendChild(friendlyRecipient);
     card.appendChild(help);
     if (field.state !== "missing") {
       const clear = document.createElement("button");
@@ -843,18 +818,6 @@ async function mktConfigRefresh() {
 document.getElementById("mktConfigForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const changes = {};
-  const recipient = document.querySelector('[data-marketplace-name="MOONPAY_COMMERCE_RECIPIENTS_JSON"]');
-  const recipientParts = Array.from(document.querySelectorAll("[data-moonpay-recipient-part]"));
-  if (recipient && recipientParts.some((input) => input.value !== "")) {
-    const currency = document.querySelector('[data-marketplace-name="MOONPAY_COMMERCE_PRICING_CURRENCY_ID"]')?.value || "";
-    const wallet = recipientParts.find((input) => input.dataset.moonpayRecipientPart === "walletId")?.value || "";
-    const blockchain = recipientParts.find((input) => input.dataset.moonpayRecipientPart === "sourceBlockchainEngine")?.value || "";
-    if (!currency || !wallet || !blockchain) {
-      document.getElementById("mktConfigNote").textContent = "MoonPay currency ID, payout wallet ID and blockchain are all required together.";
-      return;
-    }
-    recipient.value = JSON.stringify([{ currencyId: currency, walletId: wallet, sourceBlockchainEngine: blockchain }]);
-  }
   for (const input of document.querySelectorAll("#mktConfigFields [data-marketplace-name]")) {
     const name = input.dataset.marketplaceName;
     if (input.dataset.clear === "1") changes[name] = null;

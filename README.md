@@ -792,6 +792,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.13 — Pin the private Marketplace services to mock subscriptions, expose
+  only the two real Bybit vendor inputs, split secrets strictly by service role,
+  migrate the encrypted Demo vault into its worker-only StateDirectory, retire
+  the legacy monolithic secret environment after a healthy restart, and restore
+  both role files and vault bytes if any apply/restart step fails.
 - v0.3.12 — Hydrate the masked Marketplace setup from the already-running
   split service roles, tolerate duplicate unrelated Hub settings while reading
   the one public origin, keep deferred MoonPay defaults out of readiness, and
