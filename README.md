@@ -808,6 +808,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.15 — Collect, persist and serve signed Binance USD-M USDT-perpetual
+  one-minute candles for Optimized bots. Binance uses its own native symbol
+  census, REST history, optional finalized WebSocket tail and request-weight
+  pacing; its seed data remains venue-partitioned and never falls back to
+  Bybit. Keep the separate paid market-cap producer venue list unchanged.
 - v0.3.14 — Add the required Bybit Demo worker egress IP allowlist as a masked,
   strictly validated JSON array of literal addresses routed only to the private
   Marketplace API role; refuse hostnames, CIDRs, wildcards, duplicates and
