@@ -117,6 +117,11 @@ const mk = (t, i) => ({ openMs: t, open: 100 + i, high: 101 + i, low: 99 + i, cl
 hubStore.write("bitget", "BTCUSDT", [
   mk(DAY0, 0), mk(DAY0 + MINUTE_MS, 1), mk(DAY0 + 3 * MINUTE_MS, 3), mk(DAY0 + 4 * MINUTE_MS, 4),
 ]);
+// Same symbol and minute on two exchanges, deliberately different. A Binance
+// seed must read only the Binance partition; serving the Bybit row here would
+// be the exact silent fallback Optimized bots must never accept.
+hubStore.write("binance", "BTCUSDT", [{ ...mk(DAY0, 0), close: 501.25 }]);
+hubStore.write("bybit", "BTCUSDT", [{ ...mk(DAY0, 0), close: 901.25 }]);
 
 const seedUrl = (q) => `${h.origin}/api/candles/seed?${new URLSearchParams(q)}`;
 
@@ -136,6 +141,16 @@ await test("a valid key gets a signed seed whose signature verifies over the wir
   const pub = createPublicKey(h.store.publicKeyPem());
   assert.equal(edVerify(null, canonicalBytes(unsigned), pub, Buffer.from(sig, "base64")), true,
     "a client that strips sig and re-serialises in the documented order verifies it");
+});
+
+await test("a Binance seed is served from the Binance partition, never Bybit", async () => {
+  const res = await fetch(seedUrl({ venue: "binance", symbol: "BTCUSDT", fromMs: DAY0, toMs: DAY0, key: token }));
+  assert.equal(res.status, 200);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.venue, "binance", "the signed provenance names Binance");
+  assert.equal(body.interval, "1", "the Hub contract remains native 1m");
+  assert.equal(body.rows[0][4], 501.25, "the Binance value is served");
+  assert.notEqual(body.rows[0][4], 901.25, "the Bybit sibling is unreachable");
 });
 
 // ── THE LICENCE MAY TRAVEL IN A HEADER, AND THE QUERY STRING STILL WORKS ────
@@ -222,7 +237,7 @@ await test("no key, a bad key, an expired key and a revoked key are all refused"
 });
 
 await test("an unknown venue is 400", async () => {
-  for (const venue of ["binance", "", "BITGET!"]) {
+  for (const venue of ["kraken", "", "BITGET!"]) {
     const r = await jsonReq(seedUrl({ venue, symbol: "BTCUSDT", fromMs: DAY0, toMs: DAY0 + MINUTE_MS, key: token }));
     assert.equal(r.status, 400, `venue: ${venue}`);
   }

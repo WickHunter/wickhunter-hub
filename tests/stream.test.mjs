@@ -9,7 +9,7 @@
 //
 // What these pin, in order of how badly each would hurt:
 //
-//  1. THE CLOSURE RULE. Two of three venues never mark a candle closed, so a
+//  1. THE CLOSURE RULE. Bitget and Bitunix never mark a candle closed, so a
 //     minute is published only once the venue sends a LATER minute. Get this
 //     wrong and the hub stores forming bars as final — a wrong candle, which
 //     this repo's own header calls worse than a missing one because the missing
@@ -60,7 +60,7 @@ await test("bitunix: the minute is DERIVED from the message clock", () => {
   assert.equal(t.closed, false, "bitunix never states closure");
 });
 
-await test("bybit: `confirm` is the only closure any venue states", () => {
+await test("bybit: `confirm` is its authoritative closure statement", () => {
   const [forming] = STREAM_ADAPTERS.bybit.parse(BYBIT_FORMING);
   const [closed] = STREAM_ADAPTERS.bybit.parse(BYBIT_CLOSED);
   assert.equal(forming.closed, false);

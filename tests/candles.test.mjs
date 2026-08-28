@@ -123,7 +123,7 @@ function stubStatus(status, body = {}, headers = {}) {
 }
 
 await test("HTTP 429 is classified as a rate limit, not a plain failure", async () => {
-  for (const venue of ["bybit", "bitunix", "bitget"]) {
+  for (const venue of ["bybit", "bitunix", "bitget", "binance"]) {
     const err = await ADAPTERS[venue].fetchKlines(stubStatus(429), "BTCUSDT", 0, 0).then(
       () => null, (e) => e,
     );
@@ -477,7 +477,10 @@ await test("each venue collects at its OWN documented rate, not one global figur
   // is therefore expressed in the venue's OWN units and converted, because a
   // request-count entry here would be a number nobody at Aster ever published.
   const documented = { bybit: 120, bitunix: 10, bitget: 20 };
-  const weightBudgeted = { aster: { perMinute: 2400, weightPerRequest: 5 } };
+  const weightBudgeted = {
+    binance: { perMinute: 2400, weightPerRequest: 5 },
+    aster: { perMinute: 2400, weightPerRequest: 5 },
+  };
   for (const v of VENUE_IDS) {
     const rps = ADAPTERS[v].publicRequestsPerSecond;
     assert.ok(rps > 0, `${v} states a ceiling`);
@@ -501,6 +504,7 @@ await test("each venue collects at its OWN documented rate, not one global figur
   assert.ok(auto.perVenueRequestsPerSecond, "the per-venue table is present when HUB_CANDLE_RPS is unset");
   assert.equal(auto.perVenueRequestsPerSecond.bitunix, ADAPTERS.bitunix.publicRequestsPerSecond);
   assert.equal(auto.perVenueRequestsPerSecond.bitget, ADAPTERS.bitget.publicRequestsPerSecond);
+  assert.equal(auto.perVenueRequestsPerSecond.binance, ADAPTERS.binance.publicRequestsPerSecond);
 
   // …and the operator's own number CLEARS it, so one figure they set means the
   // same thing on every venue — including when it is LOWER than the defaults,

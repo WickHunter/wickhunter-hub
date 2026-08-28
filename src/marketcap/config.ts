@@ -9,10 +9,10 @@
 // on it would be spending somebody's money without being asked, so the switch
 // is `MARKET_CAP_VENUES=` and there is no default value that turns it on.
 import path from "node:path";
-import { isVenueId, type VenueId } from "../candles/venues.js";
 import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS, DAY_MS, HOUR_MS, type MarketCapConfig } from "./service.js";
 import { QUOTE_BATCH_SIZE } from "./budget.js";
 import { LEDGER_FILE_DEFAULT, OVERRIDES_FILE_DEFAULT, SNAPSHOT_FILE_DEFAULT } from "./store.js";
+import { isMarketCapVenueId, type MarketCapVenueId } from "./venues.js";
 
 /** WHICH KEY SIGNS A MARKET-CAP SNAPSHOT.
  *
@@ -147,23 +147,23 @@ export function marketCapConfigFromEnv(env: NodeJS.ProcessEnv, dataDir: string):
   const venues = (env.MARKET_CAP_VENUES ?? "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
-    .filter(isVenueId);
+    .filter(isMarketCapVenueId);
 
-  const slugs: Record<VenueId, string> = { ...DEFAULT_EXCHANGE_SLUGS };
+  const slugs: Record<MarketCapVenueId, string> = { ...DEFAULT_EXCHANGE_SLUGS };
   // `MARKET_CAP_SLUGS=aster:aster-pro,bybit:bybit` — an escape hatch for the
   // day a provider renames one, so a rename is an env edit and not a release.
   for (const pair of (env.MARKET_CAP_SLUGS ?? "").split(",")) {
     const [v, slug] = pair.split(":").map((s) => s.trim());
-    if (v && slug && isVenueId(v)) slugs[v] = slug;
+    if (v && slug && isMarketCapVenueId(v)) slugs[v] = slug;
   }
 
   // `MARKET_CAP_EXCHANGE_IDS=aster:1452,bybit:521` — the same escape hatch the
   // slugs have, for the day the provider re-keys an exchange. Both are checked
   // against each other at run time; see DEFAULT_EXCHANGE_IDS.
-  const exchangeIds: Partial<Record<VenueId, number>> = { ...DEFAULT_EXCHANGE_IDS };
+  const exchangeIds: Partial<Record<MarketCapVenueId, number>> = { ...DEFAULT_EXCHANGE_IDS };
   for (const pair of (env.MARKET_CAP_EXCHANGE_IDS ?? "").split(",")) {
     const [v, id] = pair.split(":").map((x) => x.trim());
-    if (v && id && isVenueId(v) && Number.isInteger(Number(id)) && Number(id) > 0) exchangeIds[v] = Number(id);
+    if (v && id && isMarketCapVenueId(v) && Number.isInteger(Number(id)) && Number(id) > 0) exchangeIds[v] = Number(id);
   }
 
   const signing = marketCapSigningFromEnv(env);

@@ -18,8 +18,9 @@
 // silently truncate the universe, which reads downstream as "those pairs no
 // longer exist". The cursor is followed to exhaustion, bounded, and a venue
 // that keeps handing back cursors is refused rather than looped on.
-import type { FetchLike, VenueId } from "../candles/venues.js";
+import type { FetchLike } from "../candles/venues.js";
 import type { ExchangeInstrument } from "./identity.js";
+import type { MarketCapVenueId } from "./venues.js";
 
 /** Rows arrive as `unknown`; a field that is not a non-empty string is absent,
  *  and absent is never filled in. */
@@ -28,7 +29,7 @@ const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 const asArray = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 export interface InstrumentCatalogue {
-  venue: VenueId;
+  venue: MarketCapVenueId;
   instruments: ExchangeInstrument[];
   /** Rows the venue published that this parser could not use, counted so a
    *  catalogue that starts arriving in a new shape is visible as a number
@@ -145,7 +146,7 @@ async function getJson(fetchLike: FetchLike, url: string): Promise<unknown> {
 
 const BYBIT_MAX_PAGES = 20;
 
-export async function fetchInstruments(venue: VenueId, fetchLike: FetchLike): Promise<InstrumentCatalogue> {
+export async function fetchInstruments(venue: MarketCapVenueId, fetchLike: FetchLike): Promise<InstrumentCatalogue> {
   switch (venue) {
     case "bybit": {
       const instruments: ExchangeInstrument[] = [];

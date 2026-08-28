@@ -17,7 +17,7 @@
 // to start: every added package is code that runs beside the licence signing
 // key.
 //
-// ── THE HARD PART: TWO OF THREE VENUES NEVER SAY "CLOSED" ───────────────────
+// ── THE HARD PART: SOME VENUES NEVER SAY "CLOSED" ───────────────────────────
 // Frames captured live from the real endpoints while writing this (Bybit's leg
 // is from its documented v5 contract and the working client in the bot repo —
 // this build environment is geo-blocked from Bybit and could not probe it):
@@ -43,6 +43,13 @@
 //   BYBIT  wss://stream.bybit.com/v5/public/linear
 //     {"topic":"kline.1.BTCUSDT","data":[{"start":...,"confirm":true,...}]}
 //     States closure outright, and it is authoritative.
+//
+//   BINANCE USD-M  wss://fstream.binance.com/market/stream
+//     {"stream":"btcusdt@kline_1m","data":{"e":"kline","s":"BTCUSDT",
+//      "st":1,"k":{"t":...,"i":"1m","o":"...","c":"...",
+//      "h":"...","l":"...","v":"...","x":true}}}
+//     Official USD-M contract. `x` states closure; post-UM/CM-migration `st=1`
+//     identifies USD-M and any explicit other product is refused here.
 //
 //   ASTER  wss://fstream.asterdex.com/ws
 //     {"e":"kline","E":1787004721172,"s":"BTCUSDT","k":{"t":1787004660000,
@@ -123,7 +130,7 @@ export function openMsFromTs(tsMs: number): number {
   return floorMinute(num(tsMs));
 }
 
-// ── the three adapters ──────────────────────────────────────────────────────
+// ── the venue adapters ──────────────────────────────────────────────────────
 
 const bitget: StreamAdapter = {
   id: "bitget",
@@ -219,13 +226,61 @@ const bybit: StreamAdapter = {
           openMs, open: num(k.open), high: num(k.high), low: num(k.low),
           close: num(k.close), volume: num(k.volume),
         },
-        // THE ONLY VENUE THAT STATES IT. Trusted, because it is the venue's
-        // own assertion rather than an inference of ours.
+        // The venue states it. Trusted, because it is the venue's own assertion
+        // rather than an inference of ours.
         closed: k.confirm === true,
       };
       if (usable(t)) out.push(t);
     }
     return out;
+  },
+};
+
+const binance: StreamAdapter = {
+  id: "binance",
+  // The MARKET route is load-bearing after Binance's public/market split.
+  // Public REST and this socket are both mainnet and credentialless.
+  url: "wss://fstream.binance.com/market/stream",
+  // Binance documents 1024 streams per connection. Five hundred leaves room
+  // for protocol evolution and keeps a full USDT perpetual roster to one or
+  // two sockets without approaching the limit.
+  maxTopicsPerConnection: 500,
+  // No JSON ping: Binance uses protocol ping/pong and Node's WebSocket answers
+  // it. Sending an invented application heartbeat spends the incoming-message
+  // budget for no benefit.
+  subscribeFrames(symbols) {
+    const params = symbols
+      .filter((s) => /^[A-Z0-9]{2,28}USDT$/.test(s))
+      .map((s) => `${s.toLowerCase()}@kline_1m`);
+    return params.length ? [{ method: "SUBSCRIBE", params, id: 1 }] : [];
+  },
+  parse(frame) {
+    let m: {
+      e?: string; s?: string; st?: unknown; k?: Record<string, unknown>;
+      stream?: string; data?: { e?: string; s?: string; st?: unknown; k?: Record<string, unknown> };
+    };
+    try { m = JSON.parse(frame); } catch { return []; }
+    if (!m || typeof m !== "object") return [];
+    const p = m.data && typeof m.data === "object" ? m.data : m;
+    if (p.e !== "kline" || !p.k || typeof p.k !== "object") return [];
+    // After the UM/CM public-market merge both products can ride this host.
+    // An explicit product discriminator other than USD-M is never accepted.
+    if (p.st !== undefined && Number(p.st) !== 1) return [];
+    const k = p.k;
+    if (k.i !== "1m") return [];
+    const symbol = String(k.s ?? p.s ?? "");
+    if (!/^[A-Z0-9]{2,28}USDT$/.test(symbol)) return [];
+    const openMs = num(k.t);
+    const t: StreamTick = {
+      symbol,
+      openMs,
+      candle: {
+        openMs, open: num(k.o), high: num(k.h), low: num(k.l), close: num(k.c),
+        volume: num(k.v),
+      },
+      closed: k.x === true,
+    };
+    return usable(t) ? [t] : [];
   },
 };
 
@@ -296,7 +351,7 @@ const aster: StreamAdapter = {
   },
 };
 
-export const STREAM_ADAPTERS: Record<VenueId, StreamAdapter> = { bybit, bitunix, bitget, aster };
+export const STREAM_ADAPTERS: Record<VenueId, StreamAdapter> = { bybit, bitunix, bitget, binance, aster };
 
 // ── the closure buffer ──────────────────────────────────────────────────────
 

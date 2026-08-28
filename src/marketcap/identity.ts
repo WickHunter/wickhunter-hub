@@ -29,14 +29,14 @@
 // system carries that in its name. The genuine numeric-leading tickers —
 // `1INCH`, `0G`, `2Z`, `4`, `100X` — must come out of it untouched, which is
 // the property the suite pins.
-import type { VenueId } from "../candles/venues.js";
+import type { MarketCapVenueId } from "./venues.js";
 
 /** One tradeable instrument as ITS OWN EXCHANGE describes it. `base` is the
  *  venue's own base-asset field, kept as raw evidence: deriving it by trimming
  *  "USDT" off the symbol would invent a base for every venue that spells one
  *  differently, and it is precisely the join key the pair map uses. */
 export interface ExchangeInstrument {
-  venue: VenueId;
+  venue: MarketCapVenueId;
   symbol: string;
   base: string;
   quote: string;
@@ -71,7 +71,7 @@ export interface ProviderPair {
 export type IdentityState = "mapped" | "ambiguous" | "provider_untracked" | "not_applicable";
 
 export interface IdentityRow {
-  venue: VenueId;
+  venue: MarketCapVenueId;
   symbol: string;
   exchangeBase: string;
   exchangeQuote: string;
@@ -206,7 +206,7 @@ export function buildPairIndex(pairs: readonly ProviderPair[]): PairIndex {
 
 export interface ResolveDeps {
   /** venue id -> the provider's exchange slug (e.g. aster -> "aster-pro"). */
-  slugOf(venue: VenueId): string | null;
+  slugOf(venue: MarketCapVenueId): string | null;
   index: PairIndex;
   overrides: OverrideMap;
 }
