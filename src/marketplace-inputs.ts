@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createPrivateKey, createPublicKey, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { spawn as nodeSpawn } from "node:child_process";
 import { TextDecoder } from "node:util";
 
@@ -38,7 +39,8 @@ export const MARKETPLACE_ROLE_INPUT_NAMES = Object.freeze({
     "LIQHUNTER_HUB_KEY", "MARKETPLACE_ADMIN_LICENCES",
   ]),
   api: Object.freeze([
-    "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", "MOONPAY_COMMERCE_ENVIRONMENT",
+    "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL", "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST",
+    "MOONPAY_COMMERCE_ENVIRONMENT",
     "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
     "MOONPAY_COMMERCE_WEBHOOK_SHARED_TOKEN", "MOONPAY_COMMERCE_PRICING_CURRENCY_ID",
     "MOONPAY_COMMERCE_PRICING_ASSET", "MOONPAY_COMMERCE_RECIPIENTS_JSON",
@@ -158,6 +160,30 @@ function roster(name: string): Validator {
   };
 }
 
+/** Bybit applies this value to newly created Demo API credentials. It is an
+ * operator-supplied network fact, not a hostname/CIDR policy language: accept
+ * only a bounded JSON array of literal addresses and persist one canonical
+ * spelling of the array. Error text never repeats a submitted address. */
+const exactIpAllowlist: Validator = (value) => {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { refusal("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST", "must be valid JSON containing a non-empty array of exact IP address strings"); }
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 64) {
+    refusal("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST", "must contain 1 through 64 exact IPv4 or IPv6 address strings");
+  }
+  const addresses: string[] = [];
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (typeof item !== "string" || item.trim() !== item || item.length > 64 || isIP(item) === 0) {
+      refusal("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST", "accepts only literal IPv4 or IPv6 addresses; CIDRs, wildcards, hostnames and surrounding whitespace are refused");
+    }
+    if (seen.has(item)) refusal("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST", "must not contain duplicate address strings");
+    seen.add(item);
+    addresses.push(item);
+  }
+  return JSON.stringify(addresses);
+};
+
 const publicKeyring: Validator = (value) => {
   let parsed: unknown;
   try { parsed = JSON.parse(value); } catch { refusal("LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS", "must be a JSON object of key id to canonical base64url 32-byte public key"); }
@@ -245,6 +271,7 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
 
   d({ name: "MARKETPLACE_DEMO_MASTER_API_KEY", label: "Bybit Demo master API key", group: "bybit-demo", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the WickHunter-owned Bybit API key used to create and control Demo accounts." }, opaque("MARKETPLACE_DEMO_MASTER_API_KEY", 8, "Bybit API key")),
   d({ name: "MARKETPLACE_DEMO_MASTER_API_SECRET", label: "Bybit Demo master API secret", group: "bybit-demo", setup: "operator", secret: true, required: true, kind: "password", help: "Paste the matching Bybit API secret." }, opaque("MARKETPLACE_DEMO_MASTER_API_SECRET", 16, "Bybit API secret")),
+  d({ name: "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST", label: "Demo worker egress IP allowlist", group: "bybit-demo", setup: "operator", secret: true, required: true, kind: "textarea", placeholder: "[\"203.0.113.10\"]", help: "Enter a JSON array of the exact IPv4/IPv6 addresses used by this API/worker host. Hostnames, CIDRs and wildcards are refused. The saved addresses remain masked." }, exactIpAllowlist),
   d({ name: "MARKETPLACE_DEMO_VAULT_PATH", label: "Demo credential vault path", group: "bybit-demo", setup: "automatic", secret: false, required: true, kind: "text", placeholder: "/var/lib/liqhunter/marketplace-worker/demo-credentials.vault", help: "Fixed automatically inside the worker-only StateDirectory." }, (v) => exact(v, "MARKETPLACE_DEMO_VAULT_PATH", ["/var/lib/liqhunter/marketplace-worker/demo-credentials.vault", "/var/lib/liqhunter/marketplace/demo-credentials.vault"])),
   d({ name: "MARKETPLACE_DEMO_VAULT_KEY", label: "Demo vault key", group: "bybit-demo", setup: "automatic", secret: true, required: true, kind: "password", generated: "vault", help: "Generated automatically and kept server-side." }, canonicalKey32("MARKETPLACE_DEMO_VAULT_KEY")),
   d({ name: "MARKETPLACE_DEMO_WORKER_CREDENTIAL", label: "Demo worker credential", group: "bybit-demo", setup: "automatic", secret: true, required: true, kind: "password", generated: "worker", help: "Generated automatically and kept server-side." }, opaque("MARKETPLACE_DEMO_WORKER_CREDENTIAL", 32, "worker credential")),

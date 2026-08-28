@@ -792,6 +792,10 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.14 — Add the required Bybit Demo worker egress IP allowlist as a masked,
+  strictly validated JSON array of literal addresses routed only to the private
+  Marketplace API role; refuse hostnames, CIDRs, wildcards, duplicates and
+  malformed input without exposing the saved network boundary.
 - v0.3.13 — Pin the private Marketplace services to mock subscriptions, expose
   only the two real Bybit vendor inputs, split secrets strictly by service role,
   migrate the encrypted Demo vault into its worker-only StateDirectory, retire
