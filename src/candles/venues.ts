@@ -27,6 +27,11 @@
 //           pinned by a REPLAY TEST against a recorded-shape page that contains
 //           a forming bar, rather than by a live probe. See the note below on
 //           why that is nonetheless safe.
+//   binance /fapi/v1/klines                      INCLUDES it (documented).
+//           This is USD-M MAINNET only. The exchangeInfo census below admits
+//           only USDT-quoted, USDT-margined PERPETUAL contracts; after Binance's
+//           UM/CM market-data merge that filter is the product boundary rather
+//           than an assumption based on which public host answered.
 //   aster   /fapi/v1/klines                      INCLUDES it.
 //           probed at 1787004960000+ with an explicit endTime on the forming
 //           minute; the forming bar came back. Probed WITHOUT a range it is
@@ -57,7 +62,7 @@
 import type { Candle } from "./store.js";
 import { MINUTE_MS, newestClosedOpenMs } from "./store.js";
 
-export const VENUE_IDS = ["bybit", "bitunix", "bitget", "aster"] as const;
+export const VENUE_IDS = ["bybit", "bitunix", "bitget", "binance", "aster"] as const;
 export type VenueId = (typeof VENUE_IDS)[number];
 
 export function isVenueId(v: unknown): v is VenueId {
@@ -110,7 +115,7 @@ export function isRateLimit(err: unknown): err is RateLimitError {
  *  The message regex is a SAFETY NET over those, not the primary test: a venue
  *  that invents a new code but still says "too frequent" is still telling us to
  *  slow down, and mistaking that for a hard error is the expensive direction. */
-const RATE_LIMIT_CODES = new Set(["10006", "10018", "429", "40018"]);
+const RATE_LIMIT_CODES = new Set(["10006", "10018", "429", "40018", "-1003"]);
 const RATE_LIMIT_TEXT = /too many|too frequent|frequently|rate.?limit|request limit|visit limit|exceed.*limit/i;
 
 function rateLimited(code: unknown, msg: unknown): boolean {
@@ -124,8 +129,8 @@ export interface KlinePage {
   /** ── v0.2.19 — "SLOW DOWN", SAID BEFORE THE REFUSAL ──────────────────────
    *
    *  Set when the venue's OWN budget readout says we are near its ceiling.
-   *  Only Aster publishes one (`x-mbx-used-weight-1m`); the other three leave
-   *  this undefined and are bit-for-bit unchanged.
+   *  Binance and Aster publish one (`x-mbx-used-weight-1m`); flat-rate venues
+   *  leave this undefined and are bit-for-bit unchanged.
    *
    *  RETURNED BESIDE THE PAGE RATHER THAN THROWN, and that is the whole point:
    *  the weight for this request is already spent, so throwing the candles away
@@ -362,6 +367,110 @@ const bitget: VenueAdapter = {
   },
 };
 
+// ── BINANCE USD-M ──────────────────────────────────────────────────────────
+// Public MAINNET market data only. Binance's post-migration public endpoints
+// may expose both USD-M and COIN-M products, so the host name is not the
+// provenance boundary: exchangeInfo must say quoteAsset=USDT,
+// marginAsset=USDT and contractType=PERPETUAL before a symbol is tracked.
+// That exact native spelling becomes both the store directory and the signed
+// seed symbol. There is no aliasing and no second-venue fallback.
+const BINANCE_BASE = "https://fapi.binance.com";
+const BINANCE_PAGE_LIMIT = 1000;
+
+/** Published IP request-weight ceiling from USD-M exchangeInfo. */
+export const BINANCE_REQUEST_WEIGHT_PER_MINUTE = 2400;
+/** Response header carrying this IP's current one-minute weight spend. */
+export const BINANCE_WEIGHT_HEADER = "x-mbx-used-weight-1m";
+export const BINANCE_WEIGHT_SHARE = 0.5;
+export const BINANCE_WEIGHT_ALARM_SHARE = 0.8;
+
+/** Binance's documented kline weight schedule. */
+export function binanceKlineWeight(limit: number): number {
+  if (!Number.isFinite(limit) || limit < 100) return 1;
+  if (limit < 500) return 2;
+  if (limit <= 1000) return 5;
+  return 10;
+}
+
+/** Convert Binance's weight/minute budget into this collector's request rate. */
+export function binancePacedRps(pageLimit: number, share = BINANCE_WEIGHT_SHARE): number {
+  return (BINANCE_REQUEST_WEIGHT_PER_MINUTE * share) / binanceKlineWeight(pageLimit) / 60;
+}
+
+function binanceWeightPressure(res: { headers?: { get(name: string): string | null } }): RateLimitError | undefined {
+  const used = Number(res.headers?.get(BINANCE_WEIGHT_HEADER));
+  if (!Number.isFinite(used) || used <= 0) return undefined;
+  const alarm = BINANCE_REQUEST_WEIGHT_PER_MINUTE * BINANCE_WEIGHT_ALARM_SHARE;
+  if (used < alarm) return undefined;
+  return new RateLimitError(
+    `binance reports ${used} of its published ${BINANCE_REQUEST_WEIGHT_PER_MINUTE}/min request-weight budget spent on this IP ` +
+    `(over ${Math.round(BINANCE_WEIGHT_ALARM_SHARE * 100)}%) — backing off before it refuses`,
+  );
+}
+
+async function binanceGet(fetchLike: FetchLike, url: string): Promise<{ body: unknown; slowDown?: RateLimitError }> {
+  const res = await fetchLike(url);
+  const refused = httpRefusal(res);
+  if (refused) throw refused;
+  let body: unknown;
+  try { body = await res.json(); }
+  catch { throw new Error(`HTTP ${res.status}: Binance returned unreadable JSON`); }
+  const error = body && typeof body === "object" && !Array.isArray(body)
+    ? body as { code?: unknown; msg?: unknown }
+    : null;
+  if (!res.ok || (error?.code !== undefined && Number(error.code) !== 0)) {
+    const detail = error?.code !== undefined
+      ? `binance code ${String(error.code)}: ${String(error.msg ?? "")}`
+      : `HTTP ${res.status}`;
+    throw rateLimited(error?.code, error?.msg) ? new RateLimitError(detail) : new Error(detail);
+  }
+  const slowDown = binanceWeightPressure(res);
+  return { body, ...(slowDown ? { slowDown } : {}) };
+}
+
+const binance: VenueAdapter = {
+  id: "binance",
+  pageLimit: BINANCE_PAGE_LIMIT,
+  // 1000 rows cost weight 5. Four requests/second spends 1200 weight/minute:
+  // exactly half of the published 2400/minute IP ceiling. The 1500-row maximum
+  // costs weight 10 and is worse value, so it is deliberately not used.
+  publicRequestsPerSecond: binancePacedRps(BINANCE_PAGE_LIMIT),
+  klineEndpoint: "GET /fapi/v1/klines (USD-M USDT perpetual, interval=1m, limit=1000, weight 5)",
+  async listSymbols(fetchLike) {
+    const { body } = await binanceGet(fetchLike, `${BINANCE_BASE}/fapi/v1/exchangeInfo`);
+    const out: VenueSymbol[] = [];
+    for (const raw of asArray((body as { symbols?: unknown[] }).symbols)) {
+      const r = raw as {
+        symbol?: unknown; quoteAsset?: unknown; marginAsset?: unknown;
+        contractType?: unknown; status?: unknown;
+      };
+      if (typeof r.symbol !== "string") continue;
+      if (r.quoteAsset !== "USDT" || r.marginAsset !== "USDT" || r.contractType !== "PERPETUAL") continue;
+      out.push({ symbol: r.symbol, tradable: r.status === "TRADING" });
+    }
+    if (!out.length) throw new Error("binance exchangeInfo contained no USD-M USDT perpetual instruments");
+    return out;
+  },
+  async fetchKlines(fetchLike, symbol, startMs, endMs) {
+    // The collector speaks in inclusive OPEN times. Widening endTime to the
+    // final millisecond of the requested minute cannot reach the next bar, and
+    // keeps a one-minute final backfill window valid on Binance-shaped APIs.
+    const url = `${BINANCE_BASE}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=1m`
+      + `&startTime=${startMs}&endTime=${endMs + MINUTE_MS - 1}&limit=${this.pageLimit}`;
+    const { body, slowDown } = await binanceGet(fetchLike, url);
+    const list = asArray(body);
+    const candles: Candle[] = [];
+    for (const raw of list) {
+      const r = raw as unknown[];
+      if (!Array.isArray(r) || r.length < 6) continue;
+      // [openMs, o, h, l, c, BASE volume, closeMs, quote turnover, ...]
+      const c = candle(r[0], r[1], r[2], r[3], r[4], r[5]);
+      if (c) candles.push(c);
+    }
+    return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
+  },
+};
+
 // ── ASTER ───────────────────────────────────────────────────────────────────
 // A Binance USD-M clone: the same `/fapi/v1` routes, the same array-shaped
 // kline rows, the same weight-based rate limiting and the same `x-mbx-*`
@@ -537,4 +646,4 @@ const aster: VenueAdapter = {
   },
 };
 
-export const ADAPTERS: Record<VenueId, VenueAdapter> = { bybit, bitunix, bitget, aster };
+export const ADAPTERS: Record<VenueId, VenueAdapter> = { bybit, bitunix, bitget, binance, aster };

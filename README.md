@@ -139,7 +139,7 @@ so it is a deliberate operator action, not something a hub upgrade starts doing.
 In `/etc/wickhunter-hub/env`:
 
 ```
-HUB_CANDLE_VENUES=bybit,bitunix,bitget,aster
+HUB_CANDLE_VENUES=bybit,bitunix,bitget,binance,aster
 ```
 
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
@@ -162,9 +162,24 @@ that wants investigating. The panel also states the live rate and how many
 refusals a venue has issued, so "slow" and "broken" are never the same picture.
 
 Each venue runs at **its own** published ceiling when `HUB_CANDLE_RPS` is unset
-— Bybit 15/s, Bitget 10/s, Bitunix 5/s, Aster 4/s, each about half what that
-venue allows. Setting `HUB_CANDLE_RPS` replaces all four with your number,
+— Bybit 15/s, Bitget 10/s, Bitunix 5/s, Binance 4/s, Aster 4/s, each about half
+what that venue allows. Setting `HUB_CANDLE_RPS` replaces all five with your number,
 including when it is lower.
+
+**Binance means USD-M USDT perpetuals, exactly.** Its collector reads only
+mainnet `/fapi/v1/exchangeInfo` rows whose `quoteAsset` and `marginAsset` are
+both `USDT` and whose `contractType` is `PERPETUAL`; the native symbol then
+names both the store partition and the signed seed. The REST path is
+`/fapi/v1/klines` at one minute and the optional stream is
+`wss://fstream.binance.com/market/stream` with `@kline_1m`. Binance's merged
+UM/CM market-data surface does not weaken that boundary: explicit non-UM
+stream frames are refused, and there is no Bybit or testnet fallback.
+This expands only `HUB_CANDLE_VENUES`: Binance remains outside the separately
+verified, paid `MARKET_CAP_VENUES` registry.
+
+Binance uses the same published request-weight shape as Aster: 2400/minute per
+IP and weight 5 for the 1000-row page, so its default 4 req/s spends half the
+budget. Its `x-mbx-used-weight-1m` readout also triggers the pre-refusal backoff.
 
 **Aster is paced to a weight budget, not a request count.** Its published limit
 is `REQUEST_WEIGHT` **2400 per minute per IP** — stated in its docs and in the
@@ -207,7 +222,8 @@ database dependency, because 1-minute candles are a dense exactly-gridded series
 whose every key is known in advance. Presence is stored rather than inferred,
 gaps are computed from the data, writes are idempotent and order-free, and
 retention pruning is `unlink` of whole day files. Budget ~2 MB per symbol-month,
-about 5 GB across all four venues at 30 days.
+about 6 GB across all five venues at 30 days (actual size follows each venue's
+current native USDT-perpetual roster).
 
 **Back this up or not, as you like** — unlike `data/licenses.json` it is
 entirely reproducible by re-collecting, just slowly.
@@ -792,6 +808,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.15 — Collect, persist and serve signed Binance USD-M USDT-perpetual
+  one-minute candles for Optimized bots. Binance uses its own native symbol
+  census, REST history, optional finalized WebSocket tail and request-weight
+  pacing; its seed data remains venue-partitioned and never falls back to
+  Bybit. Keep the separate paid market-cap producer venue list unchanged.
 - v0.3.14 — Add the required Bybit Demo worker egress IP allowlist as a masked,
   strictly validated JSON array of literal addresses routed only to the private
   Marketplace API role; refuse hostnames, CIDRs, wildcards, duplicates and

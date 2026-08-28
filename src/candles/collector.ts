@@ -592,8 +592,8 @@ export class VenueCollector {
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;
         // ── v0.2.19 — THE VENUE SAID "NEARLY" RATHER THAN "NO" ──────────────
-        // Aster publishes this IP's spend against its own weight budget on
-        // every response; nobody else does, and for them `slowDown` is always
+        // Binance and Aster publish this IP's spend against their own weight
+        // budgets on every response; flat-rate venues leave `slowDown`
         // undefined. The candles are KEPT — their cost is already paid, and
         // discarding them is the "budget spent on things that never become
         // candles" failure the RateLimitError note warns about — but the pass

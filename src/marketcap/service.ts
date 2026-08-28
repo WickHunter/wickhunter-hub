@@ -25,7 +25,7 @@
 // costs: an unhandled rejection inside a periodic pass is `process.exit(1)`,
 // which on a systemd unit with `Restart=always` is a crash loop that looks like
 // anything except a crash loop.
-import type { FetchLike, VenueId } from "../candles/venues.js";
+import type { FetchLike } from "../candles/venues.js";
 import {
   AGREED_SCHEDULE, charge, creditsForQuoteCall, emptyLedger, monthKey, nextCallDelayMs, noteRefusal,
   planRefresh, QUOTE_BATCH_SIZE, rolled, type CallKind, type CreditLedger,
@@ -40,13 +40,14 @@ import { catalogueSanity, fetchInstruments } from "./exchanges.js";
 import { buildPairIndex, resolveUniverse, type ExchangeInstrument, type ProviderPair } from "./identity.js";
 import { buildSnapshot, publicKeyRawB64u, signSnapshot, type SignerKey, type SnapshotSigned } from "./snapshot.js";
 import { MarketCapStore } from "./store.js";
+import type { MarketCapVenueId } from "./venues.js";
 import { createHash } from "node:crypto";
 
 /** The provider's slug for each venue we serve. EXPECTED, and VALIDATED at run
  *  time against the provider's own exchange list — never hard-coded forever. A
  *  slug that silently stops matching turns one venue's entire book into
  *  `provider_untracked`, which reads exactly like a provider outage. */
-export const DEFAULT_EXCHANGE_SLUGS: Record<VenueId, string> = {
+export const DEFAULT_EXCHANGE_SLUGS: Record<MarketCapVenueId, string> = {
   bybit: "bybit",
   aster: "aster-pro",
   bitget: "bitget",
@@ -66,7 +67,7 @@ export const DEFAULT_EXCHANGE_SLUGS: Record<VenueId, string> = {
  *  balances, and one venue's book quietly takes another venue's identities. The
  *  id is what tells those apart, so it is compared and a mismatch is refused by
  *  name. */
-export const DEFAULT_EXCHANGE_IDS: Record<VenueId, number> = {
+export const DEFAULT_EXCHANGE_IDS: Record<MarketCapVenueId, number> = {
   bybit: 521,
   bitget: 513,
   bitunix: 7302,
@@ -86,13 +87,13 @@ export interface MarketCapConfig {
   /** Venues to cover. EMPTY = the service is off and says so, exactly like the
    *  candle collectors: this one spends real money per call, so it is an
    *  operator action and never something an upgrade starts doing. */
-  venues: VenueId[];
-  slugs: Record<VenueId, string>;
+  venues: MarketCapVenueId[];
+  slugs: Record<MarketCapVenueId, string>;
   /** The provider's numeric exchange id per venue — the DURABLE key the slug is
    *  validated against. OPTIONAL because `MarketCapConfig` is built by hand in
    *  tests and tools as well as from env (the v0.2.17 lesson, one file along);
    *  absent falls back to `DEFAULT_EXCHANGE_IDS`. */
-  exchangeIds?: Partial<Record<VenueId, number>>;
+  exchangeIds?: Partial<Record<MarketCapVenueId, number>>;
   monthlyCeiling: number;
   requestsPerMinute: number;
   mappingIntervalMs: number;
@@ -126,7 +127,7 @@ export interface FeedHealthEvent {
 
 export interface MarketCapHealth {
   enabled: boolean;
-  venues: VenueId[];
+  venues: MarketCapVenueId[];
   slugs: Record<string, {
     slug: string;
     /** What the provider's list says this slug's exchange id is, or null when
@@ -157,7 +158,7 @@ export interface MarketCapHealth {
 }
 
 interface RetryEntry {
-  venue: VenueId;
+  venue: MarketCapVenueId;
   symbol: string;
   attempts: number;
   nextAt: number;
@@ -176,9 +177,9 @@ export class MarketCapService {
   private busy = false;
 
   /** LAST GOOD, per venue. Never replaced by a catalogue that failed sanity. */
-  private catalogues = new Map<VenueId, ExchangeInstrument[]>();
-  private pairs = new Map<VenueId, ProviderPair[]>();
-  private pairPages = new Map<VenueId, number>();
+  private catalogues = new Map<MarketCapVenueId, ExchangeInstrument[]>();
+  private pairs = new Map<MarketCapVenueId, ProviderPair[]>();
+  private pairPages = new Map<MarketCapVenueId, number>();
   private validatedSlugs = new Set<string>();
   private observedExchanges = new Map<string, DerivativeExchange>();
   private capFacts = new Map<number, CapFact>();
@@ -399,7 +400,7 @@ export class MarketCapService {
   /** ONE exchange's pair map. Also the targeted-refresh path, which is why it
    *  is its own method: an unseen symbol costs one exchange's pages and not a
    *  full re-map. */
-  private async refreshPairsFor(venue: VenueId): Promise<boolean> {
+  private async refreshPairsFor(venue: MarketCapVenueId): Promise<boolean> {
     const slug = this.cfg.slugs[venue];
     // A slug we have SEEN and found to name the wrong exchange is not asked
     // again: its rows would be another venue's book. A slug we have never
@@ -614,7 +615,7 @@ export class MarketCapService {
 
   /** Record a symbol whose identity we could not resolve, for a targeted
    *  re-map. Public so the route/admin can nudge one in. */
-  queueRetry(venue: VenueId, symbol: string, now: number): void {
+  queueRetry(venue: MarketCapVenueId, symbol: string, now: number): void {
     const key = `${venue}:${symbol}`;
     if (this.retries.has(key)) return;
     this.retries.set(key, { venue, symbol, attempts: 0, nextAt: now + NEW_SYMBOL_RETRY_MS[0]! });
@@ -663,7 +664,7 @@ export class MarketCapService {
   }
 
   /** The provider exchange id this hub serves as `venue`. */
-  private expectedId(venue: VenueId): number {
+  private expectedId(venue: MarketCapVenueId): number {
     return this.cfg.exchangeIds?.[venue] ?? DEFAULT_EXCHANGE_IDS[venue];
   }
 
@@ -678,7 +679,7 @@ export class MarketCapService {
     }
   }
 
-  private isMapped(venue: VenueId, symbol: string): boolean {
+  private isMapped(venue: MarketCapVenueId, symbol: string): boolean {
     const inst = (this.catalogues.get(venue) ?? []).find((i) => i.symbol === symbol);
     if (!inst) return true; // it went away again; nothing left to map
     const { rows } = resolveUniverse([inst], {
@@ -741,8 +742,8 @@ export class MarketCapService {
    *  for what it is rather than hidden behind a cast — `as unknown as` is how a
    *  defect becomes invisible to the compiler (the bot repo's v0.76.5). */
   __setStateForTests(state: {
-    catalogues?: Map<VenueId, ExchangeInstrument[]>;
-    pairs?: Map<VenueId, ProviderPair[]>;
+    catalogues?: Map<MarketCapVenueId, ExchangeInstrument[]>;
+    pairs?: Map<MarketCapVenueId, ProviderPair[]>;
     capFacts?: Map<number, CapFact>;
     requestedIds?: number[];
     ledger?: CreditLedger;

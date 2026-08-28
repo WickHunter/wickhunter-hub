@@ -59,7 +59,7 @@ export interface HubConfig {
   // ── candle seed service ───────────────────────────────────────────────────
   /** Venues that run a 1m collector. EMPTY BY DEFAULT: collecting is hours of
    *  outbound requests and gigabytes on disk, so it is something the operator
-   *  turns on deliberately (HUB_CANDLE_VENUES=bybit,bitunix,bitget), not
+   *  turns on deliberately (HUB_CANDLE_VENUES=bybit,bitunix,bitget,binance,aster), not
    *  something a hub upgrade silently starts doing. Venues left out report
    *  "no collector configured" on the admin page rather than looking broken. */
   candleVenues: VenueId[];
