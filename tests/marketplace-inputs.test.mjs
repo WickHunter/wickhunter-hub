@@ -51,6 +51,7 @@ await test("schema exposes the complete census but accepts only current external
     "MARKETPLACE_DATABASE_URL", "MARKETPLACE_INTENT_KEY_ID", "MARKETPLACE_INTENT_SIGNING_SEED",
     "MARKETPLACE_ALPHA_LICENCES", "MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED",
     "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
+    "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST",
     "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_WORKER_CREDENTIAL",
     "MOONPAY_COMMERCE_PUBLIC_KEY", "MOONPAY_COMMERCE_SECRET_KEY",
     "MOONPAY_COMMERCE_RECIPIENTS_JSON", "MOONPAY_COMMERCE_MONTHLY_INTERVAL",
@@ -61,6 +62,8 @@ await test("schema exposes the complete census but accepts only current external
   assert.equal(byName.get("MARKETPLACE_DEMO_VAULT_KEY").generated, "vault");
   assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_CREDENTIAL").generated, "worker");
   assert.equal(byName.get("MARKETPLACE_DEMO_MASTER_API_KEY").generated, undefined);
+  assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").secret, true);
+  assert.equal(byName.get("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").kind, "textarea");
   assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").generated, undefined);
   assert.equal(byName.get("MOONPAY_COMMERCE_PRICING_ASSET").required, false);
   assert.equal(byName.get("MOONPAY_COMMERCE_MONTHLY_INTERVAL").required, false);
@@ -72,8 +75,9 @@ await test("schema exposes the complete census but accepts only current external
     MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.setup === "operator").map((field) => field.name),
     [
       "MARKETPLACE_DEMO_MASTER_API_KEY", "MARKETPLACE_DEMO_MASTER_API_SECRET",
+      "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST",
     ],
-    "the normal Hub form must contain only the two Bybit facts the operator has to supply",
+    "the normal Hub form must contain only the three Bybit facts the operator has to supply",
   );
   assert.equal(
     MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.group === "moonpay")
@@ -87,7 +91,12 @@ await test("role routing gives API no signer, vault, worker, master or bridge se
   const common = new Set(MARKETPLACE_ROLE_INPUT_NAMES.common);
   const api = new Set(MARKETPLACE_ROLE_INPUT_NAMES.api);
   const worker = new Set(MARKETPLACE_ROLE_INPUT_NAMES.worker);
+  const migrate = new Set(MARKETPLACE_ROLE_INPUT_NAMES.migrate);
   assert.equal(common.has("MARKETPLACE_SUBSCRIPTION_MODE"), true);
+  assert.equal(api.has("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST"), true);
+  assert.equal(common.has("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST"), false);
+  assert.equal(worker.has("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST"), false);
+  assert.equal(migrate.has("MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST"), false);
   assert.deepEqual([...worker].sort(), [
     "MARKETPLACE_DEMO_VAULT_KEY", "MARKETPLACE_DEMO_VAULT_PATH",
     "MARKETPLACE_DEMO_WORKER_CREDENTIAL", "MARKETPLACE_INTENT_SIGNING_SEED",
@@ -115,6 +124,7 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
     changes: {
       MARKETPLACE_DEMO_MASTER_API_KEY: vendorKey,
       MARKETPLACE_DEMO_MASTER_API_SECRET: vendorSecret,
+      MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST: '["203.0.113.10","2001:db8::10"]',
     },
   }, fake.spawn);
   assert.equal(snapshot.operatorMissing.includes("MARKETPLACE_DEMO_MASTER_API_KEY"), false);
@@ -130,6 +140,7 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
     'MARKETPLACE_ALPHA_LICENCES="lic_a,lic_z"',
     'MARKETPLACE_ADMIN_LICENCES="lic_a,lic_z"',
     'MARKETPLACE_ALPHA_LICENCE_FEATURE_CONFIRMED="1"',
+    'MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST="[\\"203.0.113.10\\",\\"2001:db8::10\\"]"',
     `MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`,
   ]) assert.ok(bytes.includes(expected), expected);
   const seed = JSON.parse(bytes.match(/^MARKETPLACE_INTENT_SIGNING_SEED=(.*)$/m)[1]);
@@ -147,6 +158,7 @@ await test("automatic setup fills defaults, derives the public signer, mirrors t
   const afterRemoval = fs.readFileSync(cfg.envFile, "utf8");
   assert.doesNotMatch(afterRemoval, /MARKETPLACE_(?:ALPHA|ADMIN)_LICENCES=/);
   assert.ok(afterRemoval.includes(`MARKETPLACE_DEMO_MASTER_API_KEY="${vendorKey}"`), "vendor input was not preserved during alpha sync");
+  assert.match(afterRemoval, /^MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST=/m, "worker IP allowlist was not preserved during alpha sync");
 });
 
 await test("automatic setup keeps the optional Bybit Demo group wholly absent until both operator keys arrive", async () => {
@@ -174,6 +186,7 @@ await test("automatic setup purges deferred MoonPay and migrates the obsolete va
   fs.writeFileSync(cfg.envFile, [
     'MARKETPLACE_DEMO_MASTER_API_KEY="legacy-bybit-key"',
     'MARKETPLACE_DEMO_MASTER_API_SECRET="legacy-bybit-secret-value"',
+    'MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST="[\\"203.0.113.7\\", \\"2001:db8::7\\"]"',
     'MARKETPLACE_DEMO_VAULT_PATH="/var/lib/liqhunter/marketplace/demo-credentials.vault"',
     'MOONPAY_COMMERCE_PUBLIC_KEY="legacy-moonpay-public"',
     'MOONPAY_COMMERCE_SECRET_KEY="legacy-moonpay-secret"',
@@ -190,6 +203,8 @@ await test("automatic setup purges deferred MoonPay and migrates the obsolete va
   const bytes = fs.readFileSync(cfg.envFile, "utf8");
   assert.match(bytes, /^MARKETPLACE_SUBSCRIPTION_MODE="mock"$/m);
   assert.match(bytes, /^MARKETPLACE_DEMO_VAULT_PATH="\/var\/lib\/liqhunter\/marketplace-worker\/demo-credentials\.vault"$/m);
+  assert.match(bytes, /^MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST="\[\\"203\.0\.113\.7\\", \\"2001:db8::7\\"\]"$/m,
+    "valid legacy monolithic state is retained for API-role distribution");
   assert.doesNotMatch(bytes, /^MOONPAY_COMMERCE_/m);
 });
 
@@ -202,6 +217,7 @@ await test("a successful update is atomic, 0600, masked, and restarts only the e
       MARKETPLACE_ENABLED: "1",
       MARKETPLACE_STORE: "postgres",
       MARKETPLACE_DEMO_MASTER_API_SECRET: vendorSecret,
+      MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST: '["198.51.100.23"]',
       LIQHUNTER_MARKETPLACE_URL: "https://alpha-marketplace.example.com",
       LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS: JSON.stringify({ "marketplace-1": Buffer.alloc(32, 7).toString("base64url") }),
       MARKETPLACE_ALPHA_LICENCES: "alpha-one,alpha-two",
@@ -234,6 +250,9 @@ await test("a successful update is atomic, 0600, masked, and restarts only the e
   for (const secret of [vendorSecret, hubStatus]) assert.equal(serialized.includes(secret), false, secret);
   assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_MASTER_API_SECRET").state, "configured");
   assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_MASTER_API_SECRET").safeValue, undefined);
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").state, "configured");
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").safeValue, undefined);
+  assert.equal(serialized.includes("198.51.100.23"), false, "the infrastructure allowlist crossed the masked response");
   assert.equal(snapshot.fields.find((field) => field.name === "LIQHUNTER_MARKETPLACE_URL").safeValue, "https://alpha-marketplace.example.com");
 });
 
@@ -259,6 +278,52 @@ await test("unknown keys, short secrets, newline injection and vendor-key genera
     assert.equal(fake.calls.length, 0);
     assert.equal(thrown.message.includes(forbidden), false, `error echoed ${forbidden}`);
   }
+});
+
+await test("Demo worker IP allowlist refuses hostnames, networks, wildcards, duplicates and malformed JSON without persistence", async () => {
+  const hostile = [
+    "not-json", "{}", "[]", '["worker.example.com"]', '["0.0.0.0/0"]',
+    '["*"]', '["203.0.113.10 "]', '["203.0.113.10","203.0.113.10"]',
+    '["999.1.1.1"]', '[2030011310]', `[
+      "203.0.113.10"
+    ]`,
+  ];
+  for (const submitted of hostile) {
+    const { cfg } = config("marketplace-ip-refuse");
+    const fake = fakeSpawner();
+    let thrown;
+    try {
+      await applyMarketplaceInputUpdate(cfg, {
+        changes: { MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST: submitted },
+      }, fake.spawn);
+    } catch (error) { thrown = error; }
+    assert.ok(thrown instanceof MarketplaceInputError, submitted);
+    assert.equal(fs.existsSync(cfg.envFile), false, submitted);
+    assert.equal(fs.existsSync(cfg.hubBridgeEnvFile), false, submitted);
+    assert.equal(fake.calls.length, 0, submitted);
+    assert.equal(thrown.message.includes(submitted), false, "refusal echoed the submitted allowlist");
+  }
+});
+
+await test("Demo worker IP allowlist round-trips canonically while every response remains masked", async () => {
+  const { cfg } = config("marketplace-ip-roundtrip");
+  const fake = fakeSpawner();
+  const submitted = '[ "198.51.100.23" , "2001:db8::10" ]';
+  const saved = await applyMarketplaceInputUpdate(cfg, {
+    changes: { MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST: submitted },
+  }, fake.spawn);
+  const bytes = fs.readFileSync(cfg.envFile, "utf8");
+  assert.match(bytes, /^MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST="\[\\"198\.51\.100\.23\\",\\"2001:db8::10\\"\]"$/m);
+  assert.equal(saved.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").state, "configured");
+  assert.equal(saved.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").safeValue, undefined);
+  assert.equal(JSON.stringify(saved).includes("198.51.100.23"), false);
+  const replay = await applyMarketplaceInputUpdate(cfg, { automatic: true }, fake.spawn);
+  assert.match(fs.readFileSync(cfg.envFile, "utf8"), /^MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST=/m);
+  assert.equal(JSON.stringify(replay).includes("2001:db8::10"), false);
+  assert.deepEqual(fake.calls.map((row) => row.args), [
+    ["restart", ...MARKETPLACE_RESTART_UNITS],
+    ["restart", ...MARKETPLACE_RESTART_UNITS],
+  ]);
 });
 
 await test("symlink, symlink-directory and nonregular destinations are refused", () => {
@@ -387,11 +452,16 @@ await test("admin config endpoint enforces auth plus JSON/CSRF and returns only 
     const secret = "worker-credential-that-stays-server-side-123";
     const saved = await jsonReq(`${h.origin}/admin/api/marketplace-config`, {
       method: "POST", headers: { ...auth, "x-hub-csrf": "marketplace-config-v1", "content-type": "application/json" },
-      body: JSON.stringify({ changes: { MARKETPLACE_DEMO_WORKER_CREDENTIAL: secret } }),
+      body: JSON.stringify({ changes: {
+        MARKETPLACE_DEMO_WORKER_CREDENTIAL: secret,
+        MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST: '["198.51.100.23"]',
+      } }),
     });
     assert.equal(saved.status, 200);
     assert.equal(JSON.stringify(saved.body).includes(secret), false);
+    assert.equal(JSON.stringify(saved.body).includes("198.51.100.23"), false);
     assert.equal(saved.body.config.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_CREDENTIAL").state, "configured");
+    assert.equal(saved.body.config.fields.find((field) => field.name === "MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST").state, "configured");
     assert.equal(fake.calls.length, 1);
   } finally { await h.close(); }
 });
