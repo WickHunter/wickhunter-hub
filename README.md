@@ -808,6 +808,10 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.16 — Normalize installed code and compiled-runtime permissions after a
+  root build so an inherited restrictive umask cannot leave new modules
+  unreadable by the unprivileged Hub service. Keep `data/` and `releases/`
+  pruned from normalization, service-owned and mode 0700.
 - v0.3.15 — Collect, persist and serve signed Binance USD-M USDT-perpetual
   one-minute candles for Optimized bots. Binance uses its own native symbol
   census, REST history, optional finalized WebSocket tail and request-weight
