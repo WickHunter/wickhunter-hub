@@ -65,6 +65,11 @@ cd "$HUB_DIR"
 npm ci --no-audit --no-fund >/dev/null
 npm run build >/dev/null
 npm prune --omit=dev --no-audit --no-fund >/dev/null
+# A root caller's restrictive umask is inherited by npm/tsc. Normalize the
+# installed code after every build so the unprivileged service can read new
+# modules and traverse new directories. The helper prunes data/ and releases/
+# completely; their private ownership/modes are enforced below.
+/bin/bash "$HUB_DIR/bin/normalize-runtime-permissions.sh" "$HUB_DIR"
 ok "built dist/ ($(node -pe 'require("./package.json").version'))"
 
 if [ ! -f "$HUB_DIR/data/license-signing.key" ]; then
