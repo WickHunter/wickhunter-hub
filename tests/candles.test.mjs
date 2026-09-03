@@ -14,6 +14,11 @@ import {
 } from "../dist/src/candles/store.js";
 import { ADAPTERS, dropUnclosed, isRateLimit } from "../dist/src/candles/venues.js";
 import { buildSeed, canonicalBytes, SEED_CANONICAL_KEY_ORDER } from "../dist/src/candles/seed.js";
+import {
+  buildSnapshot, canonicalSnapshotBytes, foldSymbolWindow, newestCompleteBucketOpenMs,
+  snapshotExpiresAtMs, SNAPSHOT_CANONICAL_KEY_ORDER, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
+  SNAPSHOT_SETTLE_LAG_MS,
+} from "../dist/src/candles/snapshot.js";
 
 // ── FROZEN CLOCK ────────────────────────────────────────────────────────────
 // Taken from a real probe instant. At NOW the minute 1786410720000 has OPENED
@@ -513,6 +518,278 @@ await test("each venue collects at its OWN documented rate, not one global figur
   assert.equal(forced.perVenueRequestsPerSecond, undefined, "an explicit rate clears the table");
   assert.equal(forced.requestsPerSecond, 1.5);
   assert.ok(forced.minRequestsPerSecond <= 1.5, "and the floor can never sit above it");
+});
+
+
+// ── THE WHOLE-VENUE SNAPSHOT ────────────────────────────────────────────────
+//
+// The bot's volatility filter asks the same question of every pair at once —
+// "the last N closed candles at this timeframe" — so what is asserted here is
+// what makes one response usable for that: the fold's arithmetic, the buckets'
+// UTC alignment and contiguity, that the forming bucket never appears, and that
+// a pair we cannot answer for completely is NAMED rather than served short.
+
+const SNAP_DAY = Date.parse("2026-08-02T00:00:00.000Z");
+
+/** A clock at which `lastClosedMs` is the newest COMPLETE bucket: one bucket
+ *  past it, plus the settle lag. Derived rather than typed, so the fixtures
+ *  cannot drift from the rule the module actually applies. */
+function clockFor(lastClosedMs, intervalMinutes) {
+  return lastClosedMs + intervalMinutes * MINUTE_MS + SNAPSHOT_SETTLE_LAG_MS;
+}
+
+function snapDeps(store, sign, symbols) {
+  return { store, keyId: "seed-1", sign, symbols: () => symbols };
+}
+
+/** Write `minutes` consecutive 1m candles from `startMs`, one per entry of
+ *  `rows` = [open, high, low, close, volume]. */
+function writeMinutes(store, venue, symbol, startMs, rows) {
+  store.write(venue, symbol, rows.map((r, i) => ({
+    openMs: startMs + i * MINUTE_MS,
+    open: r[0], high: r[1], low: r[2], close: r[3], volume: r[4],
+  })));
+}
+
+await test("the newest COMPLETE bucket is UTC-aligned, and the forming one is never it", () => {
+  const dayOpen = SNAP_DAY;
+  // Mid-afternoon on the day: the daily bucket that OPENED today is still
+  // forming, so the newest complete one is yesterday's.
+  const midday = dayOpen + 14 * 3_600_000;
+  assert.equal(newestCompleteBucketOpenMs(midday, 1440), dayOpen - 1440 * MINUTE_MS,
+    "the bucket in progress is never published; the one before it is");
+  assert.equal(newestCompleteBucketOpenMs(midday, 1440) % (1440 * MINUTE_MS), 0, "UTC-aligned");
+  for (const interval of SNAPSHOT_INTERVALS) {
+    const last = newestCompleteBucketOpenMs(midday, interval);
+    assert.equal(last % (interval * MINUTE_MS), 0, `${interval}m buckets sit on the grid`);
+    assert.ok(last + interval * MINUTE_MS <= midday, `${interval}m: the published bucket has already closed`);
+  }
+});
+
+await test("a bucket is not published until its LAST MINUTE has had time to land", () => {
+  const boundary = SNAP_DAY + 3_600_000; // an hourly boundary
+  const justAfter = boundary + 1_000;
+  assert.equal(newestCompleteBucketOpenMs(justAfter, 60), boundary - 2 * 3_600_000,
+    "one second after the boundary the freshly-closed hour is not served — its last minute may not be collected yet");
+  assert.equal(newestCompleteBucketOpenMs(boundary + SNAPSHOT_SETTLE_LAG_MS, 60), boundary - 3_600_000,
+    "once the settle lag has passed it is");
+});
+
+await test("the cache window turns over exactly on the next boundary plus the lag", () => {
+  const last = SNAP_DAY - 1440 * MINUTE_MS;
+  const expires = snapshotExpiresAtMs(last, 1440);
+  assert.equal(newestCompleteBucketOpenMs(expires - 1, 1440), last, "one ms early: the same window, so a rebuild would repeat itself");
+  assert.equal(newestCompleteBucketOpenMs(expires, 1440), last + 1440 * MINUTE_MS, "at the instant it expires, a NEWER window exists");
+});
+
+await test("the fold is first open, max high, min low, last close, summed volume", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  // Ten minutes = two 5m buckets, values written out so the assertions are the
+  // contract's arithmetic and not a second implementation of it.
+  writeMinutes(store, "bitget", "FOLDUSDT", SNAP_DAY, [
+    [10, 12, 9, 11, 1], [11, 18, 10, 13, 2], [13, 14, 4, 12, 3], [12, 15, 11, 14, 4], [14, 16, 13, 15, 5],
+    [20, 22, 19, 21, 6], [21, 28, 20, 23, 7], [23, 24, 14, 22, 8], [22, 25, 21, 24, 9], [24, 26, 23, 25, 10],
+  ]);
+  const { rows } = store.readWindow("bitget", "FOLDUSDT", SNAP_DAY, SNAP_DAY + 9 * MINUTE_MS);
+  const folded = foldSymbolWindow(rows, SNAP_DAY, 2, 5);
+  assert.equal(folded.ok, true);
+  assert.deepEqual(folded.rows, [
+    [SNAP_DAY, 10, 18, 4, 15, 15],
+    [SNAP_DAY + 5 * MINUTE_MS, 20, 28, 14, 25, 40],
+  ], "open from the first minute, close from the last, high/low across the bucket, volume summed");
+});
+
+await test("a hole inside the window skips the symbol as `gap` — never a bucket folded from what survived", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  const ten = Array.from({ length: 10 }, (_, i) => [10 + i, 20 + i, 5 + i, 12 + i, 1]);
+  // Minute 7 is never collected, so the SECOND 5m bucket has a hole in it while
+  // the first is perfect.
+  ten.forEach((r, i) => {
+    if (i !== 7) writeMinutes(store, "bitget", "HOLEUSDT", SNAP_DAY + i * MINUTE_MS, [r]);
+  });
+  const { rows } = store.readWindow("bitget", "HOLEUSDT", SNAP_DAY, SNAP_DAY + 9 * MINUTE_MS);
+  assert.equal(rows.length, 9, "precondition: nine of the ten minutes are held");
+  const folded = foldSymbolWindow(rows, SNAP_DAY, 2, 5);
+  assert.equal(folded.ok, false);
+  assert.equal(folded.reason, "gap", "the whole symbol is skipped, including the bucket that WAS complete");
+});
+
+await test("a tail we have not collected is a `gap`, and history that starts mid-window is `short`", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  const ten = Array.from({ length: 10 }, () => [1, 2, 0.5, 1.5, 1]);
+  // Trailing absence: minutes 0..7 held, 8 and 9 never fetched.
+  writeMinutes(store, "bitget", "TAILUSDT", SNAP_DAY, ten.slice(0, 8));
+  const tail = store.readWindow("bitget", "TAILUSDT", SNAP_DAY, SNAP_DAY + 9 * MINUTE_MS).rows;
+  assert.equal(foldSymbolWindow(tail, SNAP_DAY, 2, 5).reason, "gap", "a stale tail is a hole in what we hold");
+  // Leading absence: the pair was listed halfway through the window.
+  writeMinutes(store, "bitget", "NEWUSDT", SNAP_DAY + 5 * MINUTE_MS, ten.slice(0, 5));
+  const lead = store.readWindow("bitget", "NEWUSDT", SNAP_DAY, SNAP_DAY + 9 * MINUTE_MS).rows;
+  assert.equal(foldSymbolWindow(lead, SNAP_DAY, 2, 5).reason, "short", "not a collector fault — the history is simply not that deep");
+  assert.equal(foldSymbolWindow([], SNAP_DAY, 2, 5).reason, "short", "and nothing at all is short, not gapped");
+  // The same leading absence on a pair we were ALREADY collecting is a hole in
+  // what we hold, not a shallow history — which is a different fault with a
+  // different owner, so the two are not one label.
+  assert.equal(foldSymbolWindow(lead, SNAP_DAY, 2, 5, SNAP_DAY - 60 * MINUTE_MS).reason, "gap",
+    "history that reaches back BEFORE the window plus a missing leading minute is a gap");
+});
+
+await test("a full window yields EXACTLY depth buckets, contiguous and UTC-aligned", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  // Three whole days of 1m candles: the shipped rule is 1d x 10, so the daily
+  // fold is the case this feature exists for.
+  const days = 3;
+  for (let d = 0; d < days; d++) {
+    const start = SNAP_DAY + d * 1440 * MINUTE_MS;
+    writeMinutes(store, "binance", "BTCUSDT", start,
+      Array.from({ length: 1440 }, (_, i) => [100 + i, 200 + i, 50 + i, 150 + i, 2]));
+  }
+  const lastClosedMs = SNAP_DAY + 2 * 1440 * MINUTE_MS;
+  const out = buildSnapshot(
+    { venue: "binance", interval: 1440, depth: 3, now: clockFor(lastClosedMs, 1440) },
+    snapDeps(store, () => Buffer.alloc(64), ["BTCUSDT"]),
+  );
+  assert.equal(out.ok, true);
+  assert.equal(out.payload.lastClosedMs, lastClosedMs);
+  assert.equal(out.payload.symbols.length, 1);
+  const [symbol, rows] = out.payload.symbols[0];
+  assert.equal(symbol, "BTCUSDT");
+  assert.equal(rows.length, 3, "exactly `depth` buckets, never more and never fewer");
+  rows.forEach((r, i) => {
+    assert.equal(r[0] % (1440 * MINUTE_MS), 0, "each bucket opens on a UTC day boundary");
+    if (i > 0) assert.equal(r[0] - rows[i - 1][0], 1440 * MINUTE_MS, "contiguous on the interval grid");
+    assert.ok(r.every((n) => typeof n === "number" && Number.isFinite(n)), "finite JSON numbers");
+  });
+  assert.equal(rows.at(-1)[0], lastClosedMs, "the newest bucket is the newest COMPLETE one");
+  assert.equal(rows[0][5], 2880, "a day's volume is the sum of its 1,440 minutes");
+});
+
+await test("the forming day is never in the snapshot, however many of its minutes we hold", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  for (let d = 0; d < 2; d++) {
+    writeMinutes(store, "binance", "ETHUSDT", SNAP_DAY + d * 1440 * MINUTE_MS,
+      Array.from({ length: 1440 }, () => [1, 2, 0.5, 1.5, 1]));
+  }
+  // And 600 minutes of the day after that — a bucket in progress.
+  const forming = SNAP_DAY + 2 * 1440 * MINUTE_MS;
+  writeMinutes(store, "binance", "ETHUSDT", forming, Array.from({ length: 600 }, () => [1, 2, 0.5, 1.5, 1]));
+  const out = buildSnapshot(
+    { venue: "binance", interval: 1440, depth: 2, now: forming + 600 * MINUTE_MS },
+    snapDeps(store, () => Buffer.alloc(64), ["ETHUSDT"]),
+  );
+  assert.equal(out.ok, true);
+  const opens = out.payload.symbols[0][1].map((r) => r[0]);
+  assert.deepEqual(opens, [SNAP_DAY, SNAP_DAY + 1440 * MINUTE_MS], "the two closed days");
+  assert.ok(!opens.includes(forming), "the day in progress is absent, not folded short");
+});
+
+await test("skipped symbols carry no rows, and every tracked symbol is accounted for exactly once", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  const full = Array.from({ length: 10 }, () => [1, 2, 0.5, 1.5, 1]);
+  writeMinutes(store, "bitget", "GOODUSDT", SNAP_DAY, full);
+  writeMinutes(store, "bitget", "LATEUSDT", SNAP_DAY + 5 * MINUTE_MS, full.slice(0, 5)); // short
+  full.forEach((r, i) => { if (i !== 3) writeMinutes(store, "bitget", "HOLYUSDT", SNAP_DAY + i * MINUTE_MS, [r]); }); // gap
+  const lastClosedMs = SNAP_DAY + 5 * MINUTE_MS;
+  const tracked = ["GOODUSDT", "LATEUSDT", "HOLYUSDT", "UNSEENUSDT"];
+  const out = buildSnapshot(
+    { venue: "bitget", interval: 5, depth: 2, now: clockFor(lastClosedMs, 5) },
+    snapDeps(store, () => Buffer.alloc(64), tracked),
+  );
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.payload.symbols.map((s) => s[0]), ["GOODUSDT"]);
+  assert.deepEqual(out.payload.skipped, [
+    ["HOLYUSDT", "gap"],
+    ["LATEUSDT", "short"],
+    ["UNSEENUSDT", "short"],
+  ], "each skipped pair is named with the reason it was skipped");
+  const named = new Set([...out.payload.symbols.map((s) => s[0]), ...out.payload.skipped.map((s) => s[0])]);
+  assert.equal(named.size, tracked.length, "every tracked symbol appears exactly once, served or skipped");
+});
+
+await test("a venue where nothing is deep enough is 503, never a 200 with no symbols", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  writeMinutes(store, "bitget", "COLDUSDT", SNAP_DAY, [[1, 2, 0.5, 1.5, 1]]);
+  const out = buildSnapshot(
+    { venue: "bitget", interval: 5, depth: 2, now: clockFor(SNAP_DAY + 5 * MINUTE_MS, 5) },
+    snapDeps(store, () => Buffer.alloc(64), ["COLDUSDT"]),
+  );
+  assert.equal(out.ok, false);
+  assert.equal(out.code, 503, "'come back later' — not an empty roster that reads as 'this venue has nothing'");
+});
+
+await test("a bad interval or depth is refused by the builder as well as by the route", () => {
+  const store = new CandleStore(tmpDir("candles"));
+  const d = snapDeps(store, () => Buffer.alloc(64), ["BTCUSDT"]);
+  const now = clockFor(SNAP_DAY, 5);
+  for (const interval of [0, 2, 7, 1441, 1.5, NaN]) {
+    assert.equal(buildSnapshot({ venue: "bitget", interval, depth: 2, now }, d).code, 400, `interval ${interval}`);
+  }
+  for (const depth of [0, -1, 1.5, SNAPSHOT_MAX_DEPTH + 1, NaN]) {
+    assert.equal(buildSnapshot({ venue: "bitget", interval: 5, depth, now }, d).code, 400, `depth ${depth}`);
+  }
+});
+
+// ── SNAPSHOT SIGNATURE CANONICALISATION ─────────────────────────────────────
+
+await test("the snapshot's canonical key order is exactly the contract's, in order", () => {
+  assert.deepEqual([...SNAPSHOT_CANONICAL_KEY_ORDER],
+    ["v", "venue", "interval", "depth", "generatedAtMs", "lastClosedMs", "symbols", "skipped", "keyId"]);
+});
+
+await test("canonicalSnapshotBytes serialises in the pinned order and ignores any `sig`", () => {
+  const base = {
+    v: 1, venue: "binance", interval: 1440, depth: 1, generatedAtMs: 7, lastClosedMs: SNAP_DAY,
+    symbols: [["BTCUSDT", [[SNAP_DAY, 1, 2, 0.5, 1.5, 10]]]], skipped: [["ETHUSDT", "gap"]], keyId: "seed-1",
+  };
+  const scrambled = {
+    keyId: "seed-1", skipped: base.skipped, symbols: base.symbols, lastClosedMs: SNAP_DAY,
+    generatedAtMs: 7, depth: 1, interval: 1440, venue: "binance", v: 1,
+  };
+  const bytes = canonicalSnapshotBytes(scrambled).toString("utf8");
+  assert.equal(
+    bytes,
+    '{"v":1,"venue":"binance","interval":1440,"depth":1,"generatedAtMs":7,"lastClosedMs":' + SNAP_DAY +
+    ',"symbols":[["BTCUSDT",[[' + SNAP_DAY + ',1,2,0.5,1.5,10]]]],"skipped":[["ETHUSDT","gap"]],"keyId":"seed-1"}',
+    "byte-for-byte the documented serialisation",
+  );
+  assert.ok(!bytes.includes("\n") && !bytes.includes("  "), "no whitespace, no indentation");
+  assert.equal(canonicalSnapshotBytes({ ...base, sig: "AAAA" }).toString("utf8"), bytes,
+    "the signature is not part of what is signed");
+});
+
+await test("a built snapshot verifies under Ed25519 over exactly the canonical bytes", () => {
+  const { store: licenseStore } = freshStore();
+  const store = new CandleStore(tmpDir("candles"));
+  writeMinutes(store, "bitget", "BTCUSDT", SNAP_DAY,
+    Array.from({ length: 10 }, (_, i) => [100 + i, 110 + i, 90 + i, 105 + i, 1 + i]));
+  const out = buildSnapshot(
+    { venue: "bitget", interval: 5, depth: 2, now: clockFor(SNAP_DAY + 5 * MINUTE_MS, 5) },
+    snapDeps(store, (b) => licenseStore.sign(b), ["BTCUSDT"]),
+  );
+  assert.equal(out.ok, true);
+  assert.equal(out.payload.keyId, "seed-1", "the keyId names the key that signed it");
+  const { sig, ...unsigned } = out.payload;
+  const pub = createPublicKey(licenseStore.publicKeyPem());
+  assert.equal(edVerify(null, canonicalSnapshotBytes(unsigned), pub, Buffer.from(sig, "base64")), true,
+    "a client that strips `sig` and re-serialises in the documented order verifies it");
+  // And the wire bytes are the canonical bytes plus the signature, so a reader
+  // that parses the response and re-serialises the other nine keys gets what
+  // was signed without re-ordering anything.
+  const wire = JSON.stringify(out.payload);
+  assert.ok(wire.startsWith(canonicalSnapshotBytes(unsigned).toString("utf8").slice(0, -1)),
+    "`sig` rides last on the wire object");
+
+  for (const tamper of [
+    (p) => { p.symbols[0][1][0][4] += 0.01; },      // a close price
+    (p) => { p.venue = "bybit"; },                   // relabel the venue
+    (p) => { p.interval = 15; },                     // relabel the timeframe
+    (p) => { p.lastClosedMs += 5 * MINUTE_MS; },     // move the window
+    (p) => { p.skipped.push(["ETHUSDT", "gap"]); },  // add a skip nobody signed
+  ]) {
+    const copy = JSON.parse(JSON.stringify(unsigned));
+    tamper(copy);
+    assert.equal(edVerify(null, canonicalSnapshotBytes(copy), pub, Buffer.from(sig, "base64")), false,
+      "every field in the envelope is inside the signed bytes");
+  }
 });
 
 summary("candles");

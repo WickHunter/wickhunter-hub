@@ -3,6 +3,7 @@
 // answers the two questions the rest of the hub asks: "build me a signed seed
 // for this venue+symbol" and "what is each exchange's status right now".
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs } from "./store.js";
 import {
   DEFAULT_COLLECTOR_OPTIONS, VenueCollector, seedableMaxTailAgeMs,
@@ -12,6 +13,11 @@ import { ADAPTERS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
 import { STREAM_ADAPTERS } from "./stream.js";
 import { VenueStreamRunner } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
+import {
+  buildSnapshot, isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs,
+  snapshotExpiresAtMs, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
+  type SnapshotSigned,
+} from "./snapshot.js";
 
 // v0.2.4 — the seedable tail ceiling is no longer a constant here. It is
 // DERIVED from the collector's `tailFillMinutes` (see `seedableMaxTailAgeMs` in
@@ -69,6 +75,22 @@ export interface VenueStatus {
   newlyListed: Array<{ symbol: string; firstSeenAt: number; heldMinutes: number; bucket: SymbolStatus["bucket"] }>;
 }
 
+/** What the snapshot route serves, or the refusal it answers with. The 404 for
+ *  a venue this hub does not know belongs to the route, which owns the venue
+ *  vocabulary; everything decidable from the data is decided here. */
+export type CandleSnapshotResult =
+  | { ok: true; payload: SnapshotSigned; etag: string; body: Buffer }
+  | { ok: false; code: 400 | 503; error: string };
+
+/** Distinct (interval, depth) combinations cached per venue. See `snapshot`. */
+export const SNAPSHOT_CACHE_PER_VENUE = 16;
+
+interface SnapshotCacheEntry {
+  result: CandleSnapshotResult;
+  /** Wall-clock instant at which a rebuild could produce a NEWER window. */
+  expiresAt: number;
+}
+
 export interface CandleServiceConfig {
   dataDir: string;
   /** Which venues actually run a collector. Empty = the service is off. */
@@ -97,6 +119,9 @@ export interface CandleServiceDeps {
    *  suite can drive the rate limiter deterministically instead of against
    *  wall time. Defaults to `Date.now`, so production is unchanged. */
   now?: () => number;
+  /** Where a snapshot rebuild reports its cost. Injectable so a suite can read
+   *  the line instead of the console; production prints it. */
+  log?: (message: string) => void;
   /** Injectable delay. The collector paces itself by sleeping between requests;
    *  a suite passes a no-op so the pacing is exercised without the suite
    *  actually waiting for it. Defaults to a real timer. */
@@ -246,6 +271,103 @@ export class CandleService {
     } finally {
       this.ticking = false;
     }
+  }
+
+  // ── THE SNAPSHOT CACHE ────────────────────────────────────────────────────
+  //
+  // A snapshot folds every tracked symbol's window, so it is by far the most
+  // expensive thing this service builds — and its answer cannot change until
+  // the next bucket boundary has passed and settled, because the window is
+  // derived from the clock and the buckets in it are closed and immutable. So
+  // it is built LAZILY on the first request for a (venue, interval, depth) and
+  // reused verbatim until that instant.
+  //
+  // BOUNDED PER VENUE, and that bound is the point: the interval and depth come
+  // from the caller, so an unbounded map lets one licence holder make the hub
+  // fold 6,500 distinct windows and keep every one of them in memory. 16 is
+  // more combinations than the bot's own rule set can produce at once (four
+  // rows, each one timeframe and one depth) and the eviction is least-recently
+  // USED, so the combinations actually being polled survive a probe.
+  //
+  // A REFUSAL IS CACHED TOO. A cold venue answers 503 out of the same full fold
+  // over every symbol; without this, the one caller polling a venue that is
+  // still backfilling would pay that fold on every request while a healthy
+  // venue pays it once.
+  private readonly snapshotCache = new Map<VenueId, Map<string, SnapshotCacheEntry>>();
+
+  /** A signed snapshot for one venue/timeframe/depth, its ETag and its bytes.
+   *
+   *  NEVER BLOCKS ON THE COLLECTOR: the roster is read from the collector's
+   *  in-memory tracked set and the candles come off the store's own day files.
+   *  A venue that is rate-limited, cooling or mid-tick answers from what is
+   *  already on disk rather than making a request path wait for it. */
+  snapshot(venue: VenueId, interval: number, depth: number): CandleSnapshotResult {
+    // Validated here as well as at the route: the route owns the 404 for a
+    // venue nobody collects, this owns the shape of the two numbers, and a
+    // malformed pair must never reach the cache and occupy a slot.
+    if (!isSnapshotInterval(interval)) {
+      return { ok: false, code: 400, error: `interval must be one of ${SNAPSHOT_INTERVALS.join(",")} minutes` };
+    }
+    if (!isSnapshotDepth(depth)) {
+      return { ok: false, code: 400, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` };
+    }
+    const now = (this.deps.now ?? Date.now)();
+    let perVenue = this.snapshotCache.get(venue);
+    if (!perVenue) this.snapshotCache.set(venue, perVenue = new Map());
+    const key = `${interval}:${depth}`;
+    const held = perVenue.get(key);
+    if (held && now < held.expiresAt) {
+      // Re-insert so the map's insertion order IS the recency order.
+      perVenue.delete(key);
+      perVenue.set(key, held);
+      return held.result;
+    }
+
+    const startedAt = Date.now();
+    const outcome = buildSnapshot({ venue, interval, depth, now }, {
+      store: this.store,
+      keyId: this.cfg.keyId,
+      sign: this.deps.sign,
+      symbols: (v) => {
+        const c = this.collectors.get(v);
+        // No collector for this venue: answer for what we HOLD. Saying "this
+        // venue tracks nothing" would be a claim about the venue that a hub
+        // with the collector switched off is in no position to make.
+        return c ? c.symbols().map((t) => t.symbol) : this.store.symbols(v);
+      },
+    });
+
+    let result: CandleSnapshotResult;
+    if (outcome.ok) {
+      const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+      // The ETag is over the SERVED BYTES, so a 304 hands the client exactly
+      // what a 200 would have.
+      const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
+      result = { ok: true, payload: outcome.payload, etag, body };
+      this.log(`built ${venue} ${interval}m x${depth}: ${outcome.payload.symbols.length} symbols`
+        + ` (${outcome.payload.skipped.length} skipped), ${body.length} bytes in ${Date.now() - startedAt}ms`);
+    } else {
+      result = outcome;
+      this.log(`built ${venue} ${interval}m x${depth}: ${outcome.code} ${outcome.error}`
+        + ` (${Date.now() - startedAt}ms)`);
+    }
+    perVenue.set(key, { result, expiresAt: snapshotExpiresAtMs(this.snapshotWindowAnchor(now, interval), interval) });
+    while (perVenue.size > SNAPSHOT_CACHE_PER_VENUE) {
+      const oldest = perVenue.keys().next();
+      if (oldest.done) break;
+      perVenue.delete(oldest.value);
+    }
+    return result;
+  }
+
+  /** The window a build at `now` answers for, whether or not it produced a
+   *  payload — a refusal expires on the same boundary its successor would. */
+  private snapshotWindowAnchor(now: number, interval: number): number {
+    return newestCompleteBucketOpenMs(now, interval);
+  }
+
+  private log(message: string): void {
+    (this.deps.log ?? ((m: string) => console.log(`[candles·snapshot] ${m}`)))(message);
   }
 
   /** Build a signed seed. Delegates the contract to seed.ts. */
