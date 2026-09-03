@@ -12,11 +12,42 @@ suite gate every commit: `npx tsc && node tests/run-all.mjs`.
 
 Beta bots POST bug reports / feature requests to `/api/feedback`, authenticated
 by their own license token (genuine-but-expired may file; revoked/unknown may
-not). Each report carries the tester's verified name, app version, install id
-and a bounded tail of their Activity log (300 lines / 200 KB, oldest dropped).
-The admin page lists them with a `new / discussing / fixed` status per row, and
-**Export all** downloads the entire set — logs included — as one JSON file to
-hand to your assistant for triage.
+not). Each v2 report carries the tester's verified name, app version, install
+id, a bounded and attributed Activity tail (300 lines / 200 KB, oldest
+dropped), and a page snapshot capped at exactly 24 KiB of serialized JSON,
+including exact account context, managed deals and read-only Hedge Bot
+attachments. Report text, logs and structured diagnostics are redacted again
+at this boundary before storage; the diagnostics ceiling counts keys,
+punctuation and numeric spellings as well as string values.
+
+The tester may attach one PNG, JPEG or WebP screenshot. The Hub validates the
+declared type against the bytes, rejects canvases above 8,192 px on either side
+or 32 million pixels total, stores the image separately under
+`data/feedback-attachments/` with mode 0600, and keeps only its metadata and
+SHA-256 in the JSONL report. The intake acknowledges `evidenceSchema: 2`; the
+app requires that acknowledgement so an older Hub cannot claim success while
+silently dropping a screenshot or diagnostics.
+
+Feedback intake is deliberately finite for the beta. A source may make 30 raw
+attempts per minute before the Hub reads another 4 MiB body; a verified licence
+may make 30 authenticated attempts per rolling hour even when evidence is
+malformed or storage is full. Successfully stored reports are limited to 12 per
+verified licence and 60 per source IP in that hour. A `429` includes both
+`Retry-After` and `retryAfterSeconds`. The in-memory allowances may reset on a
+process restart; the durable ceilings do not: 100 reports / 32 MiB pictures /
+64 MiB combined per licence, and 2,000
+reports / 32 MiB tracker / 256 MiB pictures / 320 MiB combined for the Hub. At
+least 512 MiB filesystem free space is retained. A full store returns `507`
+before writing any part of the new report. Evidence is never silently dropped
+or auto-deleted; export it and explicitly delete resolved reports to free room.
+
+The admin page supports status/kind/search filters and lightweight evidence
+summaries. **View details** loads the screenshot, structured snapshot and full
+recent activity only when requested; **Export all** includes integrity-checked
+image bytes and diagnostics. The server hydrates and streams one report at a
+time, tells nginx not to buffer/spool the response, and Chromium-family browsers
+stream directly to the selected file. The clearly labelled compatibility
+fallback buffers in browser memory. Deleting a report also removes its image.
 
 ## Candle seed
 
@@ -643,8 +674,14 @@ existing `server { listen 443 ssl; ... }` block:
 include /opt/wickhunter-hub/nginx/hub.locations.conf;
 ```
 
-then `nginx -t && systemctl reload nginx`. Re-running `install-hub.sh`
-upgrades in place and keeps `data/`, `releases/`, and the admin token.
+then `nginx -t && systemctl reload nginx`. The shipped snippet keeps ordinary
+Hub requests at 1 MiB but gives exact `/hub/api/feedback` requests 4 MiB, which
+is required because a 2 MiB image expands in base64. Re-running
+`install-hub.sh` upgrades in place and keeps `data/`, `releases/`, and the admin
+token, but it does **not** reload the already-running nginx. For the feedback-v2
+rollout, upgrade and restart Hub v0.3.17 first, run `nginx -t`, reload nginx, and
+only then distribute the app build that requires the `evidenceSchema: 2`
+acknowledgement. That order avoids false “sent” results and proxy-side `413`s.
 
 ### 2. Issue a key
 
@@ -808,6 +845,19 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.17 — Accept feedback evidence schema v2 with content-validated picture
+  attachments, structured diagnostics independently redacted and capped at
+  exactly 24 KiB of serialized JSON, and attributed Activity logs. Store
+  pictures separately with integrity metadata;
+  add authenticated detail/export hydration and cleanup on delete. Revamp the
+  admin feedback view with search, filters, evidence counters, managed versus
+  Hedge Bot-only position facts, screenshots and full diagnostic detail. Bound
+  raw and accepted intake by source/licence with `Retry-After`; enforce durable
+  per-licence, global and free-space quotas with atomic `507` refusal and no
+  evidence eviction. Bound authenticated failures across source IPs, validate
+  image canvas dimensions before browser display, stream exports one report at
+  a time through Node/nginx and supported browsers, and raise only the exact
+  nginx feedback route to 4 MiB.
 - v0.3.16 — Normalize installed code and compiled-runtime permissions after a
   root build so an inherited restrictive umask cannot leave new modules
   unreadable by the unprivileged Hub service. Keep `data/` and `releases/`

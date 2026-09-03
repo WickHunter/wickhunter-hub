@@ -7,7 +7,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
-import { clampLogs, listFeedback, FEEDBACK_LOG_LINES_MAX, FEEDBACK_LOGS_BYTES_MAX } from "../dist/src/feedback.js";
+import {
+  clampLogs,
+  listFeedback,
+  normalizeFeedbackAttachment,
+  normalizeFeedbackDiagnostics,
+  FEEDBACK_ATTACHMENT_BYTES_MAX,
+  FEEDBACK_DIAGNOSTICS_BYTES_MAX,
+  FEEDBACK_EVIDENCE_SCHEMA,
+  FEEDBACK_LOG_LINES_MAX,
+  FEEDBACK_LOGS_BYTES_MAX,
+} from "../dist/src/feedback.js";
 
 const h = await freshHub();
 const good = h.store.issue("Reporter", 30);
@@ -30,6 +40,7 @@ await test("a genuine license files a report; the record carries the verified na
   const r = await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify({ ...report(), name: "Impostor" }) });
   assert.equal(r.status, 200);
   assert.equal(r.body.ok, true);
+  assert.equal(r.body.evidenceSchema, FEEDBACK_EVIDENCE_SCHEMA, "intake explicitly acknowledges v2 evidence support");
   assert.ok(r.body.id);
   const all = listFeedback(h.dataDir);
   assert.equal(all.length, 1);
@@ -68,6 +79,22 @@ await test("bad kind and empty text are 400s, not silent drops", async () => {
   assert.equal(r1.status, 400);
   const r2 = await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify(report({ text: "   " })) });
   assert.equal(r2.status, 400);
+  const r3 = await jsonReq(`${h.origin}/api/feedback`, { method: "POST", body: JSON.stringify(report({ text: "x".repeat(8_001) })) });
+  assert.equal(r3.status, 400, "over-limit report text is refused rather than silently truncated");
+});
+
+await test("accidentally pasted credentials are redacted while report wording survives", async () => {
+  const r = await jsonReq(`${h.origin}/api/feedback`, {
+    method: "POST",
+    body: JSON.stringify(report({ text: "Exchange error apiKey=do-not-store privateKey=also-private while opening SOLUSDT" })),
+  });
+  assert.equal(r.status, 200);
+  const saved = listFeedback(h.dataDir).find((x) => x.id === r.body.id);
+  assert.match(saved.text, /Exchange error/);
+  assert.match(saved.text, /SOLUSDT/);
+  assert.match(saved.text, /\[redacted\]/);
+  assert.ok(!saved.text.includes("do-not-store"));
+  assert.ok(!saved.text.includes("also-private"));
 });
 
 await test("clampLogs: row cap, line cap, byte cap — oldest dropped, truncation flagged", async () => {
@@ -88,6 +115,131 @@ await test("clampLogs: row cap, line cap, byte cap — oldest dropped, truncatio
   const mixed = clampLogs(["ok", 42, "also ok"]);
   assert.deepEqual(mixed.logs, ["ok", "also ok"]);
   assert.equal(mixed.truncated, true); // the non-string was dropped, say so
+});
+
+await test("diagnostics are bounded and secret-shaped values are redacted at the hub boundary", async () => {
+  const diagnostics = normalizeFeedbackDiagnostics({
+    schemaVersion: 2,
+    page: "terminal",
+    context: "bybit-main:futures",
+    logWindow: { included: 2, oldestAt: 1, newestAt: 2 },
+    apiKey: "must-never-land",
+    nested: { authorization: "Bearer must-never-land", note: "token=also-secret" },
+  });
+  assert.equal(diagnostics.page, "terminal");
+  assert.equal(diagnostics.context, "bybit-main:futures");
+  assert.equal(diagnostics.apiKey, "[redacted]");
+  assert.equal(diagnostics.nested.authorization, "[redacted]");
+  assert.ok(!JSON.stringify(diagnostics).includes("must-never-land"));
+  assert.ok(!JSON.stringify(diagnostics).includes("also-secret"));
+
+  // Numeric values did not spend the old string-only budget, while long keys
+  // and JSON punctuation still occupy the tracker. Pin the actual UTF-8 JSON
+  // contract rather than an estimate of selected value bytes.
+  const pathological = { page: "terminal" };
+  for (let group = 0; group < 20; group++) {
+    const groupPrefix = `group_${String(group).padStart(2, "0")}_`;
+    const values = {};
+    for (let item = 0; item < 80; item++) {
+      const prefix = `numeric_${String(group).padStart(2, "0")}_${String(item).padStart(2, "0")}_`;
+      values[prefix + "x".repeat(80 - prefix.length)] = Number.MAX_VALUE;
+    }
+    pathological[groupPrefix + "g".repeat(80 - groupPrefix.length)] = values;
+  }
+  const exact = normalizeFeedbackDiagnostics(pathological);
+  const exactBytes = Buffer.byteLength(JSON.stringify(exact), "utf8");
+  assert.ok(exactBytes <= FEEDBACK_DIAGNOSTICS_BYTES_MAX, `${exactBytes} <= exact serialized cap`);
+  assert.ok(exactBytes > FEEDBACK_DIAGNOSTICS_BYTES_MAX * 0.8, "the cap preserves useful early facts rather than dropping the snapshot");
+  assert.equal(exact.page, "terminal");
+  assert.ok(Object.keys(exact).length < Object.keys(pathological).length, "the pathological tail was pruned");
+});
+
+await test("picture validation accepts a real bounded raster and rejects spoofed or oversized data", async () => {
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const ok = normalizeFeedbackAttachment({ name: "screen.png", mimeType: "image/png", base64: png });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.attachment.mimeType, "image/png");
+  assert.ok(ok.attachment.bytes > 0);
+  assert.match(ok.attachment.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(normalizeFeedbackAttachment(null).attachment, null);
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00]);
+  assert.equal(normalizeFeedbackAttachment({ name: "screen.jpg", mimeType: "image/jpeg", base64: jpeg.toString("base64") }).ok, true);
+  const hugeJpeg = Buffer.from(jpeg);
+  hugeJpeg.writeUInt16BE(10_000, 7); hugeJpeg.writeUInt16BE(10_000, 9);
+  assert.equal(normalizeFeedbackAttachment({ name: "huge.jpg", mimeType: "image/jpeg", base64: hugeJpeg.toString("base64") }).ok, false);
+  const webp = Buffer.alloc(30);
+  webp.write("RIFF", 0, "ascii"); webp.writeUInt32LE(22, 4); webp.write("WEBP", 8, "ascii");
+  webp.write("VP8X", 12, "ascii"); webp.writeUInt32LE(10, 16); // zero width/height-minus-one = 1x1
+  assert.equal(normalizeFeedbackAttachment({ name: "screen.webp", mimeType: "image/webp", base64: webp.toString("base64") }).ok, true);
+  const hugeWebp = Buffer.from(webp);
+  hugeWebp.writeUIntLE(9_999, 24, 3); hugeWebp.writeUIntLE(9_999, 27, 3);
+  assert.equal(normalizeFeedbackAttachment({ name: "huge.webp", mimeType: "image/webp", base64: hugeWebp.toString("base64") }).ok, false);
+  assert.equal(normalizeFeedbackAttachment({ name: "bad.svg", mimeType: "image/svg+xml", base64: Buffer.from("<svg/>").toString("base64") }).ok, false);
+  assert.equal(normalizeFeedbackAttachment({ name: "fake.png", mimeType: "image/png", base64: Buffer.from("not a png").toString("base64") }).ok, false);
+  const hugeCanvas = Buffer.from(png, "base64");
+  hugeCanvas.writeUInt32BE(100_000, 16);
+  hugeCanvas.writeUInt32BE(100_000, 20);
+  const dimensions = normalizeFeedbackAttachment({ name: "huge-canvas.png", mimeType: "image/png", base64: hugeCanvas.toString("base64") });
+  assert.equal(dimensions.ok, false);
+  assert.match(dimensions.error, /dimensions must be at most/);
+  const tooManyPixels = Buffer.from(png, "base64");
+  tooManyPixels.writeUInt32BE(8_000, 16); tooManyPixels.writeUInt32BE(5_000, 20);
+  assert.equal(normalizeFeedbackAttachment({ name: "too-many-pixels.png", mimeType: "image/png", base64: tooManyPixels.toString("base64") }).ok, false);
+  assert.equal(normalizeFeedbackAttachment({
+    name: "huge.png", mimeType: "image/png", base64: Buffer.alloc(FEEDBACK_ATTACHMENT_BYTES_MAX + 1).toString("base64"),
+  }).ok, false);
+});
+
+await test("intake persists diagnostics + picture; list stays light and detail exposes debugging evidence", async () => {
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const filed = await jsonReq(`${h.origin}/api/feedback`, {
+    method: "POST",
+    body: JSON.stringify(report({
+      text: "chart blank while the hedge is open",
+      diagnostics: {
+        schemaVersion: 2,
+        page: "hedge-bot",
+        context: "bybit-main:futures",
+        ui: { viewport: "1440x900", online: true, positionRows: 2, managedPositionRows: 1, hedgeOnlyPositionRows: 1 },
+        managedPositions: [{ symbol: "BTCUSDT", positionKind: "managed" }],
+        hedgeOnlyPositions: [{ symbol: "PYTHUSDT", positionKind: "hedge_only", readOnly: true }],
+        password: "do-not-store-this",
+      },
+      attachment: { name: "hedge chart.png", mimeType: "image/png", base64: png },
+    })),
+  });
+  assert.equal(filed.status, 200);
+
+  const records = listFeedback(h.dataDir);
+  const persisted = records.find((x) => x.id === filed.body.id);
+  assert.ok(persisted.attachment.file);
+  assert.equal(persisted.attachment.base64, undefined, "large bytes stay outside the JSONL tracker");
+  assert.ok(!fs.readFileSync(path.join(h.dataDir, "feedback.jsonl"), "utf8").includes(png));
+  assert.ok(fs.existsSync(path.join(h.dataDir, "feedback-attachments", persisted.attachment.file)));
+
+  const list = await jsonReq(`${h.origin}/admin/api/feedback`, { headers: ADMIN });
+  const summary = list.body.reports.find((x) => x.id === filed.body.id);
+  assert.ok(summary);
+  assert.equal(summary.logLines, 2);
+  assert.equal(summary.hasAttachment, true);
+  assert.equal(summary.attachmentBytes > 0, true);
+  assert.equal(summary.page, "hedge-bot");
+  assert.equal(summary.context, "bybit-main:futures");
+  assert.equal(summary.positionRows, 2);
+  assert.equal(summary.managedPositionRows, 1);
+  assert.equal(summary.hedgeOnlyPositionRows, 1);
+  assert.equal(summary.logs, undefined);
+  assert.equal(summary.attachment, undefined, "base64 does not bloat the list response");
+
+  const anon = await jsonReq(`${h.origin}/admin/api/feedback/detail?id=${encodeURIComponent(filed.body.id)}`);
+  assert.equal(anon.status, 401);
+  const detail = await jsonReq(`${h.origin}/admin/api/feedback/detail?id=${encodeURIComponent(filed.body.id)}`, { headers: ADMIN });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.report.diagnostics.page, "hedge-bot");
+  assert.equal(detail.body.report.diagnostics.password, "[redacted]");
+  assert.equal(detail.body.report.diagnostics.hedgeOnlyPositions[0].symbol, "PYTHUSDT");
+  assert.equal(detail.body.report.attachment.base64, png);
+  assert.deepEqual(detail.body.report.logs, ["12:00 line one", "12:01 line two"]);
 });
 
 await test("admin list is auth-gated, newest-first, and carries counts instead of logs", async () => {
@@ -121,8 +273,21 @@ await test("export downloads the WHOLE set, logs included, as a named attachment
   assert.ok(body.exportedAt > 0);
   assert.ok(Array.isArray(body.reports) && body.reports.length >= 2);
   assert.ok(body.reports.some((x) => Array.isArray(x.logs) && x.logs.length > 0)); // logs ride the export
+  const pictured = body.reports.find((x) => x.text === "chart blank while the hedge is open");
+  assert.ok(pictured && pictured.attachment.base64, "picture bytes ride the operator's export");
   const anon = await fetch(`${h.origin}/admin/api/feedback/export`);
   assert.equal(anon.status, 401);
+});
+
+await test("deleting a pictured report removes its separately stored evidence too", async () => {
+  const rec = listFeedback(h.dataDir).find((x) => x.text === "chart blank while the hedge is open");
+  const file = path.join(h.dataDir, "feedback-attachments", rec.attachment.file);
+  assert.ok(fs.existsSync(file));
+  const removed = await jsonReq(`${h.origin}/admin/api/feedback/delete`, {
+    method: "POST", headers: ADMIN, body: JSON.stringify({ id: rec.id }),
+  });
+  assert.equal(removed.status, 200);
+  assert.equal(fs.existsSync(file), false);
 });
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -228,6 +393,9 @@ await test("the admin page offers per-row Delete and a Delete-all-fixed, both co
   assert.ok((page.match(/confirm\(/g) ?? []).length >= 2, "both ask before deleting");
   assert.match(page, /cannot be undone/, "and the row prompt says so in words");
   assert.match(page, /Export first/, "the bulk prompt points at the export as the backup");
+  assert.ok(page.includes("/admin/api/feedback/detail"), "report evidence is loaded on demand");
+  assert.match(page, /Recent activity/, "the detail panel names the log evidence");
+  assert.match(page, /Debug snapshot/, "the detail panel exposes structured diagnostics");
 });
 
 await h.close();

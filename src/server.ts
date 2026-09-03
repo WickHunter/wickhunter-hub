@@ -26,6 +26,7 @@
 //   admin    POST /admin/api/flags                {id|"default", flag, state:true|false|null}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
+//   admin    GET  /admin/api/feedback/detail     one report with logs/diagnostics/picture
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
 //   admin    POST /admin/api/feedback/delete     {id} or {ids:[...]} -> gone for good
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
@@ -46,7 +47,7 @@ import { createHash, timingSafeEqual, createPublicKey } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 import { CandleService, type CandleServiceDeps } from "./candles/service.js";
 import { MarketCapService } from "./marketcap/service.js";
 import { marketCapStartupRefusals } from "./marketcap/config.js";
@@ -59,8 +60,12 @@ import { isVenueId } from "./candles/venues.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
-  FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX, appendFeedback, clampLogs, deleteFeedback, listFeedback,
-  setFeedbackStatus, type FeedbackStatus,
+  DEFAULT_FEEDBACK_STORAGE_LIMITS, FEEDBACK_EVIDENCE_SCHEMA, FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX,
+  FeedbackQuotaError, FeedbackRateLimiter,
+  appendFeedback, clampLogs, deleteFeedback,
+  feedbackDetail, feedbackExport, listFeedback, normalizeFeedbackAttachment,
+  normalizeFeedbackDiagnostics, redactFeedbackText, setFeedbackStatus, type FeedbackStatus,
+  type FeedbackStorageLimits,
 } from "./feedback.js";
 import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
@@ -119,7 +124,8 @@ const realVenueFetch: NonNullable<CandleServiceDeps["fetchLike"]> = async (url: 
 
 const MAX_BODY_BYTES = 64 * 1024; // largest legitimate body is a tiny JSON object
 // Feedback carries a bounded log tail (see feedback.ts caps) — its own limit:
-const MAX_FEEDBACK_BODY_BYTES = 256 * 1024;
+// 2MB raster -> ~2.7MB base64, plus the existing 200KB logs and diagnostics.
+const MAX_FEEDBACK_BODY_BYTES = 4 * 1024 * 1024;
 
 export interface Hub {
   server: http.Server;
@@ -160,10 +166,20 @@ export interface HubDeps {
   licenseLeaseRandomId?: () => string;
   /** Injectable so Marketplace status tests never leave loopback. */
   marketplaceStatusFetch?: MarketplaceStatusFetch;
+  /** Injectable feedback clock for rate-window tests; production is Date.now. */
+  feedbackNow?: () => number;
+  /** Test seam for otherwise very large durable-capacity branches. */
+  feedbackStorageLimits?: Partial<FeedbackStorageLimits>;
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const store = new LicenseStore(cfg.dataDir);
+  const feedbackRate = new FeedbackRateLimiter();
+  const feedbackNow = deps.feedbackNow ?? Date.now;
+  const feedbackStorageLimits: Readonly<FeedbackStorageLimits> = {
+    ...DEFAULT_FEEDBACK_STORAGE_LIMITS,
+    ...deps.feedbackStorageLimits,
+  };
   let licenseLeases: LicenseLeaseService | null = null;
   try {
     licenseLeases = new LicenseLeaseService(cfg.dataDir, store, cfg.licenseLease, {
@@ -534,6 +550,18 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   async function feedbackIntake(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const ip = clientIp(req);
+    const ipRate = feedbackRate.takeIpAttempt(ip, feedbackNow());
+    if (!ipRate.ok) {
+      // Do not spend another 4 MiB allocation on a source already over its
+      // intake ceiling. Draining lets Node reuse the connection safely.
+      req.resume();
+      return sendJson(res, 429, {
+        ok: false,
+        error: `feedback intake is temporarily rate limited; try again in ${ipRate.retryAfterSeconds} seconds`,
+        retryAfterSeconds: ipRate.retryAfterSeconds,
+      }, { "retry-after": String(ipRate.retryAfterSeconds), "cache-control": "no-store" });
+    }
     const body = await readJsonBody(req, MAX_FEEDBACK_BODY_BYTES);
     if (body === null) return sendJson(res, 400, { ok: false, error: "bad feedback body" });
     // Auth is the license TOKEN in the body — same credential the bot already
@@ -544,24 +572,64 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!store.isKnown(payload.id) || store.isRevoked(payload.id)) {
       return sendJson(res, 403, { ok: false, error: "this license is not accepted here" });
     }
+    const acceptedAt = feedbackNow();
+    const authRate = feedbackRate.takeAuthenticatedAttempt(payload.id, acceptedAt);
+    if (!authRate.ok) {
+      return sendJson(res, 429, {
+        ok: false,
+        error: `feedback intake is temporarily rate limited; try again in ${authRate.retryAfterSeconds} seconds`,
+        retryAfterSeconds: authRate.retryAfterSeconds,
+      }, { "retry-after": String(authRate.retryAfterSeconds), "cache-control": "no-store" });
+    }
+    // Peek before validating/decoding the potentially large evidence. Only
+    // record this allowance after the synchronous durable append succeeds.
+    const acceptedRate = feedbackRate.checkAccepted(payload.id, ip, acceptedAt);
+    if (!acceptedRate.ok) {
+      return sendJson(res, 429, {
+        ok: false,
+        error: `feedback intake is temporarily rate limited; try again in ${acceptedRate.retryAfterSeconds} seconds`,
+        retryAfterSeconds: acceptedRate.retryAfterSeconds,
+      }, { "retry-after": String(acceptedRate.retryAfterSeconds), "cache-control": "no-store" });
+    }
     const kind = body.kind;
     if (kind !== "bug" && kind !== "feature") return sendJson(res, 400, { ok: false, error: "kind must be bug or feature" });
-    const text = typeof body.text === "string" ? body.text.trim() : "";
-    if (!text) return sendJson(res, 400, { ok: false, error: "an empty report says nothing — describe what happened" });
+    const rawText = typeof body.text === "string" ? body.text.trim() : "";
+    if (!rawText) return sendJson(res, 400, { ok: false, error: "an empty report says nothing — describe what happened" });
+    if (rawText.length > FEEDBACK_TEXT_MAX) {
+      return sendJson(res, 400, { ok: false, error: `report text must be ${FEEDBACK_TEXT_MAX} characters or fewer` });
+    }
+    const text = redactFeedbackText(rawText, FEEDBACK_TEXT_MAX);
     const { logs, truncated } = clampLogs(body.logs);
-    const rec = appendFeedback(cfg.dataDir, {
-      ts: typeof body.ts === "number" ? body.ts : 0,
-      ip: clientIp(req),
-      licenseId: payload.id,
-      name: payload.name,
-      installId: typeof body.installId === "string" ? body.installId.slice(0, 64) : "",
-      version: typeof body.version === "string" ? body.version.slice(0, 32) : "",
-      kind,
-      text: text.slice(0, FEEDBACK_TEXT_MAX),
-      logs,
-      logsTruncated: truncated,
-    });
-    sendJson(res, 200, { ok: true, id: rec.id });
+    const picture = normalizeFeedbackAttachment(body.attachment);
+    if (!picture.ok) return sendJson(res, 400, { ok: false, error: picture.error });
+    let rec;
+    try {
+      rec = appendFeedback(cfg.dataDir, {
+        ts: typeof body.ts === "number" ? body.ts : 0,
+        ip,
+        licenseId: payload.id,
+        name: payload.name,
+        installId: typeof body.installId === "string" ? body.installId.slice(0, 64) : "",
+        version: typeof body.version === "string" ? body.version.slice(0, 32) : "",
+        kind,
+        text: text.slice(0, FEEDBACK_TEXT_MAX),
+        logs,
+        logsTruncated: truncated,
+        diagnostics: normalizeFeedbackDiagnostics(body.diagnostics),
+        attachment: picture.attachment,
+      }, Date.now(), feedbackStorageLimits);
+    } catch (err) {
+      const error = feedbackStorageFailure(err);
+      if (error) {
+        return sendJson(res, 507, { ok: false, error }, { "cache-control": "no-store" });
+      }
+      throw err;
+    }
+    feedbackRate.recordAccepted(payload.id, ip, acceptedAt);
+    // evidenceSchema is a capability acknowledgement. New apps require it so
+    // an older Hub cannot say "sent" while silently dropping the screenshot
+    // and structured diagnostics it did not yet know how to persist.
+    sendJson(res, 200, { ok: true, id: rec.id, evidenceSchema: FEEDBACK_EVIDENCE_SCHEMA });
   }
 
   /** ── WHERE A LICENCE TOKEN IS READ FROM, AND THERE IS ONE OF THESE ────────
@@ -1081,13 +1149,41 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         venues: candles.status(),
       });
     }
+    if (m === "GET" && p === "/admin/api/feedback/detail") {
+      const id = url.searchParams.get("id") ?? "";
+      if (!id) return sendJson(res, 400, { ok: false, error: "feedback id is required" });
+      const report = feedbackDetail(cfg.dataDir, id);
+      if (!report) return sendJson(res, 404, { ok: false, error: "unknown report id" });
+      return sendJson(res, 200, { ok: true, report }, { "cache-control": "no-store" });
+    }
     if (m === "GET" && p === "/admin/api/feedback") {
-      // Table view: everything EXCEPT the logs (they can be hundreds of KB
-      // per report) — the export carries those.
+      // List view is intentionally light. Logs, the diagnostic tree and image
+      // bytes are fetched for one expanded row through /detail.
       const reports = listFeedback(cfg.dataDir)
         .sort((a, b) => b.at - a.at)
-        .map(({ logs, ...rest }) => ({ ...rest, logLines: logs.length }));
-      return sendJson(res, 200, { ok: true, reports });
+        .map(({ logs, diagnostics, attachment, ...rest }) => {
+          const ui = diagnostics.ui && typeof diagnostics.ui === "object" && !Array.isArray(diagnostics.ui)
+            ? diagnostics.ui as Record<string, unknown> : {};
+          const window = diagnostics.logWindow && typeof diagnostics.logWindow === "object" && !Array.isArray(diagnostics.logWindow)
+            ? diagnostics.logWindow as Record<string, unknown> : {};
+          return {
+            ...rest,
+            logLines: logs.length,
+            page: typeof diagnostics.page === "string" ? diagnostics.page : "",
+            context: typeof diagnostics.context === "string" ? diagnostics.context : "",
+            mode: typeof ui.mode === "string" ? ui.mode : "",
+            openDeals: typeof ui.openDeals === "number" ? ui.openDeals : null,
+            positionRows: typeof ui.positionRows === "number" ? ui.positionRows : null,
+            managedPositionRows: typeof ui.managedPositionRows === "number" ? ui.managedPositionRows : null,
+            hedgeOnlyPositionRows: typeof ui.hedgeOnlyPositionRows === "number" ? ui.hedgeOnlyPositionRows : null,
+            logOldestAt: typeof window.oldestAt === "number" ? window.oldestAt : null,
+            logNewestAt: typeof window.newestAt === "number" ? window.newestAt : null,
+            hasAttachment: !!attachment,
+            attachmentName: attachment?.name ?? "",
+            attachmentBytes: attachment?.bytes ?? 0,
+          };
+        });
+      return sendJson(res, 200, { ok: true, reports }, { "cache-control": "no-store" });
     }
     if (m === "POST" && p === "/admin/api/feedback/status") {
       const body = await readJsonBody(req);
@@ -1097,8 +1193,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ) {
         return sendJson(res, 400, { ok: false, error: "expected {id, status: new|discussing|fixed}" });
       }
-      if (!setFeedbackStatus(cfg.dataDir, body.id, body.status as FeedbackStatus)) {
-        return sendJson(res, 404, { ok: false, error: "unknown report id" });
+      try {
+        if (!setFeedbackStatus(cfg.dataDir, body.id, body.status as FeedbackStatus)) {
+          return sendJson(res, 404, { ok: false, error: "unknown report id" });
+        }
+      } catch (err) {
+        const error = feedbackStorageFailure(err);
+        if (error) return sendJson(res, 507, { ok: false, error }, { "cache-control": "no-store" });
+        throw err;
       }
       return sendJson(res, 200, { ok: true });
     }
@@ -1111,7 +1213,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (list.length === 0) {
         return sendJson(res, 400, { ok: false, error: "expected {id} or {ids: [...]}" });
       }
-      const removed = deleteFeedback(cfg.dataDir, list);
+      let removed: number;
+      try {
+        removed = deleteFeedback(cfg.dataDir, list);
+      } catch (err) {
+        const error = feedbackStorageFailure(err);
+        if (error) return sendJson(res, 507, { ok: false, error }, { "cache-control": "no-store" });
+        throw err;
+      }
       // An id that matched nothing is a 404, not a quiet success: the admin
       // page would otherwise drop a row that is still on disk.
       if (removed === 0) return sendJson(res, 404, { ok: false, error: "no such report id" });
@@ -1119,15 +1228,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "GET" && p === "/admin/api/feedback/export") {
       // The whole set, LOGS INCLUDED — the file the operator hands to their
-      // assistant for triage. Attachment headers so the browser downloads it.
-      const reports = listFeedback(cfg.dataDir).sort((a, b) => b.at - a.at);
-      const bytes = Buffer.from(JSON.stringify({ exportedAt: Date.now(), hubVersion: HUB_VERSION, reports }, null, 2));
-      res.writeHead(200, {
-        "content-type": "application/json; charset=utf-8",
-        "content-length": bytes.length,
-        "content-disposition": `attachment; filename="wickhunter-feedback-${new Date().toISOString().slice(0, 10)}.json"`,
-      });
-      return void res.end(bytes);
+      // assistant for triage. Each row is hydrated and written separately so
+      // export memory is bounded by one report instead of the whole evidence
+      // collection. Authentication has already run above.
+      await streamFeedbackExport(res, cfg.dataDir);
+      return;
     }
     if (m === "GET" && p === "/admin/api/licenses/command") {
       const id = url.searchParams.get("id") ?? "";
@@ -1272,11 +1377,75 @@ function pathOf(req: IncomingMessage): string {
 }
 
 function clientIp(req: IncomingMessage): string {
-  // Behind the VPS nginx the socket peer is 127.0.0.1; the snippet we ship
-  // sets X-Forwarded-For to $remote_addr (a single hop, so first value wins).
+  const peer = String(req.socket.remoteAddress ?? "").trim();
+  const normalizedPeer = peer.startsWith("::ffff:") && isIP(peer.slice(7)) === 4 ? peer.slice(7) : peer;
+  const loopback = normalizedPeer === "127.0.0.1" || normalizedPeer === "::1";
+  // Trust proxy identity only from the loopback nginx peer shipped with the
+  // Hub. A directly exposed origin must not let a caller mint a fresh rate
+  // bucket by changing X-Forwarded-For.
   const fwd = req.headers["x-forwarded-for"];
   const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
-  return first || req.socket.remoteAddress || "unknown";
+  if (loopback && first && isIP(first)) return first;
+  return isIP(normalizedPeer) ? normalizedPeer : "unknown";
+}
+
+function feedbackStorageFailure(err: unknown): string | null {
+  if (err instanceof FeedbackQuotaError) return err.message;
+  return ["ENOSPC", "EDQUOT", "EFBIG"].includes(String((err as NodeJS.ErrnoException).code ?? ""))
+    ? "feedback storage has insufficient free space; no complete report was written — ask the operator to export and clean resolved evidence"
+    : null;
+}
+
+function writeExportChunk(res: ServerResponse, chunk: string): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+  try {
+    if (res.write(chunk)) return Promise.resolve(true);
+  } catch {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const done = (ok: boolean): void => {
+      res.off("drain", drained);
+      res.off("close", closed);
+      res.off("error", errored);
+      resolve(ok);
+    };
+    const drained = (): void => done(true);
+    const closed = (): void => done(false);
+    const errored = (): void => done(false);
+    res.once("drain", drained);
+    res.once("close", closed);
+    res.once("error", errored);
+  });
+}
+
+async function streamFeedbackExport(res: ServerResponse, dataDir: string): Promise<void> {
+  const reports = feedbackExport(dataDir);
+  // Prime before committing 200 headers so an unreadable tracker still gets
+  // the normal JSON 500 response rather than a truncated download.
+  let next = reports.next();
+  res.writeHead(200, {
+    "content-type": "application/json; charset=utf-8",
+    "content-disposition": `attachment; filename="wickhunter-feedback-${new Date().toISOString().slice(0, 10)}.json"`,
+    // nginx otherwise buffers/spools the response and breaks end-to-end
+    // backpressure even though Node hydrates only one report at a time.
+    "x-accel-buffering": "no",
+    "cache-control": "no-store",
+  });
+  try {
+    const prefix = `{"exportedAt":${Date.now()},"hubVersion":${JSON.stringify(HUB_VERSION)},"reports":[`;
+    if (!await writeExportChunk(res, prefix)) return;
+    let first = true;
+    while (!next.done) {
+      if (!await writeExportChunk(res, `${first ? "" : ","}${JSON.stringify(next.value)}`)) return;
+      first = false;
+      next = reports.next();
+    }
+    if (!await writeExportChunk(res, "]}\n")) return;
+    res.end();
+  } finally {
+    reports.return(undefined);
+  }
 }
 
 /** Constant-time secret comparison. ONE implementation, because there are now

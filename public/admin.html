@@ -41,6 +41,19 @@
   .ops-ok { color:#2a7; } .ops-warn { color:#b80; } .ops-bad { color:#c33; }
   .logtail { white-space:pre-wrap; overflow:auto; max-height:18rem; font:12px/1.45 ui-monospace,monospace;
              background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
+  .fbmeta { display:flex; gap:.35rem; flex-wrap:wrap; margin:.7rem 0 .25rem; }
+  .fbpill { border:1px solid #8885; border-radius:999px; padding:.15rem .55rem; font-size:.78rem; }
+  .fbevidence { white-space:normal; min-width:10rem; line-height:1.7; }
+  .fbdetailrow td { white-space:normal; padding:.8rem; background:#00000008; }
+  .fbdetail { display:grid; gap:.8rem; }
+  .fbdetailgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(14rem,1fr)); gap:.55rem; }
+  .fbdetailcard { border:1px solid #8884; border-radius:7px; padding:.65rem; min-width:0; }
+  .fbdetailcard h3 { font-size:.86rem; margin:0 0 .35rem; }
+  .fbdetailcard dl { display:grid; grid-template-columns:auto 1fr; gap:.12rem .5rem; margin:0; }
+  .fbdetailcard dt { opacity:.62; } .fbdetailcard dd { margin:0; overflow-wrap:anywhere; }
+  .fbshot { display:block; max-width:100%; max-height:34rem; object-fit:contain; border:1px solid #8884; border-radius:7px; background:#0001; }
+  .fbjson { white-space:pre-wrap; overflow:auto; max-height:24rem; overflow-wrap:anywhere; font:12px/1.45 ui-monospace,monospace;
+            background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
   .setupcopy { white-space:normal; min-width:18rem; }
   .configgroups { display:grid; gap:.8rem; margin-top:.8rem; }
   .configgroup { border:1px solid #8884; border-radius:8px; padding:.8rem .9rem; }
@@ -252,9 +265,16 @@
        a delete is permanent and the export is the only copy. -->
   <button type="button" id="fbClearFixed">Delete all fixed</button>
   <span class="muted">Export is the file to hand to your assistant for triage — and your only copy once a report is deleted.</span>
+  <span id="fbExportNote" class="muted"></span>
 </div>
+<div class="actions">
+  <input id="fbSearch" type="search" placeholder="Search report, tester, context…" aria-label="Search feedback">
+  <select id="fbKindFilter" aria-label="Filter feedback kind"><option value="">All kinds</option><option value="bug">Bugs</option><option value="feature">Features</option></select>
+  <select id="fbStatusFilter" aria-label="Filter feedback status"><option value="">All statuses</option><option value="new">New</option><option value="discussing">Discussing</option><option value="fixed">Fixed</option></select>
+</div>
+<div id="fbMeta" class="fbmeta"></div>
 <div class="tbl"><table>
-  <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>Version</th><th>Logs</th><th>Status</th><th style="white-space:normal">Report</th><th></th></tr></thead>
+  <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>App / context</th><th>Evidence</th><th>Status</th><th style="white-space:normal">Report</th><th>Actions</th></tr></thead>
   <tbody id="fbRows"><tr><td colspan="8">loading…</td></tr></tbody>
 </table></div>
 </section>
@@ -1130,26 +1150,52 @@ async function cdRefresh() {
 document.getElementById("cdRefresh").onclick = cdRefresh;
 
 // ── feedback ────────────────────────────────────────────────────────────────
+let fbReports = [];
+const fbBytes = (n) => n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + " MB" : n >= 1024 ? Math.round(n / 1024) + " KB" : n + " B";
+const fbValue = (v) => v === null || v === undefined || v === "" ? "—" : String(v);
 async function fbRefresh() {
   const err = document.getElementById("err");
   let data;
   try { data = await api("/admin/api/feedback"); }
   catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+  fbReports = data.reports || [];
+  fbFixedIds = fbReports.filter((r) => r.status === "fixed").map((r) => r.id);
   const rows = document.getElementById("fbRows");
   rows.innerHTML = "";
-  if (data.reports.length === 0) {
+  const q = document.getElementById("fbSearch").value.trim().toLowerCase();
+  const kind = document.getElementById("fbKindFilter").value;
+  const status = document.getElementById("fbStatusFilter").value;
+  const shown = fbReports.filter((r) => (!kind || r.kind === kind) && (!status || r.status === status)
+    && (!q || [r.text, r.name, r.version, r.context, r.page, r.installId, r.licenseId].some((v) => String(v || "").toLowerCase().includes(q))));
+  document.getElementById("fbMeta").innerHTML =
+    '<span class="fbpill">' + fbReports.length + " total</span>" +
+    '<span class="fbpill">' + fbReports.filter((r) => r.status === "new").length + " new</span>" +
+    '<span class="fbpill">' + fbReports.filter((r) => r.hasAttachment).length + " with pictures</span>" +
+    '<span class="fbpill">' + shown.length + " shown</span>";
+  const clear = document.getElementById("fbClearFixed");
+  clear.disabled = fbFixedIds.length === 0;
+  clear.textContent = fbFixedIds.length ? "Delete all fixed (" + fbFixedIds.length + ")" : "Delete all fixed";
+  if (shown.length === 0) {
     rows.innerHTML = '<tr><td colspan="8">no reports yet</td></tr>';
     return;
   }
-  for (const r of data.reports) {
+  for (const r of shown) {
     const tr = document.createElement("tr");
     if (r.status === "fixed") tr.style.opacity = ".5";
+    const range = r.logOldestAt && r.logNewestAt
+      ? '<small class="muted">' + esc(fmt(r.logOldestAt)) + " → " + esc(fmt(r.logNewestAt)) + "</small><br>" : "";
+    const picture = r.hasAttachment
+      ? '<span title="' + esc(r.attachmentName) + '">🖼 ' + esc(fbBytes(r.attachmentBytes)) + "</span>"
+      : '<span class="muted">no picture</span>';
+    const positionSplit = r.managedPositionRows !== null || r.hedgeOnlyPositionRows !== null
+      ? '<small class="muted">' + esc(fbValue(r.managedPositionRows)) + ' managed · ' + esc(fbValue(r.hedgeOnlyPositionRows)) + ' hedge-only</small><br>'
+      : '';
     tr.innerHTML =
-      "<td>" + fmt(r.at) + "</td>" +
-      '<td class="name" title="' + esc(r.licenseId) + '">' + esc(r.name) + "</td>" +
+      "<td>" + fmt(r.at) + (r.ts ? '<br><small class="muted">client ' + esc(fmt(r.ts)) + "</small>" : "") + "</td>" +
+      '<td class="name" title="license ' + esc(r.licenseId) + '">' + esc(r.name) + '<br><small class="muted" title="' + esc(r.installId) + '">' + esc((r.installId || "no install id").slice(0, 18)) + "</small></td>" +
       "<td>" + (r.kind === "bug" ? "🐞 bug" : "✨ feature") + "</td>" +
-      "<td>" + esc(r.version ? vlabel(r.version) : "—") + "</td>" +
-      "<td>" + r.logLines + (r.logsTruncated ? "+" : "") + "</td>" +
+      '<td class="name">' + esc(r.version ? vlabel(r.version) : "—") + '<br><small class="muted">' + esc(r.context || "no context") + (r.page ? " · " + esc(r.page) : "") + (r.mode ? " · " + esc(r.mode) : "") + "</small></td>" +
+      '<td class="fbevidence"><b>' + r.logLines + (r.logsTruncated ? "+" : "") + " log lines</b><br>" + positionSplit + range + picture + "</td>" +
       "<td></td>" +
       '<td class="name" style="white-space:normal;min-width:14rem;max-width:28rem">' + esc(r.text) + "</td>" +
       "<td></td>";
@@ -1165,6 +1211,27 @@ async function fbRefresh() {
       fbRefresh();
     };
     tr.children[5].appendChild(sel);
+    const detailRow = document.createElement("tr");
+    detailRow.className = "fbdetailrow";
+    detailRow.hidden = true;
+    detailRow.innerHTML = '<td colspan="8"><div class="fbdetail muted">Select View details to load evidence.</div></td>';
+    const view = document.createElement("button");
+    view.type = "button";
+    view.textContent = "View details";
+    view.onclick = async () => {
+      if (!detailRow.hidden) { detailRow.hidden = true; view.textContent = "View details"; return; }
+      detailRow.hidden = false;
+      view.textContent = "Hide details";
+      const target = detailRow.querySelector(".fbdetail");
+      if (target.dataset.loaded === "1") return;
+      target.textContent = "Loading evidence…";
+      try {
+        const data = await api("/admin/api/feedback/detail?id=" + encodeURIComponent(r.id));
+        fbRenderDetail(target, data.report);
+        target.dataset.loaded = "1";
+      } catch (e) { target.textContent = e.message; }
+    };
+    tr.children[7].appendChild(view);
     // Delete is permanent and there is no undo, so it asks — and it quotes the
     // report back, because the rows are sorted by time and the one under the
     // cursor is not always the one in mind.
@@ -1181,15 +1248,83 @@ async function fbRefresh() {
     };
     tr.children[7].appendChild(del);
     rows.appendChild(tr);
+    rows.appendChild(detailRow);
   }
   // Kept on the parsed rows rather than re-fetched, so the button counts the
   // same set the table is showing.
-  fbFixedIds = data.reports.filter((r) => r.status === "fixed").map((r) => r.id);
-  const clear = document.getElementById("fbClearFixed");
-  clear.disabled = fbFixedIds.length === 0;
-  clear.textContent = fbFixedIds.length ? "Delete all fixed (" + fbFixedIds.length + ")" : "Delete all fixed";
 }
 let fbFixedIds = [];
+function fbRenderDetail(target, r) {
+  target.classList.remove("muted");
+  target.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "fbdetailgrid";
+  const facts = document.createElement("section");
+  facts.className = "fbdetailcard";
+  facts.innerHTML = "<h3>Report facts</h3><dl>" +
+    "<dt>Report ID</dt><dd>" + esc(r.id) + "</dd>" +
+    "<dt>Install ID</dt><dd>" + esc(fbValue(r.installId)) + "</dd>" +
+    "<dt>License ID</dt><dd>" + esc(fbValue(r.licenseId)) + "</dd>" +
+    "<dt>IP</dt><dd>" + esc(fbValue(r.ip)) + "</dd>" +
+    "<dt>Hub received</dt><dd>" + esc(fmt(r.at)) + "</dd>" +
+    "<dt>Client captured</dt><dd>" + esc(r.ts ? fmt(r.ts) : "—") + "</dd>" +
+    "<dt>Clock skew</dt><dd>" + esc(r.ts ? Math.round((r.at - r.ts) / 1000) + " s" : "—") + "</dd></dl>";
+  grid.appendChild(facts);
+  const diagnostics = r.diagnostics || {}, ui = diagnostics.ui || {}, lw = diagnostics.logWindow || {};
+  const summary = document.createElement("section");
+  summary.className = "fbdetailcard";
+  summary.innerHTML = "<h3>Capture summary</h3><dl>" +
+    "<dt>Page</dt><dd>" + esc(fbValue(diagnostics.page)) + "</dd>" +
+    "<dt>Context</dt><dd>" + esc(fbValue(diagnostics.context)) + "</dd>" +
+    "<dt>Mode</dt><dd>" + esc(fbValue(ui.mode)) + "</dd>" +
+    "<dt>Open deals</dt><dd>" + esc(fbValue(ui.openDeals)) + "</dd>" +
+    "<dt>Position rows</dt><dd>" + esc(fbValue(ui.positionRows)) + "</dd>" +
+    "<dt>Managed rows</dt><dd>" + esc(fbValue(ui.managedPositionRows)) + "</dd>" +
+    "<dt>Hedge-only rows</dt><dd>" + esc(fbValue(ui.hedgeOnlyPositionRows)) + "</dd>" +
+    "<dt>Log span</dt><dd>" + esc(lw.oldestAt && lw.newestAt ? fmt(lw.oldestAt) + " → " + fmt(lw.newestAt) : "—") + "</dd></dl>";
+  grid.appendChild(summary);
+  target.appendChild(grid);
+  if (r.attachment) {
+    const picture = document.createElement("section");
+    picture.className = "fbdetailcard";
+    const title = document.createElement("h3");
+    title.textContent = "Attached picture · " + r.attachment.name + " · " + fbBytes(r.attachment.bytes);
+    picture.appendChild(title);
+    if (["image/png", "image/jpeg", "image/webp"].includes(r.attachment.mimeType) && /^[A-Za-z0-9+/]+={0,2}$/.test(r.attachment.base64)) {
+      const img = document.createElement("img");
+      img.className = "fbshot";
+      img.alt = r.attachment.name;
+      img.src = "data:" + r.attachment.mimeType + ";base64," + r.attachment.base64;
+      picture.appendChild(img);
+    }
+    target.appendChild(picture);
+  } else if (r.attachmentUnavailable) {
+    const missing = document.createElement("div");
+    missing.className = "ops-bad";
+    missing.textContent = "The report names a picture, but its stored file is missing or failed integrity validation.";
+    target.appendChild(missing);
+  }
+  const snapshot = document.createElement("section");
+  snapshot.className = "fbdetailcard";
+  snapshot.innerHTML = "<h3>Debug snapshot</h3>";
+  const json = document.createElement("pre");
+  json.className = "fbjson";
+  json.textContent = JSON.stringify(diagnostics, null, 2);
+  snapshot.appendChild(json);
+  target.appendChild(snapshot);
+  const activity = document.createElement("section");
+  activity.className = "fbdetailcard";
+  activity.innerHTML = "<h3>Recent activity</h3>";
+  const log = document.createElement("pre");
+  log.className = "logtail";
+  log.textContent = (r.logs || []).join("\n") || "No activity lines attached.";
+  activity.appendChild(log);
+  target.appendChild(activity);
+}
+let fbSearchTimer = null;
+document.getElementById("fbSearch").oninput = () => { clearTimeout(fbSearchTimer); fbSearchTimer = setTimeout(fbRefresh, 150); };
+document.getElementById("fbKindFilter").onchange = fbRefresh;
+document.getElementById("fbStatusFilter").onchange = fbRefresh;
 document.getElementById("fbClearFixed").onclick = async () => {
   if (fbFixedIds.length === 0) return;
   if (!confirm("Delete " + fbFixedIds.length + " report(s) marked fixed, permanently?\n\nThey will no longer appear in the export. Export first if you want a copy.")) return;
@@ -1199,14 +1334,51 @@ document.getElementById("fbClearFixed").onclick = async () => {
 };
 document.getElementById("fbRefresh").onclick = fbRefresh;
 document.getElementById("fbExport").onclick = async () => {
-  const res = await fetch(base + "/admin/api/feedback/export", { headers: { "x-hub-admin": token } });
-  if (res.status === 401) { showGate("Wrong token — try again."); return; }
-  const blob = await res.blob();
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = (res.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || "wickhunter-feedback.json";
-  a.click();
-  URL.revokeObjectURL(a.href);
+  const note = document.getElementById("fbExportNote");
+  const err = document.getElementById("err");
+  note.textContent = "";
+  err.textContent = "";
+  let fileHandle = null;
+  // The picker must be invoked during the click gesture, before awaiting the
+  // fetch, or Chromium may reject it for lost user activation.
+  if (typeof window.showSaveFilePicker === "function") {
+    try {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: "wickhunter-feedback-" + new Date().toISOString().slice(0, 10) + ".json",
+        types: [{ description: "JSON feedback export", accept: { "application/json": [".json"] } }],
+      });
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+      err.textContent = e.message || "Could not choose an export file.";
+      return;
+    }
+  }
+  try {
+    const res = await fetch(base + "/admin/api/feedback/export", { headers: { "x-hub-admin": token } });
+    if (res.status === 401) { showGate("Wrong token — try again."); return; }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || ("Export failed with HTTP " + res.status));
+    }
+    if (fileHandle) {
+      if (!res.body) throw new Error("This browser did not provide a downloadable response stream.");
+      const writable = await fileHandle.createWritable();
+      await res.body.pipeTo(writable);
+      note.textContent = "Export saved without buffering the full evidence set in browser memory.";
+      return;
+    }
+    // Safari/Firefox fallback: still compatible, but Blob necessarily holds
+    // the full export in memory. The UI says so instead of hiding the cost.
+    note.textContent = "This browser cannot stream directly to a file; the export will be buffered in memory.";
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (res.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || "wickhunter-feedback.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 0);
+  } catch (e) {
+    err.textContent = e.message || "Could not export feedback.";
+  }
 };
 
 showGate();
