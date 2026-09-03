@@ -86,7 +86,9 @@ await test("bad kind and empty text are 400s, not silent drops", async () => {
 await test("accidentally pasted credentials are redacted while report wording survives", async () => {
   const r = await jsonReq(`${h.origin}/api/feedback`, {
     method: "POST",
-    body: JSON.stringify(report({ text: "Exchange error apiKey=do-not-store privateKey=also-private while opening SOLUSDT" })),
+    body: JSON.stringify(report({
+      text: 'Exchange error {"apiKey":"do-not-store","apiSecret":"also-private","authorization":"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="} while opening SOLUSDT',
+    })),
   });
   assert.equal(r.status, 200);
   const saved = listFeedback(h.dataDir).find((x) => x.id === r.body.id);
@@ -95,6 +97,44 @@ await test("accidentally pasted credentials are redacted while report wording su
   assert.match(saved.text, /\[redacted\]/);
   assert.ok(!saved.text.includes("do-not-store"));
   assert.ok(!saved.text.includes("also-private"));
+  assert.ok(!saved.text.includes("QWxhZGRpbjpvcGVuIHNlc2FtZQ"));
+  assert.match(saved.text, /while opening SOLUSDT/);
+});
+
+await test("single-quoted fields and unquoted authorization schemes are redacted without swallowing context", async () => {
+  const r = await jsonReq(`${h.origin}/api/feedback`, {
+    method: "POST",
+    body: JSON.stringify(report({
+      text: "Retry {'clientSecret':'CLIENTSECRET123456'} failed; Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ== while placing TP",
+      logs: ['venue {"apiSecret":"LOGSECRET123456"} retry scheduled'],
+    })),
+  });
+  assert.equal(r.status, 200);
+  const saved = listFeedback(h.dataDir).find((x) => x.id === r.body.id);
+  assert.match(saved.text, /^Retry /);
+  assert.match(saved.text, /while placing TP$/);
+  assert.ok(!JSON.stringify(saved).includes("CLIENTSECRET123456"));
+  assert.ok(!JSON.stringify(saved).includes("QWxhZGRpbjpvcGVuIHNlc2FtZQ"));
+  assert.ok(!JSON.stringify(saved).includes("LOGSECRET123456"));
+  assert.match(saved.logs[0], /retry scheduled/);
+});
+
+await test("vendor authentication headers and multi-value Cookie headers are redacted", async () => {
+  const r = await jsonReq(`${h.origin}/api/feedback`, {
+    method: "POST",
+    body: JSON.stringify(report({
+      text: '{"x-api-key":"XHEADERSECRET123456","X-BAPI-API-KEY":"BYBITKEYSECRET123456","X-BAPI-SIGN":"BYBITSIGNATURE123456"}',
+      logs: ["Cookie: session=COOKIESECRET123456; csrf=CSRFSECRET123456"],
+    })),
+  });
+  assert.equal(r.status, 200);
+  const saved = listFeedback(h.dataDir).find((x) => x.id === r.body.id);
+  const serialized = JSON.stringify(saved);
+  for (const secret of ["XHEADERSECRET123456", "BYBITKEYSECRET123456", "BYBITSIGNATURE123456", "COOKIESECRET123456", "CSRFSECRET123456"]) {
+    assert.ok(!serialized.includes(secret));
+  }
+  assert.equal((saved.text.match(/\[redacted\]/g) || []).length, 3);
+  assert.match(saved.logs[0], /Cookie=\[redacted\]/i);
 });
 
 await test("clampLogs: row cap, line cap, byte cap — oldest dropped, truncation flagged", async () => {

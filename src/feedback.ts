@@ -120,7 +120,18 @@ const ATTACHMENTS_DIR = "feedback-attachments";
 export const FEEDBACK_STATUSES: readonly FeedbackStatus[] = ["new", "discussing", "fixed"];
 
 const REDACTED = "[redacted]";
-const SECRET_FIELD = /(?:api.?key|secret|token|password|passphrase|authorization|cookie|signature|credential|private.?key|license)/i;
+const SECRET_FIELD_SOURCE = String.raw`(?:(?:x[ _-]?(?:bapi[ _-]?)?)?api[ _-]?(?:key|secret)|x[ _-]?bapi[ _-]?sign|(?:x[ _-]?)?client[ _-]?secret|secret(?:[ _-]?key)?|(?:x[ _-]?)?(?:access|private)[ _-]?key|(?:x[ _-]?)?(?:auth[ _-]?)?token|password|passphrase|authorization|(?:set[ _-]?)?cookie|(?:x[ _-]?)?signature|credential|license)`;
+const SECRET_FIELD = new RegExp(SECRET_FIELD_SOURCE, "i");
+const QUOTED_SECRET_FIELD = new RegExp(
+  `(["'])(${SECRET_FIELD_SOURCE})\\1(\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\4)[\\s\\S])*?\\4`,
+  "gi",
+);
+const AUTHORIZATION_SCHEME = /\b(authorization)\s*[:=]\s*(?:Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}/gi;
+const COOKIE_HEADER = /\b((?:set[ _-]?)?cookie)\s*[:=]\s*[^\r\n]*/gi;
+const SECRET_ASSIGNMENT = new RegExp(
+  `\\b(${SECRET_FIELD_SOURCE})\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|[^\\s,;]+)`,
+  "gi",
+);
 
 export interface FeedbackRateDecision {
   ok: boolean;
@@ -242,8 +253,12 @@ export class FeedbackQuotaError extends Error {
 export function redactFeedbackText(value: unknown, cap = FEEDBACK_LOG_LINE_MAX): string {
   return String(value ?? "")
     .replace(/\bLHK1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED)
+    .replace(QUOTED_SECRET_FIELD, (_m, keyQuote: string, key: string, separator: string, valueQuote: string) =>
+      `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${REDACTED}${valueQuote}`)
+    .replace(AUTHORIZATION_SCHEME, (_m, key: string) => `${key}=${REDACTED}`)
+    .replace(COOKIE_HEADER, (_m, key: string) => `${key}=${REDACTED}`)
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`)
-    .replace(/\b(api[ _-]?key|secret(?:[ _-]?key)?|(?:access|private)[ _-]?key|token|password|passphrase|authorization|cookie|signature|credential|license)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, (_m, key: string) => `${key}=${REDACTED}`)
+    .replace(SECRET_ASSIGNMENT, (_m, key: string) => `${key}=${REDACTED}`)
     .replace(/([?&](?:api[_-]?key|access[_-]?key|key|token|secret|signature|password|license)=)[^&#\s]+/gi, `$1${REDACTED}`)
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .trim()
