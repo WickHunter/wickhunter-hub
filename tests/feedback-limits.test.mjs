@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { freshHub, test, summary } from "./helpers.mjs";
 import { createHub } from "../dist/src/server.js";
+import { HUB_VERSION } from "../dist/src/version.js";
 import {
   appendFeedback,
   deleteFeedback,
@@ -446,7 +447,9 @@ await test("export is lazy per attachment, valid newest-first JSON, and has no f
     assert.equal(response.headers.get("content-length"), null, "streamed export must not be materialized for a length");
     assert.equal(response.headers.get("x-accel-buffering"), "no", "nginx must preserve end-to-end export backpressure");
     const exported = JSON.parse(await response.text());
-    assert.equal(exported.hubVersion, "0.3.17");
+    // Asserted against the hub's own version, never a literal: a hard-coded
+    // number here turns every release into a red suite about feedback exports.
+    assert.equal(exported.hubVersion, HUB_VERSION);
     assert.deepEqual(exported.reports.map((row) => row.text), ["newer evidence", "older evidence", "oversized evidence"]);
     assert.equal(exported.reports[1].attachment, null);
     assert.equal(exported.reports[1].attachmentUnavailable, true);

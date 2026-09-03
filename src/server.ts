@@ -9,6 +9,7 @@
 //   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
+//   keyed    GET  /api/candles/snapshot          signed last-N-closed-candles, whole venue (v1)
 //   keyed    GET  /api/market-data/market-caps/v1 signed market-cap snapshot (contract v1)
 //   keyed    GET  /api/hub/strategies            community Strat gallery
 //   keyed    POST /api/hub/strategies/publish    share 1..N bots as one Strat
@@ -57,6 +58,7 @@ import type { HttpLike } from "./marketcap/cmc.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
+import { isSnapshotDepth, isSnapshotInterval, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH } from "./candles/snapshot.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
@@ -153,6 +155,12 @@ export interface HubDeps {
   candleFetch?: CandleServiceDeps["fetchLike"];
   /** Injectable so candle tests do not wait out the collector's request pacing. */
   candleSleep?: CandleServiceDeps["sleep"];
+  /** Injectable candle clock. The snapshot cache turns over on bucket
+   *  boundaries, which is hours or a day apart — a suite cannot wait for one
+   *  and must not be left asserting a cache it never saw expire. */
+  candleNow?: CandleServiceDeps["now"];
+  /** Where a snapshot rebuild reports its cost; production prints it. */
+  candleLog?: CandleServiceDeps["log"];
   /** Injectable so market-cap tests never reach a paid provider. */
   marketCapHttp?: HttpLike;
   /** The venues' own public endpoints, for the instrument catalogues. */
@@ -249,7 +257,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,
     },
-    { sign: signSeed, fetchLike: deps.candleFetch, sleep: deps.candleSleep },
+    {
+      sign: signSeed,
+      fetchLike: deps.candleFetch,
+      sleep: deps.candleSleep,
+      now: deps.candleNow,
+      log: deps.candleLog,
+    },
   );
   // ── THE MARKET-CAP PRODUCER ───────────────────────────────────────────────
   // Built only when it is configured AND usable. A refusal is PRINTED and the
@@ -357,6 +371,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
     if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
+    if (m === "GET" && p === "/api/candles/snapshot") return candleSnapshot(req, url, res);
     if (m === "GET" && p === "/api/market-data/market-caps/v1") return marketCapSnapshot(req, url, res);
     // ── the community Strat gallery ────────────────────────────────────────
     // These paths are the BOT's existing ones, deliberately: a liqhunter
@@ -816,6 +831,80 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
       // Candles are immutable once closed, but `lastClosedMs` advances every
       // minute, so the response is only good for about that long.
+      "cache-control": "public, max-age=60",
+    });
+    res.end(bytes);
+  }
+
+  // ── the whole-venue candle snapshot ───────────────────────────────────────
+  //
+  // GET /api/candles/snapshot?venue=&interval=<minutes>&depth=<n> — contract v1.
+  //
+  // The bot's configurable-volatility filter needs the last N CLOSED candles at
+  // a rule's timeframe for every pair it might trade. Asked of the venue that is
+  // one paced request per pair — about nine minutes for a 500-pair roster, on
+  // every install, every restart. This answers the whole roster at once from
+  // the 1m history the hub is already collecting.
+  //
+  // AUTH IS THE SEED'S, UNCHANGED: `x-license` first (a licence in a query
+  // string is written into every access log it passes through and outlives the
+  // request there), `?key=` still accepted because an older install has no
+  // other way to ask. Same `requireKey`-grade gate, same
+  // HUB_CANDLE_REQUIRE_LICENSE escape hatch for a local test hub.
+  //
+  // ⚠ AN UNKNOWN VENUE IS 404 HERE AND 400 ON THE SEED, DELIBERATELY. This
+  // route's venue names a COLLECTION the hub either has or has not — the same
+  // question `/download/<file>` answers with a 404 — and the bot is built
+  // against exactly that. The seed's 400 is unchanged; do not "harmonise" them,
+  // because a shipped bot reads each one.
+  async function candleSnapshot(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    if (cfg.candleRequireLicense) {
+      const v = store.verify(licenseTokenOf(req, url));
+      if (!v.ok) return sendJson(res, 403, { ok: false, error: `license ${v.reason}` });
+    }
+    const venue = url.searchParams.get("venue") ?? "";
+    if (!isVenueId(venue)) {
+      return sendJson(res, 404, { ok: false, error: `unknown venue: ${venue.slice(0, 32)}` });
+    }
+    const rawInterval = url.searchParams.get("interval") ?? "";
+    const rawDepth = url.searchParams.get("depth") ?? "";
+    // The regexes run FIRST so `Number("")` (which is 0) and `Number(" 5 ")`
+    // never reach the validators — an empty parameter must read as malformed,
+    // not as a number nobody typed.
+    const interval = /^\d{1,5}$/.test(rawInterval) ? Number(rawInterval) : NaN;
+    if (!isSnapshotInterval(interval)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: `interval must be one of ${SNAPSHOT_INTERVALS.join(",")} minutes`,
+      });
+    }
+    const depth = /^\d{1,4}$/.test(rawDepth) ? Number(rawDepth) : NaN;
+    if (!isSnapshotDepth(depth)) {
+      return sendJson(res, 400, { ok: false, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` });
+    }
+    const current = candles.snapshot(venue, interval, depth);
+    // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
+    // means "ask me again", which is a different sentence from "this venue has
+    // nothing on it".
+    if (!current.ok) return sendJson(res, current.code, { ok: false, error: current.error });
+
+    const inm = String(req.headers["if-none-match"] ?? "");
+    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+      return void res.end();
+    }
+    const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+    // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
+    // roughly an order of magnitude off it, exactly as it does for a seed.
+    const bytes = wantsGzip ? gzipSync(current.body) : current.body;
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "content-length": bytes.length,
+      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+      etag: current.etag,
+      // The window only moves on a bucket boundary, but `generatedAtMs` and the
+      // roster do not, so a minute of caching is the same bargain the seed and
+      // the market-cap snapshot already make.
       "cache-control": "public, max-age=60",
     });
     res.end(bytes);

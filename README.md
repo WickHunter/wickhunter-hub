@@ -107,6 +107,73 @@ other download surface here: it is a licensed benefit and by far the heaviest
 thing the hub serves. `HUB_CANDLE_REQUIRE_LICENSE=0` opens it for a local test
 hub; nothing else in the licence path changes either way.
 
+### Whole-venue snapshot: wire contract v1 (pinned)
+
+The seed answers for one pair. The bot's **configurable volatility filter** asks
+the same question of every pair at once — *the last N closed candles at this
+timeframe* — and asked of the venue that is one paced request per pair: about
+nine minutes for a 500-pair roster, on every install, after every restart. This
+answers the whole roster from the 1-minute history the hub already holds.
+
+```
+GET /api/candles/snapshot?venue=<venue>&interval=<minutes>&depth=<n>
+
+{ "v":1, "venue":"binance", "interval":1440, "depth":11,
+  "generatedAtMs":<ms>, "lastClosedMs":<ms>,
+  "symbols":[["BTCUSDT",[[openMs,open,high,low,close,volume],...]],...],
+  "skipped":[["SYM","gap"],["SYM2","short"]],
+  "keyId":"seed-1", "sig":"<base64 Ed25519>" }
+```
+
+`interval` is one of `1,3,5,15,30,60,120,180,240,360,480,720,1440` minutes — the
+bot's own rule timeframes, so a caller cannot ask the hub to fold a window no
+rule will read. `depth` is `1..500`.
+
+Each served symbol carries **exactly `depth` complete buckets**, oldest first,
+contiguous on the interval grid and UTC-aligned (`openMs % (interval*60000) ==
+0`), each folded from its 1-minute rows: **first open, max high, min low, last
+close, summed base volume**. `lastClosedMs` is the open time of the newest
+COMPLETE bucket and is the same for every symbol in the response — a per-symbol
+newest bucket would have two pairs in one answer describing different stretches
+of time, which is exactly the comparison a volatility rule is making.
+
+**The forming bucket is never included**, and a pair we cannot answer for
+completely is **named rather than served short**: a bucket folded from the
+minutes that happened to survive is a different candle, and a rule that refuses
+new exposure on a 10% move would read one as calm. `skipped` says which and why:
+
+| reason | meaning | who fixes it |
+| --- | --- | --- |
+| `gap` | we hold history here and it has a hole in it — interior, or a tail not collected yet | the collector |
+| `short` | our history does not reach back far enough: a new listing, retention, or a depth nobody has collected yet | time |
+
+Errors: `400` malformed `interval`/`depth` · `404` unknown venue · `503` nothing
+complete to publish yet. **Never a 200 with no symbols** — "we hold nothing" and
+"this venue lists nothing" must not be one answer. (The seed answers `400` for an
+unknown venue and this answers `404`; both are pinned wire contracts a shipped
+bot reads, so they are deliberately not harmonised.)
+
+Auth, gzip and `cache-control: public, max-age=60` are the seed's, unchanged;
+the response also carries an **ETag** over the served bytes and answers `304`.
+`sig` is Ed25519 over the UTF-8 JSON of the object with `sig` removed and keys
+in exactly this order:
+
+```
+v, venue, interval, depth, generatedAtMs, lastClosedMs, symbols, skipped, keyId
+```
+
+A snapshot is built **lazily, on the first request** for a `(venue, interval,
+depth)` and reused until the next bucket boundary plus a ~90-second settle lag —
+the window is derived from the clock and its buckets are closed, so nothing
+inside it can change, and the lag is what stops a snapshot taken the instant a
+boundary passed from reporting the whole roster as `gap` for the one minute
+nobody has fetched yet. **16 combinations are cached per venue, least-recently-
+used evicted**: the interval and the depth come from the caller, so an unbounded
+cache lets one licence make the hub fold thousands of windows and hold them all.
+A refusal is cached the same way — a cold venue's `503` costs a full fold over
+every symbol too. Nothing here waits on a collector: the roster is its in-memory
+tracked set and the candles come off the day files.
+
 ### Signing key
 
 Seeds were signed with the licence key. That is sound only because of an
@@ -813,6 +880,7 @@ anywhere private is enough; everything else is reproducible.
 | `GET /api/latest?key=` | valid token | signed `wickhunter.release.v1` manifest; legacy `{version,file,sha256}` remain top-level |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
 | `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
+| `GET /api/candles/snapshot?venue=&interval=&depth=` | valid token (`x-license` / `?key=`) | signed last-N-closed-candles for every tracked symbol on one venue (contract v1); ETag + gzip |
 | `GET /api/market-data/market-caps/v1` | valid token (`x-license` / `?key=`) or `x-hub-key` | signed market-cap snapshot (contract v1); ETag + gzip |
 | `GET /admin` | none (page holds no secrets) | static admin page |
 | `GET/POST /admin/api/licenses[/revoke]` | `x-hub-admin` header, constant-time | list / issue / revoke |
@@ -845,6 +913,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.18 — Serve the whole-venue candle snapshot the bot's configurable
+  volatility filter needs: one signed response carrying the last N CLOSED
+  candles at one timeframe for every symbol a venue tracks, folded from the
+  Hub's own 1-minute history, so a 500-pair roster warms in one request instead
+  of minutes of per-symbol venue reads. Publish only complete, UTC-aligned,
+  contiguous buckets and never the forming one; name a pair we cannot answer
+  for completely as `gap` or `short` rather than folding a short bucket. Build
+  lazily per (venue, interval, depth), reuse until the next boundary plus a
+  settle lag, and bound the cached combinations per venue.
 - v0.3.17 — Accept feedback evidence schema v2 with content-validated picture
   attachments, structured diagnostics independently redacted and capped at
   exactly 24 KiB of serialized JSON, and attributed Activity logs. Store

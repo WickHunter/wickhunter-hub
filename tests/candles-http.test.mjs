@@ -7,12 +7,16 @@
 // frozen clock.
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
-import { verify as edVerify, createPublicKey } from "node:crypto";
+import { createHash, verify as edVerify, createPublicKey } from "node:crypto";
 import { freshHub, jsonReq, test, summary, tmpDir } from "./helpers.mjs";
 import { CandleStore, MINUTE_MS, newestClosedOpenMs } from "../dist/src/candles/store.js";
 import { VenueCollector, DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
 import { CandleService } from "../dist/src/candles/service.js";
 import { canonicalBytes } from "../dist/src/candles/seed.js";
+import {
+  canonicalSnapshotBytes, newestCompleteBucketOpenMs, snapshotExpiresAtMs, SNAPSHOT_SETTLE_LAG_MS,
+} from "../dist/src/candles/snapshot.js";
+import { SNAPSHOT_CACHE_PER_VENUE } from "../dist/src/candles/service.js";
 import { VENUE_IDS } from "../dist/src/candles/venues.js";
 
 const NOW = 1786410725631;
@@ -1031,6 +1035,288 @@ await test("the admin page carries the per-exchange panel and refreshes it with 
   assert.ok(onclick, "the page has a Refresh button handler");
   assert.match(onclick[1], /\bcdRefresh\(\)/, "the page's Refresh button refreshes the venue cards too");
 });
+
+
+// ── THE WHOLE-VENUE SNAPSHOT OVER HTTP ──────────────────────────────────────
+//
+// One request warms a bot's volatility filter for a whole venue, so what is
+// driven here is the wire: the same licence gate the seed has, the 400/404/503
+// split, the signed envelope, gzip and the ETag, and the cache — which is the
+// only thing standing between a 500-pair fold and every poll on the box.
+
+const SNAP_DAY = Date.parse("2026-08-02T00:00:00.000Z");
+const FIVE_MS = 5 * MINUTE_MS;
+/** The clock at which `lastClosedMs` is the newest COMPLETE bucket. */
+const snapClockFor = (lastClosedMs, intervalMinutes) =>
+  lastClosedMs + intervalMinutes * MINUTE_MS + SNAPSHOT_SETTLE_LAG_MS;
+
+// A hub with an injectable candle clock: the cache turns over on bucket
+// boundaries, which are minutes to a day apart, and a suite must be able to
+// cross one rather than assert a cache it never saw expire.
+const SNAP_LAST_CLOSED = SNAP_DAY + 40 * FIVE_MS;
+let snapClock = snapClockFor(SNAP_LAST_CLOSED, 5);
+const snapLog = [];
+const snapHub = await freshHub({}, { candleNow: () => snapClock, candleLog: (m) => snapLog.push(m) });
+const snapToken = snapHub.store.issue("Snapshot Tester", 30).token;
+{
+  // 41 five-minute buckets of complete 1m history, plus one pair whose history
+  // starts inside the deepest window and one with a hole in it.
+  const store = new CandleStore(`${snapHub.dataDir}/candles`);
+  const minutes = (from, count, fn = () => true) => {
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const openMs = from + i * MINUTE_MS;
+      if (fn(i)) out.push({ openMs, open: 100 + i, high: 110 + i, low: 90 + i, close: 105 + i, volume: 2 });
+    }
+    return out;
+  };
+  const windowStart = SNAP_DAY;
+  const total = (SNAP_LAST_CLOSED + FIVE_MS - windowStart) / MINUTE_MS;
+  // One bucket MORE than the window the fixture clock selects, so the boundary
+  // test below can watch the window advance into history that exists.
+  const held = total + 5;
+  store.write("bitget", "AAAUSDT", minutes(windowStart, held));
+  store.write("bitget", "ZZZUSDT", minutes(windowStart, held));
+  // Listed 30 buckets in: complete from there, so a shallow window serves it
+  // and a deep one calls it `short`.
+  store.write("bitget", "LATEUSDT", minutes(SNAP_DAY + 30 * FIVE_MS, held - 30 * 5));
+  // One minute never collected, inside the newest bucket: `gap`, at any depth.
+  store.write("bitget", "HOLEUSDT", minutes(windowStart, held, (i) => i !== total - 3));
+}
+const snapUrl = (q) => `${snapHub.origin}/api/candles/snapshot?${new URLSearchParams(q)}`;
+
+await test("a valid key gets a signed snapshot whose signature verifies over the wire bytes", async () => {
+  const res = await fetch(snapUrl({ venue: "bitget", interval: 5, depth: 3, key: snapToken }));
+  assert.equal(res.status, 200);
+  const body = JSON.parse(await res.text());
+  assert.equal(body.v, 1);
+  assert.equal(body.venue, "bitget");
+  assert.equal(body.interval, 5);
+  assert.equal(body.depth, 3);
+  assert.equal(body.keyId, "seed-1");
+  assert.equal(body.generatedAtMs, snapClock, "generatedAtMs is the build clock");
+  assert.equal(body.lastClosedMs, SNAP_LAST_CLOSED, "the newest COMPLETE bucket, shared by every symbol in the response");
+  assert.deepEqual(body.symbols.map((s) => s[0]), ["AAAUSDT", "HOLEUSDT", "LATEUSDT", "ZZZUSDT"].filter((x) => x !== "HOLEUSDT"),
+    "the gapped pair is not among the served ones");
+  for (const [, rows] of body.symbols) {
+    assert.equal(rows.length, 3, "exactly `depth` buckets");
+    assert.equal(rows.at(-1)[0], SNAP_LAST_CLOSED);
+    rows.forEach((r, i) => {
+      assert.equal(r.length, 6);
+      assert.ok(r.every((n) => typeof n === "number" && Number.isFinite(n)), "finite numbers, never strings");
+      assert.equal(r[0] % FIVE_MS, 0, "UTC-aligned on the interval grid");
+      if (i > 0) assert.equal(r[0] - rows[i - 1][0], FIVE_MS, "contiguous");
+    });
+  }
+  assert.deepEqual(body.skipped, [["HOLEUSDT", "gap"]], "a pair we cannot answer for completely is NAMED, not omitted");
+  const { sig, ...unsigned } = body;
+  const pub = createPublicKey(snapHub.store.publicKeyPem());
+  assert.equal(edVerify(null, canonicalSnapshotBytes(unsigned), pub, Buffer.from(sig, "base64")), true,
+    "a client that strips sig and re-serialises in the documented order verifies it");
+});
+
+await test("a deeper window turns a young listing into `short` without touching the others", async () => {
+  const res = await fetch(snapUrl({ venue: "bitget", interval: 5, depth: 20, key: snapToken }));
+  assert.equal(res.status, 200);
+  const body = JSON.parse(await res.text());
+  assert.deepEqual(body.symbols.map((s) => s[0]), ["AAAUSDT", "ZZZUSDT"]);
+  assert.deepEqual(body.skipped, [["HOLEUSDT", "gap"], ["LATEUSDT", "short"]],
+    "'we do not hold enough history' and 'what we hold has a hole' are different sentences");
+  assert.equal(body.symbols[0][1].length, 20);
+});
+
+await test("the snapshot accepts the licence in an x-license header, and refuses without one", async () => {
+  const q = { venue: "bitget", interval: 5, depth: 2 };
+  const viaHeader = await fetch(snapUrl(q), { headers: { "x-license": snapToken } });
+  assert.equal(viaHeader.status, 200, "the header alone authenticates — no key= in the URL to be logged");
+  const expired = snapHub.store.issue("Lapsed", 1, Date.now() - 3 * 86_400_000);
+  const revoked = snapHub.store.issue("Banned", 30);
+  snapHub.store.revoke(revoked.payload.id);
+  for (const [label, key] of [["none", ""], ["garbage", "LHK1.x.y"], ["expired", expired.token], ["revoked", revoked.token]]) {
+    const r = await jsonReq(snapUrl({ ...q, key }));
+    assert.equal(r.status, 403, `key: ${label}`);
+    assert.equal(r.body.ok, false);
+  }
+});
+
+await test("an unknown venue is 404 and a malformed interval or depth is 400", async () => {
+  for (const venue of ["kraken", "", "BITGET!", "../bitget"]) {
+    const r = await jsonReq(snapUrl({ venue, interval: 5, depth: 2, key: snapToken }));
+    assert.equal(r.status, 404, `venue: ${venue}`);
+  }
+  for (const q of [
+    { interval: "7", depth: "2" },        // not one of the bot's rule timeframes
+    { interval: "0", depth: "2" },
+    { interval: "1441", depth: "2" },
+    { interval: "5.5", depth: "2" },
+    { interval: " 5", depth: "2" },       // Number(" 5") is 5; the parameter is still malformed
+    { interval: "", depth: "2" },
+    { interval: "5", depth: "0" },
+    { interval: "5", depth: "501" },
+    { interval: "5", depth: "-1" },
+    { interval: "5", depth: "" },
+  ]) {
+    const r = await jsonReq(snapUrl({ venue: "bitget", ...q, key: snapToken }));
+    assert.equal(r.status, 400, JSON.stringify(q));
+  }
+  const missing = await jsonReq(`${snapHub.origin}/api/candles/snapshot?venue=bitget&key=${snapToken}`);
+  assert.equal(missing.status, 400, "interval and depth are required");
+});
+
+await test("a venue with nothing deep enough is 503, never a 200 with no symbols", async () => {
+  const r = await jsonReq(snapUrl({ venue: "bybit", interval: 5, depth: 2, key: snapToken }));
+  assert.equal(r.status, 503, "a venue this hub holds nothing for");
+  assert.equal(r.body.ok, false);
+  const tooDeep = await jsonReq(snapUrl({ venue: "bitget", interval: 1440, depth: 30, key: snapToken }));
+  assert.equal(tooDeep.status, 503, "a depth no pair on the venue can fill");
+});
+
+await test("the snapshot is gzip-encoded when the client accepts it, and identical once inflated", async () => {
+  const q = { venue: "bitget", interval: 5, depth: 12, key: snapToken };
+  const plain = await fetch(snapUrl(q), { headers: { "accept-encoding": "identity" } });
+  assert.equal(plain.headers.get("content-encoding"), null, "no encoding when not accepted");
+  const gz = await fetch(snapUrl(q), { headers: { "accept-encoding": "gzip" } });
+  assert.equal(gz.headers.get("content-encoding"), "gzip", "gzip when accepted");
+  const text = await plain.text();
+  assert.equal(await gz.text(), text, "same JSON either way");
+  assert.ok(gzipSync(Buffer.from(text)).length < Buffer.byteLength(text), "and gzip is worth having on a body of decimal rows");
+});
+
+await test("the ETag is over the served bytes, is stable across requests, and answers 304", async () => {
+  const q = { venue: "bitget", interval: 5, depth: 4, key: snapToken };
+  const first = await fetch(snapUrl(q), { headers: { "accept-encoding": "identity" } });
+  const etag = first.headers.get("etag");
+  assert.ok(etag && etag.startsWith('"'), "an ETag is offered");
+  assert.equal(first.headers.get("cache-control"), "public, max-age=60");
+  const body = await first.text();
+  assert.equal(
+    `"${createHash("sha256").update(Buffer.from(body, "utf8")).digest("base64url").slice(0, 32)}"`,
+    etag,
+    "the tag is over exactly the bytes a 200 hands out, so a 304 client holds the same thing",
+  );
+  const again = await fetch(snapUrl(q));
+  assert.equal(again.headers.get("etag"), etag, "unchanged while the window is");
+  await again.text();
+  const cached = await fetch(snapUrl(q), { headers: { "if-none-match": etag } });
+  assert.equal(cached.status, 304);
+  assert.equal((await cached.text()).length, 0, "a 304 carries no body");
+});
+
+await test("the snapshot is built once per window and reused until the next boundary settles", async () => {
+  const q = { venue: "bitget", interval: 5, depth: 6, key: snapToken };
+  const before = snapLog.length;
+  const first = JSON.parse(await (await fetch(snapUrl(q))).text());
+  assert.equal(snapLog.length, before + 1, "the first request folds the roster and says what it cost");
+  assert.match(snapLog.at(-1), /bitget 5m x6: \d+ symbols \(\d+ skipped\), \d+ bytes in \d+ms/,
+    "the rebuild reports build time and size, once");
+
+  // Time passes, inside the same bucket: the answer cannot have changed,
+  // because the buckets in it are closed and the window is the same.
+  snapClock += 1_000;
+  const reused = JSON.parse(await (await fetch(snapUrl(q))).text());
+  assert.equal(reused.generatedAtMs, first.generatedAtMs, "the same build, not a fresh fold of 500 pairs");
+  assert.equal(snapLog.length, before + 1, "and nothing was rebuilt");
+
+  // One millisecond before the successor exists, it is still the same answer…
+  snapClock = snapshotExpiresAtMs(SNAP_LAST_CLOSED, 5) - 1;
+  const stillReused = JSON.parse(await (await fetch(snapUrl(q))).text());
+  assert.equal(stillReused.lastClosedMs, SNAP_LAST_CLOSED);
+  assert.equal(snapLog.length, before + 1);
+
+  // …and at the instant a newer bucket has closed and settled, the next request
+  // rebuilds — which is the ONLY thing that moves the window forward.
+  snapClock = snapshotExpiresAtMs(SNAP_LAST_CLOSED, 5);
+  const rebuilt = JSON.parse(await (await fetch(snapUrl(q))).text());
+  assert.equal(snapLog.length, before + 2, "exactly one rebuild, on the boundary");
+  assert.equal(rebuilt.lastClosedMs, SNAP_LAST_CLOSED + FIVE_MS, "the window advanced by exactly one bucket");
+  assert.equal(newestCompleteBucketOpenMs(snapClock, 5), rebuilt.lastClosedMs);
+  snapClock = snapClockFor(SNAP_LAST_CLOSED, 5); // back inside the fixture's window
+});
+
+await test("a cold venue's REFUSAL is cached too, so a poll cannot re-fold the roster every second", async () => {
+  const q = { venue: "aster", interval: 5, depth: 2, key: snapToken };
+  const before = snapLog.length;
+  assert.equal((await jsonReq(snapUrl(q))).status, 503);
+  assert.equal(snapLog.length, before + 1);
+  snapClock += 1_000;
+  assert.equal((await jsonReq(snapUrl(q))).status, 503);
+  assert.equal(snapLog.length, before + 1, "the second poll answered from the cache");
+});
+
+await test("the cache is bounded per venue, and evicts the LEAST RECENTLY USED combination", async () => {
+  // A caller chooses the interval and the depth, so an unbounded map lets one
+  // licence make the hub fold thousands of windows and hold them all.
+  const at = (depth) => snapUrl({ venue: "bitunix", interval: 5, depth, key: snapToken });
+  const store = new CandleStore(`${snapHub.dataDir}/candles`);
+  const total = (SNAP_LAST_CLOSED + FIVE_MS - SNAP_DAY) / MINUTE_MS;
+  store.write("bitunix", "BTCUSDT", Array.from({ length: total }, (_, i) => ({
+    openMs: SNAP_DAY + i * MINUTE_MS, open: 1, high: 2, low: 0.5, close: 1.5, volume: 1,
+  })));
+  const depths = Array.from({ length: SNAPSHOT_CACHE_PER_VENUE }, (_, i) => i + 1);
+  const built = new Map();
+  for (const d of depths) {
+    const b = JSON.parse(await (await fetch(at(d))).text());
+    built.set(d, b.generatedAtMs);
+  }
+  // Still inside the same bucket, so a cached answer keeps its original
+  // generatedAtMs and a rebuilt one carries the new clock — which is how a
+  // rebuild is OBSERVED rather than inferred from a log line.
+  snapClock += 1_000;
+  const overflow = SNAPSHOT_CACHE_PER_VENUE + 1;
+  await (await fetch(at(overflow))).text(); // evicts depth 1, the least recently used
+  const evicted = JSON.parse(await (await fetch(at(1))).text());
+  assert.equal(evicted.generatedAtMs, snapClock, "the oldest combination was dropped and had to be folded again");
+  // Asking for depth 1 again evicted depth 2 in its turn; depth 3 is untouched.
+  const kept = JSON.parse(await (await fetch(at(3))).text());
+  assert.equal(kept.generatedAtMs, built.get(3), "a combination inside the bound is still cached");
+});
+
+await test("the request path never waits on the collector: no venue request, whatever the collector is doing", async () => {
+  const venue = stubVenue({ symbols: ["BTCUSDT", "BRANDNEWUSDT"], listedSince: { BRANDNEWUSDT: Number.MAX_SAFE_INTEGER } });
+  // ⚠ THE STORE'S OWN CLOCK-SKEW GRACE IS 60 s, so one tick at NOW leaves the
+  // newest SETTLED minute one behind the newest closed one. The snapshot clock
+  // is set so its window ends there rather than one minute past the last thing
+  // any collector could have written — in production the 90 s settle lag is
+  // longer than that grace, which is what makes this the ordinary case.
+  const collectorNow = NOW + SNAPSHOT_SETTLE_LAG_MS - MINUTE_MS;
+  const hub = await freshHub(
+    { candleVenues: ["bitget"] },
+    { candleFetch: venue.fetchLike, candleNow: () => collectorNow, candleLog: () => {} },
+  );
+  const key = hub.store.issue("Collector Hub", 30).token;
+  await hub.candles.tickAll(NOW);
+  const requestsBefore = venue.state.requests.length;
+  const r = await jsonReq(`${hub.origin}/api/candles/snapshot?venue=bitget&interval=1&depth=1&key=${key}`);
+  assert.equal(r.status, 200);
+  assert.equal(venue.state.requests.length, requestsBefore,
+    "the snapshot is folded from what is already on disk — a rate-limited venue cannot make this route wait");
+  assert.equal(r.body.lastClosedMs, NEWEST_CLOSED - MINUTE_MS, "the newest complete 1m bucket is the newest SETTLED minute");
+  // THE ROSTER IS THE COLLECTOR'S TRACKED SET, so a pair it lists but has not
+  // collected yet is reported as `short` rather than silently missing from the
+  // response — the reader can tell "not ready" from "not on this venue".
+  assert.deepEqual(r.body.symbols.map((s) => s[0]), ["BTCUSDT"]);
+  assert.deepEqual(r.body.skipped, [["BRANDNEWUSDT", "short"]]);
+  await hub.close();
+});
+
+await test("HUB_CANDLE_REQUIRE_LICENSE=0 opens the snapshot exactly as it opens the seed", async () => {
+  const open = await freshHub(
+    { candleRequireLicense: false },
+    { candleNow: () => snapClockFor(SNAP_LAST_CLOSED, 5), candleLog: () => {} },
+  );
+  const store = new CandleStore(`${open.dataDir}/candles`);
+  const total = (SNAP_LAST_CLOSED + FIVE_MS - SNAP_DAY) / MINUTE_MS;
+  store.write("bitget", "BTCUSDT", Array.from({ length: total }, (_, i) => ({
+    openMs: SNAP_DAY + i * MINUTE_MS, open: 1, high: 2, low: 0.5, close: 1.5, volume: 1,
+  })));
+  const r = await fetch(`${open.origin}/api/candles/snapshot?venue=bitget&interval=5&depth=2`);
+  assert.equal(r.status, 200, "no key needed when the operator turns the gate off");
+  await r.text();
+  assert.equal((await fetch(`${open.origin}/api/latest`)).status, 403, "the licence gate elsewhere is untouched");
+  await open.close();
+});
+
+await snapHub.close();
 
 await h.close();
 summary("candles-http");
