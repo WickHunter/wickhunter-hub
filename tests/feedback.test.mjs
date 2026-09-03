@@ -123,17 +123,21 @@ await test("vendor authentication headers and multi-value Cookie headers are red
   const r = await jsonReq(`${h.origin}/api/feedback`, {
     method: "POST",
     body: JSON.stringify(report({
-      text: '{"x-api-key":"XHEADERSECRET123456","X-BAPI-API-KEY":"BYBITKEYSECRET123456","X-BAPI-SIGN":"BYBITSIGNATURE123456"}',
+      text: '{"x-api-key":"XHEADERSECRET123456","X-BAPI-API-KEY":"BYBITKEYSECRET123456","X-BAPI-SIGN":"BYBITSIGNATURE123456","X-MBX-APIKEY":"BINANCEKEYSECRET123456","ACCESS-SIGN":"BITGETSIGNATURE123456","ACCESS-PASSPHRASE":"BITGETPASSPHRASE123456","sign":"BITUNIXSIGNATURE123456","x-hub-key":"HUBSECRET123456"}',
       logs: ["Cookie: session=COOKIESECRET123456; csrf=CSRFSECRET123456"],
     })),
   });
   assert.equal(r.status, 200);
   const saved = listFeedback(h.dataDir).find((x) => x.id === r.body.id);
   const serialized = JSON.stringify(saved);
-  for (const secret of ["XHEADERSECRET123456", "BYBITKEYSECRET123456", "BYBITSIGNATURE123456", "COOKIESECRET123456", "CSRFSECRET123456"]) {
+  for (const secret of [
+    "XHEADERSECRET123456", "BYBITKEYSECRET123456", "BYBITSIGNATURE123456",
+    "BINANCEKEYSECRET123456", "BITGETSIGNATURE123456", "BITGETPASSPHRASE123456",
+    "BITUNIXSIGNATURE123456", "HUBSECRET123456", "COOKIESECRET123456", "CSRFSECRET123456",
+  ]) {
     assert.ok(!serialized.includes(secret));
   }
-  assert.equal((saved.text.match(/\[redacted\]/g) || []).length, 3);
+  assert.equal((saved.text.match(/\[redacted\]/g) || []).length, 8);
   assert.match(saved.logs[0], /Cookie=\[redacted\]/i);
 });
 

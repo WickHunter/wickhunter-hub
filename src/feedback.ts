@@ -120,8 +120,8 @@ const ATTACHMENTS_DIR = "feedback-attachments";
 export const FEEDBACK_STATUSES: readonly FeedbackStatus[] = ["new", "discussing", "fixed"];
 
 const REDACTED = "[redacted]";
-const SECRET_FIELD_SOURCE = String.raw`(?:(?:x[ _-]?(?:bapi[ _-]?)?)?api[ _-]?(?:key|secret)|x[ _-]?bapi[ _-]?sign|(?:x[ _-]?)?client[ _-]?secret|secret(?:[ _-]?key)?|(?:x[ _-]?)?(?:access|private)[ _-]?key|(?:x[ _-]?)?(?:auth[ _-]?)?token|password|passphrase|authorization|(?:set[ _-]?)?cookie|(?:x[ _-]?)?signature|credential|license)`;
-const SECRET_FIELD = new RegExp(SECRET_FIELD_SOURCE, "i");
+const SECRET_FIELD_SOURCE = String.raw`(?:api[ _-]?(?:key|secret)|client[ _-]?secret|secret(?:[ _-]?key)?|(?:access|private)[ _-]?key|token|password|passphrase|authorization|(?:set[ _-]?)?cookie|sign(?:ature)?|credential|license|key|(?:[A-Za-z0-9]+[ ._-])+(?:api[ _-]?key|key|token|secret|sign(?:ature)?|passphrase|password|authorization|cookie|credential|license))`;
+const SECRET_FIELD = new RegExp(`^(?:${SECRET_FIELD_SOURCE})$`, "i");
 const QUOTED_SECRET_FIELD = new RegExp(
   `(["'])(${SECRET_FIELD_SOURCE})\\1(\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\4)[\\s\\S])*?\\4`,
   "gi",
