@@ -249,6 +249,63 @@ await test("the sharing flag reaches the admin page, and reports rather than enf
   }
 });
 
+// ── v0.3.19 — EXTEND EVERYONE, AND THE CHECK-IN DELIVERS THE KEY ───────────
+await test("extend needs the admin token", async () => {
+  const r = await jsonReq(`${h.origin}/admin/api/licenses/extend`, { method: "POST", body: JSON.stringify({ exp: Date.now() + 1 }) });
+  assert.equal(r.status, 401);
+});
+
+let oldToken, newToken, extId, otherToken, newExp;
+await test("extend moves every earlier active licence and reports who moved", async () => {
+  const a = await jsonReq(`${h.origin}/admin/api/licenses`, { method: "POST", headers: AUTH, body: JSON.stringify({ name: "Beta A", days: 7 }) });
+  const b = await jsonReq(`${h.origin}/admin/api/licenses`, { method: "POST", headers: AUTH, body: JSON.stringify({ name: "Beta B", days: 900 }) });
+  oldToken = a.body.token; extId = a.body.license.id; otherToken = b.body.token;
+  newExp = Date.now() + 60 * 86_400_000;
+  const bad = await jsonReq(`${h.origin}/admin/api/licenses/extend`, { method: "POST", headers: AUTH, body: JSON.stringify({}) });
+  assert.equal(bad.status, 400);
+  const r = await jsonReq(`${h.origin}/admin/api/licenses/extend`, { method: "POST", headers: AUTH, body: JSON.stringify({ exp: newExp }) });
+  assert.equal(r.status, 200);
+  assert.ok(r.body.extended.some((x) => x.id === extId && x.exp === Math.round(newExp)), JSON.stringify(r.body));
+  assert.ok(!r.body.extended.some((x) => x.id === b.body.license.id), "the 900-day licence is not shortened");
+  newToken = h.store.tokenFor(extId);
+  assert.notEqual(newToken, oldToken);
+});
+
+const checkin = (body) => jsonReq(`${h.origin}/api/license/checkin`, {
+  method: "POST", body: JSON.stringify({ licenseId: extId, installId: "inst-1", version: "0.90.3", ts: Date.now(), ...body }),
+});
+await test("a check-in presenting the OLD genuine token receives the re-minted one", async () => {
+  const c = await checkin({ token: oldToken });
+  assert.equal(c.status, 200);
+  assert.equal(c.body.token, newToken);
+  assert.equal(c.body.exp, Math.round(newExp));
+  assert.equal(h.store.verify(c.body.token).payload.exp, Math.round(newExp));
+});
+await test("a bare licence id gets NO token — the id is not a secret, the token is", async () => {
+  const c = await checkin({});
+  assert.equal(c.status, 200);
+  assert.equal("token" in c.body, false, JSON.stringify(c.body));
+});
+await test("presenting the NEW token gets nothing more (not later)", async () => {
+  const c = await checkin({ token: newToken });
+  assert.equal("token" in c.body, false);
+});
+await test("another tester's genuine token does not unlock this id", async () => {
+  const c = await checkin({ token: otherToken });
+  assert.equal("token" in c.body, false);
+});
+await test("a forged token gets nothing", async () => {
+  const [p, body] = oldToken.split(".");
+  const c = await checkin({ token: `${p}.${body}.${"A".repeat(86)}` });
+  assert.equal("token" in c.body, false);
+});
+await test("a revoked licence gets nothing, even with its genuine old token", async () => {
+  h.store.revoke(extId);
+  const c = await checkin({ token: oldToken });
+  assert.equal(c.body.revoked, true);
+  assert.equal("token" in c.body, false);
+});
+
 await h.close();
 
 await test("with no HUB_ADMIN_TOKEN configured the whole admin surface is 503", async () => {

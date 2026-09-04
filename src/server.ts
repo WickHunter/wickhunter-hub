@@ -435,11 +435,34 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // deserves a truthful answer. Nothing here grants access to anything — the
     // licence gate is a separate mechanism at the order-submit seam.
     const flags = flagsFor(cfg.dataDir, body.licenseId);
+    // ── v0.3.19 — A LONGER KEY RIDES THE REPLY, TO A CALLER WHO PROVED THE OLD ONE
+    //
+    // `exp` is inside the signed token and the bot checks it offline, so until
+    // now an extension only took effect once the tester ran a new install
+    // command. Now the bot may send its CURRENT token in the check-in body;
+    // if it is genuine (signature over the exact bytes), names THIS id, and
+    // the registry promises a LATER expiry, the reply carries the re-minted
+    // key and the bot installs it after verifying it against the same public
+    // key. Nothing is handed to a bare id: a licence id is not a secret, the
+    // token is, and only a holder of the current token gets its successor.
+    // A revoked or unknown id gets nothing, and a registry date that is not
+    // later hands back nothing — the reply is byte-identical to before for
+    // every caller this branch does not admit.
+    let renewal: { token: string; exp: number } | null = null;
+    if (!revoked && typeof body.token === "string" && body.token.length <= 4096) {
+      const presented = store.decodeGenuine(body.token);
+      const current = presented && presented.id === body.licenseId ? store.get(body.licenseId) : null;
+      if (presented && current && current.exp > presented.exp) {
+        const token = store.tokenFor(body.licenseId);
+        if (token) renewal = { token, exp: current.exp };
+      }
+    }
     sendJson(res, 200, {
       ok: true,
       ...(revoked ? { revoked: true } : {}),
       ...(latest ? { latest } : {}),
       flags,
+      ...(renewal ? { token: renewal.token, exp: renewal.exp } : {}),
     });
   }
 
@@ -1354,6 +1377,28 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         ok: true,
         exp: payload.exp,
         installCommand: token ? `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
+      });
+    }
+    // ── v0.3.19 — EXTEND EVERY ACTIVE LICENCE TO ONE DATE ────────────────
+    // `{exp}` unix-ms. Every non-revoked licence expiring EARLIER moves to it;
+    // nothing is ever shortened here. The re-minted keys reach running bots
+    // through the check-in, so the reply lists who moved and who did not, and
+    // per-row install commands are still available from `/licenses/command`
+    // for a bot too old to pick the key up itself.
+    if (m === "POST" && p === "/admin/api/licenses/extend") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.exp !== "number" || !Number.isFinite(body.exp)) {
+        return sendJson(res, 400, { ok: false, error: "expected {exp} with exp a unix-ms timestamp" });
+      }
+      let out;
+      try { out = store.extendAll(body.exp); }
+      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }); }
+      return sendJson(res, 200, {
+        ok: true,
+        exp: Math.round(body.exp),
+        extended: out.extended.map((x) => ({ id: x.id, name: x.name, exp: x.exp })),
+        unchanged: out.unchanged,
+        refused: out.refused,
       });
     }
     if (m === "GET" && p === "/admin/api/flags") {

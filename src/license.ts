@@ -292,6 +292,46 @@ export class LicenseStore {
     return payload;
   }
 
+  /** The stored payload for an id, or null for an unknown or revoked one. The
+   *  check-in reads this to learn whether the registry now promises a LATER
+   *  expiry than the token a tester is presenting. */
+  get(id: string): LicensePayload | null {
+    const registry = readJson<Record<string, LicensePayload>>(this.licensesFile, {});
+    const payload = registry[id];
+    return payload && !this.isRevoked(id) ? payload : null;
+  }
+
+  /** ── EXTEND EVERY ACTIVE LICENCE TO ONE DATE (v0.3.19) ───────────────────
+   *
+   *  Operator, 2026-09-04: "extend every beta tester's sub to 9/30 — I am going
+   *  to start charging on 10/1. I want it to be as easy on users and myself."
+   *  One call, every non-revoked licence whose expiry is EARLIER than `exp`
+   *  moves to `exp`; a licence already past that date is left alone (this
+   *  never shortens anything — `setExpiry` is the tool for that, one at a
+   *  time). A licence the bound refuses (more than 3650 days from its issue)
+   *  is reported by name rather than aborting the rest.
+   *
+   *  The re-minted key reaches a running bot through the check-in (see
+   *  `server.ts`'s check-in reply) once the bot presents its current key, so
+   *  after this call the operator has nothing else to send. */
+  extendAll(exp: number, now = Date.now()): { extended: LicensePayload[]; unchanged: number; refused: Array<{ id: string; name: string; error: string }> } {
+    if (!Number.isFinite(exp)) throw new Error("exp must be a finite unix-ms timestamp");
+    const extended: LicensePayload[] = [];
+    const refused: Array<{ id: string; name: string; error: string }> = [];
+    let unchanged = 0;
+    for (const rec of this.list()) {
+      if (rec.revoked) continue;
+      if (rec.exp >= exp) { unchanged++; continue; }
+      try {
+        const p = this.setExpiry(rec.id, exp, now);
+        if (p) extended.push(p);
+      } catch (e) {
+        refused.push({ id: rec.id, name: rec.name, error: (e as Error).message });
+      }
+    }
+    return { extended, unchanged, refused };
+  }
+
   /** Revoke by id. Returns false for an id this hub never issued (caller
    *  decides whether that is an error); revoking twice is a no-op success. */
   revoke(id: string, now = new Date()): boolean {

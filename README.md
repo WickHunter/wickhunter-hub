@@ -8,6 +8,19 @@ runs on the same VPS as the bot (its own systemd unit, loopback-only on
 Zero runtime dependencies: node builtins only. TypeScript + a hermetic test
 suite gate every commit: `npx tsc && node tests/run-all.mjs`.
 
+## Licence extension at check-in (v0.3.19)
+
+`npm run extend -- --to 2026-09-30` (or the admin page's "Extend every active
+license" control) moves every non-revoked licence expiring earlier to the end
+of that UTC day; nothing is ever shortened. The bot's daily check-in now sends
+its CURRENT token in the body; when that token is genuine, names the same
+licence id and the registry promises a later expiry, the reply carries
+`token` (the re-minted key) and `exp`. The bot verifies it against the same
+pinned public key and installs it itself — no install command to send. A bare
+licence id never receives a token (the id is not a secret, the token is), and
+a revoked id receives nothing. Bots older than v0.90.3 ignore the field and
+still need their row's install command.
+
 ## Tester feedback
 
 Beta bots POST bug reports / feature requests to `/api/feedback`, authenticated
@@ -913,6 +926,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.19 — A licence extension reaches a running bot at check-in. The bot may
+  send its current token in the check-in body; when it is genuine, names the
+  same id, is not revoked and the registry promises a later expiry, the reply
+  carries the re-minted key and its `exp`. A bare id never receives a token.
+  `LicenseStore.extendAll`, `POST /admin/api/licenses/extend`, `npm run
+  extend -- --to YYYY-MM-DD` and the admin page's "Extend every active
+  license" control move every earlier-expiring active licence to one date and
+  never shorten one. Operator: every beta tester to 2026-09-30, billing from
+  2026-10-01.
 - v0.3.18 — Serve the whole-venue candle snapshot the bot's configurable
   volatility filter needs: one signed response carrying the last N CLOSED
   candles at one timeframe for every symbol a venue tracks, folded from the
