@@ -51,6 +51,7 @@
   .expsave { margin-left: .3rem; }
   .expsave:disabled { opacity: .45; cursor: default; }
   .share { color: var(--warn); font-weight: 600; white-space: nowrap; }
+.seat { font: 600 11px var(--mono); color: var(--muted); margin-top: 3px; }
   .muted { color: var(--muted); }
   .opsgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(18rem,1fr)); gap:.7rem; margin-top:.7rem; }
   .opscard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r); padding:.9rem 1rem; min-width:0; }
@@ -554,6 +555,41 @@ async function refresh() {
         + "the replaced install stops checking in. Revoking is per-key, so it stops every copy at once.";
       tr.querySelector(".instcell").appendChild(warn);
     }
+    // ── v0.4.1 — THE SEAT. One install per licence, enforced at check-in. ──
+    // The cell names the seat holder (alive = checked in within the release
+    // window), how many other installs were refused, and a clone signal when
+    // the holder's id checks in from several IPs. "Release seat" frees it now
+    // instead of waiting out the 30-minute silence.
+    if (l.seat) {
+      const cell = tr.querySelector(".instcell");
+      const holder = l.seat.installs[0];
+      if (holder) {
+        const s = document.createElement("div");
+        s.className = "seat";
+        s.textContent = "seat " + holder.installId.slice(0, 8) + (holder.alive ? " ●" : " ○")
+          + (l.seat.installs.length > 1 ? " +" + (l.seat.installs.length - 1) : "")
+          + (l.seat.limit > 1 ? " (limit " + l.seat.limit + ")" : "");
+        s.title = (holder.alive ? "Holding the seat; last check-in " : "Silent since ") + fmt(holder.lastSeenMs)
+          + " from " + holder.lastIp + (l.seat.enforce ? "" : " (enforcement OFF)");
+        cell.appendChild(s);
+        if (holder.clone) {
+          const c = document.createElement("span");
+          c.className = "share";
+          c.textContent = " ⚠ " + holder.clone.ips + " IPs";
+          c.title = "This install id checked in from " + holder.clone.ips + " different IPs inside " + holder.clone.windowMinutes
+            + " minutes (" + holder.clone.switches + " switches). A copied data/ directory on a second box looks like this; so can a home line whose address changes.";
+          cell.appendChild(c);
+        }
+      }
+      if (l.seat.refused > 0) {
+        const r = document.createElement("span");
+        r.className = "share";
+        r.textContent = " ⛔ " + l.seat.refused + " refused";
+        r.title = "Another install tried to use this licence and was answered as revoked (exit-only). Last: install "
+          + String(l.seat.lastRefusedInstallId || "").slice(0, 8) + " from " + (l.seat.lastRefusedIp || "?") + " at " + fmt(l.seat.lastRefusedAtMs);
+        cell.appendChild(r);
+      }
+    }
 
     // ── EXPIRY, EDITABLE ────────────────────────────────────────────────────
     // A revoked license keeps a plain date: `setExpiry` refuses one server-side
@@ -650,6 +686,18 @@ async function refresh() {
         } catch (e) { if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message; }
       };
       tr.lastElementChild.appendChild(copy);
+      if (l.seat && l.seat.installs.length) {
+        const rel = document.createElement("button");
+        rel.textContent = "Release seat";
+        rel.title = "Free this licence's seat now. The next install to check in takes it; the current holder is refused if it is still running.";
+        rel.onclick = async () => {
+          if (!confirm("Release the seat for " + l.name + "? The next install to check in takes it.")) return;
+          try { await api("/admin/api/licenses/seat/release", { method: "POST", body: JSON.stringify({ id: l.id }) }); }
+          catch (e) { document.getElementById("err").textContent = e.message; }
+          refresh();
+        };
+        tr.lastElementChild.appendChild(rel);
+      }
       const btn = document.createElement("button");
       btn.className = "revoke";
       btn.textContent = "Revoke";

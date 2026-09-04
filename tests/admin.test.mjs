@@ -227,26 +227,36 @@ await test("two installs on one key are flagged; a reinstall is not", async () =
     "a reinstall was counted as sharing — the signal is cumulative, not concurrent, and is useless");
 });
 
-await test("the sharing flag reaches the admin page, and reports rather than enforces", async () => {
+await test("the sharing flag reaches the admin page, and v0.4.1 ENFORCES one install per licence at check-in", async () => {
   const r = await fetch(`${h.origin}/admin`);
   const html = await r.text();
   assert.ok(/l\.sharing && l\.sharing\.installs > 1/.test(html), "the page never reads the sharing signal");
   assert.ok(/installs checked in with this key/.test(html), "no explanation of what the flag means");
-  // A shared key still WORKS — this release detects, it does not lock anyone
-  // out, and a test that let enforcement slip in silently would be worse than
-  // no test at all.
+  assert.ok(/Release seat/.test(html), "the page offers no way to free a seat");
+  // v0.4.1 — the first install holds the seat; a second LIVE install is
+  // answered as revoked (exit-only) while the registry is untouched. Before
+  // this release the second install was let through and merely flagged.
   const issued = await jsonReq(`${h.origin}/admin/api/licenses`, {
     method: "POST", headers: AUTH, body: JSON.stringify({ name: "Still Works", days: 5 }),
   });
   const id = issued.body.license.id;
-  for (const installId of ["one", "two"]) {
-    const c = await jsonReq(`${h.origin}/api/license/checkin`, {
-      method: "POST",
-      body: JSON.stringify({ licenseId: id, installId, version: "0.74.80", ts: Date.now() }),
-    });
-    assert.equal(c.status, 200);
-    assert.ok(!c.body.revoked, "a second install was refused — that is enforcement, which was not asked for");
-  }
+  const one = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST", body: JSON.stringify({ licenseId: id, installId: "one", version: "0.74.80", ts: Date.now() }),
+  });
+  assert.equal(one.status, 200);
+  assert.ok(!one.body.revoked, "the first install holds the seat");
+  const two = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST", body: JSON.stringify({ licenseId: id, installId: "two", version: "0.74.80", ts: Date.now() }),
+  });
+  assert.equal(two.status, 200);
+  assert.equal(two.body.revoked, true, "a second live install is refused");
+  assert.match(two.body.reason, /another install already holds/);
+  assert.equal(h.store.isRevoked(id), false, "the licence itself is not revoked");
+  const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
+  const row = list.body.licenses.find((l) => l.id === id);
+  assert.equal(row.seat.installs[0].installId, "one");
+  assert.equal(row.seat.refused, 1);
+  assert.equal(row.sharing.installs, 2, "the report still shows both installs were seen");
 });
 
 // ── v0.3.19 — EXTEND EVERYONE, AND THE CHECK-IN DELIVERS THE KEY ───────────

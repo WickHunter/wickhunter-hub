@@ -9,4 +9,4 @@
 // into data/upgrade.log, so the refusal was written where nobody looks while
 // the restart had already succeeded. The suite now pins the two together; a
 // comment is no longer what holds this.
-export const HUB_VERSION = "0.4.0";
+export const HUB_VERSION = "0.4.1";

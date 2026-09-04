@@ -3,7 +3,7 @@
 //
 // Surfaces, outermost first:
 //   public   GET  /api/health                    liveness + version
-//   keyed    POST /api/license/checkin           bot phone-home; answers revoked
+//   keyed    POST /api/license/checkin           bot phone-home; answers revoked (also for a 2nd install — see src/seats.ts)
 //   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
@@ -90,6 +90,7 @@ import {
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
+import { DEFAULT_SEAT_POLICY, SeatStore } from "./seats.js";
 import type { BillingMode } from "./billing/config.js";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
@@ -162,6 +163,8 @@ export interface Hub {
   /** Stripe -> licence -> install page. Always constructed; does nothing
    *  until the admin page is given keys (see src/billing/). */
   billing: BillingService;
+  /** One install per licence, decided at check-in (see src/seats.ts). */
+  seats: SeatStore;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
@@ -201,6 +204,9 @@ export interface HubDeps {
   billingFetch?: BillingServiceDeps["fetchLike"];
   billingNow?: BillingServiceDeps["now"];
   billingRandomBytes?: BillingServiceDeps["randomBytes"];
+  /** Injectable seat clock: a seat frees after 30 minutes of silence, which a
+   *  suite cannot wait out. */
+  seatNow?: () => number;
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -239,6 +245,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
   });
+  const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
+  const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
   /** A Strat body is bigger than a vote and smaller than a feedback log dump:
    *  ten bot configs, capped again inside the service regardless of this. */
@@ -461,7 +469,26 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     );
     // Unknown id => revoked:true. A licenseId this hub never issued has no
     // business running; failing safe here is the whole kill switch.
-    const revoked = !store.isKnown(body.licenseId) || store.isRevoked(body.licenseId);
+    const registryRevoked = !store.isKnown(body.licenseId) || store.isRevoked(body.licenseId);
+    // ── v0.4.1 — ONE INSTALL PER LICENCE, DECIDED HERE ─────────────────────
+    // The first install id to check in holds the seat; another live install
+    // presenting the same licence is answered exactly as a revoked one would
+    // be, so IT goes exit-only while the seat holder is untouched. The
+    // registry is not written: this is a refusal of an install, not of the
+    // licence, and it lifts by itself once the seat frees (30 min of silence,
+    // or an admin release). Recorded even when enforcement is off, so turning
+    // it on later starts with history. See src/seats.ts.
+    let seatRefused: "seat-taken" | "clone" | null = null;
+    if (!registryRevoked) {
+      const admit = seats.admit(body.licenseId, body.installId.slice(0, 64), clientIp(req), seatNow());
+      if (!admit.admitted) {
+        seatRefused = admit.reason;
+        console.warn(`[seat] ${body.licenseId} refused install ${body.installId.slice(0, 8)} from ${clientIp(req)} (${admit.reason})`);
+      } else if (admit.bound) {
+        console.log(`[seat] ${body.licenseId} bound to install ${body.installId.slice(0, 8)}${admit.evicted.length ? ` (replacing silent ${admit.evicted.map((e) => e.slice(0, 8)).join(", ")})` : ""}`);
+      }
+    }
+    const revoked = registryRevoked || seatRefused !== null;
     // The reply also carries the latest published beta version (when one
     // exists) so the bot can show "update available" — informational only;
     // a bot that ignores it loses nothing.
@@ -505,6 +532,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     sendJson(res, 200, {
       ok: true,
       ...(revoked ? { revoked: true } : {}),
+      // Why, for a human reading the bot's log; the bot itself ignores it.
+      ...(seatRefused ? { reason: seatRefused === "clone" ? "this install id is checking in from more than one machine" : "another install already holds this licence's seat" } : {}),
       ...(latest ? { latest } : {}),
       flags,
       ...(renewal ? { token: renewal.token, exp: renewal.exp } : {}),
@@ -1131,6 +1160,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // second one is visible.
       const sharing = sharingSignals(cfg.dataDir);
       const featureFlags = readFlags(cfg.dataDir);
+      const seatViews = seats.views(seatNow());
       const licenses = store.list().map((l) => ({
         ...l,
         // Marketplace is intentionally per-licence alpha. A global default is
@@ -1138,8 +1168,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         marketplaceAlpha: featureFlags.byLicense[l.id]?.marketplace === true,
         lastSeen: roster[l.id] ?? null,
         sharing: sharing[l.id] ?? null,
+        seat: seatViews[l.id] ?? null,
       }));
-      return sendJson(res, 200, { ok: true, origin: cfg.publicOrigin, licenses });
+      return sendJson(res, 200, { ok: true, origin: cfg.publicOrigin, seatPolicy: seats.policy, licenses });
+    }
+    // ── seats: release / per-licence limit ───────────────────────────────
+    if (m === "POST" && p === "/admin/api/licenses/seat/release") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.id !== "string" || !body.id) return sendJson(res, 400, { ok: false, error: "expected {id}" });
+      return sendJson(res, 200, { ok: true, released: seats.release(body.id, seatNow()) });
+    }
+    if (m === "POST" && p === "/admin/api/licenses/seat/limit") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.id !== "string" || !body.id || !(body.limit === null || typeof body.limit === "number")) {
+        return sendJson(res, 400, { ok: false, error: "expected {id, limit: number|null}" });
+      }
+      if (!store.isKnown(body.id)) return sendJson(res, 404, { ok: false, error: "unknown license id" });
+      try { seats.setLimit(body.id, body.limit as number | null); }
+      catch (err) { return sendJson(res, 400, { ok: false, error: (err as Error).message }); }
+      return sendJson(res, 200, { ok: true, seat: seats.view(body.id, seatNow()) });
     }
     if (m === "POST" && p === "/admin/api/licenses") {
       const body = await readJsonBody(req);
@@ -1633,6 +1680,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     candleKey,
     licenseLeases,
     billing,
+    seats,
     listen: () =>
       new Promise<number>((resolve, reject) => {
         server.once("error", reject);

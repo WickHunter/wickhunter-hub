@@ -19,6 +19,7 @@ import {
   type MarketplaceStatusBridgeConfig,
 } from "./marketplace-status.js";
 import type { MarketplaceInputsConfig } from "./marketplace-inputs.js";
+import { seatPolicyFromEnv, type SeatPolicy } from "./seats.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -46,6 +47,13 @@ export interface HubConfig {
   /** Additive WHL1 lease service. Old LHK1/check-in clients do not read this
    * and retain their exact wire behavior during staged migration. */
   licenseLease?: LicenseLeaseConfig;
+
+  // ── one install per licence ────────────────────────────────────────────
+  /** Seat enforcement at the check-in seam (src/seats.ts). OPTIONAL for the
+   *  same reason the other late additions are: HubConfig is built by hand in
+   *  tests and tools; absent means the shipped default — enforce, 30-minute
+   *  release, clone signal reported but not enforced, one install. */
+  seats?: SeatPolicy;
 
   // ── private Marketplace operations bridge ──────────────────────────────
   /** Optional, server-to-server, loopback-only status bridge. The browser
@@ -184,6 +192,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       maxClockSkewMs: Number(env.HUB_LICENSE_LEASE_CLOCK_SKEW_MS ?? 5 * 60 * 1_000),
       defaultMaxMachines: Number(env.HUB_LICENSE_LEASE_DEFAULT_MAX_MACHINES ?? 1),
     },
+    seats: seatPolicyFromEnv(env),
     marketplaceStatus: marketplaceStatusBridgeFromEnv(env),
     marketplaceInputs: {
       envFile: env.HUB_MARKETPLACE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace-state.env",
