@@ -21,6 +21,37 @@ licence id never receives a token (the id is not a secret, the token is), and
 a revoked id receives nothing. Bots older than v0.90.3 ignore the field and
 still need their row's install command.
 
+## One install per licence (v0.4.1)
+
+A licence is valid on **one VPS**. The Hub decides this at the check-in seam,
+with no bot change: the first install id to check in holds the licence's
+**seat**, and any other install presenting the same licence is answered
+exactly as a revoked one would be (`revoked:true`), so *that* install goes
+exit-only while the seat holder is untouched. The registry is never written —
+the licence stays valid, an extra install is refused — and the refusal lifts by
+itself once the seat frees.
+
+A seat frees after **30 minutes of silence** (`HUB_SEAT_RELEASE_MINUTES`, six
+missed check-ins). That is the honest case that keeps working: reinstall on a
+new server, destroy the old one, and the new install takes the seat on its
+next check-in. It is also the window a sharer cannot fake — two live boxes both
+check in every five minutes, so neither goes silent and the second stays
+refused for as long as the first runs. The admin page shows the seat holder
+(● alive / ○ silent), how many installs were refused and from where, and a
+**Release seat** button that frees it now; `POST /admin/api/licenses/seat/limit`
+allows a named licence more than one install.
+
+What this cannot see: a copied `data/` directory carries the install id, so two
+clones present the same identity. They still show up as one id checking in from
+two IPs inside 15 minutes — reported as a **clone signal** (⚠ N IPs) and
+enforceable with `HUB_SEAT_CLONE_ENFORCE=1`, off by default because a home line
+behind carrier NAT can change egress IP legitimately. Closing that gap for good
+is the machine-bound lease below (an install-held private key), whose Hub half
+already ships and whose bot half is a separate rollout.
+
+`HUB_SEAT_ENFORCE=0` turns refusal off (the Hub keeps recording seats so
+switching it on later starts with history). State: `data/license-seats.v1.json`.
+
 ## Billing: Stripe → licence → install page (v0.4.0)
 
 The Hub sells the product without a second server. A visitor buys through a
@@ -973,6 +1004,7 @@ artifact before it expires if no new build is planned.
 | `data/upgrade-status.v1.json`, `data/upgrade.log` | last self-upgrade outcome and bounded diagnostic log | upgrade remains possible, but the admin loses the previous audit trail |
 | `data/candle-signing.key` | Ed25519 candle-seed private key, mode 600 | a new key is generated, so every bot pinned to the old `candle-1` public key refuses every seed until re-pasted — back this up too |
 | `data/licenses.json` | registry of issued licenses | can't tell known ids from foreign ones |
+| `data/license-seats.v1.json` | which install holds each licence's seat, refusals, IP history | every seat frees; the next check-in of each licence re-binds it |
 | `data/revoked.json` | durable revocations | revoked keys work again |
 | `data/roster.json` | compact last-seen per license | rebuildable from the ledger |
 | `data/checkins.jsonl` | append-only check-in ledger | history gone |
@@ -989,7 +1021,8 @@ anywhere private is enough; everything else is reproducible.
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `GET /api/health` | none | version plus installed build, source checkout comparison and last upgrade outcome (no log tail) |
-| `POST /api/license/checkin` | none (records everything) | bot phone-home; answers `revoked:true` for revoked/unknown ids |
+| `POST /api/license/checkin` | none (records everything) | bot phone-home; answers `revoked:true` for revoked/unknown ids **and for a second live install of a licence** (seat, v0.4.1) |
+| `POST /admin/api/licenses/seat/release` · `/seat/limit` | `x-hub-admin` header | free a licence's seat now / allow it N installs |
 | `POST /api/license/lease/challenge` | active LHK1 in `x-license` (lapsed genuine LHK1 only for deactivation) | one-time purpose/key-bound nonce and exact proof bytes |
 | `POST /api/license/lease/activate` | LHK1 + install Ed25519 proof | consume nonce, enforce seat limit, create binding and WHL1 lease |
 | `POST /api/license/lease/renew` | LHK1 + bound install proof | increment sequence and issue a short lease |
@@ -1043,6 +1076,14 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.1 — **One install per licence.** The first install id to check in
+  holds the licence's seat; any other live install is answered `revoked:true`
+  (exit-only) while the holder is alive, and the registry is untouched. A seat
+  frees after 30 minutes of silence so a reinstall on a new server takes over
+  by itself; an admin can release it now or allow a licence N installs. A
+  copied install id checking in from alternating IPs is surfaced as a clone
+  signal (enforceable, off by default). `src/seats.ts`, pinned in
+  `tests/seats.test.mjs`. The welcome page says so in words.
 - v0.4.0 — **Sell the product from the Hub.** A Stripe Payment Link checkout
   posts a signed webhook; the Hub mints an `LHK1` licence against the Stripe
   customer and emails a link to a private install page, which mints a
