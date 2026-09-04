@@ -926,6 +926,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.3.20 — A file written by a root-run CLI belongs to the data directory's
+  owner. `npm run extend` (and `issue`/`revoke`) run as root rewrote
+  `data/licenses.json` at mode 0600 owned by root, so the `wickhunter-hub`
+  service answered `EACCES` on `GET /admin/api/licenses` and on EVERY tester
+  check-in until the file was chowned by hand. `writeJsonAtomic` and
+  `appendJsonl` now hand a file to the directory's owner before it lands when
+  the writer is root; a non-root writer and a root-owned directory are
+  untouched. Pinned in `tests/jsonfile.test.mjs`. Recovery on an affected
+  box: `chown -R wickhunter-hub:wickhunter-hub /opt/wickhunter-hub/data`.
 - v0.3.19 — A licence extension reaches a running bot at check-in. The bot may
   send its current token in the check-in body; when it is genuine, names the
   same id, is not revoked and the registry promises a later expiry, the reply
