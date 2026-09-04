@@ -9,129 +9,186 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wick Hunter Hub</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: dark;
+    --ground:#0a0c12; --raised:#11141d; --inset:#0d1017; --line:#212736; --line-soft:#1a1f2c;
+    --ink:#e9ecf5; --muted:#96a0b8; --dim:#5c6579;
+    --accent:#6f68f2; --accent-dim:rgba(111,104,242,.14); --accent-line:rgba(111,104,242,.38);
+    --long:#2fd08a; --short:#f0556e; --warn:#f2a93b;
+    --r:14px; --r-sm:10px;
+    --sans:-apple-system,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
   * { box-sizing: border-box; }
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 68rem; margin: 1.5rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; margin: 1.2rem 0 .4rem; } h1 small { font-weight: normal; opacity: .6; }
+  html { background: var(--ground); }
+  body { font: 14px/1.55 var(--sans); max-width: 72rem; margin: 0 auto; padding: 0 1rem 3rem; background: var(--ground); color: var(--ink); }
+  h1 { font-size: 1.3rem; margin: 1.2rem 0 .4rem; color: var(--ink); } h1 small { font-weight: normal; color: var(--muted); }
+  h2 { color: var(--ink); }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
   .tbl { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tbl table th:first-child, .tbl table td:first-child { position: sticky; left: 0; background: var(--ground); }
   table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
-  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #8884; white-space: nowrap; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--line-soft); white-space: nowrap; color: var(--ink); }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
   td.name { white-space: normal; }
   .revoked { opacity: .5; text-decoration: line-through; }
-  .state-active { color: #2a7; } .state-expired { color: #b80; } .state-revoked { color: #c33; }
+  .state-active { color: var(--long); } .state-expired { color: var(--warn); } .state-revoked { color: var(--short); }
   form, .actions { display: flex; gap: .5rem; align-items: center; margin-top: .8rem; flex-wrap: wrap; }
-  input, button, select { font: inherit; padding: .45rem .7rem; min-height: 2.6rem; border-radius: 6px; }
-  button { cursor: pointer; }
+  input, button, select, textarea { font: inherit; color: var(--ink); }
+  input, button, select { padding: .5rem .8rem; min-height: 2.6rem; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--raised); }
+  input, select, textarea { background: var(--inset); }
+  button { cursor: pointer; background: var(--raised); border: 1px solid var(--line); transition: border-color .15s ease, background .15s ease; }
+  button:hover { border-color: var(--accent-line); }
+  button[type=submit] { background: var(--accent); border-color: var(--accent); color: #fff; }
   input[name=name] { width: 14rem; max-width: 100%; } input[name=days] { width: 5rem; }
-  #issued { margin-top: 1rem; padding: 1rem; border: 1px solid #8884; border-radius: 6px; display: none; }
-  #issued textarea { width: 100%; font: 12px/1.4 ui-monospace, monospace; margin-top: .5rem; }
-  #err { color: #c33; margin-top: 1rem; overflow-wrap: anywhere; }
-  #note { color: #2a7; margin-top: 1rem; }
-  button.revoke { color: #c33; }
+  #issued { margin-top: 1rem; padding: 1rem; border: 1px solid var(--line); background: var(--raised); border-radius: var(--r); display: none; }
+  #issued textarea { width: 100%; font: 12px/1.4 var(--mono); margin-top: .5rem; }
+  #err { color: var(--short); margin-top: 1rem; overflow-wrap: anywhere; }
+  #note { color: var(--long); margin-top: 1rem; }
+  button.revoke { color: var(--short); border-color: var(--short); }
   .expinput { width: 9.2rem; }
   .expsave { margin-left: .3rem; }
   .expsave:disabled { opacity: .45; cursor: default; }
-  .share { color: #c33; font-weight: 600; white-space: nowrap; }
-  .muted { opacity: .6; }
+  .share { color: var(--warn); font-weight: 600; white-space: nowrap; }
+  .muted { color: var(--muted); }
   .opsgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(18rem,1fr)); gap:.7rem; margin-top:.7rem; }
-  .opscard { border:1px solid #8884; border-radius:8px; padding:.75rem .9rem; min-width:0; }
-  .opscard h2 { font-size:.95rem; margin:0 0 .35rem; }
-  .opscard dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .6rem; margin:0; }
-  .opscard dt { opacity:.65; } .opscard dd { margin:0; overflow-wrap:anywhere; }
-  .ops-ok { color:#2a7; } .ops-warn { color:#b80; } .ops-bad { color:#c33; }
-  .logtail { white-space:pre-wrap; overflow:auto; max-height:18rem; font:12px/1.45 ui-monospace,monospace;
-             background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
+  .opscard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r); padding:.9rem 1rem; min-width:0; }
+  .opscard h2 { font-size:.95rem; margin:0 0 .5rem; }
+  .opscard dl { display:grid; grid-template-columns:auto 1fr; gap:.2rem .6rem; margin:0; }
+  .opscard dt { color: var(--muted); } .opscard dd { margin:0; overflow-wrap:anywhere; }
+  .ops-ok { color:var(--long); } .ops-warn { color:var(--warn); } .ops-bad { color:var(--short); }
+  .logtail { white-space:pre-wrap; overflow:auto; overflow-wrap:anywhere; max-height:18rem; font:12px/1.5 var(--mono);
+             background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:.7rem; color:var(--ink); }
   .fbmeta { display:flex; gap:.35rem; flex-wrap:wrap; margin:.7rem 0 .25rem; }
-  .fbpill { border:1px solid #8885; border-radius:999px; padding:.15rem .55rem; font-size:.78rem; }
+  .fbpill { border:1px solid var(--line); border-radius:999px; padding:.2rem .6rem; font-size:.78rem; color:var(--muted); }
   .fbevidence { white-space:normal; min-width:10rem; line-height:1.7; }
-  .fbdetailrow td { white-space:normal; padding:.8rem; background:#00000008; }
+  .fbdetailrow td { white-space:normal; padding:.9rem; background:var(--inset); }
   .fbdetail { display:grid; gap:.8rem; }
-  .fbdetailgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(14rem,1fr)); gap:.55rem; }
-  .fbdetailcard { border:1px solid #8884; border-radius:7px; padding:.65rem; min-width:0; }
+  .fbdetailgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(14rem,1fr)); gap:.6rem; }
+  .fbdetailcard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem; min-width:0; }
   .fbdetailcard h3 { font-size:.86rem; margin:0 0 .35rem; }
   .fbdetailcard dl { display:grid; grid-template-columns:auto 1fr; gap:.12rem .5rem; margin:0; }
-  .fbdetailcard dt { opacity:.62; } .fbdetailcard dd { margin:0; overflow-wrap:anywhere; }
-  .fbshot { display:block; max-width:100%; max-height:34rem; object-fit:contain; border:1px solid #8884; border-radius:7px; background:#0001; }
-  .fbjson { white-space:pre-wrap; overflow:auto; max-height:24rem; overflow-wrap:anywhere; font:12px/1.45 ui-monospace,monospace;
-            background:#0002; border:1px solid #8884; border-radius:6px; padding:.6rem; }
+  .fbdetailcard dt { color:var(--muted); } .fbdetailcard dd { margin:0; overflow-wrap:anywhere; }
+  .fbshot { display:block; max-width:100%; max-height:34rem; object-fit:contain; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--inset); }
+  .fbjson { white-space:pre-wrap; overflow:auto; max-height:24rem; overflow-wrap:anywhere; font:12px/1.5 var(--mono);
+            background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:.7rem; color:var(--ink); }
   .setupcopy { white-space:normal; min-width:18rem; }
   .configgroups { display:grid; gap:.8rem; margin-top:.8rem; }
-  .configgroup { border:1px solid #8884; border-radius:8px; padding:.8rem .9rem; }
-  .configgroup h2 { font-size:1rem; margin:0 0 .55rem; }
-  .configfields { display:grid; grid-template-columns:repeat(auto-fit,minmax(19rem,1fr)); gap:.65rem; }
-  .configfield { min-width:0; border-top:1px solid #8883; padding-top:.55rem; }
+  .configgroup { border:1px solid var(--line); background:var(--raised); border-radius:var(--r); padding:.9rem 1rem; }
+  .configgroup h2 { font-size:1rem; margin:0 0 .6rem; }
+  .configfields { display:grid; grid-template-columns:repeat(auto-fit,minmax(19rem,1fr)); gap:.7rem; }
+  .configfield { min-width:0; border-top:1px solid var(--line-soft); padding-top:.6rem; }
   .configfield label { display:block; font-weight:650; }
-  .configfield code { display:block; font-size:.7rem; opacity:.62; overflow-wrap:anywhere; }
+  .configfield code { display:block; font-size:.7rem; color:var(--muted); overflow-wrap:anywhere; font-family:var(--mono); }
   .configfield input, .configfield select, .configfield textarea { width:100%; margin-top:.35rem; font-size:16px; }
   .configfield textarea { min-height:5.2rem; resize:vertical; }
   .recipientfields { display:grid; grid-template-columns:1fr 1fr; gap:.45rem; margin-top:.35rem; }
   .recipientfields label { font-size:.76rem; font-weight:600; }
   .recipientfields input { margin-top:.18rem; }
-  .confighelp { font-size:.78rem; opacity:.68; margin-top:.25rem; overflow-wrap:anywhere; }
+  .confighelp { font-size:.78rem; color:var(--muted); margin-top:.25rem; overflow-wrap:anywhere; }
   .configstate { font-size:.7rem; margin-left:.35rem; text-transform:uppercase; }
-  .configclear { margin-top:.3rem; min-height:2rem; padding:.25rem .55rem; }
+  .configclear { margin-top:.3rem; min-height:2.6rem; padding:.3rem .6rem; }
   #mktConfigNote { overflow-wrap:anywhere; }
-  .hubnav { display:flex; gap:.45rem; flex-wrap:wrap; margin:1rem 0 .35rem; }
-  .hubnav button[aria-selected="true"] { border-color:#6c63ff; color:#fff; background:#5147d9; }
+  .topbar { position:sticky; top:0; z-index:6; background:var(--ground); border-bottom:1px solid var(--line); padding-top:.7rem; margin-bottom:.2rem; }
+  .topbar-row { display:flex; align-items:center; gap:.7rem; flex-wrap:wrap; padding-bottom:.6rem; }
+  .topbar h1 { margin:0; font-size:1.15rem; }
+  .hubnav { display:flex; gap:.4rem; flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch; padding:.1rem .1rem .7rem; margin:0; }
+  .hubnav button { flex:0 0 auto; white-space:nowrap; border-radius:999px; padding:.55rem 1.1rem; background:var(--raised); border:1px solid var(--line); color:var(--muted); }
+  .hubnav button[aria-selected="true"] { border-color:var(--accent-line); color:var(--ink); background:var(--accent-dim); }
   .hubpage[hidden] { display:none !important; }
-  .leasepub { font:12px/1.5 ui-monospace,monospace; overflow-wrap:anywhere;
-              border:1px solid #8884; border-radius:6px; padding:.5rem .6rem; margin:.45rem 0; }
+  .leasepub { font:12px/1.5 var(--mono); overflow-wrap:anywhere; color:var(--ink);
+              background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:.6rem .7rem; margin:.5rem 0; }
   /* per-exchange collector cards */
   #venues { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: .8rem; margin-top: .6rem; }
-  .venue { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; }
+  .venue { border: 1px solid var(--line); background:var(--raised); border-radius: var(--r); padding: .9rem 1.05rem; }
   .venue h2 { font-size: 1.05rem; margin: 0 0 .35rem; display: flex; align-items: baseline; gap: .5rem; }
   .venue h2 .id { text-transform: uppercase; letter-spacing: .04em; }
-  .vstate { font-size: .78rem; font-weight: 700; padding: .1rem .45rem; border-radius: 4px; border: 1px solid currentColor; }
-  .v-running { color: #2a7; } .v-stalled { color: #b80; }
-  .v-failing { color: #c33; } .v-starting { color: #78c; } .v-off { color: #999; }
-  .v-cooling { color: #59c; }
-  .venue dl { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; margin: .5rem 0 0; font-size: .88rem; }
-  .venue dt { opacity: .65; } .venue dd { margin: 0; }
-  .venue .detail { font-size: .85rem; margin: .1rem 0 .3rem; }
-  .venue .verr { color: #c33; font-size: .82rem; overflow-wrap: anywhere; margin-top: .4rem; }
-  .buckets { display: flex; flex-wrap: wrap; gap: .3rem; margin: .55rem 0 .1rem; }
-  .bkt { font-size: .8rem; padding: .12rem .45rem; border-radius: 4px; border: 1px solid #8886; white-space: nowrap; }
+  .vstate { font-size: .78rem; font-weight: 700; padding: .12rem .5rem; border-radius: 999px; border: 1px solid currentColor; }
+  .v-running { color: var(--long); } .v-stalled { color: var(--warn); }
+  .v-failing { color: var(--short); } .v-starting { color: #8f9ffc; } .v-off { color: var(--dim); }
+  .v-cooling { color: #59c2e6; }
+  .venue dl { display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; margin: .5rem 0 0; font-size: .88rem; }
+  .venue dt { color:var(--muted); } .venue dd { margin: 0; }
+  .venue .detail { font-size: .85rem; margin: .1rem 0 .3rem; color:var(--muted); }
+  .venue .verr { color: var(--short); font-size: .82rem; overflow-wrap: anywhere; margin-top: .4rem; }
+  .buckets { display: flex; flex-wrap: wrap; gap: .35rem; margin: .6rem 0 .1rem; }
+  .bkt { font-size: .8rem; padding: .15rem .5rem; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
   .bkt b { font-weight: 700; }
-  .b-seedable { color: #2a7; } .b-backfilling { color: #78c; }
-  .b-gapped { color: #b80; } .b-empty { color: #999; } .b-new { color: #a6c; }
-  .venue .worst { font-size: .82rem; margin-top: .45rem; overflow-wrap: anywhere; }
-  .venue .noconf { font-size: .88rem; margin-top: .5rem; }
+  .b-seedable { color: var(--long); } .b-backfilling { color: #8f9ffc; }
+  .b-gapped { color: var(--warn); } .b-empty { color: var(--dim); } .b-new { color: #c58ff2; }
+  .venue .worst { font-size: .82rem; margin-top: .45rem; overflow-wrap: anywhere; color:var(--muted); }
+  .venue .noconf { font-size: .88rem; margin-top: .5rem; color:var(--muted); }
   /* candle seed signing key — public material, meant to be copied */
-  #seedkey { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; margin-top: .6rem; }
+  #seedkey { border: 1px solid var(--line); background:var(--raised); border-radius: var(--r); padding: .9rem 1.05rem; margin-top: .6rem; }
   #seedkey h2 { font-size: 1rem; margin: 0 0 .3rem; }
-  #seedkey .pub { font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere;
-                  border: 1px solid #8884; border-radius: 6px; padding: .5rem .6rem; margin: .45rem 0; }
-  #seedkey .safe { color: #2a7; font-weight: 600; }
-  #seedkey .steps { font-size: .85rem; margin: .5rem 0 0; padding-left: 1.1rem; }
-  #seedkey .steps li { margin: .1rem 0; }
+  #seedkey .pub { font: 12px/1.5 var(--mono); overflow-wrap: anywhere; color:var(--ink);
+                  background:var(--inset); border: 1px solid var(--line); border-radius: var(--r-sm); padding: .6rem .7rem; margin: .5rem 0; }
+  #seedkey .safe { color: var(--long); font-weight: 600; }
+  #seedkey .steps { font-size: .85rem; margin: .5rem 0 0; padding-left: 1.1rem; color:var(--muted); }
+  #seedkey .steps li { margin: .15rem 0; }
   #seedkey .live { font-size: .85rem; margin-top: .4rem; }
   /* sign-in overlay: a real form so password managers offer autofill */
-  #gate { position: fixed; inset: 0; display: grid; place-items: center; background: Canvas; z-index: 10; }
-  #gate .card { width: min(92vw, 22rem); border: 1px solid #8884; border-radius: 10px; padding: 1.2rem; }
+  #gate { position: fixed; inset: 0; display: grid; place-items: center; background: var(--ground); z-index: 10; }
+  #gate .card { width: min(92vw, 22rem); border: 1px solid var(--line); background:var(--raised); border-radius: var(--r); padding: 1.2rem; }
   #gate input[type=password] { width: 100%; font-size: 16px; } /* 16px = no iOS zoom */
   #gate button { width: 100%; margin-top: .6rem; }
+  /* billing panel */
+  .billinghead { display:flex; align-items:center; gap:.7rem; flex-wrap:wrap; margin:1rem 0 .2rem; }
+  .modeswitch { display:flex; gap:.3rem; border:1px solid var(--line); border-radius:999px; padding:.25rem; background:var(--raised); }
+  .modeswitch button { border:0; border-radius:999px; padding:.5rem 1.1rem; background:transparent; color:var(--muted); min-height:2.4rem; font-weight:700; }
+  .modeswitch button[aria-pressed="true"] { background:var(--accent); color:#fff; }
+  .modeswitch button.live[aria-pressed="true"] { background:var(--short); }
+  .readylist { display:grid; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); gap:.6rem; margin-top:.7rem; }
+  .readyitem { display:flex; gap:.6rem; align-items:flex-start; border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem .8rem; }
+  .dot { width:.65rem; height:.65rem; border-radius:50%; margin-top:.3rem; flex:0 0 auto; background:var(--dim); }
+  .dot.ok { background:var(--long); } .dot.warn { background:var(--warn); }
+  .linkrow { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; padding:.5rem 0; border-top:1px solid var(--line-soft); }
+  .linkrow:first-child { border-top:0; }
+  .linkrow label { flex:0 0 9rem; color:var(--muted); font-size:.82rem; }
+  .linkrow code { flex:1 1 14rem; min-width:0; overflow-wrap:anywhere; background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:.5rem .6rem; font:12px/1.4 var(--mono); }
+  .billingcards { display:grid; grid-template-columns:repeat(auto-fit,minmax(20rem,1fr)); gap:.8rem; margin-top:.8rem; }
+  .secretrow { display:flex; align-items:center; gap:.4rem; }
+  .secretrow input { flex:1 1 auto; }
+  .secretrow button { flex:0 0 auto; padding:.4rem .6rem; min-height:2.4rem; font-size:.78rem; }
+  .custbadge { display:inline-block; font-size:.7rem; padding:.1rem .45rem; border-radius:999px; border:1px solid currentColor; margin-right:.25rem; white-space:nowrap; }
+  .custbadge.test { color:var(--muted); } .custbadge.live { color:var(--accent); }
+  .custbadge.revoked, .custbadge.disputed, .custbadge.refunded { color:var(--short); }
+  .eventrow { display:flex; gap:.6rem; align-items:baseline; padding:.5rem 0; border-top:1px solid var(--line-soft); font-size:.85rem; flex-wrap:wrap; }
+  .eventrow:first-child { border-top:0; }
+  .custcards { display:none; }
+  .custcard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem .8rem; }
+  .custcard dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .5rem; margin:.4rem 0; font-size:.85rem; }
+  .custcard dt { color:var(--muted); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
+  }
   @media (max-width: 640px) {
-    body { margin: .8rem auto; }
+    body { margin: 0 auto; padding: 0 .8rem 3rem; }
     th, td { padding: .4rem .45rem; }
     input[name=name] { width: 100%; }
+    input, select, textarea { font-size: 16px; }
     /* This checklist is an operator workflow, not a data grid on phones.
        Horizontal scrolling left the state and actual action off screen, so
        stack every field while other dense admin tables remain scrollable. */
     #mktInputs thead { position:absolute; width:1px; height:1px; overflow:hidden;
                       clip:rect(0 0 0 0); white-space:nowrap; }
     #mktInputs, #mktInputs tbody, #mktInputs tr, #mktInputs td { display:block; width:100%; }
-    #mktInputs tr { padding:.65rem 0; border-bottom:1px solid #8884; }
+    #mktInputs tr { padding:.65rem 0; border-bottom:1px solid var(--line); }
     #mktInputs td { min-width:0; padding:.22rem .45rem; border:0;
                     white-space:normal; overflow-wrap:anywhere; }
     #mktInputs td[data-label]::before { content:attr(data-label); display:block;
                                        margin-bottom:.08rem; font-size:.72rem;
-                                       font-weight:700; opacity:.58; text-transform:uppercase;
+                                       font-weight:700; color:var(--dim); text-transform:uppercase;
                                        letter-spacing:.035em; }
     #mktInputs .copySetup { margin-top:.35rem; }
     .configfields { grid-template-columns:1fr; }
     .recipientfields { grid-template-columns:1fr; }
     .configgroup { padding:.7rem; }
     #mktConfigActions button, #mktConfigForm > button { width:100%; }
+    .custtable { display:none; }
+    .custcards { display:grid; }
+    .linkrow label { flex-basis:100%; }
   }
 </style>
 </head>
@@ -144,23 +201,27 @@
     <input type="text" name="username" value="hub-admin" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
     <input type="password" name="token" autocomplete="current-password" autocapitalize="none" spellcheck="false" required placeholder="HUB_ADMIN_TOKEN">
     <button type="submit">Sign in</button>
-    <div id="gateErr" style="color:#c33;margin-top:.6rem"></div>
+    <div id="gateErr" style="color:var(--short);margin-top:.6rem"></div>
   </form>
 </div>
 
-<h1>Wick Hunter Hub <small>— licensing &amp; operations</small></h1>
-<div class="actions">
-  <button type="button" id="refresh">Refresh</button>
-  <button type="button" id="upgradeHub">Upgrade hub</button>
-  <span id="hubVer" class="muted"></span>
-</div>
-
-<nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
-  <button type="button" data-hub-page="licenses">Licenses &amp; installs</button>
-  <button type="button" data-hub-page="market-data">Market data</button>
-  <button type="button" data-hub-page="marketplace">Marketplace</button>
-  <button type="button" data-hub-page="system">System &amp; feedback</button>
-</nav>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1>Wick Hunter Hub <small>— licensing &amp; operations</small></h1>
+    <div class="actions" style="margin-top:0">
+      <button type="button" id="refresh">Refresh</button>
+      <button type="button" id="upgradeHub">Upgrade hub</button>
+      <span id="hubVer" class="muted"></span>
+    </div>
+  </div>
+  <nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
+    <button type="button" data-hub-page="licenses">Licenses &amp; installs</button>
+    <button type="button" data-hub-page="market-data">Market data</button>
+    <button type="button" data-hub-page="marketplace">Marketplace</button>
+    <button type="button" data-hub-page="billing">Billing</button>
+    <button type="button" data-hub-page="system">System &amp; feedback</button>
+  </nav>
+</header>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
@@ -208,6 +269,81 @@
   <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
 </form>
 </section>
+
+<section class="hubpage" data-hub-page-panel="billing" hidden>
+<h1 style="margin-top:2.2rem">Billing <small>— Stripe checkout, licences and receipts</small></h1>
+<div id="billingUnavailable" class="opscard muted" hidden>This Hub build has no billing yet.</div>
+<div id="billingBody" hidden>
+
+<div class="billinghead">
+  <span class="muted">Mode</span>
+  <div class="modeswitch" id="billingModeSwitch" role="group" aria-label="Billing mode">
+    <button type="button" class="test" data-mode="test" aria-pressed="false">TEST</button>
+    <button type="button" class="live" data-mode="live" aria-pressed="false">LIVE</button>
+  </div>
+</div>
+
+<h2 style="margin:1.2rem 0 .2rem">Readiness</h2>
+<div class="readylist" id="billingReady"></div>
+
+<h2 style="margin:1.2rem 0 .2rem">Links to use</h2>
+<p class="muted" style="margin:.2rem 0">Put the Buy and Billing links on the website; paste the webhook URLs into Stripe (Developers &rarr; Webhooks) for the matching mode.</p>
+<div class="opscard" id="billingLinks"></div>
+
+<div class="billingcards">
+  <section class="configgroup" id="billingStripeTest">
+    <h2>Stripe &middot; Test</h2>
+    <div class="configfields" id="billingStripeTestFields"></div>
+    <button type="button" class="save" data-mode="test" style="margin-top:.7rem">Save Test keys</button>
+    <span class="muted billing-savenote" data-mode="test" style="margin-left:.5rem"></span>
+  </section>
+  <section class="configgroup" id="billingStripeLive">
+    <h2>Stripe &middot; Live</h2>
+    <div class="configfields" id="billingStripeLiveFields"></div>
+    <button type="button" class="save" data-mode="live" style="margin-top:.7rem">Save Live keys</button>
+    <span class="muted billing-savenote" data-mode="live" style="margin-left:.5rem"></span>
+  </section>
+</div>
+
+<section class="configgroup" style="margin-top:.8rem">
+  <h2>Email</h2>
+  <div class="configfields" id="billingEmailFields"></div>
+  <button type="button" id="billingEmailSave" style="margin-top:.7rem">Save email settings</button>
+  <span class="muted" id="billingEmailNote" style="margin-left:.5rem"></span>
+  <div class="actions">
+    <input type="email" id="billingTestEmailTo" placeholder="Send test email to&hellip;" autocomplete="off">
+    <button type="button" id="billingTestEmailSend">Send test email</button>
+    <span class="muted" id="billingTestEmailNote"></span>
+  </div>
+</section>
+
+<section class="configgroup" style="margin-top:.8rem">
+  <h2>Policy</h2>
+  <div class="configfields" id="billingPolicyFields"></div>
+  <button type="button" id="billingPolicySave" style="margin-top:.7rem">Save policy</button>
+  <span class="muted" id="billingPolicyNote" style="margin-left:.5rem"></span>
+</section>
+
+<h2 style="margin:1.2rem 0 .2rem">Customers</h2>
+<div class="actions">
+  <button type="button" id="billingCustomersRefresh">Refresh</button>
+  <span id="billingCustomersMeta" class="muted"></span>
+</div>
+<div class="tbl"><table class="custtable">
+  <thead><tr><th>Customer</th><th>Mode</th><th>Licence</th><th>Subscription</th><th>Welcome</th><th>Last seen</th><th></th></tr></thead>
+  <tbody id="billingCustomerRows"><tr><td colspan="7">loading&hellip;</td></tr></tbody>
+</table></div>
+<div class="custcards" id="billingCustomerCards"></div>
+
+<h2 style="margin:1.2rem 0 .2rem">Recent events</h2>
+<div class="actions">
+  <button type="button" id="billingEventsRefresh">Refresh</button>
+</div>
+<div id="billingEvents"><div class="muted">loading&hellip;</div></div>
+
+</div>
+</section>
+
 
 <section class="hubpage" data-hub-page-panel="licenses">
 <h1 style="margin-top:2.2rem">Licenses &amp; install commands</h1>
@@ -296,7 +432,7 @@
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
 
-const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "system"]);
+const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "system"]);
 function showHubPage(wanted, remember) {
   const page = HUB_PAGES.has(wanted) ? wanted : "licenses";
   document.querySelectorAll("[data-hub-page-panel]").forEach((panel) => {
@@ -332,6 +468,9 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   cdRefresh();
   mcRefresh();
   fbRefresh();
+  billingConfigRefresh();
+  billingCustomersRefresh();
+  billingEventsRefresh();
 };
 
 async function api(path, opts) {
@@ -548,7 +687,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -1074,7 +1213,7 @@ async function mcRefresh() {
   html += '<div class="detail">The <b>id</b> is the durable key; the slug is a label the provider owns. '
     + "A slug that names a different id is refused — that is the failure where one venue's book quietly "
     + "takes another's identities.</div>";
-  html += '<table style="width:100%;font-size:.86rem"><thead><tr><th>venue</th><th>slug</th><th>id</th>'
+  html += '<div class="tbl"><table style="width:100%;font-size:.86rem"><thead><tr><th>venue</th><th>slug</th><th>id</th>'
     + "<th>pairs held</th><th>provider says</th></tr></thead><tbody>";
   for (const v of Object.keys(h.slugs)) {
     const s = h.slugs[v];
@@ -1082,11 +1221,11 @@ async function mcRefresh() {
       ? '<span class="muted">not read</span>'
       : s.exchangeId === s.expectedId
         ? String(s.exchangeId)
-        : '<span style="color:#c33">' + s.exchangeId + " (expected " + s.expectedId + ")</span>";
-    html += "<tr><td>" + esc(v) + "</td><td>" + esc(s.slug) + (s.validated ? "" : ' <span style="color:#c33">unvalidated</span>')
+        : '<span style="color:var(--short)">' + s.exchangeId + " (expected " + s.expectedId + ")</span>";
+    html += "<tr><td>" + esc(v) + "</td><td>" + esc(s.slug) + (s.validated ? "" : ' <span style="color:var(--short)">unvalidated</span>')
       + "</td><td>" + idCell + "</td><td>" + s.pairs + "</td><td>" + (s.providerPairs === null ? "—" : s.providerPairs) + "</td></tr>";
   }
-  html += "</tbody></table></div>";
+  html += "</tbody></table></div></div>";
 
   if (h.errors.length) {
     html += '<div class="venue"><h2><span class="id">recent errors</span></h2>';
@@ -1410,6 +1549,397 @@ document.getElementById("fbExport").onclick = async () => {
     err.textContent = e.message || "Could not export feedback.";
   }
 };
+
+// ── Billing ─────────────────────────────────────────────────────────────────
+// A separate branch implements the server side of this against a fixed
+// contract (see the route comments in src/server.ts once merged). Every call
+// here degrades: a 404 (this Hub build predates billing) or any other failure
+// to load /admin/api/billing/config swaps the whole panel for one line, never
+// a half-built form.
+let billingConfig = null;
+let billingCustomers = [];
+
+function billingSecretField(name, meta, placeholder) {
+  const wrap = document.createElement("div");
+  wrap.className = "secretrow";
+  const input = document.createElement("input");
+  input.type = "password";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.dataset.field = name;
+  const configured = !!(meta && meta.configured);
+  input.placeholder = configured ? ("configured" + (meta.last4 ? " ····" + meta.last4 : "")) : placeholder;
+  input.addEventListener("input", () => { delete input.dataset.clear; input.placeholder = configured ? ("configured" + (meta.last4 ? " ····" + meta.last4 : "")) : placeholder; });
+  wrap.appendChild(input);
+  if (configured) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.textContent = "Clear";
+    clear.onclick = () => { input.value = ""; input.dataset.clear = "1"; input.placeholder = "will clear on save"; };
+    wrap.appendChild(clear);
+  }
+  return { wrap, input };
+}
+
+function billingConfigField(labelText, input, help) {
+  const card = document.createElement("div");
+  card.className = "configfield";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  card.appendChild(label);
+  card.appendChild(input);
+  if (help) {
+    const h = document.createElement("div");
+    h.className = "confighelp";
+    h.textContent = help;
+    card.appendChild(h);
+  }
+  return card;
+}
+
+function billingTextField(name, value, placeholder) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.dataset.field = name;
+  input.value = value || "";
+  if (placeholder) input.placeholder = placeholder;
+  return input;
+}
+
+function renderStripeCard(mode, data) {
+  const wrap = document.getElementById(mode === "test" ? "billingStripeTestFields" : "billingStripeLiveFields");
+  wrap.innerHTML = "";
+  const pub = billingTextField("publishableKey", data.publishableKey, "pk_" + mode + "_…");
+  wrap.appendChild(billingConfigField("Publishable key", pub));
+  const secret = billingSecretField("secretKey", data.secretKey, "sk_" + mode + "_… / rk_…");
+  wrap.appendChild(billingConfigField("Secret key", secret.wrap));
+  const whsec = billingSecretField("webhookSecret", data.webhookSecret, "whsec_…");
+  wrap.appendChild(billingConfigField("Webhook signing secret", whsec.wrap));
+  const link = billingTextField("paymentLinkUrl", data.paymentLinkUrl, "https://buy.stripe.com/…");
+  wrap.appendChild(billingConfigField("Payment Link URL", link));
+  const portal = billingTextField("portalUrl", data.portalUrl, "https://billing.stripe.com/…");
+  wrap.appendChild(billingConfigField("Customer Portal login URL", portal));
+}
+
+async function billingSaveStripe(mode) {
+  const wrap = document.getElementById(mode === "test" ? "billingStripeTestFields" : "billingStripeLiveFields");
+  const payload = {};
+  for (const input of wrap.querySelectorAll("[data-field]")) {
+    const name = input.dataset.field;
+    if (input.type === "password") {
+      if (input.dataset.clear === "1") payload[name] = null;
+      else if (input.value !== "") payload[name] = input.value;
+    } else if (input.value !== "") {
+      payload[name] = input.value;
+    }
+  }
+  const note = document.querySelector('.billing-savenote[data-mode="' + mode + '"]');
+  note.textContent = "Saving…";
+  try {
+    const data = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { [mode]: payload } }) });
+    billingConfig = data;
+    billingRenderAll(data);
+    note.textContent = "Saved.";
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+}
+document.querySelectorAll(".billingcards .save").forEach((btn) => {
+  btn.onclick = () => billingSaveStripe(btn.dataset.mode);
+});
+
+function renderEmailCard(email) {
+  const wrap = document.getElementById("billingEmailFields");
+  wrap.innerHTML = "";
+  const select = document.createElement("select");
+  select.dataset.field = "provider";
+  for (const opt of ["none", "resend", "postmark"]) {
+    const o = document.createElement("option");
+    o.value = opt; o.textContent = opt;
+    if (email.provider === opt) o.selected = true;
+    select.appendChild(o);
+  }
+  wrap.appendChild(billingConfigField("Provider", select));
+  const secret = billingSecretField("apiKey", email.apiKey, "API key…");
+  wrap.appendChild(billingConfigField("API key", secret.wrap));
+  const from = billingTextField("from", email.from, 'Wick Hunter <hello@wickhunterunleashed.com>');
+  wrap.appendChild(billingConfigField("From", from));
+  const replyTo = billingTextField("replyTo", email.replyTo, "");
+  wrap.appendChild(billingConfigField("Reply-To", replyTo));
+}
+document.getElementById("billingEmailSave").onclick = async () => {
+  const wrap = document.getElementById("billingEmailFields");
+  const payload = {};
+  for (const input of wrap.querySelectorAll("[data-field]")) {
+    const name = input.dataset.field;
+    if (input.tagName === "SELECT") { payload[name] = input.value; continue; }
+    if (input.type === "password") {
+      if (input.dataset.clear === "1") payload[name] = null;
+      else if (input.value !== "") payload[name] = input.value;
+    } else if (input.value !== "") {
+      payload[name] = input.value;
+    }
+  }
+  const note = document.getElementById("billingEmailNote");
+  note.textContent = "Saving…";
+  try {
+    const data = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ email: payload }) });
+    billingConfig = data;
+    billingRenderAll(data);
+    note.textContent = "Saved.";
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+};
+document.getElementById("billingTestEmailSend").onclick = async () => {
+  const to = document.getElementById("billingTestEmailTo").value.trim();
+  const note = document.getElementById("billingTestEmailNote");
+  if (!to) { note.textContent = "Enter an address first."; return; }
+  note.textContent = "Sending…";
+  try {
+    await api("/admin/api/billing/test-email", { method: "POST", body: JSON.stringify({ to }) });
+    note.textContent = "Sent to " + to + ".";
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+};
+
+const BILLING_POLICY_NUMBER_FIELDS = [
+  ["graceDays", "Grace days", "Days added after the paid period end before the bot goes exit-only."],
+  ["bootstrapDays", "Bootstrap days", "Days a new subscription licence is valid before the first invoice.paid event arrives."],
+  ["oneOffDays", "One-off days", "Licence length for one-time purchases."],
+  ["testMaxDays", "Test max days", "Cap on licences minted from TEST-mode checkouts."],
+];
+function renderPolicyCard(policy, siteOrigin) {
+  const wrap = document.getElementById("billingPolicyFields");
+  wrap.innerHTML = "";
+  for (const [name, label, help] of BILLING_POLICY_NUMBER_FIELDS) {
+    const input = document.createElement("input");
+    input.type = "number"; input.min = "0"; input.dataset.field = name;
+    input.value = policy[name] != null ? policy[name] : "";
+    wrap.appendChild(billingConfigField(label, input, help));
+  }
+  wrap.appendChild(billingConfigField("Plan", billingTextField("plan", policy.plan, "unleashed")));
+  for (const [name, label] of [["revokeOnDispute", "Revoke on dispute"], ["revokeOnRefund", "Revoke on refund"]]) {
+    const card = document.createElement("div");
+    card.className = "configfield";
+    const label2 = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.dataset.field = name; cb.checked = !!policy[name];
+    cb.style.cssText = "width:auto;min-height:auto;margin-right:.4rem;vertical-align:middle";
+    label2.appendChild(cb);
+    label2.appendChild(document.createTextNode(label));
+    card.appendChild(label2);
+    wrap.appendChild(card);
+  }
+  wrap.appendChild(billingConfigField("Site origin", billingTextField("siteOrigin", siteOrigin, "https://wickhunterunleashed.com")));
+}
+document.getElementById("billingPolicySave").onclick = async () => {
+  const wrap = document.getElementById("billingPolicyFields");
+  const policy = {};
+  let siteOrigin;
+  for (const input of wrap.querySelectorAll("[data-field]")) {
+    const name = input.dataset.field;
+    if (name === "siteOrigin") { siteOrigin = input.value; continue; }
+    if (input.type === "checkbox") policy[name] = input.checked;
+    else if (input.type === "number") { if (input.value !== "") policy[name] = Number(input.value); }
+    else policy[name] = input.value;
+  }
+  const body = { policy };
+  if (siteOrigin !== undefined) body.siteOrigin = siteOrigin;
+  const note = document.getElementById("billingPolicyNote");
+  note.textContent = "Saving…";
+  try {
+    const data = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify(body) });
+    billingConfig = data;
+    billingRenderAll(data);
+    note.textContent = "Saved.";
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+};
+
+function billingRenderMode(mode) {
+  document.querySelectorAll("#billingModeSwitch button").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+  });
+}
+document.querySelectorAll("#billingModeSwitch button").forEach((btn) => {
+  btn.onclick = async () => {
+    if (!billingConfig || btn.dataset.mode === billingConfig.mode) return;
+    if (btn.dataset.mode === "live" && !confirm("Real customers will be charged and receive real licences. Switch to LIVE?")) return;
+    try {
+      const data = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ mode: btn.dataset.mode }) });
+      billingConfig = data;
+      billingRenderAll(data);
+    } catch (e) {
+      if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+    }
+  };
+});
+
+const BILLING_READY_ITEMS = [
+  ["stripeTest", "Stripe · Test keys", "Publishable and secret key configured for test-mode checkout."],
+  ["stripeLive", "Stripe · Live keys", "Publishable and secret key configured for live-mode checkout."],
+  ["email", "Email", "A provider, API key and From address are configured to send welcome mail."],
+  ["release", "Release published", "A signed bot release exists for the install link to hand out."],
+];
+function billingRenderReady(ready) {
+  document.getElementById("billingReady").innerHTML = BILLING_READY_ITEMS.map(([key, label, hint]) => {
+    const ok = !!(ready && ready[key]);
+    return '<div class="readyitem"><span class="dot ' + (ok ? "ok" : "warn") + '"></span><div><div>'
+      + esc(label) + (ok ? "" : ' <span class="muted">not ready</span>') + '</div>'
+      + '<div class="muted" style="font-size:.8rem">' + esc(hint) + '</div></div></div>';
+  }).join("");
+}
+
+function billingRenderLinks(cfg) {
+  const e = cfg.endpoints || {};
+  const rows = [
+    ["Buy link", e.buy],
+    ["Billing portal", e.billing],
+    ["Test webhook URL", e.webhookTest],
+    ["Live webhook URL", e.webhookLive],
+  ];
+  const box = document.getElementById("billingLinks");
+  box.innerHTML = rows.map(([label, url]) =>
+    '<div class="linkrow"><label>' + esc(label) + '</label><code>' + esc(url || "—") + '</code>'
+    + (url ? '<button type="button" class="copyLink" data-copy="' + esc(url) + '">Copy</button>' : "") + '</div>'
+  ).join("");
+  box.querySelectorAll(".copyLink").forEach((btn) => {
+    btn.onclick = async () => {
+      await navigator.clipboard.writeText(btn.dataset.copy);
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    };
+  });
+}
+
+function billingRenderAll(data) {
+  billingRenderMode(data.mode);
+  billingRenderReady(data.ready);
+  billingRenderLinks(data);
+  renderStripeCard("test", (data.stripe && data.stripe.test) || {});
+  renderStripeCard("live", (data.stripe && data.stripe.live) || {});
+  renderEmailCard(data.email || {});
+  renderPolicyCard(data.policy || {}, data.siteOrigin || "");
+}
+
+async function billingConfigRefresh() {
+  try {
+    const data = await api("/admin/api/billing/config");
+    billingConfig = data;
+    document.getElementById("billingUnavailable").hidden = true;
+    document.getElementById("billingBody").hidden = false;
+    billingRenderAll(data);
+  } catch (e) {
+    if (e.message === "unauthorized") return;
+    // Most commonly a 404 on a Hub build without billing yet — the whole
+    // panel collapses to one line rather than showing a half-built form.
+    document.getElementById("billingBody").hidden = true;
+    document.getElementById("billingUnavailable").hidden = false;
+  }
+}
+
+function billingCustomerBadges(c) {
+  let b = "";
+  if (c.revoked) b += ' <span class="custbadge revoked">REVOKED</span>';
+  if (c.disputed) b += ' <span class="custbadge disputed">DISPUTED</span>';
+  if (c.refunded) b += ' <span class="custbadge refunded">REFUNDED</span>';
+  return b;
+}
+async function billingCustomersRefresh() {
+  const rows = document.getElementById("billingCustomerRows");
+  const cards = document.getElementById("billingCustomerCards");
+  const meta = document.getElementById("billingCustomersMeta");
+  let d;
+  try { d = await api("/admin/api/billing/customers"); }
+  catch (e) {
+    if (e.message === "unauthorized") return;
+    return; // billing not available on this build — the config card already says so
+  }
+  billingCustomers = d.customers || [];
+  meta.textContent = billingCustomers.length + " customer(s)";
+  rows.innerHTML = "";
+  cards.innerHTML = "";
+  if (!billingCustomers.length) {
+    rows.innerHTML = '<tr><td colspan="7">no customers yet</td></tr>';
+    return;
+  }
+  for (const c of billingCustomers) {
+    const badges = billingCustomerBadges(c);
+    const modeBadge = '<span class="custbadge ' + (c.livemode ? "live" : "test") + '">' + (c.livemode ? "LIVE" : "TEST") + "</span>";
+    const welcome = c.welcomeError
+      ? '<span style="color:var(--short)">' + esc(c.welcomeError) + "</span>"
+      : (c.welcomeSentAtMs ? esc(fmt(c.welcomeSentAtMs)) : '<span class="muted">not sent</span>');
+    const lastSeen = c.lastSeen ? esc(vlabel(c.lastSeen.version)) + " · " + esc(fmt(c.lastSeen.lastSeen)) : "—";
+    const licence = esc(c.licenseName || c.licenseId || "—") + (c.exp ? '<br><small class="muted">' + esc(fmt(c.exp)) + "</small>" : "") + badges;
+
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="name">' + esc(c.name || c.email || c.customerId) + '<br><small class="muted">' + esc(c.email || "") + "</small></td>" +
+      "<td>" + modeBadge + "</td>" +
+      "<td>" + licence + "</td>" +
+      "<td>" + esc(c.subscriptionStatus || "—") + "</td>" +
+      "<td>" + welcome + "</td>" +
+      "<td>" + lastSeen + "</td>" +
+      "<td></td>";
+    const resend = document.createElement("button");
+    resend.type = "button";
+    resend.textContent = "Resend welcome";
+    resend.onclick = async () => {
+      resend.disabled = true;
+      try {
+        const r = await api("/admin/api/billing/resend-welcome", { method: "POST", body: JSON.stringify({ customerId: c.customerId }) });
+        resend.textContent = "Sent to " + r.sentTo;
+      } catch (e) {
+        if (e.message !== "unauthorized") resend.textContent = e.message;
+      }
+      setTimeout(() => { resend.disabled = false; resend.textContent = "Resend welcome"; }, 2500);
+    };
+    tr.lastElementChild.appendChild(resend);
+    rows.appendChild(tr);
+
+    const card = document.createElement("div");
+    card.className = "custcard";
+    card.innerHTML =
+      "<div><b>" + esc(c.name || c.email || c.customerId) + "</b> " + modeBadge + "</div>" +
+      "<dl><dt>Email</dt><dd>" + esc(c.email || "—") + "</dd>" +
+      "<dt>Licence</dt><dd>" + licence + "</dd>" +
+      "<dt>Subscription</dt><dd>" + esc(c.subscriptionStatus || "—") + "</dd>" +
+      "<dt>Welcome</dt><dd>" + welcome + "</dd>" +
+      "<dt>Last seen</dt><dd>" + lastSeen + "</dd></dl>";
+    const cardResend = document.createElement("button");
+    cardResend.type = "button";
+    cardResend.textContent = "Resend welcome";
+    cardResend.onclick = resend.onclick;
+    card.appendChild(cardResend);
+    cards.appendChild(card);
+  }
+}
+document.getElementById("billingCustomersRefresh").onclick = billingCustomersRefresh;
+
+function billingEventOutcomeClass(outcome) {
+  return outcome === "applied" ? "ops-ok" : (outcome === "error" || outcome === "signature") ? "ops-bad" : "ops-warn";
+}
+async function billingEventsRefresh() {
+  const box = document.getElementById("billingEvents");
+  let d;
+  try { d = await api("/admin/api/billing/events?limit=100"); }
+  catch (e) { return; } // billing not available on this build — the config card already says so
+  const events = d.events || [];
+  box.innerHTML = events.length
+    ? events.map((ev) =>
+        '<div class="eventrow"><span class="custbadge ' + (ev.livemode ? "live" : "test") + '">' + (ev.livemode ? "LIVE" : "TEST") + "</span>"
+        + "<b>" + esc(ev.type) + "</b><span class=\"muted\">" + esc(fmt(ev.receivedAtMs)) + "</span>"
+        + '<span class="' + billingEventOutcomeClass(ev.outcome) + '">' + esc(ev.outcome) + "</span>"
+        + (ev.note ? '<span class="muted">' + esc(ev.note) + "</span>" : "")
+        + "</div>"
+      ).join("")
+    : '<div class="muted">no events yet</div>';
+}
+document.getElementById("billingEventsRefresh").onclick = billingEventsRefresh;
 
 showGate();
 </script>
