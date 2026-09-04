@@ -217,6 +217,16 @@
   <button type="submit">Issue license</button>
 </form>
 
+<!-- v0.3.19 — EXTEND EVERYONE TO ONE DATE. Every active licence expiring
+     earlier moves to the end of the chosen UTC day; nothing is shortened.
+     Running bots on v0.90.3 or later pick the re-minted key up at their next
+     check-in (within five minutes), so there is nothing to send them. -->
+<form id="extendForm" style="margin-top:.6rem">
+  <input name="to" type="date" required>
+  <button type="submit">Extend every active license to this date</button>
+  <span class="muted" style="margin-left:.5rem">Nothing is shortened. Bots on v0.90.3+ install the new key themselves at check-in; older bots need their row's install command.</span>
+</form>
+
 <div id="issued">
   <strong>License issued.</strong> Copy now — the token is not shown again in full.
   <textarea id="issuedText" rows="6" readonly></textarea>
@@ -334,6 +344,26 @@ async function api(path, opts) {
   if (!body.ok) throw new Error(body.error || ("HTTP " + res.status));
   return body;
 }
+
+document.getElementById("extendForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const to = ev.target.elements.to.value;
+  const exp = Date.parse(to + "T23:59:59.999Z");
+  if (!Number.isFinite(exp)) return;
+  const btn = ev.target.querySelector("button"); btn.disabled = true;
+  try {
+    const d = await api("/admin/api/licenses/extend", { method: "POST", body: JSON.stringify({ exp }) });
+    document.getElementById("err").textContent = "";
+    document.getElementById("note").textContent =
+      "Extended " + d.extended.length + " license(s) to " + to + " (end of day UTC); " + d.unchanged +
+      " already ran past that date" + (d.refused.length ? "; REFUSED " + d.refused.map((r) => r.name + " (" + r.error + ")").join(", ") : "") +
+      ". Bots on v0.90.3 or later install the new key at their next check-in; for an older bot, use its row's install command.";
+  } catch (e) {
+    if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+  }
+  btn.disabled = false;
+  refresh();
+};
 
 function fmt(ms) { return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) : "—"; }
 function esc(s) { const d = document.createElement("span"); d.textContent = String(s); return d.innerHTML; }

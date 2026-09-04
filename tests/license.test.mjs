@@ -116,4 +116,31 @@ await test("tokenFor rebuilds the EXACT original token; revoked/unknown get noth
   assert.equal(store.tokenFor("never-issued"), null);
 });
 
+await test("v0.3.19 — extendAll moves every earlier active licence to one date, never shortens, reports refusals by name", async () => {
+  const { store } = freshStore();
+  const short = store.issue("Short Trial", 14);
+  const long = store.issue("Already Long", 400);
+  const gone = store.issue("Revoked", 14);
+  store.revoke(gone.payload.id);
+  const to = Date.now() + 100 * 86_400_000;
+  const out = store.extendAll(to);
+  assert.deepEqual(out.extended.map((p) => p.id), [short.payload.id]);
+  assert.equal(out.unchanged, 1, "the 400-day licence is left alone — nothing is ever shortened");
+  assert.equal(out.refused.length, 0);
+  assert.equal(store.get(short.payload.id).exp, to);
+  assert.equal(store.get(long.payload.id).exp, long.payload.exp);
+  assert.equal(store.get(gone.payload.id), null, "a revoked licence is neither extended nor readable");
+  // The re-minted key verifies and carries the new date; the OLD token still verifies as genuine too.
+  const minted = store.tokenFor(short.payload.id);
+  assert.notEqual(minted, short.token);
+  assert.equal(store.verify(minted).payload.exp, to);
+  assert.equal(store.decodeGenuine(short.token).exp, short.payload.exp);
+  // Beyond the 3650-day bound from issue: refused by name, the rest still move.
+  const far = store.issue("Far", 10);
+  const outFar = store.extendAll(Date.now() + 4000 * 86_400_000);
+  assert.equal(outFar.refused.length, 3, "every active licence is more than 3650 days from its issue at that date");
+  assert.ok(outFar.refused.some((r) => r.id === far.payload.id && /3650/.test(r.error)));
+  assert.equal(store.get(far.payload.id).exp, far.payload.exp, "a refused licence is untouched");
+});
+
 summary("license");
