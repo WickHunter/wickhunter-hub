@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Your Wick Hunter Unleashed install</title>
+<style>
+  :root{
+    --wh-accent:#8f86ff; color-scheme:dark;
+    --ground:#0a0c12; --raised:#11141d; --inset:#0d1017; --overlay:#161a26;
+    --line:#212736; --line-soft:#1a1f2c;
+    --ink:#e9ecf5; --muted:#96a0b8; --dim:#5c6579;
+    --accent:#6f68f2; --accent-dim:rgba(111,104,242,.14); --accent-line:rgba(111,104,242,.38);
+    --long:#2fd08a; --long-dim:rgba(47,208,138,.12);
+    --short:#f0556e; --short-dim:rgba(240,85,110,.12);
+    --warn:#f2a93b; --warn-dim:rgba(242,169,59,.12);
+    --link:#8f8afe; --r:14px; --r-sm:10px;
+    --sans:-apple-system,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.55 var(--sans)}
+  a{color:var(--link)}
+  .wrap{max-width:760px;margin:0 auto;padding:28px 18px 60px}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:26px}
+  .brand svg{width:36px;height:36px;flex:none}
+  .brand .n{font-weight:700;font-size:14.5px;line-height:1.15}
+  .brand .n b{color:var(--accent)}
+  .brand .t{font-size:9px;letter-spacing:2.6px;color:var(--dim);text-transform:uppercase;margin-top:1px}
+  h1{font-size:26px;letter-spacing:-.01em;margin:0 0 6px}
+  .sub{color:var(--muted);margin:0 0 22px}
+  .card{background:var(--raised);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;margin-bottom:14px}
+  .card h2{font-size:15px;margin:0 0 10px}
+  .eyebrow{font-size:10px;letter-spacing:1.6px;text-transform:uppercase;color:var(--dim);font-weight:650}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;font-weight:650;padding:6px 12px;border-radius:99px}
+  .pill.live{color:var(--long);background:var(--long-dim);border:1px solid rgba(47,208,138,.3)}
+  .pill.obs{color:var(--warn);background:var(--warn-dim);border:1px solid rgba(242,169,59,.3)}
+  .pill.bad{color:var(--short);background:var(--short-dim);border:1px solid rgba(240,85,110,.35)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13.5px}
+  .kv .k{color:var(--dim)}
+  .cmd{position:relative;background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);padding:14px 96px 14px 14px;font:13px/1.5 var(--mono);word-break:break-all;margin:10px 0 8px}
+  .copy{position:absolute;top:9px;right:9px;font:600 12px var(--sans);color:#fff;background:var(--accent);border:0;border-radius:8px;padding:8px 12px;cursor:pointer;min-height:36px}
+  .copy:hover{filter:brightness(1.1)}
+  ol{padding-left:20px;margin:8px 0 0;color:var(--muted)}
+  ol li{margin:6px 0}
+  .btn{display:inline-flex;align-items:center;gap:8px;font-weight:650;font-size:13px;color:#fff;background:var(--accent);border:0;border-radius:10px;padding:11px 18px;cursor:pointer;text-decoration:none;min-height:40px}
+  .btn:hover{filter:brightness(1.1)}
+  .btn.quiet{color:var(--muted);background:transparent;border:1px solid var(--line)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .warn{border-color:rgba(242,169,59,.45);background:var(--warn-dim)}
+  .bad{border-color:rgba(240,85,110,.45);background:var(--short-dim)}
+  .fine{color:var(--dim);font-size:12.5px}
+  form{display:inline}
+  @media (max-width:520px){.cmd{padding-right:14px;padding-bottom:52px}.copy{top:auto;bottom:9px;right:9px}.kv{grid-template-columns:1fr}}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <svg viewBox="14.841 -198.638 73.114 76.874" role="img" aria-label="Wick Hunter Unleashed"><g transform="scale(1,-1)">
+      <path fill="currentColor" d="M33.216 191.959C26.515 188.02 21.185 181.891 18.065 174.785C20.55 174.804 23.033 174.797 25.517 174.789C28.06 179.904 31.856 184.405 36.548 187.675C41.198 190.952 46.695 193.043 52.363 193.616C60.561 194.543 69.06 192.283 75.729 187.431C79.358 184.852 82.37 181.493 84.783 177.767C80.358 185.912 72.791 192.302 63.984 195.217C53.897 198.638 42.356 197.448 33.216 191.959"/>
+      <path fill="var(--wh-accent)" d="M49.53 191.239C43.515 190.029 37.883 187.003 33.532 182.681C34.391 183.185 35.147 183.84 35.985 184.378C38.644 186.098 41.58 187.392 44.65 188.17C52.841 190.297 61.916 188.566 68.755 183.582C72.015 181.237 74.753 178.201 76.847 174.777C79.312 174.789 81.78 174.791 84.246 174.775C82.022 178.969 78.904 182.703 75.084 185.533C67.902 190.983 58.347 193.091 49.53 191.239"/>
+      <path fill="var(--wh-accent)" d="M36.746 172.988C35.543 172.602 34.771 171.513 34.21 170.443C32.723 167.654 31.23 164.867 29.755 162.073L29.714 162.097C28.806 160.378 27.97 158.622 27.099 156.883C26.877 157.738 26.78 158.629 26.48 159.462C25.382 163.937 24.128 168.373 22.935 172.821C20.291 172.814 17.649 172.814 15.005 172.819C16.319 168.298 17.669 163.787 18.941 159.255L18.963 159.532C18.936 159.149 19.074 158.774 19.166 158.405C19.982 155.659 20.772 152.904 21.588 150.156C21.863 149.197 22.397 148.296 23.196 147.678C24.433 146.683 26.196 146.553 27.669 147.028C29.093 147.494 30.013 148.786 30.69 150.049C32.735 153.746 34.911 157.369 36.886 161.1C37.461 162.22 38.031 163.346 38.581 164.478C39.306 162.858 40.204 161.329 41.028 159.757C42.715 156.565 44.577 153.466 46.338 150.313C46.973 149.158 47.705 147.965 48.89 147.306C50.387 146.512 52.317 146.591 53.747 147.499C54.809 148.2 55.389 149.4 55.727 150.588C56.603 153.582 57.516 156.565 58.383 159.561C58.967 161.786 59.68 163.973 60.317 166.183C61.766 166.181 63.215 166.183 64.664 166.181C64.662 168.393 64.671 170.605 64.691 172.817C61.31 172.819 57.929 172.814 54.548 172.819C53.483 168.777 52.293 164.761 51.361 160.684L51.368 160.559C50.733 159.455 50.721 158.067 50.337 156.85C49.706 158.142 49.141 159.467 48.417 160.711C46.635 163.976 44.942 167.291 43.201 170.578C42.633 171.662 41.771 172.693 40.549 173.036C39.313 173.372 37.97 173.367 36.746 172.988"/>
+      <path fill="currentColor" d="M79.95 172.819C79.984 169.776 79.952 166.736 79.989 163.693C74.005 163.679 68.021 163.684 62.034 163.691C61.498 161.853 60.957 160.013 60.428 158.173L60.375 158.163C59.858 156.253 59.262 154.367 58.723 152.464C58.17 150.66 57.815 148.748 56.741 147.159C59.373 147.214 62.008 147.168 64.642 147.188C64.662 150.479 64.666 153.771 64.683 157.065C68.05 157.113 71.416 156.999 74.782 157.086C75.381 157.062 75.982 157.057 76.586 157.06C77.707 157.081 78.83 157.069 79.95 157.072C79.984 153.768 79.984 150.465 79.991 147.159C82.609 147.188 85.226 147.202 87.842 147.156C87.849 152.102 87.955 157.05 87.839 161.996C87.873 165.608 87.878 169.221 87.902 172.831C85.251 172.802 82.602 172.824 79.95 172.819"/>
+      <path fill="currentColor" d="M15.247 164.828C15.196 162.814 14.841 160.807 15.015 158.791C15.143 156.842 15.332 154.893 15.783 152.99C17.667 144.357 23.373 136.676 31.055 132.322C39.154 127.625 49.345 126.833 58.096 130.131C62.3 131.687 66.142 134.174 69.354 137.294C68.601 136.842 67.922 136.282 67.2 135.785C61.165 131.701 53.532 130.032 46.35 131.3C38.113 132.551 30.675 137.704 26.302 144.753C24.349 144.724 22.335 145.485 21.076 147.016C19.734 148.55 19.466 150.638 18.867 152.512C17.64 156.61 16.582 160.764 15.247 164.828"/>
+      <path fill="var(--wh-accent)" d="M77.381 145.227C75.191 140.88 72.17 136.922 68.378 133.848C61.274 127.944 51.656 125.14 42.496 126.449C33.764 127.512 25.592 132.274 20.229 139.226C19.652 139.982 19.125 140.772 18.517 141.503C23.327 132.979 31.709 126.563 41.18 124.102C49.934 121.764 59.54 122.754 67.601 126.906C75.256 130.757 81.436 137.386 84.843 145.244C82.356 145.217 79.868 145.241 77.381 145.227"/>
+    </g></svg>
+    <div><div class="n">Wick<b>Hunter</b></div><div class="t">Unleashed</div></div>
+  </div>
+
+  <h1>Hi {{firstName}}, here is your install.</h1>
+  <p class="sub">This page is private to you. Anyone who has the link can install with your licence, so do not share it.</p>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <span class="eyebrow">Licence</span>
+      <span class="pill {{statusClass}}">{{statusLabel}}</span>
+    </div>
+    <div class="kv">
+      <span class="k">Plan</span><span>{{plan}}</span>
+      <span class="k">Valid until</span><span>{{expiresOn}}</span>
+      <span class="k">Renewal</span><span>{{renewalLine}}</span>
+      <span class="k">Email</span><span>{{email}}</span>
+    </div>
+  </div>
+
+  {{#if canInstall}}
+  <div class="card">
+    <h2>1. Get a fresh Ubuntu 22.04+ server</h2>
+    <p class="fine" style="margin:0">Any VPS with 1 GB RAM and root access (Vultr, Hetzner, DigitalOcean, …). One server per licence.</p>
+  </div>
+  <div class="card">
+    <h2>2. Run this one command on it</h2>
+    <div class="cmd" id="cmd">{{installCommand}}<button class="copy" type="button" data-copy="cmd">Copy</button></div>
+    <p class="fine">Installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address and asks you to choose a login password. About three minutes.</p>
+    <p class="fine">This command works <b>once</b> and expires in 24 hours. Reload this page for a fresh one — for example to reinstall on a new server.</p>
+  </div>
+  <div class="card">
+    <h2>3. Open the dashboard</h2>
+    <ol>
+      <li>Go to the https address the installer printed and sign in.</li>
+      <li>Add an exchange API key with <b>trade permission only</b> — withdrawals off, IP allowlist on.</li>
+      <li>Start in demo mode where the venue offers one, and let the guided setup walk you through the first bot.</li>
+    </ol>
+    <p class="fine">Updates are signed and applied from inside the app; you never need this page to upgrade.</p>
+  </div>
+  {{/if}}
+
+  {{#if notice}}
+  <div class="card {{noticeClass}}">
+    <h2>{{noticeTitle}}</h2>
+    <p style="margin:0">{{noticeText}}</p>
+  </div>
+  {{/if}}
+
+  <div class="card">
+    <h2>Billing and help</h2>
+    <div class="row">
+      {{#if portal}}<form method="post" action="{{portalAction}}"><button class="btn" type="submit">Manage billing</button></form>{{/if}}
+      {{#if site}}<a class="btn quiet" href="{{siteOrigin}}">Back to the website</a>{{/if}}
+      {{#if support}}<a class="btn quiet" href="mailto:{{supportEmail}}">Email support</a>{{/if}}
+    </div>
+    <p class="fine" style="margin:12px 0 0">Cancelling stops future charges; your licence stays active to the end of the paid period. If it lapses, the bot keeps closing and protecting positions but opens nothing new until it is renewed.</p>
+  </div>
+</div>
+<script>
+  document.querySelectorAll('[data-copy]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var el = document.getElementById(b.getAttribute('data-copy'));
+      var text = el ? el.childNodes[0].nodeValue : '';
+      var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, done);
+      else { var r = document.createRange(); r.selectNodeContents(el); var s = window.getSelection(); s.removeAllRanges(); s.addRange(r); try { document.execCommand('copy'); } catch (e) {} done(); }
+    });
+  });
+</script>
+</body>
+</html>

@@ -139,15 +139,30 @@ export class LicenseStore {
   }
 
   issue(name: string, days: number, now = Date.now()): { payload: LicensePayload; token: string } {
+    if (!Number.isFinite(days) || days < 1 || days > 3650) throw new Error("days must be 1..3650");
+    return this.issueUntil(name, now + Math.round(days * 86_400_000), "beta", now);
+  }
+
+  /** ── v0.4.0 — ISSUE TO AN EXACT EXPIRY, WITH A PLAN ──────────────────────
+   *
+   *  Billing knows the instant a paid period ends, not a number of days, and
+   *  it labels what it sells (`unleashed`, or `unleashed-test` for a test-mode
+   *  checkout). Same v1 wire format: `plan` was always a free string that the
+   *  bot verifies only for TYPE, so a value other than "beta" is not a format
+   *  change. `issue()` above is this with `now + days` and "beta". */
+  issueUntil(name: string, exp: number, plan = "beta", now = Date.now()): { payload: LicensePayload; token: string } {
     const trimmed = name.trim();
     if (!trimmed || trimmed.length > 120) throw new Error("name must be 1..120 characters");
-    if (!Number.isFinite(days) || days < 1 || days > 3650) throw new Error("days must be 1..3650");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(plan)) throw new Error("plan must be letters, digits, dots, dashes or underscores, max 64 characters");
+    if (!Number.isFinite(exp)) throw new Error("exp must be a finite unix-ms timestamp");
     const { priv } = this.loadKeys();
     const iat = now;
-    const exp = iat + Math.round(days * 86_400_000);
+    const expMs = Math.round(exp);
+    if (expMs <= iat) throw new Error("expiry must be after the license is issued");
+    if (expMs > iat + 3650 * 86_400_000) throw new Error("expiry must be within 3650 days of issue");
     // Key order below IS the pinned v1 wire order (JS object insertion order
     // survives JSON.stringify). Do not reorder.
-    const payload: LicensePayload = { v: 1, id: randomUUID(), name: trimmed, exp, iat, plan: "beta" };
+    const payload: LicensePayload = { v: 1, id: randomUUID(), name: trimmed, exp: expMs, iat, plan };
     const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
     const sig = edSign(null, payloadBytes, priv);
     const token = `${TOKEN_PREFIX}.${payloadBytes.toString("base64url")}.${sig.toString("base64url")}`;
