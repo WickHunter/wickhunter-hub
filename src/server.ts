@@ -8,6 +8,17 @@
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
+//   public   GET  /buy                           302 -> the ACTIVE mode's Stripe Payment Link
+//   public   GET  /billing                       302 -> the active mode's Customer Portal login
+//   stripe   POST /api/billing/stripe/{test,live} signed webhook (mints/extends/revokes licences)
+//   token    GET  /welcome/<page-token>          a buyer's private install page (mints a one-time command)
+//   token    POST /welcome/<page-token>/portal   303 -> a Customer Portal session for that buyer
+//   token    GET  /install/<install-token>       the installer, once; the token burns
+//   admin    GET/POST /admin/api/billing/config  mode switch, Stripe keys (write-only), email, policy
+//   admin    GET  /admin/api/billing/customers   Stripe customers joined to their licences
+//   admin    POST /admin/api/billing/resend-welcome {customerId}
+//   admin    POST /admin/api/billing/test-email  {to}
+//   admin    GET  /admin/api/billing/events      recent webhook events + outcomes
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   keyed    GET  /api/candles/snapshot          signed last-N-closed-candles, whole venue (v1)
 //   keyed    GET  /api/market-data/market-caps/v1 signed market-cap snapshot (contract v1)
@@ -78,6 +89,8 @@ import {
   type LeasePurpose,
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
+import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
+import type { BillingMode } from "./billing/config.js";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
   verifyReleaseArtifact,
@@ -125,6 +138,9 @@ const realVenueFetch: NonNullable<CandleServiceDeps["fetchLike"]> = async (url: 
 };
 
 const MAX_BODY_BYTES = 64 * 1024; // largest legitimate body is a tiny JSON object
+// A Stripe event is a few KB; an invoice with many lines can reach ~100 KB.
+// nginx caps /hub/ at 1 MiB, so this is the same bound seen from inside.
+const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 // Feedback carries a bounded log tail (see feedback.ts caps) — its own limit:
 // 2MB raster -> ~2.7MB base64, plus the existing 200KB logs and diagnostics.
 const MAX_FEEDBACK_BODY_BYTES = 4 * 1024 * 1024;
@@ -143,6 +159,9 @@ export interface Hub {
   /** Null only when the additive lease authority could not initialize. Legacy
    * LHK1 and check-in surfaces remain available in that case. */
   licenseLeases: LicenseLeaseService | null;
+  /** Stripe -> licence -> install page. Always constructed; does nothing
+   *  until the admin page is given keys (see src/billing/). */
+  billing: BillingService;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
   listen(): Promise<number>;
   close(): Promise<void>;
@@ -178,6 +197,10 @@ export interface HubDeps {
   feedbackNow?: () => number;
   /** Test seam for otherwise very large durable-capacity branches. */
   feedbackStorageLimits?: Partial<FeedbackStorageLimits>;
+  /** Injectable so billing tests never reach Stripe or an email provider. */
+  billingFetch?: BillingServiceDeps["fetchLike"];
+  billingNow?: BillingServiceDeps["now"];
+  billingRandomBytes?: BillingServiceDeps["randomBytes"];
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -203,6 +226,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // feedback, or exit-capable check-ins offline.
     console.warn(`[license-lease] disabled: ${(err as Error).message}`);
   }
+  // ── billing: Stripe -> licence -> install page ───────────────────────────
+  // Always built. With no keys on file every route answers "not configured",
+  // and nothing else here changes: a hub that never sells anything runs
+  // exactly as before.
+  const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+    now: deps.billingNow,
+    fetchLike: deps.billingFetch,
+    randomBytes: deps.billingRandomBytes,
+    onRevoke: (licenseId, reason) => {
+      try { licenseLeases?.observeRevocation(licenseId, `license revoked by billing: ${reason}`); }
+      catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
+    },
+  });
   const community = new CommunityService(cfg.dataDir);
   /** A Strat body is bigger than a vote and smaller than a feedback log dump:
    *  ten bot configs, capped again inside the service regardless of this. */
@@ -383,6 +419,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/hub/strategies/vote") return communityVote(req, url, res);
     if (m === "POST" && p === "/api/hub/strategies/delete") return communityDelete(req, url, res);
     if (m === "GET" && p.startsWith("/download/")) return download(url, res);
+    // ── billing (public) ────────────────────────────────────────────────
+    if (m === "GET" && p === "/buy") return billingRedirect(res, billing.buyUrl(), "checkout");
+    if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
+    if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
+      return stripeWebhook(req, res, p.endsWith("/live") ? "live" : "test");
+    }
+    if (m === "GET" && p.startsWith("/welcome/")) return welcomePage(p, res);
+    if (m === "POST" && p.startsWith("/welcome/") && p.endsWith("/portal")) return welcomePortal(p, res);
+    if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
     sendJson(res, 404, { ok: false, error: "not found" });
@@ -707,14 +752,86 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!readLatest()) {
       return sendJson(res, 503, { ok: false, error: "no authenticated release is available" });
     }
+    sendInstaller(res, url.searchParams.get("key")!);
+  }
+
+  /** The personalised installer, ONE renderer for both doors: `?key=` (the
+   *  beta invite) and `/install/<one-time token>` (a purchase). */
+  function sendInstaller(res: ServerResponse, licenseToken: string): void {
     const template = fs.readFileSync(path.join(cfg.templatesDir, "install.sh"), "utf8");
     const script = template
       .replaceAll("__HUB_ORIGIN__", cfg.publicOrigin)
-      .replaceAll("__LICENSE_KEY__", url.searchParams.get("key")!)
+      .replaceAll("__LICENSE_KEY__", licenseToken)
       .replaceAll("__RELEASE_KEYS_B64U__", Buffer.from(JSON.stringify(cfg.releasePublicKeys), "utf8").toString("base64url"))
       .replaceAll("__RELEASE_MAX_AGE_MS__", String(cfg.releaseMaxAgeMs));
-    res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8" });
+    res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "no-store" });
     res.end(script);
+  }
+
+  // ── billing surface ───────────────────────────────────────────────────────
+
+  function sendText(res: ServerResponse, status: number, text: string): void {
+    res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+    res.end(`${text}\n`);
+  }
+
+  function sendHtml(res: ServerResponse, status: number, html: string): void {
+    res.writeHead(status, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow",
+      "referrer-policy": "no-referrer",
+    });
+    res.end(html);
+  }
+
+  /** `/buy` and `/billing`: the website links here and the Hub decides where
+   *  that goes, so flipping test/live never needs a site deploy. */
+  function billingRedirect(res: ServerResponse, target: string, what: string): void {
+    if (!target) return sendText(res, 503, `${what} is not configured yet — please try again later`);
+    res.writeHead(302, { location: target, "cache-control": "no-store" });
+    res.end();
+  }
+
+  async function stripeWebhook(req: IncomingMessage, res: ServerResponse, mode: BillingMode): Promise<void> {
+    // The RAW bytes: the signature covers them exactly as sent, so this must
+    // never go through the JSON reader (which would re-serialise nothing, but
+    // also could not hand the bytes back).
+    const raw = await readRawBody(req, MAX_WEBHOOK_BODY_BYTES);
+    if (raw === null) return sendJson(res, 413, { ok: false, error: "webhook body too large or unreadable" });
+    const reply = await billing.handleWebhook(mode, raw, req.headers);
+    sendJson(res, reply.status, reply.body, { "cache-control": "no-store" });
+  }
+
+  function pageTokenOf(p: string): string {
+    return decodeURIComponent(p.slice("/welcome/".length).replace(/\/portal$/, ""));
+  }
+
+  function welcomePage(p: string, res: ServerResponse): void {
+    const r = billing.welcomePage(pageTokenOf(p), readLatest() !== null);
+    if (!r.ok) return sendHtml(res, r.status, notFoundPage(r.text));
+    sendHtml(res, 200, r.html);
+  }
+
+  async function welcomePortal(p: string, res: ServerResponse): Promise<void> {
+    const r = await billing.portalRedirect(pageTokenOf(p));
+    if (!r.ok) return sendHtml(res, r.status, notFoundPage(r.error));
+    res.writeHead(303, { location: r.url, "cache-control": "no-store" });
+    res.end();
+  }
+
+  function installByToken(p: string, res: ServerResponse): void {
+    if (!readLatest()) return sendText(res, 503, "no release is published on the Hub yet — try again later");
+    const r = billing.installByToken(decodeURIComponent(p.slice("/install/".length)));
+    if (!r.ok) return sendText(res, r.status, `forbidden: ${r.text}`);
+    sendInstaller(res, r.licenseToken);
+  }
+
+  function notFoundPage(message: string): string {
+    const safe = message.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Wick Hunter Unleashed</title>
+<style>html,body{margin:0;background:#0a0c12;color:#e9ecf5;font:15px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}.w{max-width:560px;margin:60px auto;padding:0 18px}.c{background:#11141d;border:1px solid #212736;border-radius:14px;padding:22px}h1{font-size:20px;margin:0 0 10px}p{color:#96a0b8;margin:0}</style></head>
+<body><div class="w"><div class="c"><h1>Wick Hunter Unleashed</h1><p>${safe}</p></div></div></body></html>`;
   }
 
   function readLatest(): SignedReleaseManifest | null {
@@ -1458,6 +1575,43 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
       return sendJson(res, 200, { ok: true, configured: true, health: marketCaps.health() });
     }
+    // ── billing ─────────────────────────────────────────────────────────
+    // Keys are WRITE-ONLY here: the page gets `configured` + last4. See
+    // src/billing/config.ts for the patch semantics ("" keeps, null clears).
+    if (m === "GET" && p === "/admin/api/billing/config") {
+      return sendJson(res, 200, { ok: true, ...billing.adminConfigView(readLatest() !== null) }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p === "/admin/api/billing/config") {
+      const body = await readJsonBody(req);
+      if (body === null) return sendJson(res, 400, { ok: false, error: "expected a JSON object" });
+      try { billing.updateConfig(body); }
+      catch (err) {
+        if (err instanceof BillingConfigError) return sendJson(res, 400, { ok: false, error: err.message });
+        throw err;
+      }
+      return sendJson(res, 200, { ok: true, ...billing.adminConfigView(readLatest() !== null) }, { "cache-control": "no-store" });
+    }
+    if (m === "GET" && p === "/admin/api/billing/customers") {
+      return sendJson(res, 200, { ok: true, customers: billing.customersView(readRoster(cfg.dataDir)) }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p === "/admin/api/billing/resend-welcome") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.customerId !== "string" || !body.customerId) {
+        return sendJson(res, 400, { ok: false, error: "expected {customerId}" });
+      }
+      const r = await billing.resendWelcome(body.customerId);
+      return r.ok ? sendJson(res, 200, { ok: true, sentTo: r.sentTo }) : sendJson(res, r.status, { ok: false, error: r.error });
+    }
+    if (m === "POST" && p === "/admin/api/billing/test-email") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.to !== "string") return sendJson(res, 400, { ok: false, error: "expected {to}" });
+      const r = await billing.sendTestEmail(body.to);
+      return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, 502, { ok: false, error: r.error });
+    }
+    if (m === "GET" && p === "/admin/api/billing/events") {
+      const limit = Number(url.searchParams.get("limit") ?? 100);
+      return sendJson(res, 200, { ok: true, events: billing.events(Number.isFinite(limit) ? limit : 100) }, { "cache-control": "no-store" });
+    }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.id !== "string" || !body.id) {
@@ -1478,6 +1632,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     marketCaps,
     candleKey,
     licenseLeases,
+    billing,
     listen: () =>
       new Promise<number>((resolve, reject) => {
         server.once("error", reject);
@@ -1608,6 +1763,26 @@ function sendJson(
     ...extraHeaders,
   });
   res.end(bytes);
+}
+
+/** The exact bytes of a body, or null when it is too large or the connection
+ *  broke. Webhook signatures cover these bytes verbatim. */
+function readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        req.destroy();
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", () => resolve(null));
+  });
 }
 
 /** Read a JSON object body; null on any malformation (caller answers 400). */

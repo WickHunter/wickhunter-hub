@@ -21,6 +21,112 @@ licence id never receives a token (the id is not a secret, the token is), and
 a revoked id receives nothing. Bots older than v0.90.3 ignore the field and
 still need their row's install command.
 
+## Billing: Stripe → licence → install page (v0.4.0)
+
+The Hub sells the product without a second server. A visitor buys through a
+Stripe **Payment Link**; Stripe posts a signed webhook to the Hub; the Hub
+mints an `LHK1` licence, stores it against the Stripe customer, and emails the
+buyer a link to a **private install page**. That page shows a one-line install
+command whose token works **once** and expires in 24 hours; reloading the page
+mints a fresh one (that is how a customer reinstalls on a new server). The
+licence key itself is never in an email or a URL — it is written into the
+installer the Hub serves for that one-time token, exactly as `install.sh?key=`
+does for a beta invite.
+
+Nothing in the bot changes: renewals reach a running install through the
+check-in re-mint (v0.3.19), revocation through the check-in `revoked` answer,
+and a lapsed licence is exit-only as before.
+
+### One switch, both key sets
+
+The admin page's **Billing** panel holds Stripe keys for **test** and **live**
+side by side and a **mode** switch. `/buy` (which the website links to) 302s to
+the active mode's Payment Link, `/billing` to its Customer Portal login link,
+so flipping the switch never needs a website deploy. Secret values are
+write-only: the page only ever sees `configured` + the last four characters.
+Everything lives in `data/billing-config.v1.json` (mode 0600); nothing goes in
+the env file.
+
+| Field (per mode) | Where it comes from | Used for |
+| --- | --- | --- |
+| Publishable key `pk_…` | Stripe → Developers → API keys | kept for reference; the site uses Payment Links, so the Hub needs it for nothing |
+| Secret key `sk_…` / restricted `rk_…` | same page | only `POST /v1/billing_portal/sessions`, so "Manage billing" opens without a login step. A restricted key with **Customer portal: write** is enough |
+| Webhook signing secret `whsec_…` | Stripe → Developers → Webhooks → the endpoint for this mode | verifying every event |
+| Payment Link URL | Stripe → Payment Links | where `/buy` sends visitors |
+| Customer Portal login URL | Stripe → Settings → Billing → Customer portal → "login link" | where `/billing` sends customers; also the fallback when no secret key is on file |
+
+Register **two** webhook endpoints in Stripe, one per mode (Stripe's
+test-mode and live-mode dashboards each have their own):
+
+```
+<HUB_PUBLIC_ORIGIN>/api/billing/stripe/test
+<HUB_PUBLIC_ORIGIN>/api/billing/stripe/live
+```
+
+subscribed to `checkout.session.completed`,
+`checkout.session.async_payment_succeeded`, `invoice.paid`,
+`invoice.payment_failed`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `charge.succeeded`, `charge.refunded`,
+`charge.dispute.created`. Anything else is answered `200` and recorded as
+ignored.
+
+### What each event does
+
+Handlers are **order-independent** — Stripe does not promise order, and for a
+new subscription `invoice.paid` and `checkout.session.completed` race. Every
+handler first makes sure the customer has a licence, then moves its expiry
+**forward** to what the event proves was paid for. Nothing here ever shortens
+an expiry (the bot only accepts a *later* key at check-in, so a shortened
+registry date would change nothing on the box).
+
+| Event | Effect |
+| --- | --- |
+| `checkout.session.completed` | licence exists (subscription: `bootstrapDays` until the invoice lands; one-time: `oneOffDays`, or `license_days` from the Payment Link's metadata); welcome email sent once |
+| `invoice.paid` | expiry → latest line `period.end` + `graceDays`; status active; charge ids remembered |
+| `customer.subscription.updated` | status recorded; an active period end also extends |
+| `customer.subscription.deleted` / `invoice.payment_failed` | status recorded only — the licence runs to its paid-through date plus grace, then the bot is exit-only |
+| `charge.succeeded` | charge id remembered (a dispute names only the charge) |
+| `charge.refunded` (full) | licence **revoked** when `revokeOnRefund`; partial refunds are recorded |
+| `charge.dispute.created` | licence **revoked** when `revokeOnDispute`; unknown charge → recorded, revoke by hand |
+
+Events are de-duplicated by id (Stripe retries), signature failures are
+`400`, an internal failure is `500` so Stripe retries, and every event lands
+in `data/billing-events.v1.jsonl` with its outcome — the admin panel lists
+them.
+
+### Test mode is a sandbox with teeth
+
+A test-mode event mints a **working** licence — you must be able to install
+for real from a `4242` card — but only while the Hub's mode is `test`, only
+with plan `<plan>-test`, and never for longer than `policy.testMaxDays`. A
+live event is honoured in either mode: real money is never ignored because the
+switch was left on test. Once you switch to live, a leaked test Payment Link
+can no longer mint anything.
+
+### Email
+
+Resend or Postmark, one JSON POST each, no SDK. Configure provider, API key,
+From and Reply-To in the panel; **Send test email** proves it. A welcome email
+that fails is recorded on the customer (`welcomeError`) and never fails the
+webhook; **Resend welcome** rotates the customer's page link and sends again.
+
+### Policy
+
+`graceDays` (7) after a paid period; `bootstrapDays` (3) for a subscription
+before its first invoice arrives; `oneOffDays` (365) for one-time purchases;
+`testMaxDays` (14); `plan` (`unleashed`); `revokeOnDispute` / `revokeOnRefund`
+(both on); `siteOrigin` for links back to the website.
+
+### Where billing data lives
+
+| Path | What | Loss means |
+| --- | --- | --- |
+| `data/billing-config.v1.json` | mode, Stripe keys for both modes, email provider, policy — mode 0600 | re-enter keys on the admin page |
+| `data/billing-customers.v1.json` | Stripe customer → licence, subscription status, charge ids, welcome state | a later event re-creates the customer with a NEW licence; restore from backup instead |
+| `data/billing-tokens.v1.json` | page and one-time install tokens, **hashed** | every emailed link stops working; use Resend welcome |
+| `data/billing-events.v1.jsonl` | every webhook event and its outcome | audit history only |
+| `data/billing-events-seen.v1.json` | bounded id set for idempotent replay | a Stripe retry could re-apply an old event (extensions are idempotent; a refund would re-revoke the same licence) |
+
 ## Tester feedback
 
 Beta bots POST bug reports / feature requests to `/api/feedback`, authenticated
@@ -890,6 +996,17 @@ anywhere private is enough; everything else is reproducible.
 | `POST /api/license/lease/deactivate` | genuine known LHK1 + bound install proof | release a seat even after expiry/revocation |
 | `POST /api/license/lease/rebind` | active LHK1 + old and replacement key proofs | atomically move one activation to a new install key |
 | `GET /install.sh?key=` | valid token | personalised tester installer |
+| `GET /buy` | none | 302 to the ACTIVE billing mode's Stripe Payment Link (503 until configured) |
+| `GET /billing` | none | 302 to the active mode's Customer Portal login link |
+| `POST /api/billing/stripe/test` · `/live` | Stripe signature (`whsec_` per mode) | mint / extend / revoke licences from Stripe events; idempotent by event id |
+| `GET /welcome/<page-token>` | the emailed page token | a buyer's private install page; mints a one-time install command per view |
+| `POST /welcome/<page-token>/portal` | the page token | 303 to a Customer Portal session (secret key) or the login link |
+| `GET /install/<install-token>` | one-time token (24 h) | the personalised installer, once; the token burns |
+| `GET/POST /admin/api/billing/config` | `x-hub-admin` header | mode switch, Stripe keys for both modes (write-only), email, policy; masked on read |
+| `GET /admin/api/billing/customers` | `x-hub-admin` header | Stripe customers joined to their licences and last check-in |
+| `POST /admin/api/billing/resend-welcome` | `x-hub-admin` header | rotate the page link and resend the welcome email |
+| `POST /admin/api/billing/test-email` | `x-hub-admin` header | send a test message through the configured provider |
+| `GET /admin/api/billing/events?limit=` | `x-hub-admin` header | recent webhook events with outcomes |
 | `GET /api/latest?key=` | valid token | signed `wickhunter.release.v1` manifest; legacy `{version,file,sha256}` remain top-level |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
 | `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
@@ -926,6 +1043,24 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.0 — **Sell the product from the Hub.** A Stripe Payment Link checkout
+  posts a signed webhook; the Hub mints an `LHK1` licence against the Stripe
+  customer and emails a link to a private install page, which mints a
+  one-time, 24-hour install command per view (`/install/<token>` serves the
+  same personalised installer as `install.sh?key=` and then burns the token).
+  `invoice.paid` extends the licence to period end + grace and the running
+  bot picks the longer key up at check-in (v0.3.19); a full refund or a
+  chargeback revokes; cancellation just lets the licence lapse into exit-only.
+  Keys for Stripe **test** and **live** sit side by side behind a mode switch
+  (`data/billing-config.v1.json`, mode 0600, secrets write-only over the
+  wire); `/buy` and `/billing` redirect to the active mode's links so the
+  website never needs a deploy to go live. Test-mode checkouts mint real but
+  short, `-test`-labelled licences and only while the Hub is in test mode.
+  Email via Resend or Postmark with no SDK. `LicenseStore.issueUntil` issues
+  to an exact expiry with a plan label — same v1 format. Events are
+  idempotent by id and every outcome is in `data/billing-events.v1.jsonl`.
+  Admin: `/admin/api/billing/*` and a Billing panel; the admin page is also
+  laid out for phones. Pinned in `tests/billing.test.mjs`.
 - v0.3.20 — A file written by a root-run CLI belongs to the data directory's
   owner. `npm run extend` (and `issue`/`revoke`) run as root rewrote
   `data/licenses.json` at mode 0600 owned by root, so the `wickhunter-hub`
