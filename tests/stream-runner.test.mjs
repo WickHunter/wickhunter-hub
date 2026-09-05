@@ -176,7 +176,7 @@ await test("a multi-row WEEX kline frame batches its closed rows and holds its f
   r.stop();
 });
 
-await test("the actual WEEX klineSnapshot batches only its 300 already-closed rows", () => {
+await test("WEEX defers the newest closed snapshot row until locally settled, without losing delta continuity", async () => {
   const { factory, made } = fakeSockets();
   const wrote = [];
   let clock = T0 + 300 * MIN + 30_000;
@@ -184,7 +184,7 @@ await test("the actual WEEX klineSnapshot batches only its 300 already-closed ro
   const r = new VenueStreamRunner({
     adapter: STREAM_ADAPTERS.weex, symbols: () => ["BTCUSDT"],
     write: (symbol, candles) => wrote.push({ symbol, candles }),
-    socket: factory, now: () => clock,
+    socket: factory, now: () => clock, settleFlushMs: 10,
   });
   try {
     Date.now = () => clock;
@@ -194,17 +194,113 @@ await test("the actual WEEX klineSnapshot batches only its 300 already-closed ro
     snapshot.d.reverse();
     made[0].h.onMessage(JSON.stringify(snapshot));
     assert.equal(wrote.length, 1);
-    assert.equal(wrote[0].candles.length, 300);
+    assert.equal(wrote[0].candles.length, 299, "only rows through the N-2 settlement boundary write immediately");
     assert.equal(wrote[0].candles[0].openMs, T0);
-    assert.equal(wrote[0].candles.at(-1).openMs, T0 + 299 * MIN);
-    assert.equal(r.status().holding, 0, "snapshot's unclosed tail is discarded, not treated as closed truth");
+    assert.equal(wrote[0].candles.at(-1).openMs, T0 + 298 * MIN);
+    assert.equal(r.status().holding, 1, "only the deferred closed N-1 row is held; the snapshot's forming tail is discarded");
+
+    // Replaying the same snapshot replaces the one deferred N-1 row by key;
+    // it must not make two copies eligible when the timer reaches its boundary.
+    made[0].h.onMessage(JSON.stringify(snapshot));
     made[0].h.onMessage(weexFrame(T0 + 300 * MIN, 311));
-    assert.equal(wrote.length, 1, "an incremental observation only holds the forming minute");
+    assert.equal(r.status().holding, 2, "deferred N-1 and forming N remain distinct and neither is stored early");
     clock += MIN;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const nMinus1 = wrote.flatMap((batch) => batch.candles)
+      .filter((candle) => candle.openMs === T0 + 299 * MIN);
+    assert.equal(nMinus1.length, 1, "the deferred N-1 row flushes once when it becomes locally settled");
+    assert.equal(r.status().holding, 1, "only forming N remains after the N-1 flush");
+
     made[0].h.onMessage(weexFrame(T0 + 301 * MIN, 312));
-    assert.equal(wrote.length, 2);
-    assert.equal(wrote[1].candles[0].openMs, T0 + 300 * MIN);
+    assert.equal(r.status().holding, 2, "closed-but-unsettled N is deferred while N+1 forms");
+    assert.equal(wrote.flatMap((batch) => batch.candles)
+      .some((candle) => candle.openMs === T0 + 300 * MIN), false, "closed N remains deferred at the N-1 settled boundary");
+    clock += MIN;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const n = wrote.flatMap((batch) => batch.candles)
+      .filter((candle) => candle.openMs === T0 + 300 * MIN);
+    assert.equal(n.length, 1, "N flushes on the following settlement boundary");
+    assert.equal(r.status().holding, 1, "only the N+1 forming observation remains");
   } finally { Date.now = realNow; r.stop(); }
+});
+
+await test("WEEX clears deferred settlement rows when a symbol is removed or the runner stops", async () => {
+  let clock = T0 + 10 * MIN + 30_000;
+  const oneDeferred = () => JSON.stringify({
+    e: "klineSnapshot", E: clock, s: "BTCUSDT", p: "LAST_PRICE",
+    d: [{ t: T0 + 9 * MIN, T: T0 + 10 * MIN, s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: "1.5", v: "3" }],
+  });
+
+  const removedSockets = fakeSockets();
+  const removedWrites = [];
+  let symbols = ["BTCUSDT"];
+  const removed = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex, symbols: () => symbols,
+    write: (_symbol, candles) => removedWrites.push(...candles),
+    socket: removedSockets.factory, now: () => clock, settleFlushMs: 10,
+  });
+  removed.start(); removedSockets.made[0].h.onOpen();
+  const retiredSocket = removedSockets.made[0];
+  retiredSocket.h.onMessage(oneDeferred());
+  assert.equal(removedWrites.length, 0, "N-1 starts deferred while only N-2 is settled");
+  symbols = [];
+  removed.resync();
+  clock += MIN;
+  retiredSocket.h.onMessage(oneDeferred());
+  retiredSocket.h.onClose(1006);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(removedWrites.length, 0, "removal discards deferred state and ignores a retired socket's late frame");
+  assert.equal(removedSockets.made.length, 1, "a retired socket's late close cannot schedule an orphan reconnect");
+  removed.stop();
+
+  clock = T0 + 20 * MIN + 30_000;
+  const stoppedSockets = fakeSockets();
+  const stoppedWrites = [];
+  const stopped = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex, symbols: () => ["BTCUSDT"],
+    write: (_symbol, candles) => stoppedWrites.push(...candles),
+    socket: stoppedSockets.factory, now: () => clock, settleFlushMs: 10,
+  });
+  stopped.start(); stoppedSockets.made[0].h.onOpen();
+  const deferredAtStop = JSON.stringify({
+    e: "klineSnapshot", E: clock, s: "BTCUSDT", p: "LAST_PRICE",
+    d: [{ t: T0 + 19 * MIN, T: T0 + 20 * MIN, s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: "1.5", v: "3" }],
+  });
+  const stoppedSocket = stoppedSockets.made[0];
+  stoppedSocket.h.onMessage(deferredAtStop);
+  stopped.stop();
+  clock += MIN;
+  stoppedSocket.h.onMessage(deferredAtStop);
+  stoppedSocket.h.onClose(1006);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(stoppedWrites.length, 0, "stop cancels the timer and clears all deferred rows");
+  assert.equal(stoppedSockets.made.length, 1, "callbacks after stop cannot reopen the socket");
+});
+
+await test("WEEX retains a complete deferred candle across an ordinary reconnect", async () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  let clock = T0 + 10 * MIN + 30_000;
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex, symbols: () => ["BTCUSDT"],
+    write: (_symbol, candles) => wrote.push(...candles),
+    socket: factory, now: () => clock,
+    settleFlushMs: 10, reconnectMs: 5, reconnectMaxMs: 5,
+  });
+  r.start(); made[0].h.onOpen();
+  made[0].h.onMessage(JSON.stringify({
+    e: "klineSnapshot", E: clock, s: "BTCUSDT", p: "LAST_PRICE",
+    d: [{ t: T0 + 9 * MIN, T: T0 + 10 * MIN, s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: "1.5", v: "3" }],
+  }));
+  assert.equal(wrote.length, 0, "the complete N-1 row is waiting only for local settlement");
+  made[0].h.onClose(1006);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.ok(made.length >= 2, "the ordinary reconnect opens a replacement socket");
+  clock += MIN;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(wrote.length, 1, "the reconnect does not discard the already-complete deferred row");
+  assert.equal(wrote[0].openMs, T0 + 9 * MIN);
+  r.stop();
 });
 
 await test("a changed symbol set rebuilds; an unchanged one does not", () => {
