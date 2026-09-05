@@ -138,6 +138,39 @@ export function parseBitunixInstruments(body: unknown): { instruments: ExchangeI
   return { instruments, unparsed };
 }
 
+// ── WEEX ──────────────────────────────────────────────────────────────────
+// The exchangeInfo catalogue is broader than API trading. Keep only symbols
+// that WEEX independently publishes through apiTradingSymbols, then require
+// the venue's explicit base/quote/margin/type fields. A missing status is the
+// current mainnet shape; an explicit status must say TRADING.
+export function parseWeexInstruments(exchangeInfo: unknown, apiTradingSymbols: unknown): { instruments: ExchangeInstrument[]; unparsed: number } {
+  const eligible = new Set(asArray(apiTradingSymbols)
+    .map(str).map((s) => s.toUpperCase()).filter(Boolean));
+  const instruments: ExchangeInstrument[] = [];
+  let unparsed = 0;
+  for (const raw of asArray((exchangeInfo as { symbols?: unknown[] })?.symbols)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) { unparsed++; continue; }
+    const r = raw as Record<string, unknown>;
+    const symbol = str(r.symbol).toUpperCase();
+    if (!symbol || !eligible.has(symbol)) continue;
+    const base = str(r.baseAsset);
+    const quote = str(r.quoteAsset);
+    const settle = str(r.marginAsset);
+    const contractType = str(r.contractType).toUpperCase();
+    if (!base || !quote || !settle || !contractType) { unparsed++; continue; }
+    if (quote !== "USDT" || settle !== "USDT"
+      || (contractType !== "PERPETUAL" && contractType !== "TRADIFI_PERPETUAL")
+      || r.forwardContractFlag !== true) continue;
+    const status = str(r.status).toUpperCase();
+    instruments.push({
+      venue: "weex", symbol, base, quote, settle,
+      status, contractType,
+      active: !status || status === "TRADING",
+    });
+  }
+  return { instruments, unparsed };
+}
+
 async function getJson(fetchLike: FetchLike, url: string): Promise<unknown> {
   const res = await fetchLike(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -176,6 +209,15 @@ export async function fetchInstruments(venue: MarketCapVenueId, fetchLike: Fetch
     }
     case "bitunix": {
       const r = parseBitunixInstruments(await getJson(fetchLike, "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs"));
+      return { venue, ...r };
+    }
+    case "weex": {
+      const [exchangeInfo, apiTradingSymbols] = await Promise.all([
+        getJson(fetchLike, "https://api-contract.weex.com/capi/v3/market/exchangeInfo"),
+        getJson(fetchLike, "https://api-contract.weex.com/capi/v3/market/apiTradingSymbols"),
+      ]);
+      const r = parseWeexInstruments(exchangeInfo, apiTradingSymbols);
+      if (!r.instruments.length) throw new Error("WEEX exchangeInfo/apiTradingSymbols contained no mainnet USDT perpetual instruments");
       return { venue, ...r };
     }
     default: {

@@ -19,7 +19,7 @@ import {
 } from "../dist/src/marketcap/identity.js";
 import {
   catalogueSanity, parseAsterInstruments, parseBitgetInstruments, parseBitunixInstruments,
-  parseBybitInstruments,
+  parseBybitInstruments, parseWeexInstruments,
 } from "../dist/src/marketcap/exchanges.js";
 import { CMC_ENDPOINT_CLAIM, parseDerivativeExchanges, parseMarketPairs } from "../dist/src/marketcap/cmc.js";
 import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS } from "../dist/src/marketcap/service.js";
@@ -239,6 +239,20 @@ await test("every venue parser keeps the exchange's OWN base field", () => {
   ] });
   assert.equal(bitunix.instruments.length, 2);
   assert.equal(bitunix.instruments[1].active, false, "PREVIEW is an announced listing with nothing behind it");
+
+  const weex = parseWeexInstruments({ symbols: [
+    { symbol: "1000PEPEUSDT", baseAsset: "1000PEPE", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+    { symbol: "ETHUSDT", baseAsset: "ETH", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true, status: "TRADING" },
+    { symbol: "OFFUSDT", baseAsset: "OFF", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+    { symbol: "DATEDUSDT", baseAsset: "DATED", quoteAsset: "USDT", marginAsset: "USDT", contractType: "CURRENT_QUARTER", forwardContractFlag: true },
+    { symbol: "UNKNOWNUSDT", baseAsset: "UNKNOWN", quoteAsset: "USDT", marginAsset: "USDT", contractType: "UNKNOWN_PERPETUAL", forwardContractFlag: true },
+    { symbol: "USDCBOOK", baseAsset: "BTC", quoteAsset: "USDC", marginAsset: "USDC", contractType: "PERPETUAL", forwardContractFlag: true },
+    { symbol: "BADUSDT" }, null,
+  ] }, ["1000PEPEUSDT", "ETHUSDT", "DATEDUSDT", "UNKNOWNUSDT", "USDCBOOK", "BADUSDT"]);
+  assert.deepEqual(weex.instruments.map((r) => [r.symbol, r.base, r.active]), [
+    ["1000PEPEUSDT", "1000PEPE", true], ["ETHUSDT", "ETH", true],
+  ], "WEEX keeps only its API-eligible USDT perpetuals and preserves the native base");
+  assert.equal(weex.unparsed, 2, "eligible malformed WEEX rows are visible rather than silently absent");
 });
 
 await test("a catalogue that collapses, or changes identity, is REFUSED", () => {
@@ -282,6 +296,7 @@ await test("the exchange list parses the shape the provider ACTUALLY sends", () 
   // an evidence record rather than as a bare constant, so the next reader can
   // see what was seen and when.
   assert.equal(CMC_ENDPOINT_CLAIM.verifiedOn, "2026-08-24");
+  assert.equal(CMC_ENDPOINT_CLAIM.exchanges.find((e) => e.venue === "weex")?.verifiedOn, "2026-09-05");
   assert.equal(CMC_ENDPOINT_CLAIM.derivativeExchangeList.totalCountPublished, false,
     "no total_count — which is why the paging loop stops on a short page AND on a page that adds nothing");
   for (const e of CMC_ENDPOINT_CLAIM.exchanges) {
