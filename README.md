@@ -1088,6 +1088,10 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.14 — Welcome email rebuilt on the Unleashed lockup: licence summary,
+  four set-up steps, what to expect, billing and help; email-safe tables,
+  inline styles, light theme.
+
 - v0.4.13 — **WEEX pairs now receive verified coin market-cap facts.** The
   producer uses WEEX's API-eligible USDT perpetual catalogue and CoinMarketCap's
   WEEX derivative identity map. New or unmapped pairs remain explicitly unknown.

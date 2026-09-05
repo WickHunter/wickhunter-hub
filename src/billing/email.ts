@@ -107,6 +107,39 @@ export interface WelcomeEmailInput {
   livemode: boolean;
 }
 
+// Light-theme tokens lifted from the app itself. Dark email bodies get
+// inverted or mangled by Gmail's dark-mode rewriter, so this commits to light
+// regardless of the recipient's client theme.
+const BG = "#f2f3f8";
+const CARD = "#ffffff";
+const BORDER = "#d4d9e6";
+const BORDER_SOFT = "#e2e5ef";
+const INSET = "#e9ebf2";
+const INK = "#1b2233";
+const MUTED = "#57617b";
+const DIM = "#8a92a8";
+const ACCENT = "#584fe6";
+const ACCENT_DIM = "rgba(88,79,230,.10)";
+const WARN = "#a8720f";
+const WARN_DIM = "rgba(168,114,15,.12)";
+const FONT = "-apple-system,'SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const MONO = "ui-monospace,'SF Mono',Menlo,Consolas,monospace";
+
+const SETUP_STEPS: ReadonlyArray<readonly [string, string]> = [
+  ["Get a server", "A fresh Ubuntu 22.04 or newer VPS with 1 GB RAM and root access — Vultr, Hetzner and DigitalOcean all work. One server per licence."],
+  ["Run the one-line command", "Open your install page, press Copy, and paste the command into an SSH session as root. It installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address and asks you to choose a password. About three minutes."],
+  ["Connect your exchange", "Sign in to the dashboard and add an API key with trade permission only — withdrawals off, IP allowlist on. Supported: Bybit, Bitget, Bitunix, Binance, Aster. Bybit and Bitget offer demo accounts; start there if you can."],
+  ["Start small", "Let the guided setup create your first bot, run it in demo or with small sizes, and grow from there."],
+];
+
+const GOOD_TO_KNOW: readonly string[] = [
+  "Updates are signed and applied from inside the app; you never re-run the installer.",
+  "Your bot checks in with our Hub every few minutes; renewals reach it automatically.",
+  "One server per licence: a second server using the same licence is put into exit-only mode.",
+  "Moving servers? Stop the old one first; the new one takes over about 30 minutes later.",
+  "If your subscription lapses, the bot keeps closing and protecting positions but opens nothing new until it is renewed.",
+];
+
 /** The one email a buyer receives: where their install page is. The licence
  *  key itself is never in an email — the page mints a one-time install
  *  command, so a forwarded or leaked message is a link that can be rotated,
@@ -114,42 +147,177 @@ export interface WelcomeEmailInput {
 export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage {
   const first = input.name.trim().split(/\s+/)[0] || "there";
   const until = dateOf(input.expiresAtMs);
-  const renewLine = input.subscription
-    ? `Your licence is active until ${until} and extends automatically each time your subscription renews.`
-    : `Your licence is active until ${until}.`;
-  const billing = input.siteOrigin ? `${input.siteOrigin.replace(/\/+$/, "")}/billing` : "";
-  const testNote = input.livemode ? "" : "\n(This is a TEST-MODE purchase. No real payment was taken.)\n";
+  const planValue = input.livemode ? "Unleashed" : "Unleashed (test)";
+  const renewalValue = input.subscription
+    ? "Extends automatically each time your subscription renews"
+    : "One-time purchase";
+  const origin = input.siteOrigin.replace(/\/+$/, "");
+  const billingUrl = origin ? `${origin}/billing` : "";
   const subject = `${input.livemode ? "" : "[TEST] "}Your Wick Hunter Unleashed licence and install link`;
+
+  // ── plain text ───────────────────────────────────────────────────────────
   const text = [
+    `Wick Hunter — Unleashed`,
+    ``,
     `Hi ${first},`,
     ``,
-    `Thanks for buying Wick Hunter Unleashed. ${renewLine}`,
-    testNote.trim(),
-    `Your personal install page:`,
+    `Thanks for buying Wick Hunter Unleashed. Your licence is active until ${until}.`,
+    ``,
+    `YOUR LICENCE`,
+    `  Plan: ${planValue}`,
+    `  Valid until: ${until}`,
+    `  Renewal: ${renewalValue}`,
+    `  Email: ${to}`,
+    ``,
+    input.livemode ? null : `This is a TEST-MODE purchase. No real payment was taken.`,
+    input.livemode ? null : ``,
+    `OPEN YOUR INSTALL PAGE`,
     `  ${input.pageUrl}`,
     ``,
-    `It gives you a one-line command to run on a fresh Ubuntu 22.04+ server (1 GB RAM is plenty). The command installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address — about three minutes. Come back to the same page any time you need to reinstall; it issues a fresh command each visit.`,
+    `Your page issues a fresh one-time install command each time you open it. Keep the link private — anyone who has it can install with your licence.`,
     ``,
-    `Keep the link private: anyone who has it can install with your licence.`,
+    `SET-UP IN FOUR STEPS`,
+    ...SETUP_STEPS.map(([title, desc], i) => `${i + 1}. ${title} — ${desc}`),
     ``,
-    billing ? `Manage your subscription, card or invoices: ${billing}` : ``,
+    `GOOD TO KNOW`,
+    ...GOOD_TO_KNOW.map((line) => `- ${line}`),
+    ``,
+    `BILLING AND HELP`,
+    billingUrl ? `Manage billing: ${billingUrl}` : null,
+    `Cancel any time; your licence stays active to the end of the paid period.`,
     `Questions? Just reply to this email.`,
     ``,
-    `— Wick Hunter Software`,
-  ].filter((line) => line !== null).join("\n").replace(/\n{3,}/g, "\n\n");
-  const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#f2f3f8;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1b2233">
-<div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #d4d9e6;border-radius:14px;padding:28px">
-  <p style="font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#8a92a8;margin:0 0 14px">Wick Hunter <span style="color:#584fe6">Unleashed</span></p>
-  <p style="font-size:16px;margin:0 0 14px">Hi ${escapeHtml(first)},</p>
-  <p style="margin:0 0 14px">Thanks for buying Wick Hunter Unleashed. ${escapeHtml(renewLine)}</p>
-  ${input.livemode ? "" : `<p style="margin:0 0 14px;padding:10px 12px;background:#fff4e0;border:1px solid #f2a93b;border-radius:8px;font-size:13px">This is a <b>test-mode</b> purchase. No real payment was taken.</p>`}
-  <p style="margin:0 0 18px"><a href="${escapeHtml(input.pageUrl)}" style="display:inline-block;background:#584fe6;color:#fff;text-decoration:none;font-weight:600;padding:12px 18px;border-radius:10px">Open your install page</a></p>
-  <p style="margin:0 0 14px;font-size:14px;color:#57617b">It gives you a one-line command to run on a fresh Ubuntu 22.04+ server (1&nbsp;GB RAM is plenty). The command installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address — about three minutes. Come back to the same page any time you need to reinstall; it issues a fresh command each visit.</p>
-  <p style="margin:0 0 14px;font-size:14px;color:#57617b">Keep the link private: anyone who has it can install with your licence.</p>
-  ${billing ? `<p style="margin:0 0 14px;font-size:14px"><a href="${escapeHtml(billing)}" style="color:#4b41d6">Manage your subscription, card or invoices</a></p>` : ""}
-  <p style="margin:0;font-size:14px;color:#57617b">Questions? Just reply to this email.</p>
-  <p style="margin:18px 0 0;font-size:13px;color:#8a92a8">If the button does not work, copy this link: <br><span style="word-break:break-all">${escapeHtml(input.pageUrl)}</span></p>
-</div></body></html>`;
+    `If the button does not work, copy this link:`,
+    `  ${input.pageUrl}`,
+    ``,
+    `— Wick Hunter Software LLC`,
+    origin || null,
+  ].filter((line): line is string => line !== null).join("\n").replace(/\n{3,}/g, "\n\n");
+
+  // ── html ─────────────────────────────────────────────────────────────────
+  const logoCell = origin
+    ? `<td width="44" style="width:44px;padding-right:12px;vertical-align:middle"><img src="${escapeHtml(origin)}/assets/icon-192.png" width="44" height="44" alt="Wick Hunter" style="display:block;border:0;border-radius:10px"></td>`
+    : "";
+  const wordmark = `<td style="vertical-align:middle">
+    <div style="font-family:${FONT};font-size:18px;font-weight:700;color:${INK};line-height:1.2">Wick<span style="color:${ACCENT}">Hunter</span></div>
+    <div style="font-family:${FONT};font-size:9px;font-weight:600;letter-spacing:2.6px;text-transform:uppercase;color:${DIM};margin-top:3px">UNLEASHED</div>
+  </td>`;
+
+  const licenceRows = ([
+    ["Plan", escapeHtml(planValue)],
+    ["Valid until", escapeHtml(until)],
+    ["Renewal", escapeHtml(renewalValue)],
+    ["Email", escapeHtml(to)],
+  ] as const).map(([label, value], i) => `
+    <tr>
+      <td style="padding:${i === 0 ? "0" : "8px"} 0 0;font-family:${FONT};font-size:13px;color:${DIM};white-space:nowrap;vertical-align:top">${label}</td>
+      <td style="padding:${i === 0 ? "0" : "8px"} 0 0 16px;font-family:${FONT};font-size:13px;color:${INK};font-weight:600;text-align:right;width:100%">${value}</td>
+    </tr>`).join("");
+
+  const noticeHtml = input.livemode ? "" : `
+    <tr><td style="padding:0 0 20px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${WARN_DIM};border:1px solid rgba(168,114,15,.35);border-radius:10px">
+        <tr><td style="padding:12px 14px;font-family:${FONT};font-size:13px;color:${WARN};line-height:1.5">This is a <strong>test-mode</strong> purchase. No real payment was taken.</td></tr>
+      </table>
+    </td></tr>`;
+
+  const stepsHtml = SETUP_STEPS.map(([title, desc], i) => `
+    <tr>
+      <td width="30" style="width:30px;padding:${i === 0 ? "0" : "16px"} 0 0;vertical-align:top">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td width="24" height="24" align="center" style="width:24px;height:24px;background-color:${ACCENT_DIM};border-radius:12px;font-family:${FONT};font-size:12px;font-weight:700;color:${ACCENT};text-align:center;line-height:24px">${i + 1}</td></tr></table>
+      </td>
+      <td style="padding:${i === 0 ? "0" : "16px"} 0 0 12px;vertical-align:top">
+        <div style="font-family:${FONT};font-size:14px;font-weight:700;color:${INK}">${escapeHtml(title)}</div>
+        <div style="font-family:${FONT};font-size:13px;color:${MUTED};line-height:1.5;margin-top:2px">${escapeHtml(desc)}</div>
+      </td>
+    </tr>`).join("");
+
+  const goodToKnowHtml = GOOD_TO_KNOW.map((line, i) => `
+    <tr><td style="padding:${i === 0 ? "0" : "8px"} 0 0;font-family:${FONT};font-size:13px;color:${MUTED};line-height:1.5">
+      <span style="color:${ACCENT}">&bull;</span>&nbsp; ${escapeHtml(line)}
+    </td></tr>`).join("");
+
+  const manageBillingBtn = billingUrl
+    ? `<a href="${escapeHtml(billingUrl)}" style="display:inline-block;font-family:${FONT};font-size:13px;font-weight:600;color:${ACCENT};background-color:${CARD};border:1px solid ${BORDER};text-decoration:none;padding:10px 18px;border-radius:10px">Manage billing</a>`
+    : "";
+
+  const footerOrigin = origin
+    ? `<a href="${escapeHtml(origin)}" style="color:${DIM};text-decoration:underline">${escapeHtml(origin.replace(/^https?:\/\//, ""))}</a>`
+    : "";
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>Wick Hunter Unleashed</title>
+<style>
+  @media only screen and (max-width:620px) {
+    .wh-container { width:100% !important; }
+    .wh-px { padding-left:20px !important; padding-right:20px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:${BG}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${BG};margin:0;padding:0;width:100%">
+<tr><td align="center" style="padding:32px 16px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" class="wh-container" style="width:600px;max-width:600px">
+
+<tr><td class="wh-px" style="padding:0 4px 20px">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>${logoCell}${wordmark}</tr></table>
+</td></tr>
+
+<tr><td class="wh-px" style="background-color:${CARD};border:1px solid ${BORDER};border-radius:14px;padding:32px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+
+    <tr><td style="font-family:${FONT};font-size:16px;color:${INK};padding:0 0 8px">Hi ${escapeHtml(first)},</td></tr>
+    <tr><td style="font-family:${FONT};font-size:14px;color:${MUTED};line-height:1.6;padding:0 0 22px">Thanks for buying Wick Hunter Unleashed. Your licence is active until <strong style="color:${INK}">${escapeHtml(until)}</strong>.</td></tr>
+
+    <tr><td style="padding:0 0 20px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${INSET};border:1px solid ${BORDER_SOFT};border-radius:10px">
+        <tr><td style="padding:16px 18px">
+          <div style="font-family:${FONT};font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:${DIM};padding-bottom:10px">Your licence</div>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${licenceRows}</table>
+        </td></tr>
+      </table>
+    </td></tr>
+${noticeHtml}
+    <tr><td style="padding:0 0 8px">
+      <a href="${escapeHtml(input.pageUrl)}" style="display:inline-block;font-family:${FONT};font-size:14px;font-weight:600;color:#ffffff;background-color:${ACCENT};text-decoration:none;padding:13px 22px;border-radius:10px">Open your install page</a>
+    </td></tr>
+    <tr><td style="font-family:${FONT};font-size:12.5px;color:${DIM};line-height:1.5;padding:0 0 28px">Your page issues a fresh one-time install command each time you open it. Keep the link private — anyone who has it can install with your licence.</td></tr>
+
+    <tr><td style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding:24px 0 12px;border-top:1px solid ${BORDER_SOFT}">Set-up in four steps</td></tr>
+    <tr><td>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${stepsHtml}</table>
+    </td></tr>
+
+    <tr><td style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding:24px 0 12px;border-top:1px solid ${BORDER_SOFT}">Good to know</td></tr>
+    <tr><td>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${goodToKnowHtml}</table>
+    </td></tr>
+
+    <tr><td style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding:24px 0 12px;border-top:1px solid ${BORDER_SOFT}">Billing and help</td></tr>
+    ${manageBillingBtn ? `<tr><td style="padding:0 0 14px">${manageBillingBtn}</td></tr>` : ""}
+    <tr><td style="font-family:${FONT};font-size:13px;color:${MUTED};line-height:1.6;padding:0 0 4px">Cancel any time; your licence stays active to the end of the paid period.</td></tr>
+    <tr><td style="font-family:${FONT};font-size:13px;color:${MUTED};line-height:1.6">Questions? Just reply to this email.</td></tr>
+
+  </table>
+</td></tr>
+
+<tr><td class="wh-px" style="padding:22px 4px 0">
+  <p style="margin:0 0 6px;font-family:${FONT};font-size:12px;color:${DIM};line-height:1.6">If the button does not work, copy this link:<br><span style="word-break:break-all;font-family:${MONO}">${escapeHtml(input.pageUrl)}</span></p>
+  <p style="margin:0;font-family:${FONT};font-size:12px;color:${DIM}">Wick Hunter Software LLC${footerOrigin ? ` &middot; ${footerOrigin}` : ""}</p>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
+
   return { to, subject, text, html };
 }
 
