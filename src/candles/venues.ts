@@ -686,6 +686,22 @@ function weexRows(value: unknown): unknown[] {
   return asArray(row.data ?? row.symbols ?? row.list ?? row.rows);
 }
 
+/** WEEX public candles document numeric fields as JSON numbers or decimal
+ * strings. Do not let JavaScript turn booleans, arrays, or blanks into prices. */
+function weexWireNumber(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function weexCandle(t: unknown, o: unknown, h: unknown, l: unknown, c: unknown, v: unknown): Candle | null {
+  const values = [t, o, h, l, c, v].map(weexWireNumber);
+  if (values.some((value) => value === null)) return null;
+  const [openMs, open, high, low, close, volume] = values as number[];
+  return { openMs, open, high, low, close, volume };
+}
+
 function weexKlinePage(body: unknown, startMs: number, endMs: number): KlinePage {
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const row = body as { code?: unknown; msg?: unknown };
@@ -699,7 +715,7 @@ function weexKlinePage(body: unknown, startMs: number, endMs: number): KlinePage
   for (const raw of list) {
     if (!Array.isArray(raw) || raw.length < 6) continue;
     // [openMs, o, h, l, c, baseVolume, closeMs, quoteVolume, ...].
-    const parsed = candle(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+    const parsed = weexCandle(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
     if (parsed && parsed.openMs >= startMs && parsed.openMs <= endMs) candles.push(parsed);
   }
   return { candles: sortOldestFirst(candles), empty: list.length === 0 };

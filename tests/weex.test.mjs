@@ -204,6 +204,16 @@ await test("WEEX history pages are bounded, range-filtered, base-volume rows nor
   assert.equal(page.candles[0].volume, 7.25, "index 5 is base volume, never quote turnover");
 });
 
+await test("WEEX REST candles reject boolean, array, and blank numeric wire fields", async () => {
+  const page = await weex.fetchKlines(async () => response([
+    [START, true, "12", "9", "11", "7"],
+    [START + MIN, "10", [12], "9", "11", "7"],
+    [START + 2 * MIN, "10", "12", "9", "11", "  "],
+    [START + 3 * MIN, "10", "12", "9", "11", "7"],
+  ]), "BTCUSDT", START, START + 3 * MIN);
+  assert.deepEqual(page.candles.map((row) => row.openMs), [START + 3 * MIN]);
+});
+
 await test("an enabled legacy candle roster gains WEEX and starts a first pull without waiting for the interval", async () => {
   const configured = configFromEnv({ HUB_CANDLE_VENUES: "bybit,bitget" });
   assert.deepEqual(configured.candleVenues, ["bybit", "bitget", "weex"]);
