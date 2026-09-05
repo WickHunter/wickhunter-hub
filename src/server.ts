@@ -8,7 +8,9 @@
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
 //   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
-//   public   GET  /buy                           302 -> the ACTIVE mode's Stripe Payment Link
+//   public   GET  /buy[?plan=key]                302 -> the ACTIVE mode's Stripe Payment Link for that plan
+//   public   GET  /api/billing/plans             the plans + prices, for the website (CORS *)
+//   admin    POST /admin/api/billing/plans/provision {mode} -> product/prices/links created or reused in Stripe
 //   public   GET  /billing                       302 -> the active mode's Customer Portal login
 //   stripe   POST /api/billing/stripe/{test,live} signed webhook (mints/extends/revokes licences)
 //   token    GET  /welcome/<page-token>          a buyer's private install page (mints a one-time command)
@@ -428,7 +430,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/hub/strategies/delete") return communityDelete(req, url, res);
     if (m === "GET" && p.startsWith("/download/")) return download(url, res);
     // ── billing (public) ────────────────────────────────────────────────
-    if (m === "GET" && p === "/buy") return billingRedirect(res, billing.buyUrl(), "checkout");
+    if (m === "GET" && p === "/buy") {
+      const planKey = url.searchParams.get("plan");
+      if (planKey && !billing.plan(planKey)) return sendText(res, 404, "unknown plan");
+      return billingRedirect(res, billing.buyUrl(planKey), "checkout");
+    }
+    // The website reads prices from here, so a price change on the Hub shows
+    // on the site without a deploy. Public facts only, cached a minute.
+    if (m === "GET" && p === "/api/billing/plans") {
+      return sendJson(res, 200, { ok: true, ...billing.publicPlans() }, { "access-control-allow-origin": "*", "cache-control": "public, max-age=60" });
+    }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
     if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
       return stripeWebhook(req, res, p.endsWith("/live") ? "live" : "test");
@@ -1655,6 +1666,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (body === null || typeof body.to !== "string") return sendJson(res, 400, { ok: false, error: "expected {to}" });
       const r = await billing.sendTestEmail(body.to);
       return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, 502, { ok: false, error: r.error });
+    }
+    if (m === "POST" && p === "/admin/api/billing/plans/provision") {
+      const body = await readJsonBody(req);
+      if (body === null || (body.mode !== "test" && body.mode !== "live")) return sendJson(res, 400, { ok: false, error: 'expected {mode: "test"|"live"}' });
+      const r = await billing.provisionPlans(body.mode);
+      return r.ok
+        ? sendJson(res, 200, { ok: true, mode: body.mode, ...r.result }, { "cache-control": "no-store" })
+        : sendJson(res, r.status, { ok: false, error: r.error });
     }
     if (m === "GET" && p === "/admin/api/billing/events") {
       const limit = Number(url.searchParams.get("limit") ?? 100);

@@ -25,6 +25,43 @@ export const BILLING_MODES: readonly BillingMode[] = ["test", "live"];
 export type EmailProvider = "none" | "resend" | "postmark";
 export const EMAIL_PROVIDERS: readonly EmailProvider[] = ["none", "resend", "postmark"];
 
+// ── plans ───────────────────────────────────────────────────────────────────
+// What the shop sells, defined ON THE HUB so a price change is an admin edit
+// plus "Create in Stripe", never a dashboard tour. Every plan carries the same
+// software; they differ only in how the customer pays. A plan's `key` is the
+// `plan` metadata Stripe copies from the Payment Link onto the checkout
+// session, which is how a webhook knows what was bought.
+export type PlanInterval = "month" | "year";
+
+export interface Plan {
+  /** Stable id: `?plan=<key>` on /buy, the price's lookup_key, link metadata. */
+  key: string;
+  name: string;
+  amountCents: number;
+  /** ISO 4217, lowercase, as Stripe wants it. */
+  currency: string;
+  /** null = one-time payment. */
+  interval: PlanInterval | null;
+  /** Licence length for a one-time plan (capped by the v1 format at 3650). */
+  licenseDays: number | null;
+  /** A one-time plan sold as "lifetime": pinned to the format's maximum,
+   *  3650 days (ten years), which the operator has accepted as the term. */
+  lifetime: boolean;
+  description: string;
+}
+
+export const MAX_LICENSE_DAYS = 3650;
+export const PLAN_KEY_RE = /^[a-z][a-z0-9-]{0,23}$/;
+
+const DEFAULT_PLAN_LIST: Plan[] = [
+  { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time." },
+  { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free." },
+  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment. Ten-year licence." },
+];
+export const DEFAULT_PLANS: readonly Plan[] = Object.freeze(DEFAULT_PLAN_LIST.map((p) => Object.freeze({ ...p })));
+
+export const clonePlans = (plans: readonly Plan[]): Plan[] => plans.map((p) => ({ ...p }));
+
 export interface StripeModeConfig {
   /** pk_test_… / pk_live_… — public; stored so the operator has one place for it. */
   publishableKey: string;
@@ -32,8 +69,12 @@ export interface StripeModeConfig {
   secretKey: string;
   /** whsec_… — the signing secret of this mode's webhook endpoint. */
   webhookSecret: string;
-  /** The Stripe Payment Link `/buy` redirects to while this mode is active. */
+  /** The Stripe Payment Link `/buy` redirects to while this mode is active —
+   *  the MONTHLY plan's link, kept for the panel's single-link field. */
   paymentLinkUrl: string;
+  /** Payment Link per plan key (`/buy?plan=<key>`). `paymentLinkFor` reads
+   *  this first and falls back to `paymentLinkUrl` for the first plan. */
+  paymentLinks: Record<string, string>;
   /** Stripe's no-code Customer Portal login link, the `/billing` fallback. */
   portalUrl: string;
 }
@@ -67,6 +108,7 @@ export interface BillingPolicy {
 export interface BillingConfig {
   v: 1;
   mode: BillingMode;
+  plans: Plan[];
   stripe: Record<BillingMode, StripeModeConfig>;
   email: EmailConfig;
   policy: BillingPolicy;
@@ -75,7 +117,7 @@ export interface BillingConfig {
   updatedAtMs: number | null;
 }
 
-const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhookSecret: "", paymentLinkUrl: "", portalUrl: "" };
+const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhookSecret: "", paymentLinkUrl: "", paymentLinks: {}, portalUrl: "" };
 
 export const DEFAULT_BILLING_POLICY: BillingPolicy = {
   graceDays: 7,
@@ -91,7 +133,8 @@ export function defaultBillingConfig(): BillingConfig {
   return {
     v: 1,
     mode: "test",
-    stripe: { test: { ...EMPTY_MODE }, live: { ...EMPTY_MODE } },
+    plans: clonePlans(DEFAULT_PLANS),
+    stripe: { test: { ...EMPTY_MODE, paymentLinks: {} }, live: { ...EMPTY_MODE, paymentLinks: {} } },
     email: { provider: "none", apiKey: "", from: "", replyTo: "" },
     policy: { ...DEFAULT_BILLING_POLICY },
     siteOrigin: "",
@@ -114,13 +157,24 @@ const num = (v: unknown, fallback: number): number => (typeof v === "number" && 
 
 function modeFrom(raw: unknown): StripeModeConfig {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const links: Record<string, string> = {};
+  const rawLinks = (o.paymentLinks && typeof o.paymentLinks === "object" ? o.paymentLinks : {}) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(rawLinks)) if (PLAN_KEY_RE.test(k) && typeof v === "string" && v) links[k] = v;
   return {
     publishableKey: str(o.publishableKey),
     secretKey: str(o.secretKey),
     webhookSecret: str(o.webhookSecret),
     paymentLinkUrl: str(o.paymentLinkUrl),
+    paymentLinks: links,
     portalUrl: str(o.portalUrl),
   };
+}
+
+/** Plans as stored; anything unreadable falls back to the defaults, so a hub
+ *  can never boot with nothing to sell. */
+function plansFrom(raw: unknown): Plan[] {
+  if (!Array.isArray(raw) || !raw.length) return clonePlans(DEFAULT_PLANS);
+  try { return validatePlans(raw); } catch { return clonePlans(DEFAULT_PLANS); }
 }
 
 /** Read the file, tolerating any missing field (a hub upgraded from a version
@@ -135,6 +189,7 @@ export function readBillingConfig(dataDir: string): BillingConfig {
   return {
     v: 1,
     mode: raw.mode === "live" ? "live" : "test",
+    plans: plansFrom(raw.plans),
     stripe: { test: modeFrom(stripe.test), live: modeFrom(stripe.live) },
     email: {
       provider: (EMAIL_PROVIDERS as readonly string[]).includes(provider) ? (provider as EmailProvider) : "none",
@@ -200,6 +255,55 @@ function intIn(value: unknown, min: number, max: number, label: string, current:
   return n;
 }
 
+/** The full plan list, validated. Keys unique; a one-time plan needs a
+ *  licence length; lifetime implies one-time. */
+export function validatePlans(raw: unknown): Plan[] {
+  if (!Array.isArray(raw)) throw new BillingConfigError("plans must be an array");
+  if (!raw.length || raw.length > 12) throw new BillingConfigError("plans must have 1 to 12 entries");
+  const out: Plan[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const o = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const key = typeof o.key === "string" ? o.key.trim().toLowerCase() : "";
+    if (!PLAN_KEY_RE.test(key)) throw new BillingConfigError(`plan key ${JSON.stringify(o.key)} must be lowercase letters, digits and dashes (max 24)`);
+    if (seen.has(key)) throw new BillingConfigError(`plan key ${key} appears twice`);
+    seen.add(key);
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    if (!name || name.length > 40) throw new BillingConfigError(`plan ${key}: name must be 1 to 40 characters`);
+    const amount = typeof o.amountCents === "string" ? Number(o.amountCents) : o.amountCents;
+    if (!Number.isInteger(amount) || (amount as number) < 100 || (amount as number) > 10_000_000) throw new BillingConfigError(`plan ${key}: amountCents must be a whole number from 100 to 10000000`);
+    const currency = typeof o.currency === "string" && o.currency ? o.currency.trim().toLowerCase() : "usd";
+    if (!/^[a-z]{3}$/.test(currency)) throw new BillingConfigError(`plan ${key}: currency must be a 3-letter code`);
+    const interval = o.interval === "month" || o.interval === "year" ? o.interval : o.interval === null || o.interval === undefined || o.interval === "" ? null : "bad";
+    if (interval === "bad") throw new BillingConfigError(`plan ${key}: interval must be "month", "year" or null for one-time`);
+    const lifetime = o.lifetime === true;
+    let licenseDays: number | null = null;
+    if (interval === null) {
+      const d = typeof o.licenseDays === "string" ? Number(o.licenseDays) : o.licenseDays;
+      licenseDays = lifetime ? MAX_LICENSE_DAYS : (d as number);
+      if (!Number.isInteger(licenseDays) || licenseDays < 1 || licenseDays > MAX_LICENSE_DAYS) throw new BillingConfigError(`plan ${key}: a one-time plan needs licenseDays from 1 to ${MAX_LICENSE_DAYS}`);
+    } else if (lifetime) {
+      throw new BillingConfigError(`plan ${key}: a lifetime plan cannot also renew — set interval to null`);
+    }
+    const description = typeof o.description === "string" ? o.description.trim().slice(0, 120) : "";
+    out.push({ key, name, amountCents: amount as number, currency, interval, licenseDays, lifetime, description });
+  }
+  return out;
+}
+
+/** The Payment Link `/buy?plan=key` sends to in a mode: the per-plan map
+ *  first, then the single legacy field for the FIRST plan (monthly). */
+export function paymentLinkFor(cfg: BillingConfig, mode: BillingMode, planKey: string | null | undefined): string {
+  const m = cfg.stripe[mode];
+  const key = planKey && PLAN_KEY_RE.test(planKey) ? planKey : cfg.plans[0]?.key ?? "monthly";
+  if (!cfg.plans.some((p) => p.key === key)) return "";
+  return m.paymentLinks[key] || (key === cfg.plans[0]?.key ? m.paymentLinkUrl : "");
+}
+
+export function planByKey(cfg: BillingConfig, key: string | null | undefined): Plan | null {
+  return key ? cfg.plans.find((p) => p.key === key) ?? null : null;
+}
+
 function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unknown): StripeModeConfig {
   if (patch === undefined) return current;
   if (!patch || typeof patch !== "object") throw new BillingConfigError(`stripe.${mode} must be an object`);
@@ -220,6 +324,17 @@ function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unk
     if (typeof p.portalUrl !== "string") throw new BillingConfigError(`${label} Customer Portal URL must be a string`);
     next.portalUrl = httpsUrl(p.portalUrl, `${label} Customer Portal URL`);
   }
+  if (p.paymentLinks !== undefined) {
+    if (!p.paymentLinks || typeof p.paymentLinks !== "object" || Array.isArray(p.paymentLinks)) throw new BillingConfigError(`${label} paymentLinks must be an object of plan key to URL`);
+    const links = { ...current.paymentLinks };
+    for (const [k, v] of Object.entries(p.paymentLinks as Record<string, unknown>)) {
+      if (!PLAN_KEY_RE.test(k)) throw new BillingConfigError(`${label} paymentLinks: ${JSON.stringify(k)} is not a plan key`);
+      if (v === null || v === "") { delete links[k]; continue; }
+      if (typeof v !== "string") throw new BillingConfigError(`${label} paymentLinks.${k} must be a URL string or null`);
+      links[k] = httpsUrl(v, `${label} Payment Link for ${k}`);
+    }
+    next.paymentLinks = links;
+  }
   return next;
 }
 
@@ -228,7 +343,11 @@ function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unk
 export function applyBillingPatch(current: BillingConfig, patch: Record<string, unknown>, now = Date.now()): BillingConfig {
   const next: BillingConfig = {
     ...current,
-    stripe: { test: { ...current.stripe.test }, live: { ...current.stripe.live } },
+    plans: clonePlans(current.plans),
+    stripe: {
+      test: { ...current.stripe.test, paymentLinks: { ...current.stripe.test.paymentLinks } },
+      live: { ...current.stripe.live, paymentLinks: { ...current.stripe.live.paymentLinks } },
+    },
     email: { ...current.email },
     policy: { ...current.policy },
   };
@@ -279,6 +398,7 @@ export function applyBillingPatch(current: BillingConfig, patch: Record<string, 
       next.policy[field] = p[field] as boolean;
     }
   }
+  if (patch.plans !== undefined) next.plans = validatePlans(patch.plans);
   if (patch.siteOrigin !== undefined) {
     if (typeof patch.siteOrigin !== "string") throw new BillingConfigError("siteOrigin must be a string");
     next.siteOrigin = httpsUrl(patch.siteOrigin, "siteOrigin", true);
@@ -295,7 +415,7 @@ export const maskSecret = (v: string): MaskedSecret => ({ configured: !!v, last4
 export interface BillingReadiness { stripeTest: boolean; stripeLive: boolean; email: boolean; release: boolean }
 
 export function stripeModeReady(m: StripeModeConfig): boolean {
-  return !!m.webhookSecret && !!m.paymentLinkUrl;
+  return !!m.webhookSecret && (!!m.paymentLinkUrl || Object.keys(m.paymentLinks).length > 0);
 }
 
 export function emailReady(e: EmailConfig): boolean {
@@ -309,8 +429,11 @@ export function maskedBillingConfig(cfg: BillingConfig, publicOrigin: string, re
     secretKey: maskSecret(m.secretKey),
     webhookSecret: maskSecret(m.webhookSecret),
     paymentLinkUrl: m.paymentLinkUrl,
+    paymentLinks: { ...m.paymentLinks },
     portalUrl: m.portalUrl,
   });
+  const buyPlans: Record<string, string> = {};
+  for (const p of cfg.plans) buyPlans[p.key] = `${origin}/buy?plan=${encodeURIComponent(p.key)}`;
   const ready: BillingReadiness = {
     stripeTest: stripeModeReady(cfg.stripe.test),
     stripeLive: stripeModeReady(cfg.stripe.live),
@@ -320,8 +443,10 @@ export function maskedBillingConfig(cfg: BillingConfig, publicOrigin: string, re
   return {
     mode: cfg.mode,
     publicOrigin: origin,
+    plans: clonePlans(cfg.plans),
     endpoints: {
       buy: `${origin}/buy`,
+      buyPlans,
       billing: `${origin}/billing`,
       webhookTest: `${origin}/api/billing/stripe/test`,
       webhookLive: `${origin}/api/billing/stripe/live`,

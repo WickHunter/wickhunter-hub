@@ -68,6 +68,34 @@ Nothing in the bot changes: renewals reach a running install through the
 check-in re-mint (v0.3.19), revocation through the check-in `revoked` answer,
 and a lapsed licence is exit-only as before.
 
+### Plans (v0.4.15)
+
+The shop sells three plans, defined on the Hub (`plans` in the billing
+config, editable from the admin page): **Monthly $99**, **Yearly $699**,
+**Lifetime $999** (a one-time payment; the licence key is issued for 3650
+days, the v1 format's maximum). Every plan carries the same software; they
+differ only in how the customer pays.
+
+- `/buy?plan=<key>` redirects to that plan's Payment Link in the active mode
+  (`stripe.<mode>.paymentLinks[key]`; the legacy `paymentLinkUrl` is the
+  fallback for the first plan). The website's three Buy buttons use these.
+- `GET /api/billing/plans` is public (CORS `*`) and lists the plans with
+  prices, so the website can show what the Hub says without a deploy.
+- **Create in Stripe** (`POST /admin/api/billing/plans/provision {mode}`)
+  creates or reuses, with the mode's saved secret key: the product (tagged
+  `metadata.wickhunter=unleashed`), one price per plan (`lookup_key`
+  `unleashed-<key>`) and one Payment Link per plan (`metadata.plan`, redirect
+  to `<siteOrigin>/thanks/`, billing address collected, `license_days` on
+  one-time plans). Change an amount on the Hub and run it again: a new price
+  takes the lookup key over, the old price is archived, the old link is
+  deactivated and the new link is saved. The key needs Products, Prices and
+  Payment Links **write** (a plain `sk_` key, or a restricted key with those
+  three); the Customer-portal-only restricted key is not enough.
+- The webhook labels the licence with the plan it finds in the checkout
+  session's `metadata.plan` (`unleashed-yearly`, `unleashed-lifetime`, with
+  `-test` appended in test mode) and takes a one-time plan's length from the
+  plan definition unless the link carries an explicit `license_days`.
+
 ### One switch, both key sets
 
 The admin page's **Billing** panel holds Stripe keys for **test** and **live**
@@ -1041,7 +1069,9 @@ anywhere private is enough; everything else is reproducible.
 | `POST /api/license/lease/deactivate` | genuine known LHK1 + bound install proof | release a seat even after expiry/revocation |
 | `POST /api/license/lease/rebind` | active LHK1 + old and replacement key proofs | atomically move one activation to a new install key |
 | `GET /install.sh?key=` | valid token | personalised tester installer |
-| `GET /buy` | none | 302 to the ACTIVE billing mode's Stripe Payment Link (503 until configured) |
+| `GET /buy[?plan=key]` | none | 302 to the ACTIVE mode's Stripe Payment Link for that plan (503 until configured, 404 unknown plan) |
+| `GET /api/billing/plans` | none (CORS `*`) | the plans with prices and Buy URLs, for the website |
+| `POST /admin/api/billing/plans/provision` | `x-hub-admin` header | create or reuse the product, prices and Payment Links in Stripe for one mode |
 | `GET /billing` | none | 302 to the active mode's Customer Portal login link |
 | `POST /api/billing/stripe/test` · `/live` | Stripe signature (`whsec_` per mode) | mint / extend / revoke licences from Stripe events; idempotent by event id |
 | `GET /welcome/<page-token>` | the emailed page token | a buyer's private install page; mints a one-time install command per view |
@@ -1088,6 +1118,17 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.15 — **Plans on the Hub.** Monthly $99, Yearly $699 and Lifetime $999
+  (a ten-year key) are configured on the Hub and editable there; `/buy?plan=key`
+  redirects to that plan's Payment Link for the active mode; `GET
+  /api/billing/plans` publishes prices for the website so a price change needs
+  no deploy; **Create in Stripe** (`POST /admin/api/billing/plans/provision`)
+  makes or reuses the product, one price per plan and one Payment Link per
+  plan through Stripe's API with the mode's saved key — a changed amount rolls
+  a new price and link and retires the old ones. The webhook reads
+  `metadata.plan` off the checkout and labels the licence (`unleashed-yearly`,
+  `unleashed-lifetime-test`); a one-time plan's length comes from the plan.
+  Pinned in `tests/plans.test.mjs` against a fake Stripe API.
 - v0.4.14 — Welcome email rebuilt on the Unleashed lockup: licence summary,
   four set-up steps, what to expect, billing and help; email-safe tables,
   inline styles, light theme.
