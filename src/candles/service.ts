@@ -223,7 +223,10 @@ export class CandleService {
         // Read fresh on every resync, so a new listing joins the stream on the
         // collector's own listing cadence with no restart.
         symbols: () => collector.symbols().filter((t) => !t.delisted).map((t) => t.symbol),
-        write: (symbol, candles, notAfterMs) => { this.store.write(v, symbol, candles, notAfterMs); },
+        write: (symbol, candles, notAfterMs) => {
+          const result = this.store.write(v, symbol, candles, notAfterMs);
+          collector.noteStoredCandles(symbol, candles, result.written, result.newlyFilled);
+        },
         now: this.deps.now,
         log: (m) => console.log(`[candles·stream] ${m}`),
         socket: this.deps.streamSocket,
@@ -261,6 +264,13 @@ export class CandleService {
   /** Live socket state, for the admin panel. Empty when the tail is off. */
   streamStatus(): Array<ReturnType<VenueStreamRunner["status"]>> {
     return [...this.streams.values()].map((r) => r.status());
+  }
+
+  /** Prepare the exact data used by synchronous `status()`. The admin route
+   *  awaits this yielding pass; existing in-process callers retain the same
+   *  status signature once their normal collector tick has primed it. */
+  async prepareStatus(): Promise<void> {
+    await Promise.all([...this.collectors.values()].map((collector) => collector.prepareCoverage()));
   }
 
   /** Re-chunk every runner against the current tracked set. Called on the same
