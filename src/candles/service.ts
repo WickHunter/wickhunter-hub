@@ -11,7 +11,7 @@ import {
 } from "./collector.js";
 import { ADAPTERS, VENUE_IDS, type FetchLike, type VenueId } from "./venues.js";
 import { STREAM_ADAPTERS } from "./stream.js";
-import { VenueStreamRunner } from "./stream-runner.js";
+import { VenueStreamRunner, type SocketFactory } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
 import {
   buildSnapshot, isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs,
@@ -129,6 +129,9 @@ export interface CandleServiceDeps {
    *  a suite passes a no-op so the pacing is exercised without the suite
    *  actually waiting for it. Defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable websocket transport keeps service wiring testable without
+   * opening a public socket. Production uses the runner's native factory. */
+  streamSocket?: SocketFactory;
 }
 
 const realFetch: FetchLike = async (url: string) => {
@@ -209,8 +212,8 @@ export class CandleService {
       const collector = this.collectors.get(v)!;
       const adapter = STREAM_ADAPTERS[v];
       // A configured collector remains useful when a venue has no verified
-      // candle socket.  In particular WEEX is REST-only; never invent a stream
-      // from another public topic or let an env typo crash startup.
+      // candle socket. Never invent a stream from another public topic or let
+      // an env typo crash startup.
       if (!adapter) {
         console.warn(`[candles·stream] ${v}: no verified candle websocket; continuing with REST collection`);
         continue;
@@ -223,6 +226,7 @@ export class CandleService {
         write: (symbol, candles, notAfterMs) => { this.store.write(v, symbol, candles, notAfterMs); },
         now: this.deps.now,
         log: (m) => console.log(`[candles·stream] ${m}`),
+        socket: this.deps.streamSocket,
       });
       this.streams.set(v, runner);
       runner.start();
@@ -304,6 +308,9 @@ export class CandleService {
           // unexpected throw must never stop the other venues from running.
         }
       }));
+      // WEEX discovery updates its tracked roster. Subscribe newly eligible
+      // pairs in this same pass; retain other venues' existing stream cadence.
+      this.streams.get("weex")?.resync();
       if (now - this.lastPruneAt >= DAY_MS) {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);

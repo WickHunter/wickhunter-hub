@@ -157,14 +157,9 @@ await test("symbols do not interfere with each other", () => {
 });
 
 await test("each advertised websocket venue states a topic cap and a reachable url", () => {
-  // A candle venue does not imply a websocket venue. WEEX is deliberately
-  // REST-only until its candle stream is documented and replay-tested.
   for (const v of VENUE_IDS) {
     const a = STREAM_ADAPTERS[v];
-    if (!a) {
-      assert.equal(v, "weex", `${v} may lack a stream only with an explicit REST-only decision`);
-      continue;
-    }
+    assert.ok(a, `${v} is a configured candle venue with a documented stream adapter`);
     assert.equal(a.id, v);
     assert.ok(/^wss:\/\//.test(a.url), `${v} url is a websocket`);
     assert.ok(a.maxTopicsPerConnection > 0, `${v} states a topic cap`);

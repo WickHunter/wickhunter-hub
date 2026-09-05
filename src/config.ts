@@ -156,9 +156,23 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     .map((s) => s.trim().toLowerCase())
     .filter(isVenueId))];
   // An existing enabled candle producer must pick up the new public venue on
-  // update.  Empty stays empty: this does not turn the whole outbound service
+  // update. Empty stays empty: this does not turn the whole outbound service
   // on for an installation that has deliberately disabled candle collection.
   if (configuredCandleVenues.length && !configuredCandleVenues.includes("weex")) configuredCandleVenues.push("weex");
+  // WEEX's documented public candle socket is the only newly-enabled default:
+  // it keeps the auto-added producer current without changing any existing
+  // venue's stream policy. `-weex` is an explicit operational escape hatch.
+  const configuredStreamTokens = (env.HUB_CANDLE_STREAM ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const configuredCandleStreams = [...new Set(configuredStreamTokens.filter(isVenueId))]
+    .filter((venue) => venue !== "weex" || !configuredStreamTokens.includes("-weex"));
+  if (configuredCandleVenues.includes("weex")
+    && !configuredStreamTokens.includes("-weex")
+    && !configuredCandleStreams.includes("weex")) {
+    configuredCandleStreams.push("weex");
+  }
   const publicOrigin = env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`;
   if (env.NODE_ENV === "production") {
     let url: URL;
@@ -208,14 +222,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       rootHelper: env.HUB_ROOT_HELPER ?? "/usr/local/libexec/wickhunter-hub-root-helper",
     },
     candleVenues: configuredCandleVenues,
-    // v0.2.17 — venues whose TAIL comes from a websocket. A SUBSET of the
-    // collecting venues, intersected below rather than trusted: naming a venue
-    // here that is not collecting would open sockets for a roster nobody is
-    // tracking. Absent = REST only, which is every install today.
-    candleStreamVenues: (env.HUB_CANDLE_STREAM ?? "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(isVenueId),
+    // A subset of the collecting venues, intersected by the server. Existing
+    // venues remain opt-in; an enabled WEEX collector starts its verified V3
+    // candle stream unless HUB_CANDLE_STREAM includes `-weex`.
+    candleStreamVenues: configuredCandleStreams,
     // Both come out of one function so the key and its label move together.
     candleSigner: signing.signer,
     candleKeyId: signing.keyId,

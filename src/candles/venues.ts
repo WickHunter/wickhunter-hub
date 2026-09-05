@@ -662,8 +662,8 @@ const aster: VenueAdapter = {
 // HistoryKlines permits at most 100 rows and costs weight 5; current klines
 // permit 1000 rows at weight 1. Older ranges retain bounded historical pages.
 // Pacing still budgets the worst-case history cost at half of the 50/min lane:
-// 25 / 5 / 60 = 1/12 request per second.  There is no documented candle socket
-// in this integration, so WEEX is intentionally REST-only (see stream.ts).
+// 25 / 5 / 60 = 1/12 request per second. The optional V3 candle stream owns
+// the fresh tail; this REST adapter remains the source for gaps and backfill.
 const WEEX_BASE = "https://api-contract.weex.com";
 export const WEEX_HISTORY_KLINE_WEIGHT = 5;
 export const WEEX_PUBLIC_WEIGHT_PER_MINUTE = 50;

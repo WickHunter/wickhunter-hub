@@ -104,6 +104,9 @@ export interface StreamAdapter {
    *  unrecognised — an unparseable frame is never an error, because a venue
    *  adding a field must not stop the tail. */
   parse(frame: string): StreamTick[];
+  /** Immediate protocol replies for an incoming frame. Most venues use
+   * websocket-level ping/pong, but WEEX sends a JSON ping that needs JSON PONG. */
+  replyFrames?(frame: string): unknown[];
   /** Some venues want a periodic ping to keep the socket open. */
   readonly pingIntervalMs?: number;
   readonly pingFrame?: string;
@@ -112,6 +115,24 @@ export interface StreamAdapter {
 const num = (v: unknown): number => {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : NaN;
+};
+
+/** WEEX wire fields must be actual finite numbers or nonblank numeric strings.
+ * Generic Number coercion accepts null, booleans and blanks as zero, which is
+ * harmless for legacy adapters but turns malformed WEEX frames into candles. */
+const strictWeexNum = (v: unknown): number => {
+  if (typeof v !== "number" && typeof v !== "string") return NaN;
+  if (typeof v === "string" && !v.trim()) return NaN;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+};
+const positiveWeexNum = (v: unknown): number => {
+  const n = strictWeexNum(v);
+  return n > 0 ? n : NaN;
+};
+const nonNegativeWeexNum = (v: unknown): number => {
+  const n = strictWeexNum(v);
+  return n >= 0 ? n : NaN;
 };
 
 /** A candle is only usable if every field parsed and the minute is on grid. */
@@ -351,13 +372,75 @@ const aster: StreamAdapter = {
   },
 };
 
+const weex: StreamAdapter = {
+  id: "weex",
+  // V3 mainnet public-contract endpoint. It was live-probed with the exact
+  // subscription below; there is no testnet or spot fallback in this adapter.
+  url: "wss://ws-contract.weex.com/v3/ws/public",
+  // V3 documents at most 100 channels per connection. One frame per chunk also
+  // stays well below its 240 subscription operations/hour connection limit.
+  maxTopicsPerConnection: 100,
+  subscribeFrames(symbols) {
+    const params = symbols
+      .filter((s) => /^[A-Z0-9]{2,28}USDT$/.test(s))
+      .map((s) => `${s}@kline_1m_LAST_PRICE`);
+    return params.length ? [{ method: "SUBSCRIBE", params, id: 1 }] : [];
+  },
+  replyFrames(frame) {
+    let m: { event?: unknown };
+    try { m = JSON.parse(frame); } catch { return []; }
+    // Public V3 pings in-band as `{event:"ping",time:...}`. Its documented
+    // reply has a client id and deliberately does not echo the server time.
+    return m?.event === "ping" ? [{ method: "PONG", id: 1 }] : [];
+  },
+  parse(frame) {
+    let m: { e?: unknown; s?: unknown; p?: unknown; d?: unknown };
+    try { m = JSON.parse(frame); } catch { return []; }
+    const snapshot = m?.e === "klineSnapshot";
+    if (!m || (!snapshot && m.e !== "kline") || m.p !== "LAST_PRICE" || !Array.isArray(m.d)) return [];
+    const symbol = String(m.s ?? "");
+    if (!/^[A-Z0-9]{2,28}USDT$/.test(symbol)) return [];
+    const out: StreamTick[] = [];
+    for (const raw of m.d) {
+      if (!raw || typeof raw !== "object") continue;
+      const d = raw as Record<string, unknown>;
+      // Live V3 frames use an exclusive `T` exactly one minute after `t`.
+      // Ordinary kline updates carry no x/confirm flag, so ClosureBuffer waits
+      // for a later `t`. A one-time `klineSnapshot` instead contains a closed
+      // historical prefix plus the current forming bar; its explicit end time
+      // lets that prefix seed the store without inventing a close flag.
+      if (d.i !== "1m" || (d.s !== undefined && String(d.s) !== symbol)) continue;
+      const openMs = positiveWeexNum(d.t);
+      const endMs = positiveWeexNum(d.T);
+      // Live V3 uses an exclusive end boundary. Require it on both snapshots
+      // and incremental frames so a malformed update cannot reopen a bar off
+      // the 1m grid. Snapshot rows are additionally known closed only when the
+      // wire has already moved past their exclusive end.
+      if (endMs !== openMs + MINUTE_MS || (snapshot && endMs > Date.now())) continue;
+      const t: StreamTick = {
+        symbol,
+        openMs,
+        candle: {
+          openMs, open: positiveWeexNum(d.o), high: positiveWeexNum(d.h),
+          low: positiveWeexNum(d.l), close: positiveWeexNum(d.c),
+          volume: nonNegativeWeexNum(d.v), // v is base volume; q is quote turnover.
+        },
+        closed: snapshot,
+      };
+      if (usable(t)) out.push(t);
+    }
+    // A snapshot's closed prefix must reach ClosureBuffer oldest-first. The
+    // normal per-minute update is one row and preserves the wire observation.
+    return snapshot ? out.sort((a, b) => a.openMs - b.openMs) : out;
+  },
+};
+
 /**
- * Only venues with a documented, parsed candle websocket appear here.  WEEX
- * deliberately has no entry: its Hub collector is REST-only until a candle
- * stream can be documented and replay-tested, rather than treating a ticker
- * socket as candle provenance.
+ * Only venues with a documented, parsed candle websocket appear here. WEEX V3
+ * kline is included because its subscription and real forming frames were
+ * verified. An enabled WEEX collector starts it unless `HUB_CANDLE_STREAM=-weex`.
  */
-export const STREAM_ADAPTERS: Partial<Record<VenueId, StreamAdapter>> = { bybit, bitunix, bitget, binance, aster };
+export const STREAM_ADAPTERS: Partial<Record<VenueId, StreamAdapter>> = { bybit, bitunix, bitget, binance, aster, weex };
 
 // ── the closure buffer ──────────────────────────────────────────────────────
 
