@@ -206,6 +206,10 @@ export class VenueCollector {
   private startedAt: number;
   /** Round-robin cursor so one slow symbol cannot starve the rest. */
   private cursor = 0;
+  /** WEEX history costs five request-weight units per 100-row page. With only
+   * five safe pages per minute, preserving insertion order would backfill the
+   * first five symbols to retention before any later listing received a page. */
+  private weexBackfillCursor = 0;
 
   // ── RATE STATE ────────────────────────────────────────────────────────────
   /** Current adaptive rate. Starts at the configured ceiling and only ever
@@ -519,6 +523,16 @@ export class VenueCollector {
       tail.push(...tail.splice(0, k));
     }
     this.cursor++;
+    // Keep the established ordering for every existing venue. WEEX's very low
+    // historical lane needs its own fair cursor: a first 100-row page makes a
+    // pair materially more useful, while serial 30-day digging leaves later
+    // API-eligible pairs cold for days. The cursor advances only after this
+    // pass actually attempts a backfill request; tail/repair work, deadlines,
+    // and idle ticks must not consume an unseen symbol's turn.
+    if (this.venue === "weex" && backfill.length > 0) {
+      const k = this.weexBackfillCursor % backfill.length;
+      backfill.push(...backfill.splice(0, k));
+    }
     return [...tail, ...repair, ...backfill];
   }
 
@@ -640,6 +654,7 @@ export class VenueCollector {
     const newestClosed = settledOpenMs(now);
     let requests = 0;
     let written = 0;
+    let weexBackfillAttempts = 0;
     this.lastPollAt = now;
 
     for (const item of queue) {
@@ -648,6 +663,10 @@ export class VenueCollector {
       await this.pace(clock, sleep);
       requests++;
       this.requestsMade++;
+      // Advance fair scheduling by work actually attempted, including an
+      // ordinary error or rate-limit response. If tail/repair uses the budget
+      // first, or a deadline stops the pass, later WEEX symbols retain turn.
+      if (this.venue === "weex" && item.kind === "backfill") weexBackfillAttempts++;
       try {
         const adapter = ADAPTERS[this.venue];
         const page = item.recent && adapter.fetchRecentKlines
@@ -749,6 +768,7 @@ export class VenueCollector {
         this.consecutiveFailures++;
       }
     }
+    this.weexBackfillCursor += weexBackfillAttempts;
     return { requests, written };
   }
 

@@ -50,6 +50,45 @@ function fixture() {
   };
 }
 
+await test("WEEX deep backfill gives a 12-symbol roster a first page within three 5-request passes", async () => {
+  const store = new CandleStore(tmpDir("weex-backfill-fairness"));
+  const calls = [];
+  const symbols = Array.from({ length: 12 }, (_, index) => `C${String(index).padStart(2, "0")}USDT`);
+  const newest = settledOpenMs(NOW);
+  const fetchLike = async (url) => {
+    const u = new URL(url);
+    if (u.pathname.endsWith("/exchangeInfo")) return response({ symbols: symbols.map((symbol) => ({
+      symbol, quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true,
+    })) });
+    if (u.pathname.endsWith("/apiTradingSymbols")) return response(symbols);
+    if (u.pathname.endsWith("/historyKlines")) {
+      calls.push(u.searchParams.get("symbol"));
+      const start = Number(u.searchParams.get("startTime"));
+      return response(rows(start, WEEX_PAGE_LIMIT));
+    }
+    throw new Error(`unexpected URL ${url}`);
+  };
+  const collector = new VenueCollector("weex", store, tmpDir("weex-backfill-fairness-state"), {
+    ...DEFAULT_COLLECTOR_OPTIONS,
+    requestsPerSecond: 100,
+    minRequestsPerSecond: 0.1,
+    tailFillMinutes: 10_000,
+    retentionDays: 1,
+  }, NOW);
+  await collector.refreshSymbols(fetchLike, NOW);
+  for (const symbol of symbols) store.write("weex", symbol, rows(newest, 1).map((row) => ({
+    openMs: row[0], open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]),
+  })));
+
+  await collector.tick(fetchLike, 5, NOW, { sleep: async () => {} });
+  await collector.tick(fetchLike, 5, NOW, { sleep: async () => {} });
+  await collector.tick(fetchLike, 5, NOW, { sleep: async () => {} });
+  assert.deepEqual(calls.slice(0, 12), symbols,
+    "at five WEEX history pages/minute, every listing receives a first warmup page before any symbol gets a second page");
+  assert.deepEqual(calls.slice(12), symbols.slice(0, 3),
+    "the third pass resumes at the head only after all twelve first pages were attempted");
+});
+
 await test("WEEX cold start drops the forming and grace rows from a real-shaped 1000-row current page", async () => {
   const f = fixture();
   const newest = settledOpenMs(NOW);
