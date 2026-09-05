@@ -382,7 +382,7 @@ const weex: StreamAdapter = {
   maxTopicsPerConnection: 100,
   subscribeFrames(symbols) {
     const params = symbols
-      .filter((s) => /^[A-Z0-9]{2,28}USDT$/.test(s))
+      .filter((s) => /^[A-Z0-9]{1,28}USDT$/.test(s))
       .map((s) => `${s}@kline_1m_LAST_PRICE`);
     return params.length ? [{ method: "SUBSCRIBE", params, id: 1 }] : [];
   },
@@ -399,7 +399,7 @@ const weex: StreamAdapter = {
     const snapshot = m?.e === "klineSnapshot";
     if (!m || (!snapshot && m.e !== "kline") || m.p !== "LAST_PRICE" || !Array.isArray(m.d)) return [];
     const symbol = String(m.s ?? "");
-    if (!/^[A-Z0-9]{2,28}USDT$/.test(symbol)) return [];
+    if (!/^[A-Z0-9]{1,28}USDT$/.test(symbol)) return [];
     const out: StreamTick[] = [];
     for (const raw of m.d) {
       if (!raw || typeof raw !== "object") continue;

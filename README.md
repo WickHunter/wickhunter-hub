@@ -1088,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.9 — **WEEX one-character base symbols now receive their candle stream.**
+  Eligible contracts such as HUSDT and WUSDT are included in subscriptions and
+  accepted on snapshot and incremental frames. Their existing REST collection
+  remains the fallback, and validation for every other venue is unchanged.
+
 - v0.4.8 — **WEEX websocket closes now wait for the Hub's settled boundary.**
   WEEX's next-minute update no longer hands the just-closed bar to the store one
   grace minute too early and loses it. A small per-symbol queue flushes on new
