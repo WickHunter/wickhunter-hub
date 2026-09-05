@@ -161,6 +161,14 @@
   .custcard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem .8rem; }
   .custcard dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .5rem; margin:.4rem 0; font-size:.85rem; }
   .custcard dt { color:var(--muted); }
+  .planstable td { white-space:normal; }
+  .planlinkfield { display:flex; align-items:center; gap:.4rem; }
+  .planlinkfield input { flex:1 1 12rem; min-width:0; }
+  .plancards { display:none; }
+  .plancard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem .8rem; display:grid; gap:.4rem; }
+  .plancard .planlabel { font-size:.78rem; color:var(--muted); margin-top:.2rem; }
+  .planbuyline { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+  .planbuyline code, .buycell code { flex:1 1 10rem; min-width:0; overflow-wrap:anywhere; background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); padding:.4rem .5rem; font:12px/1.4 var(--mono); }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
   }
@@ -190,6 +198,8 @@
     .custtable { display:none; }
     .custcards { display:grid; }
     .linkrow label { flex-basis:100%; }
+    .planstable { display:none; }
+    .plancards { display:grid; gap:.6rem; }
   }
 </style>
 </head>
@@ -305,6 +315,21 @@
     <span class="muted billing-savenote" data-mode="live" style="margin-left:.5rem"></span>
   </section>
 </div>
+
+<section class="configgroup" id="billingPlansCard" style="margin-top:.8rem" hidden>
+  <h2>Plans</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">These are the plans provisioned into Stripe. The list itself is fixed here; edit the Test/Live Payment Link for a plan below, or create them all in one go with the buttons underneath.</p>
+  <div class="tbl"><table class="planstable">
+    <thead><tr><th>Name</th><th>Price</th><th>Billing</th><th>Buy link</th><th>Test link</th><th>Live link</th><th></th></tr></thead>
+    <tbody id="billingPlanRows"></tbody>
+  </table></div>
+  <div class="plancards" id="billingPlanCards"></div>
+  <div class="actions" style="margin-top:.7rem">
+    <button type="button" id="billingProvisionTest">Create in Stripe (test)</button>
+    <button type="button" id="billingProvisionLive">Create in Stripe (live)</button>
+  </div>
+  <div id="billingProvisionNote" class="muted" style="margin-top:.5rem;overflow-wrap:anywhere"></div>
+</section>
 
 <section class="configgroup" style="margin-top:.8rem">
   <h2>Email</h2>
@@ -1850,6 +1875,15 @@ function billingRenderLinks(cfg) {
     ["Test webhook URL", e.webhookTest],
     ["Live webhook URL", e.webhookLive],
   ];
+  // The plain "Buy link" above is the monthly-plan fallback and stays as-is;
+  // once the server carries a plan list, add one explicit line per plan so
+  // an operator never has to guess which buy link is which.
+  if (Array.isArray(cfg.plans)) {
+    const buyPlans = e.buyPlans || {};
+    for (const p of cfg.plans) {
+      rows.push(["Buy · " + p.name, buyPlans[p.key]]);
+    }
+  }
   const box = document.getElementById("billingLinks");
   box.innerHTML = rows.map(([label, url]) =>
     '<div class="linkrow"><label>' + esc(label) + '</label><code>' + esc(url || "—") + '</code>'
@@ -1864,12 +1898,184 @@ function billingRenderLinks(cfg) {
   });
 }
 
+// ── Plans ────────────────────────────────────────────────────────────────
+// The plan list itself is fixed (three defaults); this card only lets an
+// operator wire up per-plan Payment Link URLs and provision them in Stripe.
+// Older Hub builds have no `plans` in the config response at all — the card
+// stays hidden rather than rendering with nothing in it.
+function billingPlanPrice(p) {
+  const dollars = (Number(p.amountCents) || 0) / 100;
+  return "$" + (Number.isInteger(dollars) ? String(dollars) : dollars.toFixed(2));
+}
+function billingPlanBilling(p) {
+  if (p.interval === "month") return "per month";
+  if (p.interval === "year") return "per year";
+  const days = p.licenseDays != null ? p.licenseDays : "?";
+  return "one-time, " + days + "-day licence";
+}
+function billingBuyLinkHtml(url) {
+  if (!url) return '<span class="muted">—</span>';
+  return "<code>" + esc(url) + '</code> <button type="button" class="copyLink" data-copy="' + esc(url) + '">Copy</button>';
+}
+function billingBindCopyButtons(root) {
+  root.querySelectorAll(".copyLink").forEach((btn) => {
+    btn.onclick = async () => {
+      await navigator.clipboard.writeText(btn.dataset.copy);
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    };
+  });
+}
+function billingPlanLinkField(mode, value) {
+  const wrap = document.createElement("span");
+  wrap.className = "planlinkfield";
+  const dot = document.createElement("span");
+  dot.className = "dot" + (value ? " ok" : "");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.value = value || "";
+  input.placeholder = mode === "test" ? "https://buy.stripe.com/test_…" : "https://buy.stripe.com/…";
+  wrap.appendChild(dot);
+  wrap.appendChild(input);
+  return { wrap, input };
+}
+// Only the modes whose input actually changed are sent — an untouched mode
+// stays out of the payload entirely so it is left alone server-side, per the
+// POST contract (omitted key = untouched, empty string = delete → null).
+function billingPlanRowSave(key, testInput, liveInput, origTest, origLive, note, btn) {
+  return async () => {
+    const stripe = {};
+    const nt = testInput.value.trim();
+    const nl = liveInput.value.trim();
+    if (nt !== (origTest || "")) stripe.test = { paymentLinks: { [key]: nt === "" ? null : nt } };
+    if (nl !== (origLive || "")) stripe.live = { paymentLinks: { [key]: nl === "" ? null : nl } };
+    if (!Object.keys(stripe).length) return;
+    btn.disabled = true;
+    note.className = "muted";
+    note.textContent = "Saving…";
+    try {
+      const data = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe }) });
+      billingConfig = data;
+      billingRenderAll(data); // rebuilds this row with the saved values, so no lingering "Saving…" to clear
+    } catch (e) {
+      btn.disabled = false;
+      if (e.message !== "unauthorized") { note.className = "ops-bad"; note.textContent = e.message; }
+    }
+  };
+}
+function billingRenderPlans(cfg) {
+  const card = document.getElementById("billingPlansCard");
+  const plans = Array.isArray(cfg.plans) ? cfg.plans : null;
+  if (!plans) { card.hidden = true; return; }
+  card.hidden = false;
+  const testLinks = (cfg.stripe && cfg.stripe.test && cfg.stripe.test.paymentLinks) || {};
+  const liveLinks = (cfg.stripe && cfg.stripe.live && cfg.stripe.live.paymentLinks) || {};
+  const buyPlans = (cfg.endpoints && cfg.endpoints.buyPlans) || {};
+  const rows = document.getElementById("billingPlanRows");
+  const cards = document.getElementById("billingPlanCards");
+  rows.innerHTML = "";
+  cards.innerHTML = "";
+  for (const p of plans) {
+    const price = billingPlanPrice(p);
+    const billing = billingPlanBilling(p);
+    const buyUrl = buyPlans[p.key] || "";
+    const origTest = testLinks[p.key] || "";
+    const origLive = liveLinks[p.key] || "";
+    const buyHtml = billingBuyLinkHtml(buyUrl);
+
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + esc(p.name) + "</td>" +
+      "<td>" + esc(price) + "</td>" +
+      "<td>" + esc(billing) + "</td>" +
+      '<td class="buycell">' + buyHtml + "</td>" +
+      '<td class="testcell"></td>' +
+      '<td class="livecell"></td>' +
+      '<td class="savecell"></td>';
+    const rowTest = billingPlanLinkField("test", origTest);
+    const rowLive = billingPlanLinkField("live", origLive);
+    tr.querySelector(".testcell").appendChild(rowTest.wrap);
+    tr.querySelector(".livecell").appendChild(rowLive.wrap);
+    const rowSave = document.createElement("button");
+    rowSave.type = "button";
+    rowSave.textContent = "Save";
+    const rowNote = document.createElement("div");
+    rowNote.className = "muted";
+    rowSave.onclick = billingPlanRowSave(p.key, rowTest.input, rowLive.input, origTest, origLive, rowNote, rowSave);
+    tr.querySelector(".savecell").appendChild(rowSave);
+    tr.querySelector(".savecell").appendChild(rowNote);
+    rows.appendChild(tr);
+
+    const cardEl = document.createElement("div");
+    cardEl.className = "plancard";
+    cardEl.innerHTML =
+      "<div><b>" + esc(p.name) + "</b> <span class=\"muted\">" + esc(price) + " · " + esc(billing) + "</span></div>" +
+      '<div class="planbuyline">' + buyHtml + "</div>" +
+      '<div class="planlabel">Test link</div>';
+    const cardTest = billingPlanLinkField("test", origTest);
+    cardEl.appendChild(cardTest.wrap);
+    const liveLabel = document.createElement("div");
+    liveLabel.className = "planlabel";
+    liveLabel.textContent = "Live link";
+    cardEl.appendChild(liveLabel);
+    const cardLive = billingPlanLinkField("live", origLive);
+    cardEl.appendChild(cardLive.wrap);
+    const cardSave = document.createElement("button");
+    cardSave.type = "button";
+    cardSave.textContent = "Save";
+    cardSave.style.marginTop = ".2rem";
+    const cardNote = document.createElement("div");
+    cardNote.className = "muted";
+    cardSave.onclick = billingPlanRowSave(p.key, cardTest.input, cardLive.input, origTest, origLive, cardNote, cardSave);
+    cardEl.appendChild(cardSave);
+    cardEl.appendChild(cardNote);
+    cards.appendChild(cardEl);
+  }
+  billingBindCopyButtons(rows);
+  billingBindCopyButtons(cards);
+}
+
+async function billingProvisionPlans(mode) {
+  const MODE = mode.toUpperCase();
+  if (!confirm("This creates the product, prices and Payment Links in your Stripe " + MODE
+    + " account using the saved " + mode + " secret key. Existing ones are reused. Continue?")) return;
+  const btn = document.getElementById(mode === "test" ? "billingProvisionTest" : "billingProvisionLive");
+  const otherBtn = document.getElementById(mode === "test" ? "billingProvisionLive" : "billingProvisionTest");
+  const note = document.getElementById("billingProvisionNote");
+  const original = btn.textContent;
+  btn.disabled = true; otherBtn.disabled = true;
+  btn.textContent = "Creating…";
+  note.className = "muted";
+  note.textContent = "Talking to Stripe…";
+  try {
+    const r = await api("/admin/api/billing/plans/provision", { method: "POST", body: JSON.stringify({ mode }) });
+    const productLine = "Product " + esc((r.product && r.product.name) || "")
+      + ((r.product && r.product.created) ? " (created)" : " (reused)");
+    const planLines = (r.plans || []).map((pr) =>
+      "<div>" + esc(pr.key) + ": price " + (pr.priceCreated ? "created" : "reused")
+      + ", link " + (pr.linkCreated ? "created" : "reused")
+      + " — <code>" + esc(pr.paymentLinkUrl) + "</code></div>"
+    ).join("");
+    note.className = "";
+    note.innerHTML = "<div>" + productLine + "</div>" + planLines;
+    await billingConfigRefresh(); // fills the Test/Live link inputs in from what was just provisioned
+  } catch (e) {
+    if (e.message !== "unauthorized") { note.className = "ops-bad"; note.textContent = e.message; }
+  }
+  btn.disabled = false; otherBtn.disabled = false;
+  btn.textContent = original;
+}
+document.getElementById("billingProvisionTest").onclick = () => billingProvisionPlans("test");
+document.getElementById("billingProvisionLive").onclick = () => billingProvisionPlans("live");
+
 function billingRenderAll(data) {
   billingRenderMode(data.mode);
   billingRenderReady(data.ready);
   billingRenderLinks(data);
   renderStripeCard("test", (data.stripe && data.stripe.test) || {});
   renderStripeCard("live", (data.stripe && data.stripe.live) || {});
+  billingRenderPlans(data);
   renderEmailCard(data.email || {});
   renderPolicyCard(data.policy || {}, data.siteOrigin || "");
 }
