@@ -1088,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.10 — **WEEX history now backfills fairly across pairs.** Historical
+  requests rotate through eligible pairs instead of finishing the first few
+  pairs before serving the rest. Current candles and gap repairs retain
+  priority, and the exchange request ceiling is unchanged.
+
 - v0.4.9 — **WEEX one-character base symbols now receive their candle stream.**
   Eligible contracts such as HUSDT and WUSDT are included in subscriptions and
   accepted on snapshot and incremental frames. Their existing REST collection
