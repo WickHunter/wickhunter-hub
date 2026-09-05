@@ -153,6 +153,17 @@ interface SymbolsFile {
   symbols: Record<string, TrackedSymbol>;
 }
 
+interface CandleWorkItem {
+  symbol: string;
+  startMs: number;
+  endMs: number;
+  kind: "tail" | "backfill" | "repair";
+  /** Use the venue's newest-page endpoint. Existing tails still require the
+   *  exact first missing minute before any returned row may be written. */
+  recent?: boolean;
+  requireStart?: boolean;
+}
+
 export type VenueState = "starting" | "running" | "cooling" | "stalled" | "failing";
 
 export interface VenueHealth {
@@ -206,6 +217,10 @@ export class VenueCollector {
   private consecutiveRateLimits = 0;
   private rateLimitHits = 0;
   private successStreak = 0;
+  /** A recent page that did not contain an existing tail's first missing
+   *  minute. The next pass uses bounded history instead of retrying the same
+   *  newest page or jumping over the gap. */
+  private forceHistoricalTail = new Set<string>();
 
   constructor(
     readonly venue: VenueId,
@@ -350,14 +365,15 @@ export class VenueCollector {
     return gap;
   }
 
-  private workQueue(now: number): Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> {
+  private workQueue(now: number): CandleWorkItem[] {
     const adapter = ADAPTERS[this.venue];
     // v0.2.10 — SETTLED, not merely closed: one minute of grace against our
     // own clock running fast. See CLOSED_GRACE_MS.
     const newestClosed = settledOpenMs(now);
     const horizon = newestClosed - this.opts.retentionDays * DAY_MS;
     const pageSpan = (adapter.pageLimit - 1) * MINUTE_MS;
-    const tail: Array<{ symbol: string; startMs: number; endMs: number; kind: "tail" | "backfill" | "repair" }> = [];
+    const recentPageSpan = ((adapter.recentPageLimit ?? adapter.pageLimit) - 1) * MINUTE_MS;
+    const tail: CandleWorkItem[] = [];
     const backfill: typeof tail = [];
     // REPAIR sits between them: a hole is worse than shallow history (it
     // poisons a seed while the symbol reads deep and current) and less urgent
@@ -368,9 +384,12 @@ export class VenueCollector {
       if (rec.delisted || !rec.tradable) continue;
       const cov = this.coverage(rec.symbol);
       if (cov.lastClosedMs === null) {
-        // Nothing at all yet: one page ending at the newest closed minute gets
-        // it serving something quickly, and backfill deepens it from there.
-        tail.push({ symbol: rec.symbol, startMs: newestClosed - pageSpan, endMs: newestClosed, kind: "tail" });
+        // Nothing at all yet: WEEX's native current page can safely establish a
+        // contiguous recent suffix without claiming anything about older time.
+        // Other venues retain their existing historical first-page behavior.
+        const recent = !!adapter.fetchRecentKlines && !this.forceHistoricalTail.has(rec.symbol);
+        const span = recent ? recentPageSpan : pageSpan;
+        tail.push({ symbol: rec.symbol, startMs: newestClosed - span, endMs: newestClosed, kind: "tail", recent });
         continue;
       }
       // TAIL-DUE, not merely tail-behind. Asking for one minute costs the same
@@ -395,7 +414,18 @@ export class VenueCollector {
         // Catching up now takes as many passes as it takes, each a FULL page,
         // and the series is contiguous at every moment in between.
         const startMs = cov.lastClosedMs + MINUTE_MS;
-        tail.push({ symbol: rec.symbol, startMs, endMs: Math.min(newestClosed, startMs + pageSpan), kind: "tail" });
+        // `/market/klines` includes the forming row and the collector keeps one
+        // further minute of settlement grace. Reserve both positions when
+        // deciding whether `startMs` is safely inside a 1000-row recent page.
+        const recentOldest = newestClosed - Math.max(0, (adapter.recentPageLimit ?? 0) - 3) * MINUTE_MS;
+        const recent = !!adapter.fetchRecentKlines
+          && !this.forceHistoricalTail.has(rec.symbol)
+          && startMs >= recentOldest;
+        const span = recent ? recentPageSpan : pageSpan;
+        tail.push({
+          symbol: rec.symbol, startMs, endMs: Math.min(newestClosed, startMs + span), kind: "tail",
+          recent, requireStart: recent,
+        });
       }
       if (cov.interiorMissing > 0) {
         const hole = this.oldestHole(rec.symbol, now);
@@ -557,15 +587,54 @@ export class VenueCollector {
       requests++;
       this.requestsMade++;
       try {
-        const page = await ADAPTERS[this.venue].fetchKlines(fetchLike, item.symbol, item.startMs, item.endMs);
+        const adapter = ADAPTERS[this.venue];
+        const page = item.recent && adapter.fetchRecentKlines
+          ? await adapter.fetchRecentKlines(fetchLike, item.symbol, item.startMs, item.endMs)
+          : await adapter.fetchKlines(fetchLike, item.symbol, item.startMs, item.endMs);
         // TWO GATES, both against our own clock rather than the venue's word:
         // dropUnclosed here, and `notAfterMs` inside store.write. A forming bar
         // has to get past both, and neither asks the venue what it sent.
-        const closed = dropUnclosed(page.candles, now);
+        let closed = dropUnclosed(page.candles, now);
+        if (item.recent) {
+          const unique = [...new Map(closed.map((row) => [row.openMs, row])).values()]
+            .sort((a, b) => a.openMs - b.openMs);
+          if (item.requireStart) {
+            // Existing coverage may advance only from its exact next minute.
+            // Keep the contiguous prefix and discard everything after the first
+            // gap; a missing first row forces bounded history on the next pass.
+            const contiguous: Candle[] = [];
+            let expected = item.startMs;
+            for (const row of unique) {
+              if (row.openMs < expected) continue;
+              if (row.openMs !== expected) break;
+              contiguous.push(row);
+              expected += MINUTE_MS;
+            }
+            closed = contiguous;
+            if (closed.length === 0) this.forceHistoricalTail.add(item.symbol);
+          } else {
+            // A cold current page is allowed to be a suffix (the forming bar
+            // and settlement grace normally remove its newest rows), but never
+            // to create an interior hole. Retain only its contiguous suffix.
+            const suffix: Candle[] = [];
+            for (let i = unique.length - 1; i >= 0; i--) {
+              const row = unique[i]!;
+              if (suffix.length && suffix[0]!.openMs - row.openMs !== MINUTE_MS) break;
+              suffix.unshift(row);
+            }
+            closed = suffix;
+            if (closed.length === 0) this.forceHistoricalTail.add(item.symbol);
+          }
+        }
         const w = this.store.write(this.venue, item.symbol, closed, newestClosed);
         written += w.written;
         this.candlesWritten += w.newlyFilled;
         this.noteCoverage(item.symbol, closed, w.newlyFilled);
+        if (item.kind === "tail" && !item.recent && closed.some((row) => row.openMs === item.startMs)) {
+          this.forceHistoricalTail.delete(item.symbol);
+        } else if (item.recent && closed.length > 0) {
+          this.forceHistoricalTail.delete(item.symbol);
+        }
         // A write may have closed the hole we were chasing; make the next pass
         // look again rather than re-requesting a range that is now filled.
         if (item.kind === "repair" && w.newlyFilled > 0) this.holeCache.delete(item.symbol);
