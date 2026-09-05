@@ -394,8 +394,11 @@ perpetual collector. It checks both WEEX `exchangeInfo` and
 `apiTradingSymbols` at startup and on each symbol refresh (15 minutes by
 default). A newly API-enabled pair joins candle collection without a restart.
 WEEX uses up to 1,000 native one-minute rows for initial and recent coverage,
-and bounded 100-row historical pages for older backfill or gaps. WEEX has no candle websocket adapter; never add it to
-`HUB_CANDLE_STREAM` until a documented stream can be replay-tested. An empty
+and bounded 100-row historical pages for older backfill or gaps. Its documented
+V3 `kline_1m_LAST_PRICE` public stream starts automatically with the enabled
+WEEX collector; it writes only a bar the stream has moved past, then the store
+applies its usual settlement gate. Set `HUB_CANDLE_STREAM=-weex` to keep WEEX
+REST-only. Existing venues remain controlled by `HUB_CANDLE_STREAM`. An empty
 `HUB_CANDLE_VENUES` still disables every collector, including WEEX.
 
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
@@ -1085,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.5 — **WEEX V3 candle streaming is now available.** The documented
+  mainnet public `kline_1m_LAST_PRICE` channel is chunked at its 100-topic
+  ceiling, responds to its JSON heartbeat, and stores a forming candle only
+  after WEEX advances to a later minute; REST remains the gap/backfill source.
+
 - v0.4.4 — **Retry incomplete volatility snapshots within five minutes.**
   Failed and partial snapshots no longer stay cached for an entire long candle
   bucket. Complete snapshots keep their normal cache lifetime, and newly tracked
@@ -1440,7 +1448,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
   which has no header to send, and install.sh SUBSTITUTES `?key=` into the script
   it returns. Mutation-verified: restoring the query-only read turns the header
   check red and nothing else notices.
-- v0.2.17 — **the websocket tail is wired, and OFF until an operator asks.**
+- v0.2.17 — **the websocket tail is wired; existing venues stay operator-controlled.**
   v0.2.16 was the protocol; this is the sockets — chunking at each venue's own
   topic cap, bounded jittered reconnect, and closed candles written straight to
   the store. `HUB_CANDLE_STREAM=bitget,bitunix` turns it on per venue, and that

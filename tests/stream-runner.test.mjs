@@ -46,6 +46,12 @@ const bitgetFrame = (openMs, close) =>
     data: [[String(openMs), "1", "2", "0.5", String(close), "3", "9", "9"]],
   });
 
+const weexFrame = (openMs, close) =>
+  JSON.stringify({
+    e: "kline", E: openMs + 10, s: "BTCUSDT", p: "LAST_PRICE",
+    d: [{ t: openMs, T: openMs + MIN, s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: String(close), v: "3" }],
+  });
+
 await test("a closed candle reaches the store; a forming one never does", () => {
   const { factory, made } = fakeSockets();
   const wrote = [];
@@ -96,6 +102,35 @@ await test("symbols are chunked at the venue's own topic cap", () => {
   assert.equal(st.sockets, made.length);
   r.stop();
   assert.ok(made.every((s) => s.closed), "stop closes every socket");
+});
+
+await test("WEEX shards its 100 documented channels, replies to ping, and stores only an advanced bar", () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  const symbols = ["BTCUSDT", ...Array.from({ length: 100 }, (_, i) => `S${i}USDT`)];
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex,
+    symbols: () => symbols,
+    write: (symbol, candles) => wrote.push({ symbol, candles }),
+    socket: factory,
+    now: () => T0 + 5 * MIN,
+  });
+  r.start();
+  assert.equal(made.length, 2, "101 topics are split at WEEX's 100-channel ceiling");
+  for (const s of made) s.h.onOpen();
+  const firstSubscription = JSON.parse(made[0].sent[0]);
+  assert.equal(firstSubscription.method, "SUBSCRIBE");
+  assert.equal(firstSubscription.params.length, 100, "each chunk is subscribed in one operation");
+
+  made[0].h.onMessage('{"event":"ping","time":"1788578130482"}');
+  assert.deepEqual(JSON.parse(made[0].sent.at(-1)), { method: "PONG", id: 1 });
+  made[0].h.onMessage(weexFrame(T0, 10));
+  made[0].h.onMessage(weexFrame(T0, 11));
+  assert.equal(wrote.length, 0, "same-minute updates are still forming");
+  made[0].h.onMessage(weexFrame(T0 + MIN, 20));
+  assert.equal(wrote.length, 1, "only the stream's advance publishes the earlier candle");
+  assert.equal(wrote[0].candles[0].close, 11);
+  r.stop();
 });
 
 await test("a changed symbol set rebuilds; an unchanged one does not", () => {
@@ -191,28 +226,31 @@ await test("an empty roster opens no sockets at all", () => {
   r.stop();
 });
 
-// ── the wiring: OFF by default, and a subset of the collecting venues ──────
-await test("the stream is OFF unless an operator names venues, and never exceeds them", async () => {
+// ── the wiring: WEEX starts with an enabled collector; others remain opt-in ─
+await test("WEEX streams with an enabled collector unless explicitly disabled, and never exceeds it", async () => {
   const { configFromEnv } = await import("../dist/src/config.js");
   const base = { HUB_CANDLE_VENUES: "bitget,bitunix" };
 
   const off = configFromEnv({ ...base });
-  assert.deepEqual(off.candleStreamVenues ?? [], [], "absent HUB_CANDLE_STREAM means REST only");
+  assert.deepEqual(off.candleStreamVenues ?? [], ["weex"], "the auto-added WEEX collector starts its verified stream");
 
   const on = configFromEnv({ ...base, HUB_CANDLE_STREAM: "bitget" });
-  assert.deepEqual(on.candleStreamVenues, ["bitget"]);
+  assert.deepEqual(on.candleStreamVenues, ["bitget", "weex"], "existing venue selection is preserved");
+
+  const optedOut = configFromEnv({ ...base, HUB_CANDLE_STREAM: "bitget,-weex" });
+  assert.deepEqual(optedOut.candleStreamVenues, ["bitget"], "operators can explicitly keep WEEX REST-only");
 
   // Junk and unknown venues are dropped rather than opening a socket at a url
   // that does not exist.
   const junk = configFromEnv({ ...base, HUB_CANDLE_STREAM: "bitget, nonsense ,,BITUNIX" });
-  assert.deepEqual(junk.candleStreamVenues, ["bitget", "bitunix"], "trimmed, lowercased, filtered");
+  assert.deepEqual(junk.candleStreamVenues, ["bitget", "bitunix", "weex"], "trimmed, lowercased, filtered");
 
   // A venue named for streaming that is NOT collecting must not open sockets:
   // the server intersects the two lists, so this is asserted on the same
   // expression the server uses rather than on the parse alone.
   const wide = configFromEnv({ HUB_CANDLE_VENUES: "bitget", HUB_CANDLE_STREAM: "bitget,bitunix" });
   const effective = wide.candleStreamVenues.filter((v) => wide.candleVenues.includes(v));
-  assert.deepEqual(effective, ["bitget"], "a stream venue that is not collecting is dropped");
+  assert.deepEqual(effective, ["bitget", "weex"], "a stream venue that is not collecting is dropped");
 });
 
 summary("stream-runner");

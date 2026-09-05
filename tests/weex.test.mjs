@@ -1,11 +1,11 @@
-// WEEX Hub candle collector: public mainnet REST only.
+// WEEX Hub candle collector: public mainnet REST, with optional V3 candle tail.
 import assert from "node:assert/strict";
 import { test, summary, tmpDir } from "./helpers.mjs";
 import {
   ADAPTERS, VENUE_IDS, WEEX_HISTORY_KLINE_WEIGHT, WEEX_PAGE_LIMIT,
   WEEX_PUBLIC_WEIGHT_PER_MINUTE, weexPacedRps,
 } from "../dist/src/candles/venues.js";
-import { STREAM_ADAPTERS } from "../dist/src/candles/stream.js";
+import { STREAM_ADAPTERS, ClosureBuffer } from "../dist/src/candles/stream.js";
 import { configFromEnv } from "../dist/src/config.js";
 import { CandleService } from "../dist/src/candles/service.js";
 import { DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
@@ -19,7 +19,7 @@ function response(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
-await test("WEEX is a REST-only candle venue with a conservative documented-weight pace", () => {
+await test("WEEX has conservative REST history plus a documented V3 candle stream", () => {
   assert.ok(VENUE_IDS.includes("weex"));
   assert.equal(weex.id, "weex");
   assert.equal(weex.pageLimit, 100);
@@ -28,7 +28,96 @@ await test("WEEX is a REST-only candle venue with a conservative documented-weig
   assert.equal(WEEX_PUBLIC_WEIGHT_PER_MINUTE, 50);
   assert.equal(weex.publicRequestsPerSecond, 1 / 12);
   assert.equal(weexPacedRps(), 1 / 12);
-  assert.equal(STREAM_ADAPTERS.weex, undefined, "a ticker socket is never presented as candle provenance");
+  assert.equal(STREAM_ADAPTERS.weex.id, "weex");
+  assert.equal(STREAM_ADAPTERS.weex.url, "wss://ws-contract.weex.com/v3/ws/public");
+  assert.equal(STREAM_ADAPTERS.weex.maxTopicsPerConnection, 100);
+  const configured = configFromEnv({ HUB_CANDLE_VENUES: "bybit", HUB_CANDLE_STREAM: "weex" });
+  assert.ok(configured.candleVenues.includes("weex"), "an enabled roster retains the auto-added WEEX collector");
+  assert.deepEqual(configured.candleStreamVenues, ["weex"], "the verified stream is selectable through the existing opt-in");
+});
+
+await test("WEEX V3 forming candles publish only after the venue advances its own minute", () => {
+  const a = STREAM_ADAPTERS.weex;
+  const first = {
+    e: "kline", E: 1788578130482, s: "BNBUSDT", p: "LAST_PRICE", d: [{
+      // Live V3 observes T as the exclusive next-minute boundary. It is not a
+      // close flag: WEEX carries no x/confirm field.
+      t: 1788578100000, T: 1788578160000, s: "BNBUSDT", i: "1m",
+      o: "721.80", c: "721.83", h: "722.20", l: "721.57", v: "12.51", n: 269, q: "9029.1252", V: "6.51", Q: "4697.8355",
+    }],
+  };
+  const update = structuredClone(first);
+  update.d[0].c = "721.90";
+  update.d[0].v = "12.77";
+  const next = structuredClone(first);
+  next.d[0] = { ...next.d[0], t: 1788578160000, T: 1788578220000, o: "721.90", c: "722.10", h: "722.15", l: "721.80", v: "0.5" };
+
+  const [forming] = a.parse(JSON.stringify(first));
+  const [latest] = a.parse(JSON.stringify(update));
+  const [advanced] = a.parse(JSON.stringify(next));
+  assert.equal(forming.closed, false, "no endpoint arithmetic may claim closure");
+  assert.equal(forming.candle.volume, 12.51, "v is base volume, never q quote turnover");
+  const buf = new ClosureBuffer();
+  assert.equal(buf.push(forming), null);
+  assert.equal(buf.push(latest), null, "same-minute refresh remains forming");
+  const closed = buf.push(advanced);
+  assert.ok(closed, "a later venue minute closes the held bar");
+  assert.equal(closed.openMs, first.d[0].t);
+  assert.equal(closed.candle.close, 721.9, "the last forming update wins");
+  assert.equal(closed.candle.volume, 12.77);
+});
+
+await test("WEEX V3 snapshot seeds only its closed prefix and skips its current forming bar", () => {
+  const a = STREAM_ADAPTERS.weex;
+  const now = Date.now();
+  const currentOpen = Math.floor(now / MIN) * MIN;
+  const priorOpen = currentOpen - 2 * MIN;
+  const snapshot = {
+    e: "klineSnapshot", E: now, s: "BTCUSDT", p: "LAST_PRICE", d: [
+      // Deliberately newest-first: the adapter orders a snapshot before giving
+      // it to ClosureBuffer, so a historical seed cannot be dropped as stale.
+      { t: currentOpen, T: currentOpen + MIN, s: "BTCUSDT", i: "1m", o: "100", c: "101", h: "102", l: "99", v: "7" },
+      { t: priorOpen, T: priorOpen + MIN, s: "BTCUSDT", i: "1m", o: "90", c: "100", h: "103", l: "89", v: "6" },
+    ],
+  };
+  const ticks = a.parse(JSON.stringify(snapshot));
+  assert.equal(ticks.length, 1, "current forming row is not stored from the snapshot");
+  assert.equal(ticks[0].openMs, priorOpen);
+  assert.equal(ticks[0].closed, true, "the explicit historical end creates the closed seed");
+  assert.equal(new ClosureBuffer().push(ticks[0]).candle.close, 100);
+  const inclusiveEnd = structuredClone(snapshot);
+  inclusiveEnd.d = [{ ...snapshot.d[1], T: priorOpen + MIN - 1 }];
+  assert.deepEqual(a.parse(JSON.stringify(inclusiveEnd)), [], "exclusive T is required by the live V3 wire contract");
+});
+
+await test("WEEX V3 rejects malformed wire values and non-exclusive incremental ends", () => {
+  const a = STREAM_ADAPTERS.weex;
+  const base = {
+    e: "kline", s: "BTCUSDT", p: "LAST_PRICE", d: [{
+      t: 1788578100000, T: 1788578160000, s: "BTCUSDT", i: "1m",
+      o: "100", h: "102", l: "99", c: "101", v: "0",
+    }],
+  };
+  assert.equal(a.parse(JSON.stringify(base)).length, 1, "zero base volume is a valid no-trade candle");
+  for (const [field, value] of [
+    ["o", null], ["o", ""], ["h", false], ["l", 0], ["c", -1],
+    ["v", null], ["v", ""], ["v", false], ["v", -0.01], ["T", 1788578159999],
+  ]) {
+    const invalid = structuredClone(base);
+    invalid.d[0][field] = value;
+    assert.deepEqual(a.parse(JSON.stringify(invalid)), [], `${field}=${String(value)} is not a usable WEEX candle`);
+  }
+});
+
+await test("WEEX V3 topics are exact, chunkable, and respond to its JSON heartbeat", () => {
+  const a = STREAM_ADAPTERS.weex;
+  const [frame] = a.subscribeFrames(["BTCUSDT", "ETHUSDT", "bad/pair"]);
+  assert.deepEqual(frame, {
+    method: "SUBSCRIBE", params: ["BTCUSDT@kline_1m_LAST_PRICE", "ETHUSDT@kline_1m_LAST_PRICE"], id: 1,
+  });
+  assert.deepEqual(a.replyFrames('{"event":"ping","time":"1788578130482"}'), [{ method: "PONG", id: 1 }]);
+  assert.deepEqual(a.replyFrames('{"result":true,"id":1}'), []);
+  assert.deepEqual(a.parse(JSON.stringify({ e: "kline", s: "BTCUSDT", p: "MARK_PRICE", d: [] })), [], "mark-price candles are not LAST_PRICE provenance");
 });
 
 await test("WEEX census requires mainnet USDT perpetual metadata and API eligibility", async () => {
@@ -106,6 +195,41 @@ await test("an enabled legacy candle roster gains WEEX and starts a first pull w
   await new Promise((resolve) => setImmediate(resolve));
   svc.stop();
   assert.ok(calls >= 2, "start immediately requests WEEX discovery instead of waiting one tick");
+});
+
+await test("an enabled WEEX service opens its native stream as soon as discovery tracks a pair", async () => {
+  const configured = configFromEnv({ HUB_CANDLE_VENUES: "bybit" });
+  assert.deepEqual(configured.candleStreamVenues, ["weex"], "an existing producer receives WEEX streaming without an env edit");
+  const sockets = [];
+  const streamSocket = (url, h) => {
+    const socket = { url, h, sent: [], close() {}, send(frame) { this.sent.push(frame); } };
+    sockets.push(socket);
+    return socket;
+  };
+  const svc = new CandleService({
+    dataDir: tmpDir("weex-stream-start"), venues: ["weex"], streamVenues: configured.candleStreamVenues,
+    keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, requestsPerSecond: 100, minRequestsPerSecond: 0.1 }, tickMs: 60_000,
+  }, {
+    sign: () => Buffer.alloc(64), now: () => START, sleep: async () => {}, streamSocket,
+    fetchLike: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith("/exchangeInfo")) return response({ symbols: [
+        { symbol: "BTCUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+      ] });
+      if (pathname.endsWith("/apiTradingSymbols")) return response(["BTCUSDT"]);
+      if (pathname.endsWith("/klines") || pathname.endsWith("/historyKlines")) return response([]);
+      throw new Error(`unexpected URL ${url}`);
+    },
+  });
+  svc.start();
+  await svc.tickAll(START);
+  assert.equal(sockets.length, 1, "post-discovery resync creates the WEEX public socket in the same tick");
+  assert.equal(sockets[0].url, "wss://ws-contract.weex.com/v3/ws/public");
+  sockets[0].h.onOpen();
+  assert.deepEqual(JSON.parse(sockets[0].sent[0]), {
+    method: "SUBSCRIBE", params: ["BTCUSDT@kline_1m_LAST_PRICE"], id: 1,
+  });
+  svc.stop();
 });
 
 await test("a newly API-eligible WEEX perpetual is refreshed, tracked, and seeded in the same pass", async () => {

@@ -173,6 +173,11 @@ export class VenueStreamRunner {
   }
 
   private ingest(c: Conn, data: string): void {
+    // WEEX V3 uses an application-level JSON ping rather than websocket ping
+    // frames. A heartbeat has no business entering the closure buffer.
+    try {
+      for (const reply of this.deps.adapter.replyFrames?.(data) ?? []) c.sock?.send(JSON.stringify(reply));
+    } catch { /* malformed heartbeats degrade to REST, like malformed candles */ }
     let ticks: StreamTick[];
     // A parse that throws must never kill the socket: a venue adding a field is
     // not an outage, and the REST tail covers whatever this drops.
