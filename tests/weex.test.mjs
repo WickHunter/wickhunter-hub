@@ -158,6 +158,7 @@ await test("WEEX census requires mainnet USDT perpetual metadata and API eligibi
     urls.push(url);
     if (url.endsWith("/exchangeInfo")) return response({ symbols: [
       { symbol: "BTCUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+      { symbol: "AAPLUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "TRADIFI_PERPETUAL", forwardContractFlag: true },
       { symbol: "SETTLINGUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true, status: "SETTLING" },
       { symbol: "USDCUSDT", quoteAsset: "USDC", marginAsset: "USDC", contractType: "PERPETUAL", forwardContractFlag: true },
       { symbol: "DELIVERYUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "CURRENT_QUARTER", forwardContractFlag: true },
@@ -165,12 +166,13 @@ await test("WEEX census requires mainnet USDT perpetual metadata and API eligibi
       { symbol: "DEMOUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: false },
       { symbol: "UNLISTEDUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
     ] });
-    if (url.endsWith("/apiTradingSymbols")) return response(["BTCUSDT", "SETTLINGUSDT", "USDCUSDT", "DELIVERYUSDT", "INVERSEUSDT", "DEMOUSDT"]);
+    if (url.endsWith("/apiTradingSymbols")) return response(["BTCUSDT", "AAPLUSDT", "SETTLINGUSDT", "USDCUSDT", "DELIVERYUSDT", "INVERSEUSDT", "DEMOUSDT"]);
     throw new Error(`unexpected URL ${url}`);
   };
   const rows = await weex.listSymbols(fetchLike);
   assert.deepEqual(rows, [
     { symbol: "BTCUSDT", tradable: true },
+    { symbol: "AAPLUSDT", tradable: true },
     { symbol: "SETTLINGUSDT", tradable: false },
   ]);
   assert.deepEqual(urls.sort(), [
@@ -274,7 +276,7 @@ await test("an enabled WEEX service opens its native stream as soon as discovery
   svc.stop();
 });
 
-await test("a newly API-eligible WEEX perpetual is refreshed, tracked, and seeded in the same pass", async () => {
+await test("a newly API-eligible WEEX TRADIFI perpetual is refreshed, tracked, and seeded in the same pass", async () => {
   let apiEligible = new Set(["BTCUSDT"]);
   const candleSymbols = [];
   const svc = new CandleService({
@@ -290,7 +292,7 @@ await test("a newly API-eligible WEEX perpetual is refreshed, tracked, and seede
         { symbol: "BTCUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
         // It exists in metadata at startup, but the separate API eligibility
         // list is the fact that makes it safe to fetch and store.
-        { symbol: "NEWUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+        { symbol: "NEWTRADIFIUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "TRADIFI_PERPETUAL", forwardContractFlag: true },
       ] });
       if (u.pathname.endsWith("/apiTradingSymbols")) return response([...apiEligible]);
       if (u.pathname.endsWith("/historyKlines")) {
@@ -311,22 +313,22 @@ await test("a newly API-eligible WEEX perpetual is refreshed, tracked, and seede
   });
 
   await svc.tickAll(START);
-  assert.equal(svc.collector("weex").isTracked("NEWUSDT"), false);
-  assert.ok(!candleSymbols.includes("NEWUSDT"), "metadata alone never schedules an ineligible pair");
+  assert.equal(svc.collector("weex").isTracked("NEWTRADIFIUSDT"), false);
+  assert.ok(!candleSymbols.includes("NEWTRADIFIUSDT"), "metadata alone never schedules an ineligible pair");
 
   // The eligibility endpoint changes after startup. A tick before the 15m
   // cadence is deliberately still the old set; the due tick re-reads both
   // endpoints and its work queue stores NEWUSDT without a restart.
-  apiEligible = new Set(["BTCUSDT", "NEWUSDT"]);
+  apiEligible = new Set(["BTCUSDT", "NEWTRADIFIUSDT"]);
   await svc.tickAll(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs - 1);
-  assert.equal(svc.collector("weex").isTracked("NEWUSDT"), false);
+  assert.equal(svc.collector("weex").isTracked("NEWTRADIFIUSDT"), false);
   await svc.tickAll(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs);
 
   const collector = svc.collector("weex");
-  assert.equal(collector.isTracked("NEWUSDT"), true, "fresh API eligibility joins the live collector");
-  assert.ok(candleSymbols.includes("NEWUSDT"), "the newly tracked pair receives a native WEEX candle request");
+  assert.equal(collector.isTracked("NEWTRADIFIUSDT"), true, "fresh API eligibility joins the live collector");
+  assert.ok(candleSymbols.includes("NEWTRADIFIUSDT"), "the newly tracked pair receives a native WEEX candle request");
   const newest = settledOpenMs(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs);
-  const stored = svc.store.readWindow("weex", "NEWUSDT", newest, newest).rows;
+  const stored = svc.store.readWindow("weex", "NEWTRADIFIUSDT", newest, newest).rows;
   assert.equal(stored.length, 1, "the fetched closed candle is persisted under the WEEX venue");
 });
 
