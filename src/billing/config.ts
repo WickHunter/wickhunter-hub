@@ -56,7 +56,7 @@ export const PLAN_KEY_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const DEFAULT_PLAN_LIST: Plan[] = [
   { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time." },
   { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free." },
-  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment. Ten-year licence." },
+  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment." },
 ];
 export const DEFAULT_PLANS: readonly Plan[] = Object.freeze(DEFAULT_PLAN_LIST.map((p) => Object.freeze({ ...p })));
 
