@@ -1088,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.12 — **WEEX API-eligible TradFi perpetuals now receive candles.**
+  Discovery includes `TRADIFI_PERPETUAL` alongside ordinary perpetuals while
+  retaining the USDT, forward-contract and API-eligibility requirements. Newly
+  eligible contracts are tracked and seeded during the next discovery pass.
+
 - v0.4.11 — **WEEX REST candles reject malformed numeric fields.** Boolean,
   array, object and blank values cannot become plausible prices or volumes.
   Valid JSON numbers and numeric strings continue to load normally.

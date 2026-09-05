@@ -742,8 +742,9 @@ const weex: VenueAdapter = {
       const row = raw as Record<string, unknown>;
       const symbol = typeof row.symbol === "string" ? row.symbol.trim().toUpperCase() : "";
       if (!symbol || !apiEligible.has(symbol)) continue;
+      const contractType = typeof row.contractType === "string" ? row.contractType.toUpperCase() : "";
       if (row.quoteAsset !== "USDT" || row.marginAsset !== "USDT"
-        || row.contractType !== "PERPETUAL" || row.forwardContractFlag !== true) continue;
+        || !contractType.endsWith("PERPETUAL") || row.forwardContractFlag !== true) continue;
       // A missing status is the current WEEX mainnet shape; an explicit status
       // must say trading.  API eligibility is still required in both cases.
       const status = typeof row.status === "string" ? row.status.toUpperCase() : null;
