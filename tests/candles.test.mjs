@@ -485,6 +485,7 @@ await test("each venue collects at its OWN documented rate, not one global figur
   const weightBudgeted = {
     binance: { perMinute: 2400, weightPerRequest: 5 },
     aster: { perMinute: 2400, weightPerRequest: 5 },
+    weex: { perMinute: 50, weightPerRequest: 5 },
   };
   for (const v of VENUE_IDS) {
     const rps = ADAPTERS[v].publicRequestsPerSecond;
