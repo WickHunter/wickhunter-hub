@@ -313,16 +313,15 @@ v, venue, interval, depth, generatedAtMs, lastClosedMs, symbols, skipped, keyId
 ```
 
 A snapshot is built **lazily, on the first request** for a `(venue, interval,
-depth)` and reused until the next bucket boundary plus a ~90-second settle lag —
-the window is derived from the clock and its buckets are closed, so nothing
-inside it can change, and the lag is what stops a snapshot taken the instant a
-boundary passed from reporting the whole roster as `gap` for the one minute
-nobody has fetched yet. **16 combinations are cached per venue, least-recently-
-used evicted**: the interval and the depth come from the caller, so an unbounded
-cache lets one licence make the hub fold thousands of windows and hold them all.
-A refusal is cached the same way — a cold venue's `503` costs a full fold over
-every symbol too. Nothing here waits on a collector: the roster is its in-memory
-tracked set and the candles come off the day files.
+depth)`. A complete snapshot with an unchanged tracked roster is reused until
+the next bucket boundary plus a ~90-second settle lag. Failed and partial
+snapshots expire within five minutes, or at that boundary if sooner, so newly
+collected candles can repair missing windows before a long timeframe closes.
+A changed tracked roster invalidates the cached snapshot immediately.
+**16 combinations are cached per venue, least-recently-used evicted**: the
+interval and depth come from the caller, so the bound limits memory and folding
+work. Nothing here waits on a collector: the roster is its in-memory tracked
+set and the candles come off the day files.
 
 ### Signing key
 
@@ -1085,6 +1084,12 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.4 — **Retry incomplete volatility snapshots within five minutes.**
+  Failed and partial snapshots no longer stay cached for an entire long candle
+  bucket. Complete snapshots keep their normal cache lifetime, and newly tracked
+  pairs invalidate the cache immediately. WEEX collection and discovery continue
+  automatically after the update.
 
 - v0.4.3 — **Larger recent WEEX candle pages and automatic new-pair coverage.**
   Initial collection and recent tails use the native 1,000-row endpoint; older

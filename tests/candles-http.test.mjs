@@ -1084,6 +1084,14 @@ const snapToken = snapHub.store.issue("Snapshot Tester", 30).token;
   store.write("bitget", "HOLEUSDT", minutes(windowStart, held, (i) => i !== total - 3));
 }
 const snapUrl = (q) => `${snapHub.origin}/api/candles/snapshot?${new URLSearchParams(q)}`;
+const denseRows = (from, count, base = 100) => Array.from({ length: count }, (_, i) => ({
+  openMs: from + i * MINUTE_MS,
+  open: base + i,
+  high: base + i + 1,
+  low: base + i - 1,
+  close: base + i + 0.5,
+  volume: 1,
+}));
 
 await test("a valid key gets a signed snapshot whose signature verifies over the wire bytes", async () => {
   const res = await fetch(snapUrl({ venue: "bitget", interval: 5, depth: 3, key: snapToken }));
@@ -1241,6 +1249,68 @@ await test("a cold venue's REFUSAL is cached too, so a poll cannot re-fold the r
   snapClock += 1_000;
   assert.equal((await jsonReq(snapUrl(q))).status, 503);
   assert.equal(snapLog.length, before + 1, "the second poll answered from the cache");
+});
+
+await test("a partial 1h snapshot retries after five minutes before its daily boundary", async () => {
+  const retryStart = snapClock;
+  const interval = 60;
+  const depth = 1;
+  const anchor = newestCompleteBucketOpenMs(snapClock, interval);
+  const store = new CandleStore(`${snapHub.dataDir}/candles`);
+  // A complete sibling makes this an HTTP 200 with a named partial skip, while
+  // the retry symbol is already in the roster so the five-minute expiry, rather
+  // than roster invalidation, is what makes the repaired rows visible.
+  store.write("binance", "RETRYBASE1H", denseRows(anchor, interval, 200));
+  store.write("binance", "RETRYPART1H", denseRows(anchor - interval * MINUTE_MS, 1, 300));
+  const q = { venue: "binance", interval, depth, key: snapToken };
+  const first = await jsonReq(snapUrl(q));
+  assert.equal(first.status, 200);
+  assert.ok(first.body.skipped.some(([symbol, reason]) => symbol === "RETRYPART1H" && reason === "gap"),
+    "the first response names the incomplete pair");
+  const before = snapLog.length;
+
+  store.write("binance", "RETRYPART1H", denseRows(anchor, interval, 300));
+  snapClock += 5 * MINUTE_MS + 1;
+  assert.ok(snapClock < snapshotExpiresAtMs(anchor, interval), "the retry happens before the 1h window boundary");
+  const repaired = await jsonReq(snapUrl(q));
+  assert.equal(repaired.status, 200);
+  assert.ok(repaired.body.symbols.some(([symbol]) => symbol === "RETRYPART1H"),
+    "the repaired pair appears before the coarse timeframe turns over");
+  assert.equal(snapLog.length, before + 1, "the five-minute retry caused one rebuild");
+  snapClock = retryStart;
+});
+
+await test("a failed 1d snapshot retries after five minutes, then a complete roster stays cached until it changes", async () => {
+  const retryStart = snapClock;
+  const interval = 1440;
+  const depth = 1;
+  const anchor = newestCompleteBucketOpenMs(snapClock, interval);
+  const q = { venue: "bybit", interval, depth, key: snapToken };
+  const first = await jsonReq(snapUrl(q));
+  assert.equal(first.status, 503, "the shallow existing pair is not a daily snapshot yet");
+  const beforeRetry = snapLog.length;
+
+  const store = new CandleStore(`${snapHub.dataDir}/candles`);
+  store.write("bybit", "BTCUSDT", denseRows(anchor, interval, 400));
+  snapClock += 5 * MINUTE_MS + 1;
+  assert.ok(snapClock < snapshotExpiresAtMs(anchor, interval), "the retry happens before the 1d window boundary");
+  const complete = await jsonReq(snapUrl(q));
+  assert.equal(complete.status, 200);
+  assert.deepEqual(complete.body.symbols.map(([symbol]) => symbol), ["BTCUSDT"]);
+  assert.equal(snapLog.length, beforeRetry + 1, "the failed result was retried after five minutes");
+
+  const reused = await jsonReq(snapUrl(q));
+  assert.equal(reused.status, 200);
+  assert.equal(snapLog.length, beforeRetry + 1, "the complete healthy result keeps its boundary cache");
+
+  // A newly tracked pair must invalidate that complete result even though the
+  // 1d bucket is unchanged, otherwise it would wait almost a day to appear.
+  store.write("bybit", "NEWROSTER1D", denseRows(anchor, interval, 500));
+  const expanded = await jsonReq(snapUrl(q));
+  assert.equal(expanded.status, 200);
+  assert.deepEqual(expanded.body.symbols.map(([symbol]) => symbol), ["BTCUSDT", "NEWROSTER1D"]);
+  assert.equal(snapLog.length, beforeRetry + 2, "the tracked-roster change caused one same-bucket rebuild");
+  snapClock = retryStart;
 });
 
 await test("the cache is bounded per venue, and evicts the LEAST RECENTLY USED combination", async () => {
