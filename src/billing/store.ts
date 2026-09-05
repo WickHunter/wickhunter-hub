@@ -33,6 +33,9 @@ export interface CustomerRecord {
   name: string;
   livemode: boolean;
   licenseId: string;
+  /** Which plan was bought (`metadata.plan` on the Payment Link); null for
+   *  a purchase made before plans existed or through an untagged link. */
+  planKey: string | null;
   subscriptionId: string | null;
   subscriptionStatus: string | null;
   /** What the customer has paid THROUGH (Stripe's period end), before grace. */

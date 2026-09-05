@@ -28,11 +28,17 @@ import {
   applyBillingPatch,
   emailReady,
   maskedBillingConfig,
+  paymentLinkFor,
+  planByKey,
   readBillingConfig,
   writeBillingConfig,
+  MAX_LICENSE_DAYS,
+  PLAN_KEY_RE,
   type BillingConfig,
   type BillingMode,
+  type Plan,
 } from "./config.js";
+import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, type CustomerRecord, type EventOutcome, type EventRecord } from "./store.js";
 import {
@@ -84,6 +90,7 @@ interface CustomerFacts {
   name: string;
   subscriptionId: string;
   livemode: boolean;
+  planKey: string | null;
 }
 
 const realFetch: EmailFetch = async (url, init) => {
@@ -133,16 +140,69 @@ export class BillingService {
     return maskedBillingConfig(this.config(), this.origin, releaseReady);
   }
 
-  /** Where `/buy` sends a visitor: the ACTIVE mode's Payment Link. */
-  buyUrl(): string {
+  /** Where `/buy?plan=key` sends a visitor: the ACTIVE mode's Payment Link
+   *  for that plan (the first plan when none is named). "" = not configured. */
+  buyUrl(planKey?: string | null): string {
     const cfg = this.config();
-    return cfg.stripe[cfg.mode].paymentLinkUrl;
+    return paymentLinkFor(cfg, cfg.mode, planKey);
+  }
+
+  plan(key: string): Plan | null {
+    return planByKey(this.config(), key);
   }
 
   /** Where `/billing` sends a customer: the active mode's portal login link. */
   billingUrl(): string {
     const cfg = this.config();
     return cfg.stripe[cfg.mode].portalUrl;
+  }
+
+  /** What the website shows: every plan with its price and whether the active
+   *  mode has a link for it. Public, no secrets, cacheable. */
+  publicPlans(): Record<string, unknown> {
+    const cfg = this.config();
+    return {
+      mode: cfg.mode,
+      plans: cfg.plans.map((p) => ({
+        key: p.key,
+        name: p.name,
+        amountCents: p.amountCents,
+        currency: p.currency,
+        interval: p.interval,
+        licenseDays: p.licenseDays,
+        lifetime: p.lifetime,
+        description: p.description,
+        buyUrl: `${this.origin}/buy?plan=${encodeURIComponent(p.key)}`,
+        available: !!paymentLinkFor(cfg, cfg.mode, p.key),
+      })),
+    };
+  }
+
+  /** "Create in Stripe": product, prices and Payment Links for the plans, in
+   *  one mode, with that mode's saved secret key; the resulting links are
+   *  saved into the config so `/buy?plan=` works immediately. */
+  async provisionPlans(mode: BillingMode): Promise<{ ok: true; result: ProvisionResult } | { ok: false; status: number; error: string }> {
+    const cfg = this.config();
+    const m = cfg.stripe[mode];
+    if (!m.secretKey) return { ok: false, status: 400, error: `no ${mode} secret key is saved — paste one in the Stripe · ${mode} card first` };
+    let result: ProvisionResult;
+    try {
+      result = await provisionPlans({ secretKey: m.secretKey, siteOrigin: cfg.siteOrigin, productName: "Wick Hunter Unleashed", plans: cfg.plans }, this.fetchLike);
+    } catch (err) {
+      if (err instanceof StripeApiError) {
+        const hint = err.status === 401 || err.status === 403
+          ? " — the saved key cannot create products; use a secret key (sk_) or a restricted key with Products, Prices and Payment Links set to Write"
+          : "";
+        return { ok: false, status: 502, error: `Stripe: ${err.message}${hint}` };
+      }
+      return { ok: false, status: 502, error: `Stripe request failed: ${(err as Error).message}` };
+    }
+    const links: Record<string, string> = {};
+    for (const p of result.plans) links[p.key] = p.paymentLinkUrl;
+    const first = cfg.plans[0]?.key;
+    this.updateConfig({ stripe: { [mode]: { paymentLinks: links, ...(!m.paymentLinkUrl && first && links[first] ? { paymentLinkUrl: links[first] } : {}) } } });
+    this.log(`[billing] provisioned ${result.plans.length} plan(s) in Stripe ${mode}: ${result.plans.map((p) => `${p.key} ${p.linkCreated ? "created" : "reused"}`).join(", ")}`);
+    return { ok: true, result };
   }
 
   // ── the webhook ───────────────────────────────────────────────────────────
@@ -226,10 +286,11 @@ export class BillingService {
     if (f.paymentStatus === "unpaid") return { outcome: "ignored", note: "payment not confirmed yet (async_payment_succeeded will follow)" };
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "checkout carried neither a customer nor an email" };
     const now = this.now();
-    const oneOffDays = this.oneOffDaysFor(f.metadata, cfg);
+    const planKey = this.planKeyOf(f.metadata, cfg);
+    const oneOffDays = this.oneOffDaysFor(f.metadata, planByKey(cfg, planKey), cfg);
     const bootstrapExp = f.mode === "payment" ? now + oneOffDays * DAY_MS : now + cfg.policy.bootstrapDays * DAY_MS;
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode }, cfg, bootstrapExp, now);
-    let note = created ? "licence issued" : "customer known";
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, bootstrapExp, now);
+    let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     if (f.mode === "payment" && !created) {
       // A repeat one-time purchase stacks on whatever is left.
       const current = this.licenses.get(rec.licenseId);
@@ -250,7 +311,7 @@ export class BillingService {
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "invoice carried neither a customer nor an email" };
     const now = this.now();
     const paidThrough = f.periodEndMs !== null ? f.periodEndMs + cfg.policy.graceDays * DAY_MS : null;
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey: null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
     if (paidThrough !== null) {
       if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;
@@ -347,10 +408,21 @@ export class BillingService {
 
   // ── the licence side ──────────────────────────────────────────────────────
 
-  private oneOffDaysFor(metadata: Record<string, string>, cfg: BillingConfig): number {
+  /** `metadata.plan` on the checkout session (Stripe copies it from the
+   *  Payment Link) when it names a plan this Hub knows; else null. */
+  private planKeyOf(metadata: Record<string, string>, cfg: BillingConfig): string | null {
+    const raw = (metadata.plan ?? "").trim().toLowerCase();
+    return PLAN_KEY_RE.test(raw) && planByKey(cfg, raw) ? raw : null;
+  }
+
+  /** Explicit `license_days` on the link wins, then the plan's own length,
+   *  then the policy default. */
+  private oneOffDaysFor(metadata: Record<string, string>, plan: Plan | null, cfg: BillingConfig): number {
     const raw = metadata.license_days ?? metadata.licence_days ?? "";
     const n = Number(raw);
-    return /^\d+$/.test(raw) && n >= 1 && n <= 3650 ? n : cfg.policy.oneOffDays;
+    if (/^\d+$/.test(raw) && n >= 1 && n <= MAX_LICENSE_DAYS) return n;
+    if (plan && plan.interval === null && plan.licenseDays) return plan.licenseDays;
+    return cfg.policy.oneOffDays;
   }
 
   private licenseExp(rec: CustomerRecord): number | null {
@@ -377,11 +449,12 @@ export class BillingService {
       if (facts.name && (!existing.name || existing.name === existing.email)) existing.name = facts.name;
       if (facts.customerId && !existing.stripeCustomerId) existing.stripeCustomerId = facts.customerId;
       if (facts.subscriptionId) existing.subscriptionId = facts.subscriptionId;
+      if (facts.planKey) existing.planKey = facts.planKey;
       return { rec: existing, created: false };
     }
     const key = facts.customerId || `email:${facts.email}`;
     const name = facts.name || facts.email || "Customer";
-    const plan = facts.livemode ? cfg.policy.plan : `${cfg.policy.plan}-test`;
+    const plan = [cfg.policy.plan, facts.planKey, facts.livemode ? null : "test"].filter(Boolean).join("-");
     const exp = this.capExp({ livemode: facts.livemode, createdAtMs: now }, initialExp, cfg);
     const issued = this.licenses.issueUntil(name, exp, plan, now);
     const rec: CustomerRecord = {
@@ -391,6 +464,7 @@ export class BillingService {
       name,
       livemode: facts.livemode,
       licenseId: issued.payload.id,
+      planKey: facts.planKey,
       subscriptionId: facts.subscriptionId || null,
       subscriptionStatus: null,
       periodEndMs: null,
@@ -415,7 +489,7 @@ export class BillingService {
   private extendLicense(rec: CustomerRecord, target: number, cfg: BillingConfig, now: number): boolean {
     const current = this.licenses.get(rec.licenseId);
     if (!current) return false;
-    const capped = Math.min(this.capExp(rec, target, cfg), current.iat + 3650 * DAY_MS);
+    const capped = Math.min(this.capExp(rec, target, cfg), current.iat + MAX_LICENSE_DAYS * DAY_MS);
     if (capped <= current.exp) return false;
     this.licenses.setExpiry(rec.licenseId, capped, now);
     return true;
@@ -628,6 +702,7 @@ export class BillingService {
           name: c.name,
           livemode: c.livemode,
           licenseId: c.licenseId,
+          planKey: c.planKey ?? null,
           licenseName: lic?.name ?? null,
           plan: lic?.plan ?? null,
           exp: lic?.exp ?? null,
