@@ -193,6 +193,7 @@ export interface VenueHealth {
 export class VenueCollector {
   private tracked = new Map<string, TrackedSymbol>();
   private coverageCache = new Map<string, SymbolCoverage>();
+  private coveragePrime: Promise<void> | null = null;
   private readonly symbolsFile: string;
 
   private lastPollAt: number | null = null;
@@ -267,9 +268,50 @@ export class VenueCollector {
     return c;
   }
 
+  /** Fill the exact coverage cache without monopolising Node's event loop.
+   *  A cold 30-day roster is gigabytes of synchronous day-file reads; yielding
+   *  after each symbol keeps health and other HTTP work responsive while the
+   *  same authoritative scan completes. Concurrent startup/admin callers share
+   *  one pass. Re-read the roster until no uncached symbol remains so a listing
+   *  added while the pass is running is included too. */
+  async prepareCoverage(): Promise<void> {
+    if (this.coveragePrime) return this.coveragePrime;
+    const run = async (): Promise<void> => {
+      for (;;) {
+        const pending = [...this.tracked.keys()].filter((symbol) => !this.coverageCache.has(symbol));
+        if (!pending.length) return;
+        for (const symbol of pending) {
+          if (!this.coverageCache.has(symbol)) this.coverage(symbol);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      }
+    };
+    this.coveragePrime = run();
+    try { await this.coveragePrime; }
+    finally { this.coveragePrime = null; }
+  }
+
   private noteCoverage(symbol: string, candles: readonly Candle[], newlyFilled: number): void {
     if (candles.length === 0) return;
     const c = this.coverage(symbol);
+    this.updateCoverage(symbol, c, candles, newlyFilled);
+  }
+
+  /** A stream write may land between yielded coverage scans. Update an already
+   *  primed row exactly; leave an unprimed row absent so its later disk scan
+   *  observes the complete file without doing deep synchronous work in a
+   *  websocket callback. */
+  noteStoredCandles(symbol: string, candles: readonly Candle[], written: number, newlyFilled: number): void {
+    if (candles.length === 0 || written === 0) return;
+    // A store gate may reject an early/invalid subset. Without the accepted
+    // rows themselves, updating first/last from the input would publish a
+    // candle that is not on disk. Drop a primed row for the next yielding scan.
+    if (written !== candles.length) { this.coverageCache.delete(symbol); return; }
+    const c = this.coverageCache.get(symbol);
+    if (c) this.updateCoverage(symbol, c, candles, newlyFilled);
+  }
+
+  private updateCoverage(symbol: string, c: SymbolCoverage, candles: readonly Candle[], newlyFilled: number): void {
     let first = c.firstClosedMs;
     let last = c.lastClosedMs;
     for (const k of candles) {
@@ -363,6 +405,22 @@ export class VenueCollector {
     } catch { gap = null; }
     this.holeCache.set(symbol, { at: now, gap });
     return gap;
+  }
+
+  /** Coverage identifies symbols with holes; locating each oldest hole is
+   *  another full-window synchronous scan. Prime those scans with the same
+   *  event-loop boundary so a damaged roster cannot recreate the boot stall. */
+  private async prepareWorkQueue(now: number): Promise<void> {
+    await this.prepareCoverage();
+    for (const rec of this.tracked.values()) {
+      if (rec.delisted || !rec.tradable) continue;
+      const cov = this.coverageCache.get(rec.symbol);
+      const cached = this.holeCache.get(rec.symbol);
+      if (cov && cov.interiorMissing > 0 && (!cached || now - cached.at >= 10 * 60_000)) {
+        this.oldestHole(rec.symbol, now);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
   }
 
   private workQueue(now: number): CandleWorkItem[] {
@@ -541,7 +599,6 @@ export class VenueCollector {
     const clock = deps.clock ?? Date.now;
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const deadlineMs = deps.deadlineMs ?? Infinity;
-    const startedAt = clock();
 
     // Cooling: say nothing to the venue at all, not even the symbol list. The
     // point of a cooldown is silence.
@@ -570,6 +627,11 @@ export class VenueCollector {
       }
     }
 
+    // Do the cold exact scan before starting the request deadline. Priming is
+    // local disk work, not venue pacing; charging its wall time here would make
+    // a responsive startup skip the very first candle requests it prepared.
+    await this.prepareWorkQueue(now);
+    const startedAt = clock();
     const queue = this.workQueue(now);
     // NOTHING DUE IS NOT NOTHING WORKING. Recorded before the loop so a venue
     // that has CAUGHT UP is distinguishable from one that has fallen behind —

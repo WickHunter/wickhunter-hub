@@ -1397,6 +1397,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // zeroes would be indistinguishable from a collector that is running and
     // has collected nothing, which is the opposite diagnosis.
     if (m === "GET" && p === "/admin/api/candles") {
+      await candles.prepareStatus();
       // PUBLIC halves only. Nothing on this route, on the admin page or in any
       // log line ever carries private key material — see license.ts's rule,
       // which candles/key.ts follows.

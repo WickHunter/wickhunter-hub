@@ -1088,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.7 — **Cold candle coverage scans now yield between symbols.** Startup
+  and the candle status panel still compute exact retained depth and interior
+  gaps, while health checks and other HTTP work remain responsive as a large
+  multi-venue archive is read from disk.
+
 - v0.4.6 — **WEEX websocket snapshots are persisted in one batch per symbol.**
   A 301-row startup snapshot no longer rewrites the same day file once per row,
   avoiding the synchronous I/O spike that blocked Hub HTTP and candle polling;

@@ -480,6 +480,104 @@ await test("a collector that has never succeeded is 'starting' briefly, then FAI
   assert.equal(late.health.state, "failing", "a collector that never worked must not sit in 'starting' forever");
 });
 
+await test("cold exact coverage yields between symbols and retains interior-gap truth", async () => {
+  const dataDir = tmpDir("coverage-prime");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, DEFAULT_COLLECTOR_OPTIONS, NOW);
+  const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+  await collector.refreshSymbols(async (url) => ({
+    ok: true, status: 200,
+    json: async () => (url.includes("contracts")
+      ? { code: "00000", data: symbols.map((symbol) => ({ symbol, symbolStatus: "normal" })) }
+      : { code: "00000", data: [] }),
+  }), NOW);
+  for (const symbol of symbols) {
+    store.write("bitget", symbol, [mk(DAY0, 0), mk(DAY0 + 2 * MINUTE_MS, 2)]);
+  }
+
+  const diskCoverage = store.coverage.bind(store);
+  let scanned = 0;
+  store.coverage = (...args) => { scanned++; return diskCoverage(...args); };
+  let complete = false;
+  const prime = collector.prepareCoverage().then(() => { complete = true; });
+  const atIndependentTurn = await new Promise((resolve) => setImmediate(() => resolve({ scanned, complete })));
+  assert.equal(atIndependentTurn.complete, false, "an independent health/timer turn runs before the cold roster completes");
+  assert.ok(atIndependentTurn.scanned > 0 && atIndependentTurn.scanned < symbols.length,
+    `coverage is chunked between turns (${atIndependentTurn.scanned}/${symbols.length} scanned)`);
+  await prime;
+  assert.equal(scanned, symbols.length, "every symbol still receives its exact deep scan");
+  assert.equal(collector.coverage("BBBUSDT").interiorMissing, 1, "yielding does not smooth over an interior gap");
+});
+
+await test("stream writes maintain a primed exact cache without inventing or double-counting rows", async () => {
+  const dataDir = tmpDir("coverage-stream");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, DEFAULT_COLLECTOR_OPTIONS, NOW);
+  await collector.refreshSymbols(async (url) => ({
+    ok: true, status: 200,
+    json: async () => (url.includes("contracts")
+      ? { code: "00000", data: [{ symbol: "AAAUSDT", symbolStatus: "normal" }] }
+      : { code: "00000", data: [] }),
+  }), NOW);
+  store.write("bitget", "AAAUSDT", [mk(DAY0, 0), mk(DAY0 + 2 * MINUTE_MS, 2)]);
+  await collector.prepareCoverage();
+
+  const fill = [mk(DAY0 + MINUTE_MS, 1), mk(DAY0 + 3 * MINUTE_MS, 3)];
+  const filled = store.write("bitget", "AAAUSDT", fill);
+  collector.noteStoredCandles("AAAUSDT", fill, filled.written, filled.newlyFilled);
+  let cov = collector.coverage("AAAUSDT");
+  assert.equal(cov.count, 4, "accepted stream rows increment the exact held count");
+  assert.equal(cov.lastClosedMs, DAY0 + 3 * MINUTE_MS, "accepted stream rows advance newest coverage");
+  assert.equal(cov.interiorMissing, 0, "an accepted stream fill closes the cached hole");
+
+  const duplicate = [mk(DAY0 + 3 * MINUTE_MS, 3)];
+  const repeated = store.write("bitget", "AAAUSDT", duplicate);
+  collector.noteStoredCandles("AAAUSDT", duplicate, repeated.written, repeated.newlyFilled);
+  assert.equal(collector.coverage("AAAUSDT").count, 4, "an idempotent rewrite never double-counts a candle");
+
+  let deepScans = 0;
+  const diskCoverage = store.coverage.bind(store);
+  store.coverage = (...args) => { deepScans++; return diskCoverage(...args); };
+  const mixed = [mk(DAY0 + 4 * MINUTE_MS, 4), mk(DAY0 + 5 * MINUTE_MS, 5)];
+  const partial = store.write("bitget", "AAAUSDT", mixed, DAY0 + 4 * MINUTE_MS);
+  assert.equal(partial.written, 1, "precondition: the store gate accepts only part of the input");
+  collector.noteStoredCandles("AAAUSDT", mixed, partial.written, partial.newlyFilled);
+  cov = collector.coverage("AAAUSDT");
+  assert.equal(deepScans, 1, "partial acceptance invalidates and re-primes from exact disk truth");
+  assert.equal(cov.count, 5);
+  assert.equal(cov.lastClosedMs, DAY0 + 4 * MINUTE_MS, "the rejected row never enters cached coverage");
+
+  await collector.refreshSymbols(async (url) => ({
+    ok: true, status: 200,
+    json: async () => (url.includes("contracts")
+      ? { code: "00000", data: [{ symbol: "AAAUSDT", symbolStatus: "normal" }, { symbol: "COLDUSDT", symbolStatus: "normal" }] }
+      : { code: "00000", data: [] }),
+  }), NOW + MINUTE_MS);
+  const cold = [mk(DAY0, 0)];
+  const coldWrite = store.write("bitget", "COLDUSDT", cold);
+  collector.noteStoredCandles("COLDUSDT", cold, coldWrite.written, coldWrite.newlyFilled);
+  assert.equal(deepScans, 1, "an unprimed stream write does not start a synchronous deep scan");
+  await collector.prepareCoverage();
+  assert.equal(deepScans, 2, "the cold row is scanned later through the yielding prime path");
+  assert.equal(collector.coverage("COLDUSDT").count, 1);
+});
+
+await test("coverage priming time is outside the collector request deadline", async () => {
+  const dataDir = tmpDir("coverage-deadline");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, DEFAULT_COLLECTOR_OPTIONS, NOW);
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  await collector.refreshSymbols(venue.fetchLike, NOW);
+  let clock = 0;
+  collector.prepareCoverage = async () => { clock += 10_000; };
+  const result = await collector.tick(venue.fetchLike, 1, NOW, {
+    clock: () => clock,
+    sleep: async () => {},
+    deadlineMs: 1,
+  });
+  assert.equal(result.requests, 1, "a long cold disk prime does not consume the venue request deadline");
+});
+
 await test("the status states oldest/newest held, gap totals and the worst offenders", async () => {
   const { svc, dataDir } = serviceWith("bitget", stubVenue().fetchLike);
   const store = new CandleStore(`${dataDir}/candles`);
@@ -499,6 +597,7 @@ await test("the status states oldest/newest held, gap totals and the worst offen
   for (let i = 0; i < 100; i++) if (![10, 11, 12].includes(i)) bbb.push(mk(DAY0 + i * MINUTE_MS, i));
   store.write("bitget", "BBBUSDT", bbb);
 
+  await svc.prepareStatus();
   const s = svc.status(NOW).find((v) => v.venue === "bitget");
   assert.equal(s.oldestClosedMs, DAY0, "oldest candle held is a fact on screen");
   assert.equal(s.newestClosedMs, DAY0 + 99 * MINUTE_MS, "newest likewise");
