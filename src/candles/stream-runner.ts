@@ -78,6 +78,9 @@ export interface StreamRunnerDeps {
   /** First reconnect delay; doubles per consecutive failure to the ceiling. */
   reconnectMs?: number;
   reconnectMaxMs?: number;
+  /** How often WEEX's logically closed, but not yet skew-safe, minute is
+   *  reconsidered. Injected only so clock-driven tests do not wait a second. */
+  settleFlushMs?: number;
 }
 
 interface Conn {
@@ -94,11 +97,19 @@ interface Conn {
 
 const DEFAULT_RECONNECT_MS = 2_000;
 const DEFAULT_RECONNECT_MAX_MS = 60_000;
+const DEFAULT_SETTLE_FLUSH_MS = 1_000;
+/** Normally one row: WEEX advances N while the store still admits only N-1.
+ *  Three leaves bounded room for clock movement and duplicate snapshots while
+ *  still refusing an unbounded remote-input queue. Oldest rows win because
+ *  they become eligible first and preserve a contiguous tail. */
+const MAX_WEEX_DEFERRED_PER_SYMBOL = 3;
 
 export class VenueStreamRunner {
   private conns: Conn[] = [];
   private running = false;
   private readonly now: () => number;
+  private settleTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly weexDeferred = new Map<string, Map<number, Candle>>();
 
   constructor(private readonly deps: StreamRunnerDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -109,13 +120,22 @@ export class VenueStreamRunner {
    *  scheduler may call it as often as it likes. */
   start(): void {
     this.running = true;
+    if (this.deps.adapter.id === "weex" && !this.settleTimer) {
+      this.settleTimer = setInterval(
+        () => this.flushWeexDeferred(),
+        Math.max(1, this.deps.settleFlushMs ?? DEFAULT_SETTLE_FLUSH_MS),
+      );
+      this.settleTimer.unref();
+    }
     this.resync();
   }
 
   stop(): void {
     this.running = false;
+    if (this.settleTimer) { clearInterval(this.settleTimer); this.settleTimer = null; }
     for (const c of this.conns) this.teardown(c);
     this.conns = [];
+    this.weexDeferred.clear();
   }
 
   /** Re-read the symbol set. A CHANGED set rebuilds every connection, which is
@@ -127,6 +147,14 @@ export class VenueStreamRunner {
     const want = [...new Set(this.deps.symbols())].filter(Boolean).sort();
     const have = this.conns.flatMap((c) => c.symbols).sort();
     if (this.conns.length && want.length === have.length && want.every((s, i) => s === have[i])) return;
+
+    // A retained symbol keeps its already-complete deferred minute across a
+    // reconnect/rechunk. A removed symbol cannot write after leaving the
+    // authoritative roster.
+    const wanted = new Set(want);
+    for (const symbol of this.weexDeferred.keys()) {
+      if (!wanted.has(symbol)) this.weexDeferred.delete(symbol);
+    }
 
     for (const c of this.conns) this.teardown(c);
     this.conns = [];
@@ -173,6 +201,10 @@ export class VenueStreamRunner {
   }
 
   private ingest(c: Conn, data: string): void {
+    // Closing a retired socket can deliver one last callback after a roster
+    // rebuild or stop. WEEX owns deferred state outside the connection, so it
+    // must reject that callback before it can repopulate a removed symbol.
+    if (this.deps.adapter.id === "weex" && (!this.running || !this.conns.includes(c))) return;
     // WEEX V3 uses an application-level JSON ping rather than websocket ping
     // frames. A heartbeat has no business entering the closure buffer.
     try {
@@ -189,26 +221,26 @@ export class VenueStreamRunner {
     // roster into tens of thousands of synchronous file rewrites. Keep the
     // batching local to WEEX: one received frame becomes at most one durable
     // write per symbol, while every existing venue retains its exact delivery
-    // behaviour. Incremental WEEX frames normally contain one row and therefore
-    // continue to write immediately.
+    // behaviour. Incremental WEEX frames normally contain one row; a row the
+    // ordering rule just closed waits here until the shared skew-safe store
+    // boundary admits it.
     if (this.deps.adapter.id === "weex") {
-      const closedBySymbol = new Map<string, Candle[]>();
+      const notAfterMs = settledOpenMs(this.now());
+      const closedBySymbol = new Map<string, Map<number, Candle>>();
+      this.takeSettledWeexDeferred(notAfterMs, closedBySymbol);
+      const assigned = new Set(c.symbols);
       for (const t of ticks) {
+        if (!assigned.has(t.symbol)) continue;
         const done = c.buf.push(t);
         if (!done) continue;
-        const list = closedBySymbol.get(done.symbol);
-        if (list) list.push(done.candle);
-        else closedBySymbol.set(done.symbol, [done.candle]);
-      }
-      const notAfterMs = settledOpenMs(this.now());
-      for (const [symbol, candles] of closedBySymbol) {
-        try {
-          this.deps.write(symbol, candles, notAfterMs);
-          c.closedCandles += candles.length;
-        } catch (e) {
-          this.deps.log?.(`${this.deps.adapter.id}: could not store ${symbol} — ${(e as Error)?.message ?? "unknown"}`);
+        if (done.candle.openMs <= notAfterMs) {
+          this.addReadyWeex(closedBySymbol, done.symbol, done.candle);
+          this.weexDeferred.get(done.symbol)?.delete(done.candle.openMs);
+        } else {
+          this.deferWeex(done.symbol, done.candle);
         }
       }
+      this.writeWeexReady(closedBySymbol, notAfterMs);
       return;
     }
 
@@ -227,7 +259,69 @@ export class VenueStreamRunner {
     }
   }
 
+  private addReadyWeex(
+    ready: Map<string, Map<number, Candle>>,
+    symbol: string,
+    candle: Candle,
+  ): void {
+    let byOpen = ready.get(symbol);
+    if (!byOpen) { byOpen = new Map(); ready.set(symbol, byOpen); }
+    byOpen.set(candle.openMs, candle);
+  }
+
+  private deferWeex(symbol: string, candle: Candle): void {
+    let byOpen = this.weexDeferred.get(symbol);
+    if (!byOpen) { byOpen = new Map(); this.weexDeferred.set(symbol, byOpen); }
+    if (byOpen.has(candle.openMs)) {
+      byOpen.set(candle.openMs, candle);
+      return;
+    }
+    if (byOpen.size >= MAX_WEEX_DEFERRED_PER_SYMBOL) {
+      const newest = Math.max(...byOpen.keys());
+      if (candle.openMs >= newest) return;
+      byOpen.delete(newest);
+    }
+    byOpen.set(candle.openMs, candle);
+  }
+
+  private takeSettledWeexDeferred(
+    notAfterMs: number,
+    ready: Map<string, Map<number, Candle>>,
+  ): void {
+    for (const [symbol, byOpen] of this.weexDeferred) {
+      for (const [openMs, candle] of byOpen) {
+        if (openMs > notAfterMs) continue;
+        this.addReadyWeex(ready, symbol, candle);
+        byOpen.delete(openMs);
+      }
+      if (!byOpen.size) this.weexDeferred.delete(symbol);
+    }
+  }
+
+  private writeWeexReady(ready: Map<string, Map<number, Candle>>, notAfterMs: number): void {
+    for (const [symbol, byOpen] of ready) {
+      const candles = [...byOpen.values()].sort((a, b) => a.openMs - b.openMs);
+      if (!candles.length) continue;
+      try {
+        this.deps.write(symbol, candles, notAfterMs);
+        const owner = this.conns.find((c) => c.symbols.includes(symbol));
+        if (owner) owner.closedCandles += candles.length;
+      } catch (e) {
+        this.deps.log?.(`${this.deps.adapter.id}: could not store ${symbol} — ${(e as Error)?.message ?? "unknown"}`);
+      }
+    }
+  }
+
+  private flushWeexDeferred(): void {
+    if (!this.running || this.deps.adapter.id !== "weex" || !this.weexDeferred.size) return;
+    const notAfterMs = settledOpenMs(this.now());
+    const ready = new Map<string, Map<number, Candle>>();
+    this.takeSettledWeexDeferred(notAfterMs, ready);
+    this.writeWeexReady(ready, notAfterMs);
+  }
+
   private reopen(c: Conn): void {
+    if (this.deps.adapter.id === "weex" && (!this.running || !this.conns.includes(c))) return;
     this.clearTimers(c);
     c.sock = null;
     if (!this.running) return;
@@ -268,7 +362,8 @@ export class VenueStreamRunner {
       open: this.conns.filter((c) => c.opened).length,
       symbols: this.conns.reduce((n, c) => n + c.symbols.length, 0),
       closedCandles: this.conns.reduce((n, c) => n + c.closedCandles, 0),
-      holding: this.conns.reduce((n, c) => n + c.buf.size(), 0),
+      holding: this.conns.reduce((n, c) => n + c.buf.size(), 0)
+        + [...this.weexDeferred.values()].reduce((n, rows) => n + rows.size, 0),
     };
   }
 }

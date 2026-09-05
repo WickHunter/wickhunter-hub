@@ -1088,6 +1088,12 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.8 — **WEEX websocket closes now wait for the Hub's settled boundary.**
+  WEEX's next-minute update no longer hands the just-closed bar to the store one
+  grace minute too early and loses it. A small per-symbol queue flushes on new
+  frames and on a timer, so quiet pairs stay current while the shared store's
+  clock-skew protection and every other venue remain unchanged.
+
 - v0.4.7 — **Cold candle coverage scans now yield between symbols.** Startup
   and the candle status panel still compute exact retained depth and interior
   gaps, while health checks and other HTTP work remain responsive as a large
