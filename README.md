@@ -1088,6 +1088,10 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.13 — **WEEX pairs now receive verified coin market-cap facts.** The
+  producer uses WEEX's API-eligible USDT perpetual catalogue and CoinMarketCap's
+  WEEX derivative identity map. New or unmapped pairs remain explicitly unknown.
+
 - v0.4.12 — **WEEX API-eligible TradFi perpetuals now receive candles.**
   Discovery includes `TRADIFI_PERPETUAL` alongside ordinary perpetuals while
   retaining the USDT, forward-contract and API-eligibility requirements. Newly

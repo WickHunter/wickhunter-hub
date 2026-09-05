@@ -52,6 +52,7 @@ export const DEFAULT_EXCHANGE_SLUGS: Record<MarketCapVenueId, string> = {
   aster: "aster-pro",
   bitget: "bitget",
   bitunix: "bitunix",
+  weex: "weex",
 };
 
 /** ── THE DURABLE KEY IS THE ID, NOT THE SLUG (verified live 2026-08-24) ──────
@@ -72,6 +73,7 @@ export const DEFAULT_EXCHANGE_IDS: Record<MarketCapVenueId, number> = {
   bitget: 513,
   bitunix: 7302,
   aster: 1452,
+  weex: 5751,
 };
 
 export const DAY_MS = 24 * 3_600_000;

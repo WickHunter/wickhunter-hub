@@ -3,7 +3,7 @@
 // source must never start spending paid provider credits for a new exchange.
 import type { VenueId } from "../candles/venues.js";
 
-export const MARKET_CAP_VENUE_IDS = ["bybit", "bitunix", "bitget", "aster"] as const satisfies readonly VenueId[];
+export const MARKET_CAP_VENUE_IDS = ["bybit", "bitunix", "bitget", "aster", "weex"] as const satisfies readonly VenueId[];
 export type MarketCapVenueId = (typeof MARKET_CAP_VENUE_IDS)[number];
 
 export function isMarketCapVenueId(v: unknown): v is MarketCapVenueId {

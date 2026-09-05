@@ -55,7 +55,7 @@ export const CMC_ENDPOINT_CLAIM = {
     totalCountPublished: false,
     totalExchanges: 134,
   },
-  /** The four venues, by their DURABLE numeric id. Pair counts are the
+  /** The venues, by their DURABLE numeric id. Pair counts are the
    *  provider's own `num_market_pairs` on the day, kept as a magnitude check —
    *  never as a threshold, since a venue legitimately lists and delists. */
   exchanges: [
@@ -63,6 +63,7 @@ export const CMC_ENDPOINT_CLAIM = {
     { venue: "bitget", slug: "bitget", exchangeId: 513, perpPairs: 698 },
     { venue: "bitunix", slug: "bitunix", exchangeId: 7302, perpPairs: 671 },
     { venue: "aster", slug: "aster-pro", exchangeId: 1452, perpPairs: 572 },
+    { venue: "weex", slug: "weex", exchangeId: 5751, perpPairs: 779, verifiedOn: "2026-09-05" },
   ],
   marketPairs: {
     endpoint: "GET /v5/exchange/derivatives/market-pairs/list/latest?exchange_slug=aster-pro&category=perpetual",
