@@ -351,7 +351,13 @@ const aster: StreamAdapter = {
   },
 };
 
-export const STREAM_ADAPTERS: Record<VenueId, StreamAdapter> = { bybit, bitunix, bitget, binance, aster };
+/**
+ * Only venues with a documented, parsed candle websocket appear here.  WEEX
+ * deliberately has no entry: its Hub collector is REST-only until a candle
+ * stream can be documented and replay-tested, rather than treating a ticker
+ * socket as candle provenance.
+ */
+export const STREAM_ADAPTERS: Partial<Record<VenueId, StreamAdapter>> = { bybit, bitunix, bitget, binance, aster };
 
 // ── the closure buffer ──────────────────────────────────────────────────────
 

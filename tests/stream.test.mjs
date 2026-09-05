@@ -156,15 +156,15 @@ await test("symbols do not interfere with each other", () => {
   assert.equal(buf.size(), 2, "BBBUSDT is still holding its own minute");
 });
 
-await test("every venue states a topic cap and a reachable url", () => {
-  // Iterated over VENUE_IDS, not a typed-out list: a venue added to the
-  // registry with no stream adapter is a `streams.set(v, undefined)` and a
-  // socket runner reading fields off nothing, at the first tick after an
-  // operator names it in HUB_CANDLE_STREAM. A hardcoded list here would have
-  // been edited to add the venue and would never have asked the question.
+await test("each advertised websocket venue states a topic cap and a reachable url", () => {
+  // A candle venue does not imply a websocket venue. WEEX is deliberately
+  // REST-only until its candle stream is documented and replay-tested.
   for (const v of VENUE_IDS) {
     const a = STREAM_ADAPTERS[v];
-    assert.ok(a, `${v} has a stream adapter`);
+    if (!a) {
+      assert.equal(v, "weex", `${v} may lack a stream only with an explicit REST-only decision`);
+      continue;
+    }
     assert.equal(a.id, v);
     assert.ok(/^wss:\/\//.test(a.url), `${v} url is a websocket`);
     assert.ok(a.maxTopicsPerConnection > 0, `${v} states a topic cap`);

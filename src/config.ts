@@ -151,6 +151,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     throw new Error(`HUB_PORT is not a valid port: ${env.HUB_PORT}`);
   }
   const signing = candleSigningFromEnv(env);
+  const configuredCandleVenues = [...new Set((env.HUB_CANDLE_VENUES ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(isVenueId))];
+  // An existing enabled candle producer must pick up the new public venue on
+  // update.  Empty stays empty: this does not turn the whole outbound service
+  // on for an installation that has deliberately disabled candle collection.
+  if (configuredCandleVenues.length && !configuredCandleVenues.includes("weex")) configuredCandleVenues.push("weex");
   const publicOrigin = env.HUB_PUBLIC_ORIGIN ?? `http://127.0.0.1:${port}`;
   if (env.NODE_ENV === "production") {
     let url: URL;
@@ -199,10 +207,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       hubBridgeEnvFile: env.HUB_MARKETPLACE_BRIDGE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace.env",
       rootHelper: env.HUB_ROOT_HELPER ?? "/usr/local/libexec/wickhunter-hub-root-helper",
     },
-    candleVenues: (env.HUB_CANDLE_VENUES ?? "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(isVenueId),
+    candleVenues: configuredCandleVenues,
     // v0.2.17 — venues whose TAIL comes from a websocket. A SUBSET of the
     // collecting venues, intersected below rather than trusted: naming a venue
     // here that is not collecting would open sockets for a roster nobody is

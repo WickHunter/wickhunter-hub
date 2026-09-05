@@ -140,7 +140,11 @@ export class CandleService {
   private readonly collectors = new Map<VenueId, VenueCollector>();
   private readonly fetchLike: FetchLike;
   private timer: NodeJS.Timeout | null = null;
-  private ticking = false;
+  private startupTick: NodeJS.Immediate | null = null;
+  /** The initial startup pass and an operator-triggered pass share this one
+   * promise.  Callers that await `tickAll()` must wait for an already-running
+   * startup discovery instead of receiving a misleading completed no-op. */
+  private tickInFlight: Promise<void> | null = null;
   /** ── v0.2.17 — THE WEBSOCKET TAIL, OFF UNLESS ASKED FOR ──────────────────
    *
    *  Empty unless `HUB_CANDLE_STREAM` names venues. OFF by default on purpose:
@@ -196,8 +200,16 @@ export class CandleService {
     for (const v of this.cfg.streamVenues ?? []) {
       if (!this.collectors.has(v)) continue;
       const collector = this.collectors.get(v)!;
+      const adapter = STREAM_ADAPTERS[v];
+      // A configured collector remains useful when a venue has no verified
+      // candle socket.  In particular WEEX is REST-only; never invent a stream
+      // from another public topic or let an env typo crash startup.
+      if (!adapter) {
+        console.warn(`[candles·stream] ${v}: no verified candle websocket; continuing with REST collection`);
+        continue;
+      }
       const runner = new VenueStreamRunner({
-        adapter: STREAM_ADAPTERS[v],
+        adapter,
         // Read fresh on every resync, so a new listing joins the stream on the
         // collector's own listing cadence with no restart.
         symbols: () => collector.symbols().filter((t) => !t.delisted).map((t) => t.symbol),
@@ -212,11 +224,25 @@ export class CandleService {
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
     this.timer.unref();
+    // WEEX joined existing enabled Hub rosters in this release. Do not make
+    // that new collector wait one full scheduler period before it discovers
+    // symbols and starts its bounded queue. Existing non-WEEX service seams
+    // retain their timer-only cadence. Defer one event-loop turn so an
+    // embedding caller may establish its clock/test seam first; this is still
+    // startup work, never a 60-second scheduler wait.
+    if (this.collectors.has("weex")) {
+      this.startupTick = setImmediate(() => {
+        this.startupTick = null;
+        void this.tickAll().catch(() => undefined);
+      });
+    }
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.startupTick) clearImmediate(this.startupTick);
+    this.startupTick = null;
     for (const r of this.streams.values()) r.stop();
     this.streams.clear();
   }
@@ -236,8 +262,14 @@ export class CandleService {
   /** One pass over every venue. Re-entrancy guarded: a tick that overruns its
    *  period must not have a second one pile up behind it. */
   async tickAll(now = Date.now()): Promise<void> {
-    if (this.ticking) return;
-    this.ticking = true;
+    if (this.tickInFlight) return this.tickInFlight;
+    const run = this.tickAllOnce(now);
+    this.tickInFlight = run;
+    try { await run; }
+    finally { if (this.tickInFlight === run) this.tickInFlight = null; }
+  }
+
+  private async tickAllOnce(now: number): Promise<void> {
     try {
       // The per-second rate governs each venue independently — they are
       // different hosts and do not share a rate limit. The BUDGET now comes from
@@ -247,7 +279,8 @@ export class CandleService {
       //
       // The DEADLINE exists because the pass paces itself: a fully-paced tick
       // would otherwise consume its entire period, and the next interval would
-      // find `ticking` still true and skip — halving the very rate we set. 80%
+      // find a prior pass still running and share it — rather than halving the
+      // rate we set. 80%
       // leaves room for the venues that answer slowly.
       const deadlineMs = Math.max(1000, Math.round(this.cfg.tickMs * 0.8));
       const clock = this.deps.now ?? Date.now;
@@ -268,9 +301,7 @@ export class CandleService {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);
       }
-    } finally {
-      this.ticking = false;
-    }
+    } finally { /* the public wrapper releases the shared in-flight promise */ }
   }
 
   // ── THE SNAPSHOT CACHE ────────────────────────────────────────────────────

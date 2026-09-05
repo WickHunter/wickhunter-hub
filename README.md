@@ -230,7 +230,7 @@ mismatch. Three properties carry that weight:
 ### Wire contract v1 (pinned)
 
 ```
-GET /api/candles/seed?venue=<bybit|bitunix|bitget|aster>&symbol=<VENUE-NATIVE>&fromMs=<ms>&toMs=<ms>
+GET /api/candles/seed?venue=<bybit|bitunix|bitget|binance|aster|weex>&symbol=<VENUE-NATIVE>&fromMs=<ms>&toMs=<ms>
 
 { "v":1, "venue","symbol", "interval":"1", "fromMs","toMs","lastClosedMs",
   "rows":[[openMs,open,high,low,close,volume],...], "gaps":[[fromMs,toMs],...],
@@ -390,6 +390,13 @@ In `/etc/wickhunter-hub/env`:
 HUB_CANDLE_VENUES=bybit,bitunix,bitget,binance,aster
 ```
 
+When this list is nonempty, an update also starts the WEEX mainnet-USDT
+perpetual collector. It checks both WEEX `exchangeInfo` and
+`apiTradingSymbols`, then reads bounded 100-row historical 1-minute pages from
+the public REST API. WEEX has no candle websocket adapter; never add it to
+`HUB_CANDLE_STREAM` until a documented stream can be replay-tested. An empty
+`HUB_CANDLE_VENUES` still disables every collector, including WEEX.
+
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 `HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
 `HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_TICK_MS` (60s),
@@ -410,8 +417,9 @@ that wants investigating. The panel also states the live rate and how many
 refusals a venue has issued, so "slow" and "broken" are never the same picture.
 
 Each venue runs at **its own** published ceiling when `HUB_CANDLE_RPS` is unset
-— Bybit 15/s, Bitget 10/s, Bitunix 5/s, Binance 4/s, Aster 4/s, each about half
-what that venue allows. Setting `HUB_CANDLE_RPS` replaces all five with your number,
+— Bybit 15/s, Bitget 10/s, Bitunix 5/s, Binance 4/s, Aster 4/s, and WEEX
+1/12/s (half of its conservative 50-weight/minute lane at weight 5 per
+historical page). Setting `HUB_CANDLE_RPS` replaces all six with your number,
 including when it is lower.
 
 **Binance means USD-M USDT perpetuals, exactly.** Its collector reads only
@@ -1076,6 +1084,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.2 — **Enabled candle hubs now also collect WEEX.** Any nonempty
+  `HUB_CANDLE_VENUES` roster gains the REST-only mainnet USDT-perpetual WEEX
+  collector at startup; an empty roster remains disabled. WEEX instruments
+  must pass both public metadata and `apiTradingSymbols`, and its historical
+  1m pages are capped at 100 rows. The market-cap producer is unchanged.
 - v0.4.1 — **One install per licence.** The first install id to check in
   holds the licence's seat; any other live install is answered `revoked:true`
   (exit-only) while the holder is alive, and the registry is untouched. A seat
