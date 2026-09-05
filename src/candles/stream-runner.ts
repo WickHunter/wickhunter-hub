@@ -182,6 +182,36 @@ export class VenueStreamRunner {
     // A parse that throws must never kill the socket: a venue adding a field is
     // not an outage, and the REST tail covers whatever this drops.
     try { ticks = this.deps.adapter.parse(data); } catch { return; }
+
+    // WEEX opens each subscription with a snapshot containing hundreds of
+    // already-closed rows. `CandleStore.write` durably rewrites a whole day
+    // file, so calling it once per row turns a 301-row snapshot across a full
+    // roster into tens of thousands of synchronous file rewrites. Keep the
+    // batching local to WEEX: one received frame becomes at most one durable
+    // write per symbol, while every existing venue retains its exact delivery
+    // behaviour. Incremental WEEX frames normally contain one row and therefore
+    // continue to write immediately.
+    if (this.deps.adapter.id === "weex") {
+      const closedBySymbol = new Map<string, Candle[]>();
+      for (const t of ticks) {
+        const done = c.buf.push(t);
+        if (!done) continue;
+        const list = closedBySymbol.get(done.symbol);
+        if (list) list.push(done.candle);
+        else closedBySymbol.set(done.symbol, [done.candle]);
+      }
+      const notAfterMs = settledOpenMs(this.now());
+      for (const [symbol, candles] of closedBySymbol) {
+        try {
+          this.deps.write(symbol, candles, notAfterMs);
+          c.closedCandles += candles.length;
+        } catch (e) {
+          this.deps.log?.(`${this.deps.adapter.id}: could not store ${symbol} — ${(e as Error)?.message ?? "unknown"}`);
+        }
+      }
+      return;
+    }
+
     for (const t of ticks) {
       const done = c.buf.push(t);
       if (!done) continue;

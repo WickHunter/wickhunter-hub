@@ -1088,6 +1088,11 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.6 — **WEEX websocket snapshots are persisted in one batch per symbol.**
+  A 301-row startup snapshot no longer rewrites the same day file once per row,
+  avoiding the synchronous I/O spike that blocked Hub HTTP and candle polling;
+  incremental WEEX frames and every other venue retain their existing behavior.
+
 - v0.4.5 — **WEEX V3 candle streaming is now available.** The documented
   mainnet public `kline_1m_LAST_PRICE` channel is chunked at its 100-topic
   ceiling, responds to its JSON heartbeat, and stores a forming candle only
