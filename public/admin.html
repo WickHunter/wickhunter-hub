@@ -318,16 +318,18 @@
 
 <section class="configgroup" id="billingPlansCard" style="margin-top:.8rem" hidden>
   <h2>Plans</h2>
-  <p class="muted" style="margin:.2rem 0 .6rem">These are the plans provisioned into Stripe. The list itself is fixed here; edit the Test/Live Payment Link for a plan below, or create them all in one go with the buttons underneath.</p>
+  <p class="muted" style="margin:.2rem 0 .6rem">What the shop sells. Edit a name or price and press <b>Save prices</b>; then <b>Create in Stripe</b> for each mode makes (or, for a changed price, replaces) the Stripe price and Payment Link and fills the links in below. The website reads these prices from the Hub.</p>
   <div class="tbl"><table class="planstable">
-    <thead><tr><th>Name</th><th>Price</th><th>Billing</th><th>Buy link</th><th>Test link</th><th>Live link</th><th></th></tr></thead>
+    <thead><tr><th>Name</th><th>Price (USD)</th><th>Billing</th><th>Buy link</th><th>Test link</th><th>Live link</th><th></th></tr></thead>
     <tbody id="billingPlanRows"></tbody>
   </table></div>
   <div class="plancards" id="billingPlanCards"></div>
   <div class="actions" style="margin-top:.7rem">
+    <button type="button" id="billingSavePlans">Save prices</button>
     <button type="button" id="billingProvisionTest">Create in Stripe (test)</button>
     <button type="button" id="billingProvisionLive">Create in Stripe (live)</button>
   </div>
+  <div id="billingPlansNote" class="muted" style="margin-top:.4rem"></div>
   <div id="billingProvisionNote" class="muted" style="margin-top:.5rem;overflow-wrap:anywhere"></div>
 </section>
 
@@ -1964,11 +1966,51 @@ function billingPlanRowSave(key, testInput, liveInput, origTest, origLive, note,
     }
   };
 }
+let billingPlansCurrent = [];
+
+function billingPlanDollars(p) {
+  const cents = Number(p.amountCents) || 0;
+  return cents % 100 === 0 ? String(cents / 100) : (cents / 100).toFixed(2);
+}
+
+// ── Save prices: the plan list, with the names and amounts typed in, as one
+// POST. Both the table and the mobile cards render inputs; whichever is
+// visible is the one the operator typed into, so read the visible copy.
+async function billingSavePlans() {
+  const note = document.getElementById("billingPlansNote");
+  const btn = document.getElementById("billingSavePlans");
+  const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const plans = billingPlansCurrent.map((p) => ({ ...p }));
+  for (const p of plans) {
+    const nameEl = [...document.querySelectorAll('.planname[data-plan-key="' + p.key + '"]')].find(visible);
+    const amountEl = [...document.querySelectorAll('.planamount[data-plan-key="' + p.key + '"]')].find(visible);
+    if (nameEl) p.name = nameEl.value.trim();
+    if (amountEl) {
+      const dollars = Number(String(amountEl.value).replace(/[$,\s]/g, ""));
+      if (!Number.isFinite(dollars) || dollars <= 0) { note.textContent = "Price for " + p.key + " is not a number."; note.className = "ops-bad"; return; }
+      p.amountCents = Math.round(dollars * 100);
+    }
+  }
+  btn.disabled = true;
+  try {
+    const cfg = await api("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ plans }) });
+    note.className = "muted";
+    note.textContent = "Saved. Press Create in Stripe for each mode to make the new prices live; the website updates on its own.";
+    billingRenderPlans(cfg);
+  } catch (e) {
+    note.className = "ops-bad";
+    note.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function billingRenderPlans(cfg) {
   const card = document.getElementById("billingPlansCard");
   const plans = Array.isArray(cfg.plans) ? cfg.plans : null;
   if (!plans) { card.hidden = true; return; }
   card.hidden = false;
+  billingPlansCurrent = plans.map((p) => ({ ...p }));
   const testLinks = (cfg.stripe && cfg.stripe.test && cfg.stripe.test.paymentLinks) || {};
   const liveLinks = (cfg.stripe && cfg.stripe.live && cfg.stripe.live.paymentLinks) || {};
   const buyPlans = (cfg.endpoints && cfg.endpoints.buyPlans) || {};
@@ -1986,8 +2028,8 @@ function billingRenderPlans(cfg) {
 
     const tr = document.createElement("tr");
     tr.innerHTML =
-      "<td>" + esc(p.name) + "</td>" +
-      "<td>" + esc(price) + "</td>" +
+      '<td><input class="planname" data-plan-key="' + esc(p.key) + '" value="' + esc(p.name) + '" maxlength="40" style="width:8.5rem"></td>' +
+      '<td><input class="planamount" data-plan-key="' + esc(p.key) + '" inputmode="decimal" value="' + esc(billingPlanDollars(p)) + '" style="width:6rem;font-family:var(--mono)"></td>' +
       "<td>" + esc(billing) + "</td>" +
       '<td class="buycell">' + buyHtml + "</td>" +
       '<td class="testcell"></td>' +
@@ -2010,7 +2052,8 @@ function billingRenderPlans(cfg) {
     const cardEl = document.createElement("div");
     cardEl.className = "plancard";
     cardEl.innerHTML =
-      "<div><b>" + esc(p.name) + "</b> <span class=\"muted\">" + esc(price) + " · " + esc(billing) + "</span></div>" +
+      '<div class="planlabel">Name</div><input class="planname" data-plan-key="' + esc(p.key) + '" value="' + esc(p.name) + '" maxlength="40">' +
+      '<div class="planlabel">Price (USD) · ' + esc(billing) + '</div><input class="planamount" data-plan-key="' + esc(p.key) + '" inputmode="decimal" value="' + esc(billingPlanDollars(p)) + '" style="font-family:var(--mono)">' +
       '<div class="planbuyline">' + buyHtml + "</div>" +
       '<div class="planlabel">Test link</div>';
     const cardTest = billingPlanLinkField("test", origTest);
@@ -2066,6 +2109,7 @@ async function billingProvisionPlans(mode) {
   btn.disabled = false; otherBtn.disabled = false;
   btn.textContent = original;
 }
+document.getElementById("billingSavePlans").addEventListener("click", billingSavePlans);
 document.getElementById("billingProvisionTest").onclick = () => billingProvisionPlans("test");
 document.getElementById("billingProvisionLive").onclick = () => billingProvisionPlans("live");
 
