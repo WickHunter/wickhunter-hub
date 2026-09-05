@@ -52,6 +52,16 @@ const weexFrame = (openMs, close) =>
     d: [{ t: openMs, T: openMs + MIN, s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: String(close), v: "3" }],
   });
 
+const weexSnapshot = (firstOpenMs, count) =>
+  JSON.stringify({
+    // A multi-row observation frame through the currently forming minute.
+    e: "kline", E: firstOpenMs + (count - 1) * MIN + 30_000, s: "BTCUSDT", p: "LAST_PRICE",
+    d: Array.from({ length: count }, (_, i) => ({
+      t: firstOpenMs + i * MIN, T: firstOpenMs + (i + 1) * MIN,
+      s: "BTCUSDT", i: "1m", o: "1", h: "2", l: "0.5", c: String(10 + i), v: "3",
+    })),
+  });
+
 await test("a closed candle reaches the store; a forming one never does", () => {
   const { factory, made } = fakeSockets();
   const wrote = [];
@@ -130,7 +140,71 @@ await test("WEEX shards its 100 documented channels, replies to ping, and stores
   made[0].h.onMessage(weexFrame(T0 + MIN, 20));
   assert.equal(wrote.length, 1, "only the stream's advance publishes the earlier candle");
   assert.equal(wrote[0].candles[0].close, 11);
+  made[0].h.onMessage(weexFrame(T0 + 2 * MIN, 30));
+  assert.equal(wrote.length, 2, "a later incremental advance still writes immediately in its own frame");
+  assert.equal(wrote[1].candles[0].close, 20);
   r.stop();
+});
+
+await test("a multi-row WEEX kline frame batches its closed rows and holds its forming tail", () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex,
+    symbols: () => ["BTCUSDT"],
+    write: (symbol, candles, notAfterMs) => wrote.push({ symbol, candles, notAfterMs }),
+    socket: factory,
+    now: () => T0 + 400 * MIN,
+  });
+  r.start();
+  made[0].h.onOpen();
+  made[0].h.onMessage(weexSnapshot(T0, 301));
+  assert.equal(wrote.length, 1, "one snapshot frame causes one durable write, not one per row");
+  assert.equal(wrote[0].symbol, "BTCUSDT");
+  assert.equal(wrote[0].candles.length, 300, "all 300 closed prefix rows survive batching");
+  assert.equal(wrote[0].candles[0].openMs, T0, "the live oldest-first order is preserved");
+  assert.equal(wrote[0].candles.at(-1).openMs, T0 + 299 * MIN);
+  assert.equal(r.status().closedCandles, 300, "status still counts candles rather than write calls");
+  assert.equal(r.status().holding, 1, "the current minute remains buffered as forming");
+
+  made[0].h.onMessage(weexFrame(T0 + 301 * MIN, 999));
+  assert.equal(wrote.length, 2, "the next incremental frame writes the held minute separately");
+  assert.equal(wrote[1].candles.length, 1);
+  assert.equal(wrote[1].candles[0].openMs, T0 + 300 * MIN);
+  assert.equal(r.status().closedCandles, 301);
+  assert.equal(r.status().holding, 1, "the newly forming incremental minute replaces it");
+  r.stop();
+});
+
+await test("the actual WEEX klineSnapshot batches only its 300 already-closed rows", () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  let clock = T0 + 300 * MIN + 30_000;
+  const realNow = Date.now;
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.weex, symbols: () => ["BTCUSDT"],
+    write: (symbol, candles) => wrote.push({ symbol, candles }),
+    socket: factory, now: () => clock,
+  });
+  try {
+    Date.now = () => clock;
+    r.start(); made[0].h.onOpen();
+    const snapshot = JSON.parse(weexSnapshot(T0, 301));
+    snapshot.e = "klineSnapshot";
+    snapshot.d.reverse();
+    made[0].h.onMessage(JSON.stringify(snapshot));
+    assert.equal(wrote.length, 1);
+    assert.equal(wrote[0].candles.length, 300);
+    assert.equal(wrote[0].candles[0].openMs, T0);
+    assert.equal(wrote[0].candles.at(-1).openMs, T0 + 299 * MIN);
+    assert.equal(r.status().holding, 0, "snapshot's unclosed tail is discarded, not treated as closed truth");
+    made[0].h.onMessage(weexFrame(T0 + 300 * MIN, 311));
+    assert.equal(wrote.length, 1, "an incremental observation only holds the forming minute");
+    clock += MIN;
+    made[0].h.onMessage(weexFrame(T0 + 301 * MIN, 312));
+    assert.equal(wrote.length, 2);
+    assert.equal(wrote[1].candles[0].openMs, T0 + 300 * MIN);
+  } finally { Date.now = realNow; r.stop(); }
 });
 
 await test("a changed symbol set rebuilds; an unchanged one does not", () => {
