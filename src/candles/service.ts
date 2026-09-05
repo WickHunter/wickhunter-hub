@@ -87,8 +87,11 @@ export const SNAPSHOT_CACHE_PER_VENUE = 16;
 
 interface SnapshotCacheEntry {
   result: CandleSnapshotResult;
-  /** Wall-clock instant at which a rebuild could produce a NEWER window. */
+  /** Next boundary expiry, or an earlier retry for unavailable rows. */
   expiresAt: number;
+  /** Sorted tracked symbols folded into this result. A changed roster must
+   * invalidate even inside the same candle window so new listings appear. */
+  rosterSig: string;
 }
 
 export interface CandleServiceConfig {
@@ -134,6 +137,10 @@ const realFetch: FetchLike = async (url: string) => {
   // collector falls back to its own backoff when the header is absent.
   return { ok: res.ok, status: res.status, json: () => res.json(), headers: res.headers };
 };
+
+/** A failed or partial snapshot is useful as an honest answer, but it must not
+ * suppress a newly completed pair until a coarse timeframe's next boundary. */
+const SNAPSHOT_RETRY_TTL_MS = 5 * MINUTE_MS;
 
 export class CandleService {
   readonly store: CandleStore;
@@ -343,11 +350,19 @@ export class CandleService {
       return { ok: false, code: 400, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` };
     }
     const now = (this.deps.now ?? Date.now)();
+    const collector = this.collectors.get(venue);
+    // Read the roster once and use this exact array for both the signature and
+    // the fold. The collector already sorts, but sorting here also keeps the
+    // no-collector/store path canonical and makes the cache comparison cheap.
+    const symbols = (collector
+      ? collector.symbols().map((t) => t.symbol)
+      : this.store.symbols(venue)).sort((a, b) => a.localeCompare(b));
+    const rosterSig = symbols.join("\u0000");
     let perVenue = this.snapshotCache.get(venue);
     if (!perVenue) this.snapshotCache.set(venue, perVenue = new Map());
     const key = `${interval}:${depth}`;
     const held = perVenue.get(key);
-    if (held && now < held.expiresAt) {
+    if (held && now < held.expiresAt && held.rosterSig === rosterSig) {
       // Re-insert so the map's insertion order IS the recency order.
       perVenue.delete(key);
       perVenue.set(key, held);
@@ -359,13 +374,9 @@ export class CandleService {
       store: this.store,
       keyId: this.cfg.keyId,
       sign: this.deps.sign,
-      symbols: (v) => {
-        const c = this.collectors.get(v);
-        // No collector for this venue: answer for what we HOLD. Saying "this
-        // venue tracks nothing" would be a claim about the venue that a hub
-        // with the collector switched off is in no position to make.
-        return c ? c.symbols().map((t) => t.symbol) : this.store.symbols(v);
-      },
+      // The request's roster was captured above, so the signature and fold
+      // cannot disagree if a listing refresh runs between those operations.
+      symbols: () => symbols,
     });
 
     let result: CandleSnapshotResult;
@@ -382,7 +393,12 @@ export class CandleService {
       this.log(`built ${venue} ${interval}m x${depth}: ${outcome.code} ${outcome.error}`
         + ` (${Date.now() - startedAt}ms)`);
     }
-    perVenue.set(key, { result, expiresAt: snapshotExpiresAtMs(this.snapshotWindowAnchor(now, interval), interval) });
+    const boundaryExpiry = snapshotExpiresAtMs(this.snapshotWindowAnchor(now, interval), interval);
+    const completeHealthy = outcome.ok && outcome.payload.skipped.length === 0;
+    const expiresAt = completeHealthy
+      ? boundaryExpiry
+      : Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
+    perVenue.set(key, { result, expiresAt, rosterSig });
     while (perVenue.size > SNAPSHOT_CACHE_PER_VENUE) {
       const oldest = perVenue.keys().next();
       if (oldest.done) break;
