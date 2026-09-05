@@ -392,8 +392,10 @@ HUB_CANDLE_VENUES=bybit,bitunix,bitget,binance,aster
 
 When this list is nonempty, an update also starts the WEEX mainnet-USDT
 perpetual collector. It checks both WEEX `exchangeInfo` and
-`apiTradingSymbols`, then reads bounded 100-row historical 1-minute pages from
-the public REST API. WEEX has no candle websocket adapter; never add it to
+`apiTradingSymbols` at startup and on each symbol refresh (15 minutes by
+default). A newly API-enabled pair joins candle collection without a restart.
+WEEX uses up to 1,000 native one-minute rows for initial and recent coverage,
+and bounded 100-row historical pages for older backfill or gaps. WEEX has no candle websocket adapter; never add it to
 `HUB_CANDLE_STREAM` until a documented stream can be replay-tested. An empty
 `HUB_CANDLE_VENUES` still disables every collector, including WEEX.
 
@@ -1083,6 +1085,13 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.3 — **Larger recent WEEX candle pages and automatic new-pair coverage.**
+  Initial collection and recent tails use the native 1,000-row endpoint; older
+  backfill and gaps retain bounded 100-row historical requests. The conservative
+  request pace stays unchanged, so deep 30-day backfill still takes days.
+  A regression exercises a pair newly added to `apiTradingSymbols`, its periodic
+  discovery, and native candles reaching the store without a restart.
 
 - v0.4.2 — **Enabled candle hubs now also collect WEEX.** Any nonempty
   `HUB_CANDLE_VENUES` roster gains the REST-only mainnet USDT-perpetual WEEX

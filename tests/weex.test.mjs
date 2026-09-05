@@ -9,6 +9,7 @@ import { STREAM_ADAPTERS } from "../dist/src/candles/stream.js";
 import { configFromEnv } from "../dist/src/config.js";
 import { CandleService } from "../dist/src/candles/service.js";
 import { DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
+import { settledOpenMs } from "../dist/src/candles/store.js";
 
 const weex = ADAPTERS.weex;
 const MIN = 60_000;
@@ -105,6 +106,62 @@ await test("an enabled legacy candle roster gains WEEX and starts a first pull w
   await new Promise((resolve) => setImmediate(resolve));
   svc.stop();
   assert.ok(calls >= 2, "start immediately requests WEEX discovery instead of waiting one tick");
+});
+
+await test("a newly API-eligible WEEX perpetual is refreshed, tracked, and seeded in the same pass", async () => {
+  let apiEligible = new Set(["BTCUSDT"]);
+  const candleSymbols = [];
+  const svc = new CandleService({
+    dataDir: tmpDir("weex-new-eligibility"), venues: ["weex"], keyId: "seed-1",
+    // A high test-only allowance keeps the new pair's tail request ahead of
+    // the existing pair's ordinary backfill in the refresh pass.
+    options: { ...DEFAULT_COLLECTOR_OPTIONS, requestsPerSecond: 100, minRequestsPerSecond: 0.1 }, tickMs: 60_000,
+  }, {
+    sign: () => Buffer.alloc(64),
+    fetchLike: async (url) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith("/exchangeInfo")) return response({ symbols: [
+        { symbol: "BTCUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+        // It exists in metadata at startup, but the separate API eligibility
+        // list is the fact that makes it safe to fetch and store.
+        { symbol: "NEWUSDT", quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true },
+      ] });
+      if (u.pathname.endsWith("/apiTradingSymbols")) return response([...apiEligible]);
+      if (u.pathname.endsWith("/historyKlines")) {
+        const symbol = u.searchParams.get("symbol");
+        const end = Number(u.searchParams.get("endTime"));
+        candleSymbols.push(symbol);
+        return response([[end, "10", "11", "9", "10.5", "2", end + MIN - 1, "21"]]);
+      }
+      if (u.pathname.endsWith("/klines")) {
+        const symbol = u.searchParams.get("symbol");
+        const end = settledOpenMs(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs);
+        candleSymbols.push(symbol);
+        return response([[end, "10", "11", "9", "10.5", "2", end + MIN - 1, "21"]]);
+      }
+      throw new Error(`unexpected URL ${url}`);
+    },
+    sleep: async () => {},
+  });
+
+  await svc.tickAll(START);
+  assert.equal(svc.collector("weex").isTracked("NEWUSDT"), false);
+  assert.ok(!candleSymbols.includes("NEWUSDT"), "metadata alone never schedules an ineligible pair");
+
+  // The eligibility endpoint changes after startup. A tick before the 15m
+  // cadence is deliberately still the old set; the due tick re-reads both
+  // endpoints and its work queue stores NEWUSDT without a restart.
+  apiEligible = new Set(["BTCUSDT", "NEWUSDT"]);
+  await svc.tickAll(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs - 1);
+  assert.equal(svc.collector("weex").isTracked("NEWUSDT"), false);
+  await svc.tickAll(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs);
+
+  const collector = svc.collector("weex");
+  assert.equal(collector.isTracked("NEWUSDT"), true, "fresh API eligibility joins the live collector");
+  assert.ok(candleSymbols.includes("NEWUSDT"), "the newly tracked pair receives a native WEEX candle request");
+  const newest = settledOpenMs(START + DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs);
+  const stored = svc.store.readWindow("weex", "NEWUSDT", newest, newest).rows;
+  assert.equal(stored.length, 1, "the fetched closed candle is persisted under the WEEX venue");
 });
 
 summary("weex");

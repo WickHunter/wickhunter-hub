@@ -144,6 +144,10 @@ export interface VenueAdapter {
   readonly id: VenueId;
   /** Rows per kline page this venue will actually honour. */
   readonly pageLimit: number;
+  /** Optional larger current-market page. It may be used only for a cold seed
+   *  or a tail whose first missing minute is still inside this recent window;
+   *  older work must continue through fetchKlines without skipping time. */
+  readonly recentPageLimit?: number;
   /** ── v0.2.15 — THIS VENUE'S OWN PUBLIC-REQUEST CEILING, PER IP ────────────
    *
    *  A venue fact, so it belongs beside `pageLimit` rather than in one global
@@ -165,6 +169,9 @@ export interface VenueAdapter {
   /** One page of 1m klines covering [startMs, endMs]. Ordering is normalised
    *  to OLDEST-FIRST here so no caller has to care which way a venue sorts. */
   fetchKlines(fetchLike: FetchLike, symbol: string, startMs: number, endMs: number): Promise<KlinePage>;
+  /** A venue's cheaper/larger newest-page endpoint. Ordering and range
+   *  filtering follow fetchKlines, but the endpoint itself is not historical. */
+  fetchRecentKlines?(fetchLike: FetchLike, symbol: string, startMs: number, endMs: number): Promise<KlinePage>;
 }
 
 /** THE closed-candle gate. Drops every bar that has not finished, whatever the
@@ -652,9 +659,9 @@ const aster: VenueAdapter = {
 // absent from the API-tradeable book, so both facts are required before the Hub
 // collects or signs a candle under a WEEX venue name.
 //
-// HistoryKlines permits at most 100 rows and costs weight 5.  The WEEX adapter
-// therefore lets the collector request exactly one bounded 100-minute page.
-// Its 50 weight/minute public lane is deliberately used at half capacity:
+// HistoryKlines permits at most 100 rows and costs weight 5; current klines
+// permit 1000 rows at weight 1. Older ranges retain bounded historical pages.
+// Pacing still budgets the worst-case history cost at half of the 50/min lane:
 // 25 / 5 / 60 = 1/12 request per second.  There is no documented candle socket
 // in this integration, so WEEX is intentionally REST-only (see stream.ts).
 const WEEX_BASE = "https://api-contract.weex.com";
@@ -662,6 +669,8 @@ export const WEEX_HISTORY_KLINE_WEIGHT = 5;
 export const WEEX_PUBLIC_WEIGHT_PER_MINUTE = 50;
 export const WEEX_WEIGHT_SHARE = 0.5;
 export const WEEX_PAGE_LIMIT = 100;
+export const WEEX_RECENT_PAGE_LIMIT = 1000;
+export const WEEX_RECENT_KLINE_WEIGHT = 1;
 
 export function weexPacedRps(pageLimit = WEEX_PAGE_LIMIT, share = WEEX_WEIGHT_SHARE): number {
   if (!Number.isFinite(pageLimit) || pageLimit < 1 || pageLimit > WEEX_PAGE_LIMIT) {
@@ -677,11 +686,31 @@ function weexRows(value: unknown): unknown[] {
   return asArray(row.data ?? row.symbols ?? row.list ?? row.rows);
 }
 
+function weexKlinePage(body: unknown, startMs: number, endMs: number): KlinePage {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const row = body as { code?: unknown; msg?: unknown };
+    if (row.code !== undefined && String(row.code) !== "0" && String(row.code) !== "00000") {
+      const detail = `weex code ${String(row.code)}: ${String(row.msg ?? "")}`;
+      throw rateLimited(row.code, row.msg) ? new RateLimitError(detail) : new Error(detail);
+    }
+  }
+  const list = weexRows(body);
+  const candles: Candle[] = [];
+  for (const raw of list) {
+    if (!Array.isArray(raw) || raw.length < 6) continue;
+    // [openMs, o, h, l, c, baseVolume, closeMs, quoteVolume, ...].
+    const parsed = candle(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+    if (parsed && parsed.openMs >= startMs && parsed.openMs <= endMs) candles.push(parsed);
+  }
+  return { candles: sortOldestFirst(candles), empty: list.length === 0 };
+}
+
 const weex: VenueAdapter = {
   id: "weex",
   pageLimit: WEEX_PAGE_LIMIT,
+  recentPageLimit: WEEX_RECENT_PAGE_LIMIT,
   publicRequestsPerSecond: weexPacedRps(),
-  klineEndpoint: "GET /capi/v3/market/historyKlines (mainnet USDT perpetual, interval=1m, limit=100, weight 5; REST only)",
+  klineEndpoint: "GET /capi/v3/market/klines (recent limit=1000, weight 1) + historyKlines (older limit=100, weight 5; REST only)",
   async listSymbols(fetchLike) {
     const [exchangeInfo, apiTradingSymbols] = await Promise.all([
       getJson(fetchLike, `${WEEX_BASE}/capi/v3/market/exchangeInfo`),
@@ -714,25 +743,16 @@ const weex: VenueAdapter = {
     const url = `${WEEX_BASE}/capi/v3/market/historyKlines?symbol=${encodeURIComponent(symbol)}`
       + `&interval=1m&startTime=${startMs}&endTime=${endMs}&limit=${WEEX_PAGE_LIMIT}&priceType=LAST`;
     const body = await getJson(fetchLike, url);
-    if (body && typeof body === "object" && !Array.isArray(body)) {
-      const row = body as { code?: unknown; msg?: unknown };
-      if (row.code !== undefined && String(row.code) !== "0" && String(row.code) !== "00000") {
-        const detail = `weex code ${String(row.code)}: ${String(row.msg ?? "")}`;
-        throw rateLimited(row.code, row.msg) ? new RateLimitError(detail) : new Error(detail);
-      }
-    }
-    const list = weexRows(body);
-    const candles: Candle[] = [];
-    for (const raw of list) {
-      if (!Array.isArray(raw) || raw.length < 6) continue;
-      // [openMs, o, h, l, c, baseVolume, closeMs, quoteVolume, ...].
-      const parsed = candle(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
-      // Some WEEX pages arrive newest-first.  Retain only the requested open
-      // range and normalise below, so an out-of-window page cannot poison a
-      // historical slot even if the exchange changes its ordering.
-      if (parsed && parsed.openMs >= startMs && parsed.openMs <= endMs) candles.push(parsed);
-    }
-    return { candles: sortOldestFirst(candles), empty: list.length === 0 };
+    return weexKlinePage(body, startMs, endMs);
+  },
+  async fetchRecentKlines(fetchLike, symbol, startMs, endMs) {
+    // This endpoint always returns the newest native rows; it has no historical
+    // range semantics. The collector proves continuity before writing an
+    // existing tail and falls back to historyKlines if the requested first
+    // minute is absent.
+    const url = `${WEEX_BASE}/capi/v3/market/klines?symbol=${encodeURIComponent(symbol)}`
+      + `&interval=1m&limit=${WEEX_RECENT_PAGE_LIMIT}`;
+    return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
   },
 };
 
