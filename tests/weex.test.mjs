@@ -120,6 +120,38 @@ await test("WEEX V3 topics are exact, chunkable, and respond to its JSON heartbe
   assert.deepEqual(a.parse(JSON.stringify({ e: "kline", s: "BTCUSDT", p: "MARK_PRICE", d: [] })), [], "mark-price candles are not LAST_PRICE provenance");
 });
 
+await test("WEEX one-character base symbols subscribe and parse through snapshot and incremental paths", () => {
+  const a = STREAM_ADAPTERS.weex;
+  const [subscription] = a.subscribeFrames(["HUSDT", "WUSDT"]);
+  assert.deepEqual(subscription.params, [
+    "HUSDT@kline_1m_LAST_PRICE",
+    "WUSDT@kline_1m_LAST_PRICE",
+  ], "currently eligible one-character bases are not dropped from the socket roster");
+
+  const now = Date.now();
+  const currentOpen = Math.floor(now / MIN) * MIN;
+  for (const symbol of ["HUSDT", "WUSDT"]) {
+    const row = (openMs) => ({
+      t: openMs, T: openMs + MIN, s: symbol, i: "1m",
+      o: "1", h: "2", l: "0.5", c: "1.5", v: "3",
+    });
+    const snapshot = a.parse(JSON.stringify({
+      e: "klineSnapshot", E: now, s: symbol, p: "LAST_PRICE",
+      d: [row(currentOpen - 2 * MIN), row(currentOpen)],
+    }));
+    assert.equal(snapshot.length, 1, `${symbol} snapshot retains its closed prefix`);
+    assert.equal(snapshot[0].symbol, symbol);
+    assert.equal(snapshot[0].closed, true);
+
+    const incremental = a.parse(JSON.stringify({
+      e: "kline", E: now, s: symbol, p: "LAST_PRICE", d: [row(currentOpen)],
+    }));
+    assert.equal(incremental.length, 1, `${symbol} incremental frame is accepted`);
+    assert.equal(incremental[0].symbol, symbol);
+    assert.equal(incremental[0].closed, false, "ordinary WEEX updates still require minute advancement");
+  }
+});
+
 await test("WEEX census requires mainnet USDT perpetual metadata and API eligibility", async () => {
   const urls = [];
   const fetchLike = async (url) => {
