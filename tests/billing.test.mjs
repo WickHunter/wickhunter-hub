@@ -293,11 +293,120 @@ await test("Manage billing opens a Customer Portal session through the secret ke
   assert.match(call.init.body, /return_url=https%3A%2F%2Fhub\.test%2Fhub%2Fwelcome%2F/);
 });
 
+// ── v0.4.16: the token-proved portal-session route, and `subscription` on
+//    check-in — both consumed today by liqhunter-private's `subscription`
+//    feature flag (see src/license.ts / src/server/index.ts there). ─────────
+
+await test("check-in carries `subscription` for a licence bound to a Stripe customer, and null when unbound", async () => {
+  const bound = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: licenseA.id, installId: "inst-A", version: "0.90.6", ts: Date.now() }),
+  });
+  assert.equal(bound.status, 200);
+  // licenseA's checkout carried no `metadata.plan` (an untagged link), so
+  // `planKey` is null and the reply falls back to the base policy plan —
+  // still a non-null string, which is the app parser's whole contract.
+  assert.deepEqual(bound.body.subscription, {
+    plan: "unleashed",
+    status: "active",
+    currentPeriodEndMs: clock + 30 * DAY,
+    portalAvailable: true,
+  });
+
+  const bare = h.store.issue("No Billing Tester", 30).payload;
+  const unbound = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: bare.id, installId: "inst-nobilling", version: "0.90.6", ts: Date.now() }),
+  });
+  assert.equal(unbound.status, 200);
+  assert.equal(unbound.body.subscription, null, "no Stripe customer is bound to this licence");
+});
+
+await test("POST /api/billing/portal-session opens a session for a token-proved licence", async () => {
+  const token = h.store.tokenFor(licenseA.id);
+  const r = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: licenseA.id, token }),
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.url, "https://billing.stripe.com/p/session/test_abc");
+  const call = calls.filter((c) => c.url.startsWith("https://api.stripe.com/v1/billing_portal/sessions")).at(-1);
+  assert.ok(call);
+  assert.equal(call.init.headers.authorization, "Bearer sk_test_sec222");
+  assert.match(call.init.body, /customer=cus_A/);
+  // No page token here — the return_url falls back to siteOrigin, set earlier.
+  assert.match(call.init.body, /return_url=https%3A%2F%2Fwickhunterunleashed\.com/);
+});
+
+await test("POST /api/billing/portal-session: a bad token, a mismatched id and a revoked licence are all 401 — telling nothing apart", async () => {
+  const token = h.store.tokenFor(licenseA.id);
+  const badToken = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: licenseA.id, token: "LHK1.not.genuine" }),
+  });
+  assert.equal(badToken.status, 401);
+  assert.equal(badToken.body.ok, false);
+
+  const otherLicense = h.store.issue("Someone Else", 30).payload;
+  const mismatched = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: otherLicense.id, token }), // licenseA's own token, someone else's id
+  });
+  assert.equal(mismatched.status, 401);
+
+  const revocable = h.store.issue("Soon Revoked", 30).payload;
+  const revocableToken = h.store.tokenFor(revocable.id);
+  h.store.revoke(revocable.id);
+  const revoked = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: revocable.id, token: revocableToken }),
+  });
+  assert.equal(revoked.status, 401);
+
+  const malformed = await jsonReq(`${h.origin}/api/billing/portal-session`, { method: "POST", body: JSON.stringify({ licenseId: licenseA.id }) });
+  assert.equal(malformed.status, 400);
+});
+
+await test("POST /api/billing/portal-session answers 404 when no Stripe customer is bound to the licence", async () => {
+  const bare = h.store.issue("Bare Licence, No Customer", 30).payload;
+  const token = h.store.tokenFor(bare.id);
+  const r = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: bare.id, token }),
+  });
+  assert.equal(r.status, 404);
+  assert.equal(r.body.ok, false);
+});
+
+await test("POST /api/billing/portal-session answers 503 when billing is not configured for that mode", async () => {
+  // Bound to a customer whose LIVE mode has neither a secret key nor a
+  // portal login URL on this Hub yet — live mode is configured in the very
+  // next test, so this must run before it.
+  const lic = h.store.issue("Live Mode Not Configured Yet", 30).payload;
+  h.hub.billing.store.putCustomer({
+    key: "cus_unconfigured", stripeCustomerId: "cus_unconfigured", email: "u@example.com", name: "U",
+    livemode: true, licenseId: lic.id, planKey: null, subscriptionId: null, subscriptionStatus: "active",
+    periodEndMs: null, chargeIds: [], createdAtMs: Date.now(), updatedAtMs: Date.now(),
+    welcomeSentAtMs: null, welcomeError: null, disputed: false, refunded: false, lastEventType: null, lastEventAtMs: null,
+  });
+  const token = h.store.tokenFor(lic.id);
+  const r = await jsonReq(`${h.origin}/api/billing/portal-session`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: lic.id, token }),
+  });
+  assert.equal(r.status, 503, JSON.stringify(r.body));
+  assert.equal(r.body.ok, false);
+});
+
 // ── live mode ───────────────────────────────────────────────────────────────
 
 let licenseB, pageTokenB, licenseC;
 
 await test("switching to LIVE: test events are ignored, live events are honoured with real plan and full grace", async () => {
+  // Baseline rather than a literal count: the v0.4.16 portal-session tests
+  // above minted a few extra bare licences of their own.
+  const baseline = licenses().length;
   const r = await admin("/admin/api/billing/config", {
     method: "POST",
     body: JSON.stringify({ mode: "live", stripe: { live: { publishableKey: "pk_live_pub", secretKey: "sk_live_sec", webhookSecret: LIVE_WHSEC, paymentLinkUrl: "https://buy.stripe.com/live_link" } } }),
@@ -309,7 +418,7 @@ await test("switching to LIVE: test events are ignored, live events are honoured
   const t = await postEvent("test", event("checkout.session.completed", checkoutSession({ id: "cs_t2", customer: "cus_T2", customer_details: { email: "t2@example.com", name: "Tester Two" } })));
   assert.equal(t.status, 200);
   assert.equal(t.body.outcome, "ignored");
-  assert.equal(licenses().length, 1);
+  assert.equal(licenses().length, baseline);
   // A LIVE event: invoice first this time (order independence), then checkout.
   const inv = await postEvent("live", event("invoice.paid", invoice({ id: "in_B1", customer: "cus_B", customer_email: "bob@example.com", customer_name: "Bob Builder", subscription: "sub_B", charge: "ch_B1", payment_intent: "pi_B1" }), true));
   assert.equal(inv.body.outcome, "applied", JSON.stringify(inv.body));
@@ -322,7 +431,7 @@ await test("switching to LIVE: test events are ignored, live events are honoured
   pageTokenB = pageTokenFromEmail();
   const co = await postEvent("live", event("checkout.session.completed", checkoutSession({ id: "cs_B", customer: "cus_B", customer_details: { email: "bob@example.com", name: "Bob Builder" }, subscription: "sub_B" }), true));
   assert.equal(co.body.outcome, "applied");
-  assert.equal(licenses().length, 2, "checkout after invoice does not mint a second licence");
+  assert.equal(licenses().length, baseline + 1, "checkout after invoice does not mint a second licence");
   assert.equal(emailCalls().length, 2, "and does not email twice");
 });
 
