@@ -898,6 +898,212 @@ lost-key deactivation recovery-locks that licence against a copied-LHK1
 first-claim race. Rebind with both keys before loss, or reissue the LHK1 after
 loss—ordinary activation cannot silently take the freed seat.
 
+## Rate limiting (v0.4.17)
+
+Additive, in-memory, per-process (`src/ratelimit.ts`) — nothing here changes
+what a VALID request is answered with; a limiter only ever adds a `429` in
+front of a caller already over its own stated budget, and a refusal never
+writes anything (no check-in row, no seat binding/eviction, no lease
+event, no ledger append). Every window is a sliding log, same technique
+`FeedbackRateLimiter` has used since the tester-report surface got its own
+limiter; feedback keeps its own separate instance (its four interacting
+buckets are a documented, already-tested contract this file does not touch).
+
+A refusal is always `429` with a JSON body `{ok:false, error, retryAfterSeconds}`
+and a matching `Retry-After` header, never cached (`cache-control: no-store`).
+
+| Surface | Dimensions | Shipped default | Env override |
+| --- | --- | --- | --- |
+| `POST /api/license/checkin` | per claimed licence id, per IP | 12/min, 60/min | `HUB_RATE_CHECKIN_LICENSE_MAX`/`_WINDOW_MS`, `HUB_RATE_CHECKIN_IP_MAX`/`_WINDOW_MS` |
+| Every `/api/license/lease/*` route | per licence (the bearer's own decoded id, or a hashed bucket for a token that fails to decode), per IP | 6/min, 60/min | `HUB_RATE_LEASE_LICENSE_MAX`/`_WINDOW_MS`, `HUB_RATE_LEASE_IP_MAX`/`_WINDOW_MS` |
+| `POST /api/feedback` | its own limiter (raw-IP, authenticated-licence, and two accepted buckets) — unchanged, see `src/feedback.ts` | (unchanged) | (unchanged) |
+| `install.sh`, `/api/latest`, `/download/*`, `/welcome/*`, `/install/<token>`, `/api/billing/plans`, `/buy`, `/billing`, `/api/billing/portal-session` | one shared "general" bucket per IP | 60/min | `HUB_RATE_IP_MAX`/`HUB_RATE_IP_WINDOW_MS` |
+| `POST /api/billing/stripe/{test,live}` | per IP, deliberately generous — signature-verified before anything trusts it; this bounds a runaway/hostile sender, never Stripe's own retries of one event | 600/min | `HUB_RATE_WEBHOOK_IP_MAX`/`HUB_RATE_WEBHOOK_IP_WINDOW_MS` |
+| `GET /api/health` | none — a liveness/monitoring probe must never be throttled | — | — |
+| `GET /admin`, `/admin/api/*` | not this table — see "Admin auth hardening" below | — | — |
+
+The client IP is always `clientIp()`'s existing loopback-trusted
+`X-Forwarded-For` reading (see "HTTP surface" below) — a directly exposed
+Hub (no nginx in front) sees every caller as its own socket peer, same as
+today.
+
+**Not rate-limited, deliberately, and why:** the candle-seed, candle-snapshot
+and market-cap-snapshot routes (`/api/candles/*`, `/api/market-data/*`) —
+every one already requires a valid, signature-verified licence token per
+request, which is itself a real cost to forge at volume, and each is its own
+large, cacheable (ETag/gzip) payload rather than a cheap repeatable action;
+adding a second limiter there is a real design question (keyed on the
+resolved licence? the requested venue/symbol?) that was not made casually in
+this pass. The community gallery (`/api/hub/strategies*`) is licence-gated
+the same way. `GET /admin`/the static admin page is unauthenticated but inert
+(no secrets, no state) — the API routes behind it carry the actual auth.
+
+## Admin auth hardening (v0.4.17)
+
+The `x-hub-admin` header was always compared constant-time
+(`sameSecret`/`timingSafeEqual`) but could be tried without limit. Two
+additive layers now sit in front of that compare, in this order, for every
+`/admin/api/*` request:
+
+1. **`HUB_ADMIN_TOKEN` unset** → `503` exactly as before — this check runs
+   first and depends on nothing else here.
+2. **`HUB_ADMIN_IP_ALLOWLIST`** (optional, comma-separated IPv4/IPv6
+   addresses or CIDR ranges, e.g. `203.0.113.4,198.51.100.0/24,2001:db8::/32`)
+   — checked BEFORE the token. Unset/empty = every IP may attempt the token
+   (today's behaviour, unchanged). A non-matching IP is refused `403` with
+   **no token comparison attempted at all** and the refusal is logged
+   (`[admin] refused <ip>: not on HUB_ADMIN_IP_ALLOWLIST`). **Setting this
+   without including your own current IP locks you out of `/admin` — keep a
+   console/VPS-provider-panel path to the box before you set it.**
+3. **Per-IP exponential backoff** on wrong tokens (`AdminBackoffLimiter`):
+   `HUB_RATE_ADMIN_FAILURE_THRESHOLD` consecutive failures from one IP
+   (default **5**) open a lockout of `HUB_RATE_ADMIN_BACKOFF_BASE_MS`
+   (default **60 000**, i.e. 1 minute); each further failure doubles the
+   lockout, capped at `HUB_RATE_ADMIN_BACKOFF_MAX_MS` (default **3 600 000**,
+   1 hour). While locked out, the token is never even compared — lockout
+   timing itself cannot leak anything about it — and the response is `429`
+   with `Retry-After`. **One successful token clears the lockout AND the
+   failure count outright**: a legitimate admin who mistyped it a few times
+   does not go on paying for that, and the next bad-token sequence (if any)
+   starts over at the base duration. Every refusal (allowlist or backoff) is
+   logged with the IP; a wrong-token failure is logged as
+   `[admin] refused <ip>: wrong token`.
+
+Distinct IPs never share a lockout or an allowlist decision — the check is
+per-source, same as every rate limiter above.
+
+## Running the hub hardened (v0.4.17)
+
+Everything in `deploy/` is an OPTIONAL, additive deployment profile layered
+on top of the ordinary `install-hub.sh` install — none of it is required, and
+none of it changes what a valid request is answered with. Use as much or as
+little of it as fits your box.
+
+### Hardened systemd unit
+
+`deploy/wickhunter-hub-hardened.service` is a stricter drop-in for the unit
+`install-hub.sh` writes: the same dedicated `wickhunter-hub` user/group and
+paths, plus `ProtectSystem=strict` + `ProtectHome=true` (the whole filesystem
+read-only to the unit except `ReadWritePaths=/opt/wickhunter-hub/data`,
+which is the only directory the Hub ever writes to), `PrivateTmp=true`,
+`NoNewPrivileges=true`, `UMask=0077`, and a further set of sandboxing
+directives (`ProtectKernelTunables`, `ProtectClock`, `RestrictNamespaces`,
+`CapabilityBoundingSet=` empty, `SystemCallFilter=@system-service`, …) beyond
+what the installer ships today.
+
+```
+sudo bash install-hub.sh                     # first, if not already done
+sudo cp deploy/wickhunter-hub-hardened.service /etc/systemd/system/wickhunter-hub.service
+sudo systemctl daemon-reload
+sudo systemctl restart wickhunter-hub
+```
+
+**Read the tradeoff before enabling it**: `NoNewPrivileges=true` disables the
+`sudo`-based root-helper bridge two admin-only features depend on — the alpha
+Marketplace configuration panel (`POST /admin/api/marketplace-config` and
+`/admin/api/marketplace-providers/*`) and the root-helper path of
+`POST /admin/api/upgrade` (the in-app "Upgrade hub" button, when a root
+helper is configured). `sudo` escalates through a setuid-root binary, and the
+kernel's no-new-privileges bit specifically disables that — so under this
+unit those two actions fail closed (a `500`/`503`, never a silent success).
+Every other route — licensing, check-in, leases, feedback, billing, candle
+seed, market-cap snapshot, the community gallery, ordinary licence
+issue/revoke/extend — is unaffected. If you use the Marketplace bridge or the
+in-app upgrade button, drop `NoNewPrivileges=true` from your copy, or keep
+the installer's own unit and manage those two through it instead. (The unit's
+directive syntax was checked with `systemd-analyze verify` and the nginx site
+file below with `nginx -t` while writing this — neither runs in the
+automated test suite, since neither binary is guaranteed present wherever
+`npx tsc && node tests/run-all.mjs` runs; re-check both by hand after editing
+either file.)
+
+Also confirm `ExecStart`'s node path matches `command -v node` on your box —
+the installer resolves this dynamically at install time; a static unit file
+cannot.
+
+### Standalone TLS nginx site
+
+`deploy/nginx-hub-site.conf` is for an operator running the Hub on its own
+domain (`https://hub.example.com/`) rather than mounted under an existing
+app's `/hub/` path — if that is your setup, use the existing
+`nginx/hub.locations.conf` (included from inside your app's own
+`server { listen 443 ssl; ... }` block) instead; see "Operator runbook" below.
+
+```
+cp deploy/nginx-hub-site.conf /etc/nginx/sites-available/wickhunter-hub.conf
+# edit server_name and the ssl_certificate/ssl_certificate_key paths
+ln -s /etc/nginx/sites-available/wickhunter-hub.conf /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+```
+
+It terminates TLS, redirects plain HTTP to HTTPS, turns `access_log off`
+(license keys, admin tokens and lease bearers travel in URLs/headers this
+proxy sees in plaintext), and — the one line every other property in this
+document depends on — sets `X-Forwarded-For $remote_addr`, **overwriting**
+whatever a client sent rather than appending to it
+(`proxy_add_x_forwarded_for` is deliberately not used anywhere in this repo's
+nginx config). The Hub's `clientIp()` trusts that header only from a loopback
+peer (127.0.0.1/::1) — exactly and only this nginx, on the same box — so this
+one directive is what lets every per-IP rate limit and the admin IP
+allowlist see the real internet client instead of "127.0.0.1" for everyone.
+
+### Backing up `data/`
+
+`scripts/backup-data.sh [DATA_DIR] [BACKUP_DIR]` tars `data/` to a
+timestamped, mode-0600 file (`wickhunter-hub-data-<UTC stamp>.tar.gz`),
+prunes down to the newest `HUB_BACKUP_KEEP` (default **14**), and prints what
+it kept. It refuses to run (no tarball written) if `DATA_DIR` does not exist,
+is unreadable/untraversable by the current user, or contains a file the
+current user cannot read — a backup that looks like it worked and cannot be
+restored from is worse than a script that refuses. Run it as the
+`wickhunter-hub` service user (it owns `data/`) or as root.
+
+```
+scripts/backup-data.sh /opt/wickhunter-hub/data /var/backups/wickhunter-hub
+# or, via env:
+HUB_DATA_DIR=/opt/wickhunter-hub/data HUB_BACKUP_DIR=/var/backups/wickhunter-hub \
+  HUB_BACKUP_KEEP=30 scripts/backup-data.sh
+```
+
+Wire it to a timer — either cron:
+
+```
+# /etc/cron.d/wickhunter-hub-backup
+0 3 * * * wickhunter-hub HUB_BACKUP_KEEP=30 /opt/wickhunter-hub/scripts/backup-data.sh /opt/wickhunter-hub/data /var/backups/wickhunter-hub
+```
+
+or a systemd timer (`wickhunter-hub-backup.timer` + a matching `.service`
+with `User=wickhunter-hub`, `ExecStart=/opt/wickhunter-hub/scripts/backup-data.sh …`).
+The resulting tarballs still hold private key material — copy them
+somewhere private (see "Key custody checklist" next), the same rule the
+existing nightly-tar recipe under "Where the data lives (and backup)" states.
+
+## Key custody checklist (v0.4.17)
+
+Every private key this Hub can hold, where it lives, its required mode, and
+whether its location is fixed by the code or an operator choice. Read
+straight off the code that owns each key — nothing here is aspirational.
+
+| Key | Lives at | Mode | Fixed by code, or operator choice? |
+| --- | --- | --- | --- |
+| **LHK1 licence signer** (`data/license-signing.key`) | `data/`, alongside the registry it signs for | `600`, set by `LicenseStore.writeKey` (`src/license.ts`) | **Fixed.** One key, generated once by `npm run keygen`, which refuses to overwrite an existing file. **No rotation keyring exists for this key** — replacing it (delete + re-run keygen) orphans every token already issued against the old public half, because every bot pins that public key. |
+| **Machine-bound lease signer(s)** (`data/license-lease-signing.<kid>.key`) | `data/` | `600`, set by `license-leases.ts` | **Fixed location; kid and rotation ARE an operator choice**, and this is the one key here with a real rotation path: `npm run leasekey -- <kid>` provisions a new kid, both public keys ship in the app, adoption is watched, THEN `HUB_LICENSE_LEASE_KEY_ID=<new kid>` switches which one signs new leases. **Every historical public verifying key must be retained** (old audit/lease records need it) even after the private half for that kid goes offline. See "Machine-bound lease v1" above, "Required rollout order," for the exact sequence — do not re-derive it. |
+| **Candle-seed signer** (`data/candle-signing.key`) | `data/` | `600`, set by `CandleKeyStore` (`src/candles/key.ts`) | **Fixed.** Self-generated on first use, "generated once, reused forever" by the code's own comment — **no rotation mechanism at all**. Regenerating it (delete the file) invalidates every seed signature already served and every public key an operator has pasted into a bot; switching which key signs at all (`HUB_CANDLE_SIGNER=license\|candle`) is a *different*, one-shot, one-way rollout documented in `src/config.ts` ("THE SIGNING SWITCH, AND THE ORDER IT MUST BE THROWN IN") — read that comment before touching `HUB_CANDLE_SIGNER`, not this table. |
+| **Market-cap snapshot signer** | **`/etc/wickhunter-hub/env`** as `MARKET_DATA_SIGNING_PRIVATE_KEY_B64U` — deliberately **not** in `data/` | `600` on the env file (operator-applied; `npm run marketcapkey` only prints, it writes nothing) | **Fixed to the env file, and that placement is deliberate** (`bin/marketcapkey.ts`): unlike the licence/candle keys it is never generated on first use, so a hub started without it refuses the producer outright rather than silently minting a key nobody wrote down. `npm run marketcapkey` prints the private line exactly once; there is no on-disk copy the code ever makes. |
+| **Release signer** | **Never on this Hub, anywhere, under any name** | n/a | **Fixed — structurally absent.** Generated OFFLINE by the app repo's `scripts/generate-release-key.mjs`; the Hub holds only the PUBLIC keyring (`HUB_RELEASE_PUBLIC_KEYS_JSON` in the env file) and "has no release signing API or private-key configuration" (see "Signed-release rollout" above). Keep the private PEM offline, full stop. |
+| **Stripe secrets** (`sk_…` secret keys, `whsec_…` webhook signing secrets, per mode) | `data/billing-config.v1.json` | `600`, whole-file (`writeJsonAtomic`) | **Operator choice of WHEN, fixed WHERE.** Entered on the admin Billing panel (`POST /admin/api/billing/config`), never returned on read (masked), never logged. Not a signing key in the Ed25519 sense, but the highest-value secret on the box in dollar terms — treat its custody with the same care: it is what lets anyone holding it mint/extend/revoke licences and read customer data through Stripe's API. |
+
+**The LHK1 signer should be held offline where practical** (an operator
+choice this checklist states rather than enforces): it is the root of trust
+for every licence this Hub has ever issued or ever will, and unlike the
+lease keyring it has no rotation path to fall back on if the on-box copy is
+ever exposed — compromise means re-keying and reissuing every licence by
+hand. **Only the Hub's own keys belong on the box** — this repo's `.gitignore`
+excludes `data/` entirely and no command here ever accepts, imports, or asks
+for a licence, lease, candle, market-cap, or release PRIVATE key belonging to
+a different install; each of the "Fixed" rows above is fixed specifically to
+stop that from becoming possible by accident.
+
 ## Operator runbook
 
 ### 1. Install the hub (once, on the VPS)
@@ -1149,6 +1355,49 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.17 — **Hardening the Hub itself: rate limits, admin-auth backoff, a
+  hardened deployment profile, and a key custody checklist — additive
+  throughout, nothing a valid licence/check-in/webhook/lease request sees
+  changes.** `src/ratelimit.ts` is a new pure token-bucket
+  (`SlidingWindowLimiter`) plus a per-IP exponential lockout
+  (`AdminBackoffLimiter`), both clock-injected so a test drives every edge
+  exactly. **Rate limiting**: check-in and every machine-bound lease route
+  (challenge/activate/renew/rebind/deactivate) are now limited per claimed
+  licence AND per IP (12/min and 6/min per licence by default); the
+  install-page/one-time install-token routes under `/welcome/`, `/install/`,
+  `/install.sh`, `/api/latest`, `/download/*`, `/api/billing/plans`, `/buy`
+  and `/billing` share one general 60/min-per-IP bucket; the Stripe webhook
+  gets its own deliberately generous 600/min-per-IP allowance so a burst of
+  Stripe's own retries of one event is never refused. Every knob is
+  overridable by a `HUB_RATE_*` env var (see "Rate limiting"). A refusal is
+  always `429` + `Retry-After` and is checked strictly BEFORE any
+  state-changing work, so it can never record a check-in, bind/evict a seat,
+  or write a lease event. **Admin auth**: an optional
+  `HUB_ADMIN_IP_ALLOWLIST` (IPs/CIDRs) is checked before the token compare at
+  all; repeated wrong tokens from one IP now open an exponential lockout (5
+  failures → 1 min, doubling, capped at 1 h, one success forgives
+  everything); every refusal is logged with the IP. The existing 503
+  "admin disabled" (no `HUB_ADMIN_TOKEN` set) is unchanged and still runs
+  first. **Deployment**: `deploy/wickhunter-hub-hardened.service` (dedicated
+  user, `ProtectSystem=strict`/`ProtectHome=true`/`ReadWritePaths=` the data
+  dir only, `NoNewPrivileges`, `UMask=0077` and more — see "Running the hub
+  hardened" for the one real tradeoff it has), `deploy/nginx-hub-site.conf`
+  (a standalone TLS-terminating site, `X-Forwarded-For $remote_addr` always
+  overwritten never appended), and `scripts/backup-data.sh` (timestamped
+  mode-600 tarball of `data/`, prunes to `HUB_BACKUP_KEEP`, refuses on an
+  unreadable data dir, prints what it kept). **Key custody**: a new README
+  section states where each private key actually lives, its mode, and
+  whether that is fixed by the code or an operator choice — read off the
+  code, not asserted — plus which keys have a real rotation path (only the
+  machine-bound lease keyring) and which do not (LHK1, candle, market-cap).
+  New suites: `tests/ratelimit.test.mjs` (pure decisions),
+  `tests/rate-limit-http.test.mjs` (check-in/lease/general/webhook over real
+  HTTP, including "refused ⇒ no state change"), `tests/admin-auth.test.mjs`
+  (backoff escalation/reset, allowlist), `tests/backup-script.test.mjs` (the
+  script against a real temp data dir). The unit file and nginx site file
+  were checked with `systemd-analyze verify` / `nginx -t` by hand while
+  writing this — neither runs in the automated suite.
 
 - v0.4.16 — **A token-proved Customer Portal route, and billing status on
   check-in.** `POST /api/billing/portal-session` (`{licenseId, token}`) opens

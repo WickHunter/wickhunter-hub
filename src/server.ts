@@ -95,6 +95,16 @@ import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
 import { DEFAULT_SEAT_POLICY, SeatStore } from "./seats.js";
 import type { BillingMode } from "./billing/config.js";
+import {
+  AdminBackoffLimiter,
+  DEFAULT_ADMIN_AUTH_POLICY,
+  DEFAULT_RATE_LIMIT_POLICY,
+  SlidingWindowLimiter,
+  ipMatchesAllowlist,
+  type AdminAuthPolicy,
+  type HubRateLimitPolicy,
+  type RateDecision,
+} from "./ratelimit.js";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
   verifyReleaseArtifact,
@@ -210,6 +220,10 @@ export interface HubDeps {
   /** Injectable seat clock: a seat frees after 30 minutes of silence, which a
    *  suite cannot wait out. */
   seatNow?: () => number;
+  /** Injectable clock for every public-route rate limiter (src/ratelimit.ts)
+   *  and the admin-auth backoff, so a suite can drive an exact window/backoff
+   *  edge without waiting out a real timer. Production is Date.now. */
+  rateLimitNow?: () => number;
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -220,6 +234,45 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     ...DEFAULT_FEEDBACK_STORAGE_LIMITS,
     ...deps.feedbackStorageLimits,
   };
+  // ── public-route rate limiting (src/ratelimit.ts) ────────────────────────
+  // `HubConfig` is built by hand in tests and tools as well as by
+  // `configFromEnv`, so an absent policy falls back to the shipped default —
+  // the same `?? DEFAULT_…` shape `seats`/`DEFAULT_SEAT_POLICY` already uses.
+  const rateLimitPolicy: HubRateLimitPolicy = cfg.rateLimits ?? DEFAULT_RATE_LIMIT_POLICY;
+  const adminAuthPolicy: AdminAuthPolicy = cfg.adminAuth ?? DEFAULT_ADMIN_AUTH_POLICY;
+  const rateLimitNow = deps.rateLimitNow ?? Date.now;
+  const checkinLicenseLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.checkinLicenseMax, windowMs: rateLimitPolicy.checkinLicenseWindowMs,
+  });
+  const checkinIpLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.checkinIpMax, windowMs: rateLimitPolicy.checkinIpWindowMs,
+  });
+  const leaseLicenseLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.leaseLicenseMax, windowMs: rateLimitPolicy.leaseLicenseWindowMs,
+  });
+  const leaseIpLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.leaseIpMax, windowMs: rateLimitPolicy.leaseIpWindowMs,
+  });
+  // The shared "everything else public" bucket: install.sh, /api/latest,
+  // /download/*, /welcome/*, /install/<token>, /api/billing/plans, /buy,
+  // /billing, /api/billing/portal-session. One instance, keyed by IP only —
+  // these routes carry no licence identity worth a second dimension (a
+  // one-time install/welcome token IS its own single-use identity already).
+  const generalIpLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.generalIpMax, windowMs: rateLimitPolicy.generalIpWindowMs,
+  });
+  // Stripe webhooks are signature-verified before anything here trusts them;
+  // this exists only to cap a runaway or hostile sender, deliberately
+  // generous so a burst of Stripe's own retries (same event, several ids) is
+  // never refused.
+  const webhookIpLimiter = new SlidingWindowLimiter({
+    max: rateLimitPolicy.webhookIpMax, windowMs: rateLimitPolicy.webhookIpWindowMs,
+  });
+  const adminBackoff = new AdminBackoffLimiter({
+    failureThreshold: adminAuthPolicy.failureThreshold,
+    baseMs: adminAuthPolicy.backoffBaseMs,
+    maxMs: adminAuthPolicy.backoffMaxMs,
+  });
   let licenseLeases: LicenseLeaseService | null = null;
   try {
     licenseLeases = new LicenseLeaseService(cfg.dataDir, store, cfg.licenseLease, {
@@ -388,6 +441,29 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     };
   }
 
+  // ── the general "everything else public" rate-limit bucket ───────────────
+  // Every unauthenticated-or-bearer route below that is not the check-in, a
+  // lease route, feedback (its own limiter since v0.2.x), or the Stripe
+  // webhook (its own generous bucket, handled separately in `handle`). Named
+  // by exact path/prefix rather than folded into the dispatch table itself,
+  // so this stays a single readable list to audit against the route table in
+  // the README, and a route added to `handle` below is NOT silently
+  // rate-limited just by sharing a method — it has to be named here too.
+  function isGeneralRateLimitedRoute(m: string, p: string): boolean {
+    if (m === "GET") {
+      if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
+        || p === "/api/billing/plans" || p === "/billing") return true;
+      if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
+      return false;
+    }
+    if (m === "POST") {
+      if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
+      if (p === "/api/billing/portal-session") return true;
+      return false;
+    }
+    return false;
+  }
+
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
       // Never leak internals to the wire; do log them (message only) locally.
@@ -404,6 +480,26 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const url = new URL(req.url ?? "/", "http://hub.invalid");
     const p = url.pathname;
     const m = req.method ?? "GET";
+
+    // ── pre-dispatch rate limiting ──────────────────────────────────────
+    // Checked before ANY route-specific work — a refusal here never reads a
+    // body, verifies a token, or touches any state. Check-in, the lease
+    // routes and feedback carry their own dedicated limiters (see `checkin`,
+    // `leaseRateLimited`, `feedbackIntake`) and are deliberately not matched
+    // here. The signed Stripe webhook gets its own generous allowance so a
+    // burst of Stripe's own retries of one event is never refused; every
+    // other unauthenticated-or-bearer public route shares the general "rest
+    // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
+    if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
+      const rate = webhookIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "the billing webhook"); }
+    } else if (isGeneralRateLimitedRoute(m, p)) {
+      const rate = generalIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) {
+        if (m !== "GET") req.resume();
+        return sendRateLimited(res, rate, "this route");
+      }
+    }
 
     if (m === "GET" && p === "/api/health") {
       return sendJson(res, 200, { ok: true, version: HUB_VERSION, ...operationsStatus(false) });
@@ -457,6 +553,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // ── tester surface ────────────────────────────────────────────────────────
 
   async function checkin(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // IP gate FIRST, before the body is even read — the same shape
+    // `feedbackIntake` uses, and for the same reason: a flood from one
+    // source must not go on spending a body-parse per request once it is
+    // already over budget. Draining lets Node reuse the connection safely.
+    const ip = clientIp(req);
+    const ipRate = checkinIpLimiter.take(ip, rateLimitNow());
+    if (!ipRate.ok) {
+      req.resume();
+      return sendRateLimited(res, ipRate, "check-in");
+    }
     const body = await readJsonBody(req);
     if (
       body === null ||
@@ -467,6 +573,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     ) {
       return sendJson(res, 400, { ok: false, error: "bad checkin body" });
     }
+    // Per-licence gate, BEFORE any state-changing call below (recordCheckin,
+    // seats.admit) — a refusal here must never write a check-in row, bind or
+    // evict a seat, or hand out a renewed token. A claimed licenceId is
+    // untrusted input (exactly like `recordCheckin` below already treats
+    // it), so this bounds one caller's own claimed identity, not a proven
+    // licence — which is enough: an attacker who wants a bigger budget just
+    // rotates the claimed id, and then the IP gate above is what catches
+    // them.
+    const licenseRate = checkinLicenseLimiter.take(body.licenseId.slice(0, 64), rateLimitNow());
+    if (!licenseRate.ok) return sendRateLimited(res, licenseRate, "check-in");
     // Record EVERYTHING, including revoked/unknown ids — the record is the
     // point (who is still running what). Cap field lengths so a hostile client
     // cannot balloon the roster.
@@ -583,10 +699,39 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     sendJson(res, status, body, { "cache-control": "no-store" });
   }
 
+  /** A rate-limit key for the bearer in `x-license`, WITHOUT trusting the
+   *  raw bytes as a map key: a genuine token buckets by its actual licence id
+   *  (rotation of the token itself does not reset the bucket), and a token
+   *  that fails to decode still buckets — by a fixed-length hash rather than
+   *  by up to 16 KiB of raw bearer, so a flood of distinct garbage tokens
+   *  cannot inflate the limiter's memory the way storing them verbatim
+   *  would. */
+  function leaseRateKey(token: string): string {
+    const payload = store.decodeGenuine(token);
+    return payload ? `lic:${payload.id}` : `raw:${createHash("sha256").update(token).digest("hex")}`;
+  }
+
+  /** The IP + licence gate shared by every `/api/license/lease/*` route.
+   *  Checked once the bearer is confirmed present (a missing token is a 401,
+   *  not a rate-limit question) and BEFORE the body is read or
+   *  `licenseLeases` is touched at all — so a refusal here can never advance
+   *  a nonce, an activation sequence, a seat binding, or any other lease
+   *  state. Returns true when the caller may proceed; sends the 429 itself
+   *  otherwise. */
+  function leaseRateLimited(req: IncomingMessage, res: ServerResponse, token: string): boolean {
+    const now = rateLimitNow();
+    const ipRate = leaseIpLimiter.take(clientIp(req), now);
+    if (!ipRate.ok) { sendRateLimited(res, ipRate, "the machine-bound lease service"); return false; }
+    const licenseRate = leaseLicenseLimiter.take(leaseRateKey(token), now);
+    if (!licenseRate.ok) { sendRateLimited(res, licenseRate, "the machine-bound lease service"); return false; }
+    return true;
+  }
+
   async function leaseChallenge(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
     const token = leaseBearer(req);
     if (!token) return sendLeaseJson(res, 401, { ok: false, error: "x-license is required" });
+    if (!leaseRateLimited(req, res, token)) return;
     const body = await readJsonBody(req);
     if (body === null) return sendLeaseJson(res, 400, { ok: false, error: "bad lease challenge body" });
     const input: LeaseChallengeInput = {
@@ -610,6 +755,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!licenseLeases) return sendLeaseJson(res, 503, { ok: false, error: "machine-bound lease service is unavailable" });
     const token = leaseBearer(req);
     if (!token) return sendLeaseJson(res, 401, { ok: false, error: "x-license is required" });
+    if (!leaseRateLimited(req, res, token)) return;
     const body = await readJsonBody(req);
     if (body === null || typeof body.nonce !== "string" || typeof body.signature !== "string") {
       return sendLeaseJson(res, 400, { ok: false, error: "expected {nonce, signature}" });
@@ -1187,10 +1333,41 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   async function adminApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    // Unconfigured admin stays exactly as it was: a 503 that depends on
+    // nothing else here, checked before the IP allowlist or the backoff so
+    // an operator who has not set HUB_ADMIN_TOKEN yet gets that sentence
+    // rather than a 403/429 that would suggest the surface is half-live.
     if (!cfg.adminToken) {
       return sendJson(res, 503, { ok: false, error: "admin disabled: HUB_ADMIN_TOKEN is not set" });
     }
-    if (!adminAuthorized(req)) return sendJson(res, 401, { ok: false, error: "unauthorized" });
+    const ip = clientIp(req);
+    // The optional allowlist is checked BEFORE the token: an IP that is not
+    // on it never gets to spend a comparison (or a backoff slot) at all.
+    // Absent HUB_ADMIN_IP_ALLOWLIST (the empty-array default) means every IP
+    // may attempt the token — today's behaviour, unchanged.
+    if (!ipMatchesAllowlist(ip, adminAuthPolicy.ipAllowlist)) {
+      console.warn(`[admin] refused ${ip}: not on HUB_ADMIN_IP_ALLOWLIST`);
+      return sendJson(res, 403, { ok: false, error: "forbidden" }, { "cache-control": "no-store" });
+    }
+    // Exponential per-IP backoff for repeated wrong tokens. Checked BEFORE
+    // the token is compared: a blocked IP is refused with no compare
+    // attempted, so lockout timing itself cannot leak anything about the
+    // token, and a caller ignoring Retry-After cannot spend more guesses by
+    // retrying faster.
+    const now = rateLimitNow();
+    const backoff = adminBackoff.check(ip, now);
+    if (!backoff.ok) {
+      console.warn(`[admin] refused ${ip}: backoff in force (${backoff.retryAfterSeconds}s remaining)`);
+      return sendRateLimited(res, backoff, "the admin token");
+    }
+    if (!adminAuthorized(req)) {
+      adminBackoff.recordFailure(ip, now);
+      console.warn(`[admin] refused ${ip}: wrong token`);
+      return sendJson(res, 401, { ok: false, error: "unauthorized" });
+    }
+    // A success forgives every prior failure from this IP outright — see
+    // `AdminBackoffLimiter.recordSuccess`.
+    adminBackoff.recordSuccess(ip);
     const m = req.method ?? "GET";
     const p = url.pathname;
 
@@ -1862,6 +2039,19 @@ function sendJson(
     ...extraHeaders,
   });
   res.end(bytes);
+}
+
+/** ONE 429 shape for every rate-limited route: JSON body, a machine-readable
+ *  `retryAfterSeconds` field, and a `Retry-After` header carrying the same
+ *  number — never cached, so an intermediary never serves a stale refusal
+ *  past its own window. Call only with a REFUSING decision; the caller
+ *  already branched on `.ok`. */
+function sendRateLimited(res: ServerResponse, decision: RateDecision, what: string): void {
+  sendJson(res, 429, {
+    ok: false,
+    error: `${what} is temporarily rate limited; try again in ${decision.retryAfterSeconds} seconds`,
+    retryAfterSeconds: decision.retryAfterSeconds,
+  }, { "retry-after": String(decision.retryAfterSeconds), "cache-control": "no-store" });
 }
 
 /** The exact bytes of a body, or null when it is too large or the connection

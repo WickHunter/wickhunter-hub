@@ -1,0 +1,94 @@
+## deploy/wickhunter-hub-hardened.service
+##
+## A HARDENED alternative to the unit `install-hub.sh` writes to
+## /etc/systemd/system/wickhunter-hub.service. Same paths, same dedicated
+## `wickhunter-hub` user/group the installer already creates — this file only
+## adds sandboxing directives beyond what the installer ships. It is meant to
+## be dropped in AFTER an ordinary `sudo bash install-hub.sh` run (which
+## creates the user, the data/releases directories and their ownership, the
+## admin token, and the signing keys), replacing the unit file that run wrote.
+##
+## Install:
+##   sudo bash install-hub.sh                     # first, if not already done
+##   sudo cp deploy/wickhunter-hub-hardened.service /etc/systemd/system/wickhunter-hub.service
+##   sudo systemctl daemon-reload
+##   sudo systemctl restart wickhunter-hub
+##
+## Adjust HUB_DIR/ENV_FILE below if your install used non-default
+## HUB_DIR/HUB_ENV_FILE overrides.
+##
+## ── WHAT NoNewPrivileges=true COSTS, READ THIS BEFORE ENABLING ─────────────
+## Two admin-only features spawn `sudo -n <root-helper>` (see
+## src/marketplace-inputs.ts): the alpha Marketplace configuration bridge
+## (`POST /admin/api/marketplace-config`, `/admin/api/marketplace-providers/*`)
+## and the root-helper path of `POST /admin/api/upgrade`. `sudo` escalates
+## through a setuid-root binary, and the kernel's no_new_privs bit (which
+## NoNewPrivileges=true sets, and which every child process inherits)
+## specifically disables setuid/setgid escalation — so under this unit `sudo`
+## silently runs as the unprivileged service user and those two admin actions
+## fail closed (a 500/503, never a silent success). Every OTHER route in this
+## file — licensing, check-in, leases, feedback, billing, candles, market-cap,
+## the community gallery, ordinary licence issue/revoke/extend — is
+## unaffected; none of it needs a new privilege at runtime. If you rely on the
+## Marketplace bridge or the in-app upgrade button, either drop
+## NoNewPrivileges from this file or keep the installer's own (non-hardened)
+## unit and upgrade/configure Marketplace through it instead.
+[Unit]
+Description=Wick Hunter beta hub — HARDENED unit (licensing + distribution; NO trading code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=wickhunter-hub
+Group=wickhunter-hub
+WorkingDirectory=/opt/wickhunter-hub
+EnvironmentFile=/etc/wickhunter-hub/env
+# Optional: the Marketplace status-bridge credential, if configured. Absent
+# is fine (leading "-" means "do not fail if this file does not exist").
+EnvironmentFile=-/etc/wickhunter-hub/marketplace.env
+Environment=NODE_ENV=production
+# Match `command -v node` on your box — install-hub.sh resolves this
+# dynamically at install time; a static unit file cannot, so confirm the path
+# after installing (e.g. `which node`) and edit this line if it differs.
+ExecStart=/usr/bin/node dist/src/main.js
+Restart=always
+RestartSec=5
+
+## ── filesystem: nothing outside data/ is ever written ──────────────────────
+# ProtectSystem=strict makes the ENTIRE filesystem read-only to this unit
+# except what ReadWritePaths= names explicitly. The Hub writes signing keys,
+# the licence registry, check-in/audit ledgers, candle archives and the
+# billing config — all and only under data/.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wickhunter-hub/data
+PrivateTmp=true
+UMask=0077
+
+## ── the rest: no capability, no privilege escalation, no reason to need one
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# node:http + node:crypto need no Linux capability at all when bound above
+# port 1024 (the shipped default, HUB_PORT=8091). If you have set HUB_PORT
+# below 1024, replace the empty set below with
+# `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` and
+# `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

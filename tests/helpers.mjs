@@ -66,7 +66,22 @@ export async function freshHub(overrides = {}, deps = undefined) {
   // A test hub never waits out the collector's request pacing. The pacing still
   // RUNS — the same code path, the same gaps computed — the sleep is just a
   // no-op, so a suite that ticks a collector does not spend 312 ms per request.
-  const hub = createHub(cfg, { candleSleep: async () => {}, ...deps });
+  //
+  // rate limiting (src/ratelimit.ts) is real code on every hub, including one
+  // built by a suite that has never heard of it — so the DEFAULT clock here
+  // fast-forwards well past every shipped window (checkin/lease default to a
+  // 60s window; the general/admin-backoff windows are minutes) on EVERY call,
+  // so a suite firing a burst of ordinary HTTP requests at one licence/IP
+  // never trips a limiter by accident. A suite that means to exercise a
+  // limiter's real behaviour passes its own `rateLimitNow` in `deps` (a fixed
+  // or hand-advanced clock, the same shape `seatNow`/`licenseLeaseNow`
+  // already use) and this default is never installed.
+  let rateLimitAutoClock = Date.now();
+  const hub = createHub(cfg, {
+    candleSleep: async () => {},
+    rateLimitNow: () => (rateLimitAutoClock += 10 * 60_000),
+    ...deps,
+  });
   const port = await hub.listen();
   return {
     hub,
