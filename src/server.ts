@@ -15,6 +15,7 @@
 //   stripe   POST /api/billing/stripe/{test,live} signed webhook (mints/extends/revokes licences)
 //   token    GET  /welcome/<page-token>          a buyer's private install page (mints a one-time command)
 //   token    POST /welcome/<page-token>/portal   303 -> a Customer Portal session for that buyer
+//   keyed    POST /api/billing/portal-session    {licenseId,token} -> a Customer Portal session, as JSON (v0.4.16)
 //   token    GET  /install/<install-token>       the installer, once; the token burns
 //   admin    GET/POST /admin/api/billing/config  mode switch, Stripe keys (write-only), email, policy
 //   admin    GET  /admin/api/billing/customers   Stripe customers joined to their licences
@@ -446,6 +447,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "GET" && p.startsWith("/welcome/")) return welcomePage(p, res);
     if (m === "POST" && p.startsWith("/welcome/") && p.endsWith("/portal")) return welcomePortal(p, res);
+    if (m === "POST" && p === "/api/billing/portal-session") return billingPortalSession(req, res);
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
@@ -518,6 +520,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // deserves a truthful answer. Nothing here grants access to anything — the
     // licence gate is a separate mechanism at the order-submit seam.
     const flags = flagsFor(cfg.dataDir, body.licenseId);
+    // v0.4.16 — the customer's billing state, for the app's Subscription
+    // card (`recordSubscriptionInfo` / `SubscriptionInfo` in
+    // liqhunter-private's src/license.ts, which is what fixes this exact
+    // shape). Same ABSENT-vs-NULL rule as `flags`: `null` means "no Stripe
+    // customer is bound to this licence" and CLEARS the app's cache (a
+    // revoked licence, a beta tester who never bought anything, a customer
+    // record deleted by hand); an older hub simply never sends the key,
+    // which is what leaves a cached answer alone. Sent to revoked/unknown
+    // ids too, for the same reason `flags` is.
+    const subscription = billing.subscriptionInfoFor(body.licenseId);
     // ── v0.3.19 — A LONGER KEY RIDES THE REPLY, TO A CALLER WHO PROVED THE OLD ONE
     //
     // `exp` is inside the signed token and the bot checks it offline, so until
@@ -547,6 +559,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ...(seatRefused ? { reason: seatRefused === "clone" ? "this install id is checking in from more than one machine" : "another install already holds this licence's seat" } : {}),
       ...(latest ? { latest } : {}),
       flags,
+      subscription,
       ...(renewal ? { token: renewal.token, exp: renewal.exp } : {}),
     });
   }
@@ -858,6 +871,24 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!r.ok) return sendHtml(res, r.status, notFoundPage(r.error));
     res.writeHead(303, { location: r.url, "cache-control": "no-store" });
     res.end();
+  }
+
+  /** POST /api/billing/portal-session — the token-proved counterpart to
+   *  `welcomePortal` above, for a running bot rather than a browser on the
+   *  buyer's install page. See `BillingService.portalSession` for the whole
+   *  decision (v0.4.16); this does only the body read and the JSON reply. */
+  async function billingPortalSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody(req);
+    if (
+      body === null ||
+      typeof body.licenseId !== "string" || !body.licenseId || body.licenseId.length > 128 ||
+      typeof body.token !== "string" || !body.token || body.token.length > 4096
+    ) {
+      return sendJson(res, 400, { ok: false, error: "bad portal-session body" }, { "cache-control": "no-store" });
+    }
+    const r = await billing.portalSession(body.licenseId, body.token);
+    if (!r.ok) return sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, url: r.url }, { "cache-control": "no-store" });
   }
 
   function installByToken(p: string, res: ServerResponse): void {

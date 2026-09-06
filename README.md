@@ -176,6 +176,38 @@ before its first invoice arrives; `oneOffDays` (365) for one-time purchases;
 `testMaxDays` (14); `plan` (`unleashed`); `revokeOnDispute` / `revokeOnRefund`
 (both on); `siteOrigin` for links back to the website.
 
+### App-side portal + subscription status (v0.4.16)
+
+Two additions for a bot's own Settings page, so "Manage subscription" and a
+subscription status card work without emailing the customer an install-page
+link first:
+
+- `POST /api/billing/portal-session` takes `{licenseId, token}` — the
+  licence id and the bot's own CURRENT signed token, the same
+  proof-of-possession shape the check-in renewal path uses (v0.3.19). The
+  token is verified exactly as check-in verifies one: `decodeGenuine`
+  against the pinned signing key, the payload's `id` must equal the posted
+  `licenseId`, and the licence must not be revoked. Any one of those failing
+  answers `401` — deliberately without saying which, so an unauthenticated
+  caller learns nothing about which licence ids exist. `404` means no Stripe
+  customer is bound to this licence (a beta tester, or a licence issued by
+  hand); `503` means this Hub has no secret key or portal login URL
+  configured for that customer's mode. On success it opens the same Stripe
+  Customer Portal session `GET /welcome/<page-token>/portal` opens for a
+  buyer, and answers `{ok:true, url}` as JSON instead of a redirect.
+- The check-in reply's optional `subscription` field: `{plan, status,
+  currentPeriodEndMs, portalAvailable}` read off the customer record bound
+  to the licence, or `null` when none is bound. Same rule v0.2.11 set for
+  `flags`: an ABSENT key means an older hub with no opinion, and the app
+  leaves its cache alone; an explicit `null` means "no Stripe customer" and
+  clears whatever the app had cached (a revoked licence, a hand-deleted
+  customer record). Sent for a revoked or unrecognised licence too — a
+  truthful answer, not a grant of anything.
+
+Both are additive and read-only: neither one issues, extends or revokes a
+licence, and an app built before v0.4.16 keeps working exactly as it did
+(`GET /billing`'s email-based Customer Portal login stays up for it).
+
 ### Where billing data lives
 
 | Path | What | Loss means |
@@ -1118,6 +1150,29 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.16 — **A token-proved Customer Portal route, and billing status on
+  check-in.** `POST /api/billing/portal-session` (`{licenseId, token}`) opens
+  a Stripe Customer Portal session without an email login step — the same
+  Stripe call `welcomePortal`'s page-token flow makes, now reachable from a
+  running bot's own Settings page rather than only from the emailed install
+  page. The token is verified exactly as the check-in handler verifies one
+  (`decodeGenuine` against the pinned signing key, the id must match, the
+  licence must not be revoked) — a bare licence id can never open a portal,
+  matching the v0.3.19 rule that the id is not a secret and the token is. A
+  token that fails any of those three checks answers `401` without saying
+  which one failed; `404` when the licence has no bound Stripe customer (a
+  beta tester who never bought anything); `503` when this Hub has no secret
+  key or portal login URL configured for that customer's mode. The check-in
+  reply also carries an optional `subscription` field — `{plan, status,
+  currentPeriodEndMs, portalAvailable}` from the customer record bound to the
+  licence, or `null` when none is bound — following the same absent-vs-null
+  rule `flags` set in v0.2.11: an older app that has never seen the key
+  leaves its cache alone, while an explicit `null` clears it (so a licence
+  that stops having a Stripe customer — revoked, deleted by hand — cannot
+  leave a stale paid-subscription card showing). Both are additive; a bot
+  that predates them ignores the new field and keeps using `GET /billing`.
+  Pinned in `tests/billing.test.mjs` against the same stubbed Stripe HTTP the
+  page-token portal flow already uses.
 - v0.4.15 — **Plans on the Hub.** Monthly $99, Yearly $699 and Lifetime $999
   (a ten-year key) are configured on the Hub and editable there; `/buy?plan=key`
   redirects to that plan's Payment Link for the active mode; `GET

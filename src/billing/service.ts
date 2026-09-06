@@ -37,6 +37,7 @@ import {
   type BillingConfig,
   type BillingMode,
   type Plan,
+  type StripeModeConfig,
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
@@ -654,6 +655,34 @@ export class BillingService {
     return { ok: true, licenseToken: token };
   }
 
+  /** The Stripe API call itself, shared by every caller that ends up opening
+   *  a Customer Portal session for one customer record: `portalRedirect`
+   *  below (a page token, redirected to) and `portalSession` (a token-proved
+   *  licence, answered as JSON — v0.4.16). Returns the session url or null —
+   *  NEVER throws; a refusal or a network failure is logged and the caller
+   *  decides what to fall back to, exactly as this did inline before it had
+   *  a second call site. */
+  private async stripePortalSessionUrl(rec: CustomerRecord, m: StripeModeConfig, returnUrl: string): Promise<string | null> {
+    if (!m.secretKey || !rec.stripeCustomerId) return null;
+    try {
+      const body = new URLSearchParams({ customer: rec.stripeCustomerId, return_url: returnUrl }).toString();
+      const res = await this.fetchLike(STRIPE_PORTAL_SESSIONS_URL, {
+        method: "POST",
+        headers: { authorization: `Bearer ${m.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+        body,
+      });
+      const text = await res.text();
+      if (res.ok) {
+        const url = (JSON.parse(text) as { url?: unknown }).url;
+        if (typeof url === "string" && url.startsWith("https://")) return url;
+      }
+      this.log(`[billing] portal session refused (${res.status}): ${text.slice(0, 200)}`);
+    } catch (err) {
+      this.log(`[billing] portal session failed: ${(err as Error).message}`);
+    }
+    return null;
+  }
+
   /** Where "Manage billing" goes: a fresh Customer Portal session when the
    *  secret key is on file (no login step for the customer), else the static
    *  portal login link, else nothing. */
@@ -664,26 +693,77 @@ export class BillingService {
     if (!rec) return { ok: false, status: 404, error: "unknown customer" };
     const cfg = this.config();
     const m = cfg.stripe[rec.livemode ? "live" : "test"];
-    if (m.secretKey && rec.stripeCustomerId) {
-      try {
-        const body = new URLSearchParams({ customer: rec.stripeCustomerId, return_url: `${this.origin}/welcome/${rawPageToken}` }).toString();
-        const res = await this.fetchLike(STRIPE_PORTAL_SESSIONS_URL, {
-          method: "POST",
-          headers: { authorization: `Bearer ${m.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
-          body,
-        });
-        const text = await res.text();
-        if (res.ok) {
-          const url = (JSON.parse(text) as { url?: unknown }).url;
-          if (typeof url === "string" && url.startsWith("https://")) return { ok: true, url };
-        }
-        this.log(`[billing] portal session refused (${res.status}): ${text.slice(0, 200)}`);
-      } catch (err) {
-        this.log(`[billing] portal session failed: ${(err as Error).message}`);
-      }
-    }
+    const url = await this.stripePortalSessionUrl(rec, m, `${this.origin}/welcome/${rawPageToken}`);
+    if (url) return { ok: true, url };
     if (m.portalUrl) return { ok: true, url: m.portalUrl };
     return { ok: false, status: 404, error: "billing management is not configured — email support" };
+  }
+
+  /** POST /api/billing/portal-session (v0.4.16) — the token-proved
+   *  counterpart to `portalRedirect`'s page-token flow, for a running bot's
+   *  own Settings page (liqhunter-private's `POST /api/license/portal`
+   *  already calls this exact shape — `{licenseId, token}` — and falls back
+   *  to `GET /billing` on a 404 or an unreadable reply; see that repo's
+   *  `licensePortalFallback`).
+   *
+   *  Verified EXACTLY as the check-in handler verifies a licence token
+   *  (`decodeGenuine`, the same public-key check, then the registry's own
+   *  revocation truth): a bare licence id may NEVER open a portal — the id is
+   *  not a secret, the token is (README, "Licence extension at check-in"). A
+   *  token that does not verify, or verifies but names a different id, or
+   *  names a genuinely revoked licence, is answered 401 in every case — an
+   *  unauthenticated caller must never learn WHICH of those it hit, or which
+   *  licence ids exist at all.
+   *
+   *  The token's own EXPIRY is deliberately not checked (same reasoning as
+   *  `decodeGenuine`'s docstring): a lapsed subscriber must still be able to
+   *  reach the portal to pay again, and only a REVOKED licence — the
+   *  enforcement mechanism that acts on a running bot — is refused. */
+  async portalSession(licenseId: string, token: string): Promise<PortalResult> {
+    const presented = this.licenses.decodeGenuine(token);
+    if (!presented || presented.id !== licenseId) {
+      return { ok: false, status: 401, error: "this licence token is not valid" };
+    }
+    if (this.licenses.isRevoked(licenseId) || !this.licenses.isKnown(licenseId)) {
+      return { ok: false, status: 401, error: "this licence has been revoked" };
+    }
+    const rec = this.store.findByLicense(licenseId);
+    if (!rec) return { ok: false, status: 404, error: "no billing customer is on file for this licence" };
+    const cfg = this.config();
+    const m = cfg.stripe[rec.livemode ? "live" : "test"];
+    if (!m.secretKey && !m.portalUrl) return { ok: false, status: 503, error: "billing is not configured on this Hub" };
+    const returnUrl = cfg.siteOrigin || this.origin;
+    const url = await this.stripePortalSessionUrl(rec, m, returnUrl);
+    if (url) return { ok: true, url };
+    if (m.portalUrl) return { ok: true, url: m.portalUrl };
+    return { ok: false, status: 503, error: "billing management is temporarily unavailable — try again shortly" };
+  }
+
+  /** The check-in reply's optional `subscription` field (v0.4.16) — read by
+   *  liqhunter-private's `recordSubscriptionInfo` / `SubscriptionInfo`
+   *  (`src/license.ts`), which is what fixes this shape: `plan`/`status`
+   *  strings, `currentPeriodEndMs: number | null`, `portalAvailable: boolean`.
+   *  `null` for a licence with no bound Stripe customer — the free-through-
+   *  beta case and every pre-Stripe tester — so an app clears a stale
+   *  subscription card the moment a licence stops having one (a licence is
+   *  revoked, its customer deleted by hand, etc.); an ABSENT `subscription`
+   *  key (an older hub) is what leaves the app's cache untouched instead,
+   *  exactly as an absent `flags` key does.
+   *
+   *  Sent for a revoked or otherwise unrecognised licence too, for the same
+   *  reason `flags` and `latest` are: this is a truthful answer about what
+   *  the Hub knows, not a grant of anything. */
+  subscriptionInfoFor(licenseId: string): { plan: string; status: string; currentPeriodEndMs: number | null; portalAvailable: boolean } | null {
+    const rec = this.store.findByLicense(licenseId);
+    if (!rec) return null;
+    const cfg = this.config();
+    const m = cfg.stripe[rec.livemode ? "live" : "test"];
+    return {
+      plan: rec.planKey ?? cfg.policy.plan,
+      status: rec.subscriptionStatus ?? "none",
+      currentPeriodEndMs: rec.periodEndMs,
+      portalAvailable: Boolean(m.secretKey || m.portalUrl),
+    };
   }
 
   // ── admin views ───────────────────────────────────────────────────────────

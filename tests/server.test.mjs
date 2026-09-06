@@ -84,7 +84,10 @@ await test("checkin records to jsonl + roster and answers ok", async () => {
   // deep-equal is kept rather than loosened to a subset check, because the
   // whole point of asserting the exact body is that a field cannot join this
   // reply without someone deciding it should.
-  assert.deepEqual(r.body, { ok: true, latest: "0.9.0", flags: {} }); // no revoked flag; latest rides along for the bot's update banner
+  // v0.4.16 — `subscription` joined the reply the same way `flags` did:
+  // ALWAYS present, `null` here because this licence has no bound Stripe
+  // customer (the free-through-beta case).
+  assert.deepEqual(r.body, { ok: true, latest: "0.9.0", flags: {}, subscription: null }); // no revoked flag; latest rides along for the bot's update banner
   const lines = fs.readFileSync(path.join(h.dataDir, "checkins.jsonl"), "utf8").trim().split("\n");
   const last = JSON.parse(lines[lines.length - 1]);
   assert.equal(last.licenseId, lic.id);
@@ -107,7 +110,7 @@ await test("checkin for a revoked license answers revoked:true (and still record
   // revoked install still deserves a truthful answer. Nothing here grants
   // access to anything — the licence gate is a separate mechanism, at the
   // bot's order-submit seam.
-  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {} });
+  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {}, subscription: null });
   assert.equal(readRoster(h.dataDir)[lic.id].installId, "inst-2");
 });
 
@@ -116,7 +119,7 @@ await test("checkin for an id this hub never issued answers revoked:true", async
     method: "POST",
     body: JSON.stringify({ licenseId: "not-ours", installId: "inst-3", version: "0.9.0", ts: Date.now() }),
   });
-  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {} });
+  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {}, subscription: null });
 });
 
 await test("malformed checkin body is a 400", async () => {
