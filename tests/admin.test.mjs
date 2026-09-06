@@ -6,14 +6,20 @@ import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 const h = await freshHub(); // adminToken: "test-admin-token"
 const AUTH = { "x-hub-admin": "test-admin-token" };
 
+// Each auth-shape test below sends its bad attempts from its OWN synthetic
+// source IP (below the v0.4.17 admin-auth backoff's default 5-failure
+// threshold on any one IP — see tests/admin-auth.test.mjs for the backoff
+// itself), so this file keeps testing exactly one thing: the shape of the
+// token compare, never interacting with the lockout the next test's real
+// token attempt would otherwise walk into.
 await test("no token -> 401", async () => {
-  const r = await jsonReq(`${h.origin}/admin/api/licenses`);
+  const r = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: { "x-forwarded-for": "203.0.113.201" } });
   assert.equal(r.status, 401);
 });
 
 await test("wrong token -> 401 (any length — compare is hash-then-timingSafeEqual)", async () => {
   for (const bad of ["x", "test-admin-tokeX", "test-admin-token-longer", "a".repeat(4096)]) {
-    const r = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: { "x-hub-admin": bad } });
+    const r = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: { "x-hub-admin": bad, "x-forwarded-for": "203.0.113.202" } });
     assert.equal(r.status, 401, `token: ${bad.slice(0, 32)}...`);
   }
 });

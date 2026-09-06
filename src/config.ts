@@ -20,6 +20,12 @@ import {
 } from "./marketplace-status.js";
 import type { MarketplaceInputsConfig } from "./marketplace-inputs.js";
 import { seatPolicyFromEnv, type SeatPolicy } from "./seats.js";
+import {
+  adminAuthPolicyFromEnv,
+  rateLimitPolicyFromEnv,
+  type AdminAuthPolicy,
+  type HubRateLimitPolicy,
+} from "./ratelimit.js";
 
 // Compiled layout is dist/src/config.js, so the project root is two up.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -47,6 +53,19 @@ export interface HubConfig {
   /** Additive WHL1 lease service. Old LHK1/check-in clients do not read this
    * and retain their exact wire behavior during staged migration. */
   licenseLease?: LicenseLeaseConfig;
+
+  // ── rate limiting (src/ratelimit.ts) ────────────────────────────────────
+  /** OPTIONAL for the same reason `seats` is: `HubConfig` is built by hand in
+   *  tests and tools as well as by `configFromEnv`. Absent = the shipped
+   *  default policy (`DEFAULT_RATE_LIMIT_POLICY`). A limiter only ever adds a
+   *  429 in FRONT of a caller already over its own stated budget — it never
+   *  changes what a request under the limit is answered with. */
+  rateLimits?: HubRateLimitPolicy;
+  /** Admin-token failure backoff + optional IP allowlist. Absent = the
+   *  shipped default (5 failures -> 1 min, doubling, capped at 1h; no
+   *  allowlist configured, so every IP may attempt the token exactly as
+   *  before this existed). */
+  adminAuth?: AdminAuthPolicy;
 
   // ── one install per licence ────────────────────────────────────────────
   /** Seat enforcement at the check-in seam (src/seats.ts). OPTIONAL for the
@@ -215,6 +234,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       defaultMaxMachines: Number(env.HUB_LICENSE_LEASE_DEFAULT_MAX_MACHINES ?? 1),
     },
     seats: seatPolicyFromEnv(env),
+    rateLimits: rateLimitPolicyFromEnv(env),
+    adminAuth: adminAuthPolicyFromEnv(env),
     marketplaceStatus: marketplaceStatusBridgeFromEnv(env),
     marketplaceInputs: {
       envFile: env.HUB_MARKETPLACE_ENV_FILE ?? "/etc/wickhunter-hub/marketplace-state.env",

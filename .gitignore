@@ -8,3 +8,7 @@ data/
 # Beta tarballs are copied in by the release step; only the contract doc is tracked.
 releases/*
 !releases/README.md
+
+# scripts/backup-data.sh's default output directory when HUB_BACKUP_DIR is
+# unset — private key material in every tarball. NEVER commit.
+backups/
