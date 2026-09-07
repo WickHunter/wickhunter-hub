@@ -12,6 +12,8 @@ import {
   type CandleSigner,
 } from "./candles/key.js";
 import { marketCapConfigFromEnv, type MarketCapEnvConfig } from "./marketcap/config.js";
+import { liqRecordEnabled, liqServiceConfigFromEnv } from "./liq/config.js";
+import type { LiqServiceConfig } from "./liq/service.js";
 import { DEFAULT_RELEASE_MAX_AGE_MS, parseReleasePublicKeys } from "./release-manifest.js";
 import type { LicenseLeaseConfig } from "./license-leases.js";
 import {
@@ -118,6 +120,16 @@ export interface HubConfig {
    *  producer does not exist, which is every install until an operator sets
    *  MARKET_CAP_VENUES and a CMC key. */
   marketCap?: MarketCapEnvConfig;
+
+  // ── liquidation recorder + pair-percentile table ──────────────────────────
+  /** OPTIONAL for the same reason `seats`/`rateLimits` are: `HubConfig` is
+   *  built by hand in tests and tools as well as by `configFromEnv`. Absent
+   *  = the shipped default (`HUB_LIQ_RECORD` unset reads as ON). Every wired
+   *  source is WS-only with no history endpoint anywhere, so recording costs
+   *  only disk — unlike the market-cap producer this has no reason to
+   *  default off. `=0` is the operator's escape hatch. */
+  liqRecord?: boolean;
+  liqService?: LiqServiceConfig;
 }
 
 // ── THE SIGNING SWITCH, AND THE ORDER IT MUST BE THROWN IN ──────────────────
@@ -259,5 +271,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     // no explicit path lands beside licenses.json rather than in a second state
     // root nobody remembers to back up.
     marketCap: marketCapConfigFromEnv(env, env.HUB_DATA_DIR ?? path.join(ROOT, "data")),
+    liqRecord: liqRecordEnabled(env),
+    liqService: liqServiceConfigFromEnv(env, env.HUB_DATA_DIR ?? path.join(ROOT, "data")),
   };
 }

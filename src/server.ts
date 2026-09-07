@@ -69,6 +69,7 @@ import { marketCapStartupRefusals } from "./marketcap/config.js";
 import { CoinGeckoFallback } from "./marketcap/coingecko.js";
 import { loadSigningKey, signerFromSignFn } from "./marketcap/snapshot.js";
 import type { HttpLike } from "./marketcap/cmc.js";
+import { LiqService, DEFAULT_LIQ_SERVICE_CONFIG, type LiqFetchLike } from "./liq/service.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
@@ -167,6 +168,9 @@ export interface Hub {
    *  which is every install by default, because every call it makes spends a
    *  credit against a plan the operator pays for. */
   marketCaps: MarketCapService | null;
+  /** Records every liquidation print from every wired venue and builds the
+   *  pair-percentile table `GET /api/hub/liq-percentiles` serves. */
+  liq: LiqService;
   /** The dedicated candle-signing key. Exposed so main.ts can print its PUBLIC
    *  half at startup; it never yields private material to anyone. */
   candleKey: CandleKeyStore;
@@ -200,6 +204,9 @@ export interface HubDeps {
   marketCapHttp?: HttpLike;
   /** The venues' own public endpoints, for the instrument catalogues. */
   marketCapVenueFetch?: CandleServiceDeps["fetchLike"];
+  /** Injectable so liquidation-stream tests never touch the network — REST
+   *  symbol rosters, OKX ctVals, Binance coin-M contract sizes. */
+  liqFetch?: LiqFetchLike;
   marketCapSleep?: (ms: number) => Promise<void>;
   marketCapNow?: () => number;
   /** Injectable machine-lease clock/entropy for hermetic replay/clock tests. */
@@ -418,6 +425,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return null;
     }
   })();
+  // ── the liquidation recorder + pair-percentile table ─────────────────────
+  // Off by env only (`liqRecord`, default ON — recording costs disk, never a
+  // paid credit, and every source is WS-only with no history endpoint
+  // anywhere, so a print not captured the instant it prints is gone for
+  // good). Started at `listen()`, stopped at `close()`, same as `candles`
+  // and `marketCaps` above.
+  const liq = new LiqService(cfg.liqService ?? { ...DEFAULT_LIQ_SERVICE_CONFIG, dataDir: cfg.dataDir, sources: [] }, {
+    fetchLike: deps.liqFetch,
+    log: (msg) => console.log(msg),
+  });
 
   let upgradeStartedAt = 0;
   let sourceProbeCache: { readonly atMs: number; readonly runtimeKey: string; readonly source: ReturnType<typeof probeSourceCheckout> } | null = null;
@@ -452,7 +469,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   function isGeneralRateLimitedRoute(m: string, p: string): boolean {
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
-        || p === "/api/billing/plans" || p === "/billing") return true;
+        || p === "/api/billing/plans" || p === "/billing"
+        || p === "/api/hub/liq-percentiles") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
     }
@@ -521,6 +539,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // install can also host a gallery (LIQHUNTER_HUB_KEY with no URL), and
     // keeping one wire contract means the two are interchangeable and an
     // operator can move between them without upgrading every install.
+    if (m === "GET" && p === "/api/hub/liq-percentiles") return liqPercentiles(req, url, res);
     if (m === "GET" && p === "/api/hub/strategies") return communityList(req, url, res);
     if (m === "POST" && p === "/api/hub/strategies/publish") return communityPublish(req, url, res);
     if (m === "POST" && p === "/api/hub/strategies/vote") return communityVote(req, url, res);
@@ -800,6 +819,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const who = communityLicense(req, url, res);
     if (!who) return;
     sendJson(res, 200, { ok: true, strategies: community.list(who.id) });
+  }
+
+  // ── liquidation-size percentile table ────────────────────────────────────
+  // Same auth as the community gallery (`communityLicense` — a valid,
+  // unrevoked licence, read from `x-license` or `?key=`); every bot that can
+  // reach `/api/hub/strategies` can reach this. `table: null` with a 200 is
+  // the honest answer for a hub that has not built one yet — a client asking
+  // `ok` first (as this contract requires) tells that apart from an empty
+  // table, and `never a 200 that looks like data when there is none` is the
+  // rule the candle seed and market-cap snapshot both already keep; this
+  // route differs from those on purpose because a NEW hub's table is
+  // genuinely empty for its first minute, not an error.
+  function liqPercentiles(req: IncomingMessage, url: URL, res: ServerResponse): void {
+    const who = communityLicense(req, url, res);
+    if (!who) return;
+    sendJson(res, 200, { ok: true, table: liq.getTable() }, { "cache-control": "no-store" });
   }
 
   async function communityPublish(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
@@ -1645,6 +1680,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         venues: candles.status(),
       });
     }
+    // One-line-per-source liquidation recorder status: which venues are
+    // connected, prints recorded today, how many (source, symbol, side) rows
+    // the percentile table currently covers, and when it last rebuilt.
+    if (m === "GET" && p === "/admin/api/liq") {
+      return sendJson(res, 200, { ok: true, recording: cfg.liqRecord ?? true, ...liq.status() });
+    }
     if (m === "GET" && p === "/admin/api/feedback/detail") {
       const id = url.searchParams.get("id") ?? "";
       if (!id) return sendJson(res, 400, { ok: false, error: "feedback id is required" });
@@ -1905,6 +1946,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     store,
     candles,
     marketCaps,
+    liq,
     candleKey,
     licenseLeases,
     billing,
@@ -1921,6 +1963,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           // is actually serving, so a hub that cannot bind never spends a
           // credit.
           marketCaps?.start();
+          // Same rule again: sockets to six liquidation feeds only open once
+          // the hub is actually serving. `HUB_LIQ_RECORD=0` is the operator's
+          // full off switch — the service still exists (so the route answers
+          // `table: null` rather than 500) but records nothing.
+          if (cfg.liqRecord ?? true) liq.start();
           resolve((server.address() as AddressInfo).port);
         });
       }),
@@ -1928,6 +1975,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       new Promise<void>((resolve, reject) => {
         candles.stop();
         marketCaps?.stop();
+        liq.stop();
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),

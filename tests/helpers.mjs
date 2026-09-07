@@ -87,6 +87,7 @@ export async function freshHub(overrides = {}, deps = undefined) {
     hub,
     store,
     candles: hub.candles,
+    liq: hub.liq,
     cfg,
     dataDir,
     releasesDir,
