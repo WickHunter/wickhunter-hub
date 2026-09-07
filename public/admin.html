@@ -427,6 +427,18 @@
      nobody wrote down verifies nowhere while looking perfectly healthy here. -->
 <div id="mckey"><div class="muted">loading…</div></div>
 <div id="mcbody"><div class="muted">loading…</div></div>
+
+<h1 style="margin-top:2.2rem">Liquidations <small>— every print recorded, the pair-percentile table bots fetch</small></h1>
+<div class="actions">
+  <button type="button" id="lqRefresh">Refresh</button>
+  <span id="lqMeta" class="muted"></span>
+</div>
+<!-- v0.4.18 — the liquidation recorder feeds the pair-side size-percentile
+     table the bot's "Pair percentile" liq-size gate downloads. A source that
+     is off says OFF; a source that is connected but has recorded nothing says
+     so in its note — zeroes alone would read like a healthy feed on a quiet
+     market, which is the opposite diagnosis. -->
+<div id="lqbody"><div class="muted">loading…</div></div>
 </section>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
@@ -495,6 +507,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   mktProvidersRefresh();
   cdRefresh();
   mcRefresh();
+  lqRefresh();
   fbRefresh();
   billingConfigRefresh();
   billingCustomersRefresh();
@@ -762,7 +775,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); lqRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -792,7 +805,7 @@ document.getElementById("upgradeHub").onclick = async () => {
     } else if (up && up.state === "succeeded" && (!beforeCommit || (h.build && h.build.commit !== beforeCommit) || up.completedAtMs >= t0)) {
       clearInterval(poll);
       note.textContent = "Hub upgrade verified: v" + beforeVersion + " → v" + h.version + ", commit " + ((h.build && h.build.commit) ? h.build.commit.slice(0, 12) : "unknown") + ".";
-      refresh(); opsRefresh(); mktRefresh(); cdRefresh(); mcRefresh(); fbRefresh();
+      refresh(); opsRefresh(); mktRefresh(); cdRefresh(); mcRefresh(); lqRefresh(); fbRefresh();
     } else if (Date.now() - t0 > 120000) {
       clearInterval(poll);
       err.textContent = "The Hub has not recorded success after 2 minutes. The exact source/runtime comparison and log tail below show where it stopped.";
@@ -1392,6 +1405,41 @@ async function cdRefresh() {
   }
 }
 document.getElementById("cdRefresh").onclick = cdRefresh;
+
+// ── liquidations ──────────────────────────────────────────────────────────
+async function lqRefresh() {
+  const err = document.getElementById("err");
+  let data;
+  try { data = await api("/admin/api/liq"); }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+  const meta = document.getElementById("lqMeta");
+  const body = document.getElementById("lqbody");
+  if (!data.recording) {
+    meta.textContent = "recording is OFF (HUB_LIQ_RECORD=0) — nothing is written and the table is not rebuilt";
+  } else {
+    meta.textContent = data.eventsToday.toLocaleString() + " prints today · " + data.pairSides.toLocaleString()
+      + " pair-sides in the table · " + (data.lastRebuildAtMs ? "table rebuilt " + ago(data.lastRebuildAtMs) : "table not built yet");
+  }
+  const sources = data.sources || [];
+  if (!sources.length) {
+    body.innerHTML = '<div class="noconf">No liquidation source is configured, so the hub records nothing and <code>/api/hub/liq-percentiles</code> answers an empty table. Set <code>HUB_LIQ_SOURCES</code> (or leave it unset for every source).</div>';
+    return;
+  }
+  let html = "";
+  for (const s of sources) {
+    const state = s.state === "live" ? "running" : s.state === "connecting" ? "starting" : "off";
+    const label = s.state === "live" ? "LIVE" : s.state === "connecting" ? "CONNECTING" : "OFF";
+    html += '<div class="venue"><h2><span class="id">' + esc(s.label || s.id) + '</span>'
+      + '<span class="vstate v-' + state + '">' + label + "</span></h2>"
+      + "<dl><dt>Source</dt><dd><code>" + esc(s.id) + "</code> · " + esc(s.group) + "</dd>"
+      + "<dt>Prints since start</dt><dd>" + Number(s.events || 0).toLocaleString() + "</dd>"
+      + "<dt>Last print</dt><dd>" + (s.lastEventAt ? ago(s.lastEventAt) : "none yet") + "</dd>"
+      + (s.note ? '<dt>Note</dt><dd>' + esc(s.note) + "</dd>" : "")
+      + "</dl></div>";
+  }
+  body.innerHTML = html;
+}
+document.getElementById("lqRefresh").onclick = lqRefresh;
 
 // ── feedback ────────────────────────────────────────────────────────────────
 let fbReports = [];

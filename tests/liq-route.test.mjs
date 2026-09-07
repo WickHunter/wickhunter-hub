@@ -116,4 +116,18 @@ await test("a corrupt snapshot file is dropped silently, never thrown, and the s
   assert.equal(svc.getTable(), null, "a corrupt file is dropped, never trusted");
 });
 
+
+// v0.4.19 — the admin console's Market data page has a Liquidations card that
+// reads /admin/api/liq; without it the recorder was invisible from the UI.
+await test("the admin page renders the liquidation status card from /admin/api/liq", async () => {
+  const { readFileSync } = await import("node:fs");
+  const html = readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
+  const start = html.indexOf('data-hub-page-panel="market-data"');
+  const panel = html.slice(start, html.indexOf("</section>", start));
+  assert.ok(panel.includes('id="lqbody"') && panel.includes('id="lqRefresh"'), "the Liquidations card lives on the Market data page");
+  assert.ok(/api\("\/admin\/api\/liq"\)/.test(html), "the card reads /admin/api/liq");
+  assert.ok(/lqRefresh\(\);/.test(html.slice(html.indexOf("cdRefresh();"), html.indexOf("cdRefresh();") + 400)), "the page-load refresh includes the card");
+  assert.ok(html.includes("recording is OFF (HUB_LIQ_RECORD=0)"), "recording off is said, not shown as zeroes");
+});
+
 summary("liq-route");
