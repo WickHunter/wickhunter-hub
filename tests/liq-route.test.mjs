@@ -51,7 +51,7 @@ await test("a built table is served whole, with Cache-Control: no-store", async 
   h.liq.history.record({ ts: now, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 12_345 });
   h.liq.history.record({ ts: now, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 22_000 });
   h.liq.history.flush();
-  h.liq.rebuildNow();
+  await h.liq.rebuildNow();
 
   const alice = h.store.issue("Alice", 30);
   const res = await jsonReq(`${h.origin}/api/hub/liq-percentiles`, { headers: { "x-license": alice.token } });
@@ -73,7 +73,7 @@ await test("GET /admin/api/liq is admin-gated and reports source status, events 
   const now = Date.now();
   h.liq.history.record({ ts: now, src: "bybit-usdt", symbol: "ETHUSDT", side: "short", sizeUsd: 5_000 });
   h.liq.history.flush();
-  h.liq.rebuildNow();
+  await h.liq.rebuildNow();
 
   const res = await jsonReq(`${h.origin}/admin/api/liq`, { headers: { "x-hub-admin": h.cfg.adminToken } });
   assert.equal(res.status, 200);
@@ -89,13 +89,13 @@ await test("GET /admin/api/liq is admin-gated and reports source status, events 
 
 // ── LiqService persistence across a restart ─────────────────────────────────
 
-await test("a built table survives a restart via the persisted snapshot, and is served immediately", () => {
+await test("a built table survives a restart via the persisted snapshot, and is served immediately", async () => {
   const dataDir = tmpDir("liq-service-persist");
   const cfg = { ...DEFAULT_LIQ_SERVICE_CONFIG, dataDir, sources: [] };
   const svc1 = new LiqService(cfg);
   svc1.history.record({ ts: Date.now(), src: "okx-usdt", symbol: "SOLUSDT", side: "long", sizeUsd: 9_999 });
   svc1.history.flush();
-  svc1.rebuildNow();
+  await svc1.rebuildNow();
   assert.equal(svc1.getTable().rows["okx-usdt"]["SOLUSDT"]["long"].count, 1);
 
   // A FRESH service over the SAME dataDir, never started — the constructor's
