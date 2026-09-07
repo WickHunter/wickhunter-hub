@@ -290,8 +290,24 @@ export class LiqStreamRunner {
   }
 
   private handleBybitMessage(id: "bybit-usdt" | "bybit-usdc" | "bybit-inverse", data: string): void {
-    let m: { topic?: unknown; data?: unknown };
+    let m: { topic?: unknown; data?: unknown; op?: unknown; success?: unknown; ret_msg?: unknown };
     try { m = JSON.parse(data); } catch { return; }
+    // v0.4.21 — THE VENUE'S OWN ANSWER TO THE SUBSCRIBE IS RECORDED. A
+    // refused `allLiquidation.*` subscription used to be an unread frame on
+    // an open socket, so a source could sit at "LIVE · 0 prints" for ever
+    // and look exactly like a quiet market. The ack (or the refusal, in the
+    // venue's own words) rides the source's note on the admin card.
+    if (m?.op === "subscribe") {
+      const roster = this.bybitRoster.get(id) ?? [];
+      if (m.success === false) {
+        const why = String(m.ret_msg ?? "no reason given");
+        this.notes.set(id, `${roster.length} perp(s) requested · subscribe REFUSED: ${why}`);
+        this.deps.log?.(`[liq] ${id}: subscribe refused — ${why}`);
+      } else if (m.success === true) {
+        this.notes.set(id, `${roster.length} perp(s) subscribed · acknowledged`);
+      }
+      return;
+    }
     const topic = String(m?.topic ?? "");
     if (!topic.startsWith("allLiquidation.") || !Array.isArray(m.data)) return;
     for (const row of m.data) this.push(normalizeBybitLiq(row, id));

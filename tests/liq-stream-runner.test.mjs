@@ -96,6 +96,24 @@ await test("a bybit source ignores a Trading=false or non-perpetual row", async 
   r.stop();
 });
 
+await test("v0.4.21 — a bybit subscribe ack or refusal rides the source note, in the venue's own words", async () => {
+  const { factory, made } = fakeSockets();
+  const fetchLike = fakeFetch([{ test: () => true, body: bybitInstruments([bybitRow("BTCPERP", "USDC")]) }]);
+  const logs = [];
+  const r = new LiqStreamRunner(baseCfg({ sources: ["bybit-usdc"] }), { emit: () => {}, fetchLike, socket: factory, log: (l) => logs.push(l) });
+  r.start();
+  await settle();
+  made[0].h.onOpen();
+  const noteOf = () => r.status().find((s) => s.id === "bybit-usdc").note;
+  assert.equal(noteOf(), "1 perp(s) subscribed");
+  made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: false, ret_msg: "Invalid topic allLiquidation.BTCPERP", conn_id: "x" }));
+  assert.equal(noteOf(), "1 perp(s) requested · subscribe REFUSED: Invalid topic allLiquidation.BTCPERP");
+  assert.ok(logs.some((l) => l.includes("bybit-usdc: subscribe refused")), "the refusal is logged");
+  made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: true, ret_msg: "", conn_id: "x" }));
+  assert.equal(noteOf(), "1 perp(s) subscribed · acknowledged");
+  r.stop();
+});
+
 await test("a bybit liquidation frame reaches emit() through the normalizer, and unrelated topics are ignored", async () => {
   const { factory, made } = fakeSockets();
   const fetchLike = fakeFetch([{ test: () => true, body: bybitInstruments([bybitRow("BTCUSDT", "USDT")]) }]);
