@@ -808,6 +808,85 @@ to an `ambiguous` row, which is refused rather than guessed at because guessing
 attaches one coin's market cap to another coin's book while every screen looks
 perfectly healthy.
 
+## Liquidation percentile feed (v0.4.18)
+
+The Hub records every liquidation print from every source the bot itself
+listens to (`src/liq/sources.ts` — the same eight `LiqSourceId`s as the bot's
+own `LIQ_SOURCE_IDS`: `bybit-usdt`, `bybit-usdc`, `bybit-inverse`,
+`binance-usdt`, `binance-inverse`, `okx-usdt`, `okx-usdc`, `okx-inverse`) and
+serves a pair-percentile size table so a fresh install has a starting point
+before it has recorded anything of its own ("users might not have any data to
+start").
+
+**Six physical connections cover eight sources.** Bybit's `allLiquidation.{symbol}`
+is per-symbol and chunked at a 500-topic cap, so USDT/USDC perps (Bybit's
+`linear` category, filtered client-side by quote) and inverse perps (its own
+category and its own websocket host) are three independently-rostered
+connections, each refreshing its symbol list every six hours. Binance's
+USDT-M and coin-M feeds are two dedicated all-market `!forceOrder@arr`
+streams — one socket each, no subscription needed, the URL itself is the
+feed. OKX's one `liquidation-orders` channel carries every quote at once and
+is split into the three `okx-*` sources by each print's own instrument;
+`ctVal` (needed for notional) is loaded from OKX's public instruments
+endpoint and refreshed every six hours — **an event with no `ctVal` on file is
+DROPPED, never guessed at ×1**, matching the bot's own rule.
+
+Connection mechanics (chunking, jittered exponential reconnect/backoff,
+protocol ping) are `src/net/socket-pool.ts` — the SAME class the candle
+collector's websocket tail (`src/candles/stream-runner.ts`) uses, so there is
+exactly one reconnect implementation in this repo rather than two written
+against two wire protocols.
+
+**Recording** (`src/liq/history.ts`) is one JSONL file per UTC day under
+`data/liq-history/`, rows `{ts, src, symbol, side, price, sizeUsd}` (`symbol`
+is the venue-NATIVE spelling — a percentile table is joined by (source, native
+symbol, side), exactly what a bot's own trade history is keyed under),
+buffered and flushed every two seconds, retained 60 days.
+
+**The table** (`src/liq/percentiles.ts`) is a byte-for-byte port of the bot's
+own `src/liq/size-percentiles.ts` (`buildLiqSizePercentiles`): 30-day window,
+the newest 1,000 prints per (source, symbol, side), stops `[50,75,90,95,99]`,
+nearest-rank with interpolation between stored stops. Rebuilt once at boot and
+hourly thereafter, reading day files newest-first with a per-key cap applied
+AS ROWS ARE READ so a hyperactive pair's cost never grows past its own cap
+while a quiet pair's whole window is still being read; a day file entirely
+older than the window is never opened. The built table is persisted to
+`data/liq-percentiles.json` so a restart serves the last table immediately
+rather than waiting out the first rebuild.
+
+`GET /api/hub/liq-percentiles` (same `communityLicense` auth as the community
+gallery — `x-license` header or `?key=`) answers `{ok:true, table}`, where
+`table` is `null` (still `200`) for a hub that has recorded nothing yet.
+`GET /admin/api/liq` (`x-hub-admin`) reports per-source connection state,
+today's recorded event count, how many (source,symbol,side) rows the table
+covers, and when it last rebuilt.
+
+Env, all optional (`/etc/wickhunter-hub/env`):
+
+```
+HUB_LIQ_RECORD=1                    # default ON — "=0" is the full off switch
+HUB_LIQ_SOURCES=                    # comma list of the 8 source ids; empty = all
+HUB_LIQ_RETENTION_DAYS=60
+HUB_LIQ_WINDOW_DAYS=30
+HUB_LIQ_MAX_PRINTS=1000
+HUB_LIQ_REBUILD_MS=3600000          # 1h
+HUB_LIQ_FLUSH_MS=2000
+HUB_LIQ_PRUNE_MS=3600000            # 1h
+HUB_LIQ_ROSTER_REFRESH_MS=21600000  # 6h — bybit symbol rosters, OKX ctVals, binance coin-M contract sizes
+HUB_LIQ_BYBIT_LINEAR_WS / HUB_LIQ_BYBIT_INVERSE_WS / HUB_LIQ_BYBIT_REST
+HUB_LIQ_BINANCE_FWS / HUB_LIQ_BINANCE_DWS / HUB_LIQ_BINANCE_DAPI
+HUB_LIQ_OKX_WS / HUB_LIQ_OKX_REST
+```
+
+`HUB_LIQ_RECORD` defaults ON, unlike the candle collectors and the market-cap
+producer: every source here is WS-only with **no history endpoint anywhere**,
+so a print not recorded the instant it prints is gone for good — recording
+costs disk, never a paid credit, so there is no reason to default it off. A
+hand-built `HubConfig` (every test, most tools) that omits `liqService`
+entirely gets the safe no-network default (`sources: []`) rather than this
+production default — see `src/config.ts`'s own convention for every optional
+field here.
+
 ## License format v1 (pinned)
 
 ```
@@ -1338,6 +1417,8 @@ anywhere private is enough; everything else is reproducible.
 | `POST /admin/api/marketplace-providers/:id/decision` | `x-hub-admin`, fixed CSRF header, JSON | written-reason provider approval/rejection/suspension through the private audited service |
 | `GET /admin/api/candles` | `x-hub-admin` header | per-exchange collector status + the seed signing key's PUBLIC half |
 | `GET /admin/api/market-caps` | `x-hub-admin` header | market-cap producer health, credit spend and refusals |
+| `GET /api/hub/liq-percentiles` | valid token (`x-license` / `?key=`) | pair-percentile liquidation-size table (contract: the bot's own `LiqSizePercentileTable`); `table:null` when nothing has been built yet |
+| `GET /admin/api/liq` | `x-hub-admin` header | per-source connection status, events recorded today, pair-sides covered, last rebuild |
 
 License keys travel in query strings by design (curl-pasteable); the hub never
 logs a URL's query, and the shipped nginx snippet sets `access_log off` for
@@ -1355,6 +1436,64 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.18 — **The Hub now records every liquidation print from every source
+  the bot itself listens to, and serves a pair-percentile size table.**
+  Operator: "Push to the hub. Should record liq events from all sources we
+  have." Eight sources across six physical connections — Bybit
+  `allLiquidation.{symbol}` for USDT/USDC (chunked at 500 topics, filtered by
+  quote off the shared `linear` category) and inverse (its own category and
+  host); Binance's two dedicated `!forceOrder@arr` all-market streams
+  (USDT-M, coin-M); OKX's one `liquidation-orders` channel, split into three
+  sources by each print's own quote, with `ctVal` loaded from its public
+  instruments endpoint and an event DROPPED (never guessed at ×1) until that
+  table has loaded. `src/net/socket-pool.ts` is a NEW extraction out of
+  `candles/stream-runner.ts` (chunking, jittered exponential reconnect,
+  protocol ping) — the candle websocket tail was refactored onto it with
+  BYTE-IDENTICAL behaviour (its own 13-check suite is unchanged and green)
+  so there is exactly one reconnect implementation serving both the candle
+  and the liquidation feeds rather than two that could drift apart.
+  `src/liq/history.ts` is one JSONL day file per UTC day under
+  `data/liq-history/` (`{ts,src,symbol,side,price,sizeUsd}`, `symbol` the
+  venue-NATIVE spelling), buffered and flushed every 2s, retained 60 days.
+  `src/liq/percentiles.ts` is a byte-for-byte port of the bot's own
+  `src/liq/size-percentiles.ts` (`buildLiqSizePercentiles`) — proved
+  byte-identical against the bot repo's own compiled module on a shared
+  fixture in `tests/liq-percentiles.test.mjs`, so the wire contract this hub
+  serves needs no translation on the bot's side. Rebuilt once at boot and
+  hourly, reading day files newest-first with a per-(source,symbol,side) cap
+  applied as rows are read so a busy pair's cost never grows past its own
+  cap; persisted to `data/liq-percentiles.json` so a restart serves the last
+  table immediately. `GET /api/hub/liq-percentiles` (the SAME
+  `communityLicense` auth as the community gallery) answers
+  `{ok:true, table}`, `table:null` for a hub that has recorded nothing yet
+  — never an empty-looking table standing in for "not built". `GET
+  /admin/api/liq` reports per-source connection status, events recorded
+  today, pair-sides covered and the last rebuild time, alongside the
+  existing `/admin/api/candles` and `/admin/api/market-caps` cards.
+  `HUB_LIQ_RECORD` defaults ON (unlike the candle collectors and the
+  market-cap producer): every source here is WS-only with no history
+  endpoint anywhere on any of them, so a print not recorded the instant it
+  prints is gone for good, and recording costs disk rather than a paid
+  credit. A hand-built `HubConfig` (every test, most tools) that omits the
+  new `liqService` field gets the safe no-network default (`sources: []`),
+  matching `candleVenues: []`'s meaning everywhere else in this hub — the
+  "an unset env means record everything" translation happens exactly once,
+  in `src/liq/config.ts`. New suites: `tests/liq-sources.test.mjs` (the
+  three normalizers against the bot's own captured fixtures),
+  `tests/liq-history.test.mjs` (day rollover, buffered flush, retention,
+  a torn final line), `tests/liq-percentiles.test.mjs` (the table builder,
+  the bot-parity check, the day-walk cap), `tests/liq-stream-runner.test.mjs`
+  (chunking, the ctVal/contract-size gates, source filtering, reconnect via
+  a hand-driven fake socket), `tests/liq-route.test.mjs` (auth, `table:null`,
+  a served table, the admin status route, snapshot persistence across a
+  restart). ⚠ Not field-verified from this build environment: this box is
+  geo-blocked from Bybit (the same limitation the candle collector's own
+  header already records), so the Bybit `allLiquidation` wire shape here is
+  taken from the bot's own already-live client and its existing test
+  fixtures, never a fresh probe. Binance and OKX shapes are taken the same
+  way from the bot's `src/liq/hub.ts`, which the bot's own header records as
+  live-verified there.
 
 - v0.4.17 — **Hardening the Hub itself: rate limits, admin-auth backoff, a
   hardened deployment profile, and a key custody checklist — additive
