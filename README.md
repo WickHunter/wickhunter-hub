@@ -1437,6 +1437,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.19 — **The admin console shows the liquidation recorder.** Market data → Liquidations: each source's state (LIVE / CONNECTING / OFF), prints since start and last print, plus prints today, pair-sides in the table and the last rebuild — the card reads `/admin/api/liq`, which v0.4.18 added without a screen for it. Recording switched off says so instead of showing zeroes.
 - v0.4.18 — **The Hub now records every liquidation print from every source
   the bot itself listens to, and serves a pair-percentile size table.**
   Operator: "Push to the hub. Should record liq events from all sources we
