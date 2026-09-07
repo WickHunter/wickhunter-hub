@@ -7,7 +7,8 @@
 // day file downloaded from here reads identically to one an install wrote
 // itself and the percentile builder in `percentiles.ts` is the same function
 // either way.
-import { readdirSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, existsSync, statSync, createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import { appendJsonl } from "../jsonfile.js";
 import type { LiqSourceId } from "./sources.js";
@@ -44,7 +45,52 @@ export class LiqHistory {
    *  down with it. */
   record(e: LiqHistoryEvent): void {
     this.buf.push(e);
+    const day = dayOf(e.ts);
+    if (day !== this.todayKey) { this.todayKey = day; this.todayCount = 0; }
+    this.todayCount++;
     if (this.buf.length >= FLUSH_AT_ROWS) this.flush();
+  }
+
+  private todayKey = "";
+  private todayCount = 0;
+  /** v0.4.20 — prints recorded today BY THIS PROCESS, counted as they arrive.
+   *  `days()` answers the same question by reading every day file in full,
+   *  which the status card was doing on every request. */
+  recordedToday(now = Date.now()): number { return dayOf(now) === this.todayKey ? this.todayCount : 0; }
+
+  /** v0.4.20 — THE CHEAP LISTING: day and byte size from `stat`, never a
+   *  read. `days()` reads every file in full to count lines — an admin card
+   *  may ask that on demand; the table builder must not, and did: on a box
+   *  with 60 days of every print from every source that was gigabytes of
+   *  JSON on the event loop at boot (the bot shipped the same shape in
+   *  v0.90.44 and stalled the operator's install). */
+  dayFiles(): Array<{ day: string; bytes: number }> {
+    let files: string[] = [];
+    try { files = readdirSync(this.dir); } catch { return []; }
+    const out: Array<{ day: string; bytes: number }> = [];
+    for (const f of files) {
+      const m = DAY_RE.exec(f);
+      if (!m) continue;
+      try { out.push({ day: m[1], bytes: statSync(path.join(this.dir, f)).size }); } catch { /* skip unreadable */ }
+    }
+    return out.sort((a, b) => (a.day < b.day ? 1 : -1));
+  }
+
+  /** v0.4.20 — one day's events as a stream, a line at a time, so a large
+   *  day is never one string, one split and a million objects at once, and
+   *  the event loop breathes between chunks. Malformed lines skip. */
+  async *readLines(day: string): AsyncGenerator<LiqHistoryEvent> {
+    const p = path.join(this.dir, `${day}.jsonl`);
+    if (!existsSync(p)) return;
+    const rl = createInterface({ input: createReadStream(p, { encoding: "utf8" }), crlfDelay: Infinity });
+    try {
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        let e: LiqHistoryEvent | null = null;
+        try { e = JSON.parse(line); } catch { continue; }
+        if (e) yield e;
+      }
+    } finally { rl.close(); }
   }
 
   /** Write every buffered row, grouped by UTC day, through the shared

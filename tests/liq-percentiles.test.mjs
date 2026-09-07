@@ -129,7 +129,7 @@ await test("liqPercentileTableLooksValid refuses a malformed shape", () => {
 
 // ── rebuildLiqPercentileTable: the day-walk, newest-first, per-key cap ─────
 
-await test("rebuildLiqPercentileTable reads day files newest-first and caps ingestion per (src,symbol,side) AS ROWS ARE READ", () => {
+await test("rebuildLiqPercentileTable reads day files newest-first and caps ingestion per (src,symbol,side) AS ROWS ARE READ", async () => {
   const dir = tmpDir("liq-pctl-rebuild");
   const history = new LiqHistory(dir, 60);
   const now = Date.parse("2026-09-07T00:00:00Z");
@@ -148,12 +148,12 @@ await test("rebuildLiqPercentileTable reads day files newest-first and caps inge
   history.flush();
   assert.equal(history.days().length, 3);
 
-  const table = rebuildLiqPercentileTable(history, { now, maxPrints: 1_000, days: 30 });
+  const table = await rebuildLiqPercentileTable(history, { now, maxPrints: 1_000, days: 30 });
   const row = table.rows["bybit-usdt"]["BTCUSDT"]["long"];
   assert.equal(row.count, 1_000, "capped at the newest 1,000 prints for this key");
 });
 
-await test("rebuildLiqPercentileTable never opens a day file entirely older than the window", () => {
+await test("rebuildLiqPercentileTable never opens a day file entirely older than the window", async () => {
   const dir = tmpDir("liq-pctl-rebuild-bound");
   const history = new LiqHistory(dir, 60);
   const DAY = 86_400_000;
@@ -162,12 +162,12 @@ await test("rebuildLiqPercentileTable never opens a day file entirely older than
   history.record({ ts: now - 1 * DAY, src: "bybit-usdt", symbol: "NEWUSDT", side: "long", sizeUsd: 1_000 });
   history.flush();
 
-  const table = rebuildLiqPercentileTable(history, { now, days: 30 });
+  const table = await rebuildLiqPercentileTable(history, { now, days: 30 });
   assert.ok(table.rows["bybit-usdt"]?.["NEWUSDT"], "the in-window pair is present");
   assert.ok(!table.rows["bybit-usdt"]?.["OLDUSDT"], "the pair whose only day file is outside the window is absent");
 });
 
-await test("rebuildLiqPercentileTable and buildLiqSizePercentiles agree on a shared fixture (same function, different entry)", () => {
+await test("rebuildLiqPercentileTable and buildLiqSizePercentiles agree on a shared fixture (same function, different entry)", async () => {
   const dir = tmpDir("liq-pctl-agree");
   const history = new LiqHistory(dir, 60);
   const now = Date.parse("2026-09-07T00:00:00Z");
@@ -178,7 +178,7 @@ await test("rebuildLiqPercentileTable and buildLiqSizePercentiles agree on a sha
     history.record(r);
   }
   history.flush();
-  const viaHistory = rebuildLiqPercentileTable(history, { now, days: 30 });
+  const viaHistory = await rebuildLiqPercentileTable(history, { now, days: 30 });
   const viaRows = buildLiqSizePercentiles(rows, { now, days: 30 });
   assert.deepEqual(viaHistory.rows, viaRows.rows);
 });

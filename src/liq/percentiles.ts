@@ -137,31 +137,42 @@ export function buildLiqSizePercentiles(
  *  older than the window are never opened at all. Mirrors the bot's own
  *  `LiqSizePercentileStore.rebuildLocal` exactly, applied here to the hub's
  *  install-wide archive instead of one process's local history. */
-export function rebuildLiqPercentileTable(
-  history: Pick<LiqHistory, "days" | "read">,
+export async function rebuildLiqPercentileTable(
+  history: Pick<LiqHistory, "dayFiles" | "readLines">,
   opts: { days?: number; maxPrints?: number; now?: number } = {},
-): LiqSizePercentileTable {
+): Promise<LiqSizePercentileTable> {
+  // v0.4.20 — STREAMED. Day files newest-first off the `stat` listing, each
+  // read a line at a time; a per-(src,symbol,side) reservoir keeps the newest
+  // `maxPrints` and stops collecting a key once a newer day has filled it.
+  // Day files entirely older than the window are never opened.
   const now = opts.now ?? Date.now();
   const days = opts.days ?? LIQ_PCTL_WINDOW_DAYS;
   const maxPrints = opts.maxPrints ?? LIQ_PCTL_MAX_PRINTS;
   const cutoff = now - days * 86_400_000;
-  const counts = new Map<string, number>();
-  const rows: LiqSizeSample[] = [];
-  for (const d of history.days()) {
+  const kept = new Map<string, LiqSizeSample[]>(); // newest-first per key
+  for (const d of history.dayFiles()) {
     const dayStart = Date.parse(`${d.day}T00:00:00Z`);
     if (!Number.isFinite(dayStart) || dayStart + 86_400_000 < cutoff) break; // older than the window — nothing further matters
-    const events = history.read(d.day);
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
+    const dayRows = new Map<string, LiqSizeSample[]>(); // oldest-first, as written
+    for await (const e of history.readLines(d.day)) {
       if (!(e.ts >= cutoff && e.ts <= now)) continue;
       if (e.side !== "long" && e.side !== "short") continue;
-      const key = `${e.src && String(e.src).trim() ? e.src : DEFAULT_SRC}|${e.symbol}|${e.side}`;
-      const c = counts.get(key) ?? 0;
-      if (c >= maxPrints) continue; // already holding this key's newest `maxPrints`
-      counts.set(key, c + 1);
-      rows.push(e);
+      if (!(Number(e.sizeUsd) > 0)) continue;
+      const src = e.src && String(e.src).trim() ? e.src : DEFAULT_SRC;
+      const key = `${src}|${e.symbol}|${e.side}`;
+      if ((kept.get(key)?.length ?? 0) >= maxPrints) continue; // a newer day already filled this key
+      let arr = dayRows.get(key);
+      if (!arr) { arr = []; dayRows.set(key, arr); }
+      arr.push({ ts: e.ts, symbol: e.symbol, side: e.side, sizeUsd: e.sizeUsd, src });
+    }
+    for (const [key, arr] of dayRows) {
+      let k = kept.get(key);
+      if (!k) { k = []; kept.set(key, k); }
+      for (let i = arr.length - 1; i >= 0 && k.length < maxPrints; i--) k.push(arr[i]!);
     }
   }
+  const rows: LiqSizeSample[] = [];
+  for (const k of kept.values()) rows.push(...k);
   return buildLiqSizePercentiles(rows, { days, now, maxPrints });
 }
 

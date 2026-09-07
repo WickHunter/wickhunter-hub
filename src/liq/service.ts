@@ -71,6 +71,9 @@ export interface LiqServiceDeps {
 const SNAPSHOT_FORMAT = 1;
 interface LiqTableSnapshot { format: number; table: LiqSizePercentileTable; builtAtMs: number; }
 
+/** v0.4.20 — how long after boot the first percentile rebuild runs. */
+export const LIQ_BOOT_REBUILD_DELAY_MS = 60_000;
+
 export class LiqService {
   readonly history: LiqHistory;
   private readonly stream: LiqStreamRunner;
@@ -124,26 +127,33 @@ export class LiqService {
     } catch (e) { this.log(`[liq] could not persist the percentile snapshot: ${(e as Error).message}`); }
   }
 
-  private rebuild(): void {
+  private rebuilding = false;
+  private async rebuild(): Promise<void> {
+    if (this.rebuilding) return; // an hourly tick never overlaps a run still walking the archive
+    this.rebuilding = true;
     try {
-      this.table = rebuildLiqPercentileTable(this.history, { days: this.cfg.windowDays, maxPrints: this.cfg.maxPrints, now: this.now() });
+      this.table = await rebuildLiqPercentileTable(this.history, { days: this.cfg.windowDays, maxPrints: this.cfg.maxPrints, now: this.now() });
       this.lastRebuildAt = this.now();
       this.saveSnapshot();
       this.log(`[liq] percentile table rebuilt: ${countLiqPercentilePairSides(this.table)} pair-side(s)`);
     } catch (e) {
       // A rebuild running on a timer must never take the process down with it.
       this.log(`[liq] percentile rebuild failed: ${(e as Error).message}`);
-    }
+    } finally { this.rebuilding = false; }
   }
 
   start(): void {
     this.stream.start();
-    this.rebuild(); // immediate at boot — a fresh install sees a table within its first minute, not its first hour
+    // v0.4.20 — the first rebuild is DEFERRED, off the boot path (the persisted
+    // snapshot already answers meanwhile): a synchronous walk of a 60-day
+    // archive at boot is what stalled the bot's install in v0.90.44.
+    const first = setTimeout(() => { void this.rebuild(); }, LIQ_BOOT_REBUILD_DELAY_MS);
+    first.unref?.();
     this.flushTimer = setInterval(() => this.history.flush(), Math.max(500, this.cfg.flushMs));
     this.flushTimer.unref?.();
     this.pruneTimer = setInterval(() => { try { this.history.prune(this.now()); } catch { /* best effort */ } }, Math.max(60_000, this.cfg.pruneMs));
     this.pruneTimer.unref?.();
-    this.rebuildTimer = setInterval(() => this.rebuild(), Math.max(60_000, this.cfg.rebuildMs));
+    this.rebuildTimer = setInterval(() => { void this.rebuild(); }, Math.max(60_000, this.cfg.rebuildMs));
     this.rebuildTimer.unref?.();
   }
 
@@ -163,7 +173,7 @@ export class LiqService {
   /** Force an immediate rebuild — the admin surface's "rebuild now" and the
    *  test suite's way to drive one deterministically without waiting out
    *  `rebuildMs`. Same function the boot rebuild and the timer call. */
-  rebuildNow(): void { this.rebuild(); }
+  rebuildNow(): Promise<void> { return this.rebuild(); }
 
   status(): {
     sources: LiqSourceStatus[];
@@ -171,11 +181,9 @@ export class LiqService {
     pairSides: number;
     lastRebuildAtMs: number | null;
   } {
-    const today = new Date(this.now()).toISOString().slice(0, 10);
-    const day = this.history.days().find((d) => d.day === today);
     return {
       sources: this.stream.status(),
-      eventsToday: day?.events ?? 0,
+      eventsToday: this.history.recordedToday(this.now()),
       pairSides: countLiqPercentilePairSides(this.table),
       lastRebuildAtMs: this.lastRebuildAt,
     };
