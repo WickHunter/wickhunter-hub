@@ -106,6 +106,32 @@ await test("a built table survives a restart via the persisted snapshot, and is 
   assert.equal(restored.rows["okx-usdt"]["SOLUSDT"]["long"].count, 1);
 });
 
+await test("prints recorded BEFORE a restart are in the table REBUILT after it, beside the prints recorded after", async () => {
+  // The operator's ask: "making sure the hub uses data pre restart after a
+  // restart". Three things have to hold and this drives all three: the
+  // print reaches DISK (stop() flushes what the timer had not), the fresh
+  // service serves the OLD table at once, and its first rebuild walks the
+  // archive from BEFORE the restart rather than starting the window over.
+  const dataDir = tmpDir("liq-service-restart-archive");
+  const cfg = { ...DEFAULT_LIQ_SERVICE_CONFIG, dataDir, sources: [] };
+  const now = Date.now();
+  const svc1 = new LiqService(cfg);
+  svc1.history.record({ ts: now - 3 * 3_600_000, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 5_000 });
+  svc1.history.record({ ts: now - 2 * 3_600_000, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 7_000 });
+  svc1.stop(); // a clean SIGTERM: the buffered prints must reach the day file with no timer having fired
+  assert.equal(svc1.history.dayFiles().length >= 1 && svc1.history.dayFiles().every((d) => d.bytes > 0), true, "the prints are on disk after stop()");
+
+  const svc2 = new LiqService(cfg);
+  svc2.history.record({ ts: now - 60_000, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 9_000 });
+  svc2.history.flush();
+  await svc2.rebuildNow();
+  const row = svc2.getTable().rows["bybit-usdt"]["BTCUSDT"]["long"];
+  assert.equal(row.count, 3, "two pre-restart prints plus one post-restart print rank together");
+  assert.equal(row.usd[99], 9_000);
+  assert.equal(row.usd[20], 5_000, "the oldest pre-restart print is the 20th percentile of the three");
+  svc2.stop();
+});
+
 await test("a corrupt snapshot file is dropped silently, never thrown, and the service still boots", () => {
   const dataDir = tmpDir("liq-service-corrupt");
   fs.mkdirSync(dataDir, { recursive: true });
