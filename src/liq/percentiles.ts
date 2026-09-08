@@ -43,9 +43,18 @@ export type LiqPctlStop = (typeof LIQ_PCTL_STOPS)[number];
  *  `LIQ_PCTL_MIN_PRINTS` rule. */
 export const LIQ_PCTL_MIN_PRINTS = 30;
 
-/** At most this many of the NEWEST prints per (source, symbol, side) are
- *  ranked, however many the window actually holds. */
-export const LIQ_PCTL_MAX_PRINTS = 1000;
+/** v0.4.23 — THE GREATER OF 30 DAYS AND 1,000 PRINTS (operator: *"Should we
+ *  do the greater of at least 1000 liq events and 30 days? To make sure to
+ *  have a good sample?"*). Every print inside the window is ranked, however
+ *  many there are; a (source, symbol, side) with FEWER than this many inside
+ *  the window reaches further back, newest first, until it has this many or
+ *  the archive runs out. Until v0.4.22 this was a CAP (the newest 1,000
+ *  inside 30 days — the smaller of the two); it is now a floor the sample is
+ *  brought up to. `LIQ_PCTL_MAX_PRINTS` is kept as an alias for readers of
+ *  the old name. */
+export const LIQ_PCTL_TARGET_PRINTS = 1000;
+/** @deprecated since v0.4.23 — the same number, no longer a cap. */
+export const LIQ_PCTL_MAX_PRINTS = LIQ_PCTL_TARGET_PRINTS;
 
 /** The window every table is built over, in days. */
 export const LIQ_PCTL_WINDOW_DAYS = 30;
@@ -60,6 +69,9 @@ export interface LiqSizePercentileRow {
 
 export interface LiqSizePercentileTable {
   windowDays: number;
+  /** v0.4.23 — the print floor a pair-side is brought up to past the window
+   *  (additive; absent on a table built before it existed). */
+  targetPrints?: number;
   generatedAtMs: number;
   stops: readonly number[];
   /** src → symbol → side ("long"|"short") → row. */
@@ -78,22 +90,35 @@ function nearestRank(sortedAsc: readonly number[], pct: number): number {
   return sortedAsc[rank - 1];
 }
 
+/** How many of a key's NEWEST-FIRST samples are ranked: every one inside the
+ *  window, and — only while that is fewer than `targetPrints` — the newest
+ *  older ones up to the floor. ONE rule, shared by the pure builder and the
+ *  streaming day-walk, so the two cannot select differently. */
+export function liqSampleTake(newestFirst: ReadonlyArray<{ ts: number }>, cutoff: number, targetPrints: number): number {
+  let inWindow = 0;
+  while (inWindow < newestFirst.length && newestFirst[inWindow]!.ts >= cutoff) inWindow++;
+  return Math.max(inWindow, Math.min(newestFirst.length, Math.max(0, Math.floor(targetPrints))));
+}
+
 /** Build the whole (source, symbol, side) percentile table from a rolling
  *  window of raw samples. Pure — the same function drives the hub's own
  *  build and the test suite's parity check against the bot's copy. */
 export function buildLiqSizePercentiles(
   rows: Iterable<LiqSizeSample>,
-  opts: { days?: number; now?: number; percentiles?: readonly number[]; maxPrints?: number } = {},
+  opts: { days?: number; now?: number; percentiles?: readonly number[]; targetPrints?: number; /** @deprecated alias of targetPrints */ maxPrints?: number } = {},
 ): LiqSizePercentileTable {
   const now = opts.now ?? Date.now();
   const days = opts.days ?? LIQ_PCTL_WINDOW_DAYS;
   const stops = opts.percentiles && opts.percentiles.length ? [...opts.percentiles].sort((a, b) => a - b) : [...LIQ_PCTL_STOPS];
-  const maxPrints = opts.maxPrints ?? LIQ_PCTL_MAX_PRINTS;
+  const targetPrints = opts.targetPrints ?? opts.maxPrints ?? LIQ_PCTL_TARGET_PRINTS;
   const cutoff = now - days * 86_400_000;
 
   const buckets = new Map<string, Map<string, Map<string, Array<{ ts: number; sizeUsd: number }>>>>();
   for (const r of rows) {
-    if (!r || !(r.ts >= cutoff && r.ts <= now)) continue;
+    // v0.4.23 — rows OLDER than the window are ingested too: a pair-side under
+    // the print floor reaches back into them (selected per key below). A
+    // future-dated row is still refused.
+    if (!r || !(Number.isFinite(r.ts) && r.ts <= now)) continue;
     if (!(Number.isFinite(r.sizeUsd) && r.sizeUsd > 0)) continue;
     if (!r.symbol) continue;
     const side = normSide(r.side);
@@ -108,15 +133,16 @@ export function buildLiqSizePercentiles(
     arr.push({ ts: r.ts, sizeUsd: r.sizeUsd });
   }
 
-  const out: LiqSizePercentileTable = { windowDays: days, generatedAtMs: now, stops, rows: {} };
+  const out: LiqSizePercentileTable = { windowDays: days, targetPrints, generatedAtMs: now, stops, rows: {} };
   for (const [src, bySymbol] of buckets) {
     const symRows: Record<string, Record<string, LiqSizePercentileRow>> = {};
     for (const [symbol, bySide] of bySymbol) {
       const sideRows: Record<string, LiqSizePercentileRow> = {};
       for (const [side, samples] of bySide) {
         samples.sort((a, b) => b.ts - a.ts);
-        const capped = samples.length > maxPrints ? samples.slice(0, maxPrints) : samples;
-        const sizes = capped.map((s) => s.sizeUsd).sort((a, b) => a - b);
+        const taken = samples.slice(0, liqSampleTake(samples, cutoff, targetPrints));
+        if (!taken.length) continue;
+        const sizes = taken.map((s) => s.sizeUsd).sort((a, b) => a - b);
         const usd: Record<number, number> = {};
         for (const p of stops) usd[p] = nearestRank(sizes, p);
         sideRows[side] = { count: sizes.length, usd };
@@ -130,39 +156,41 @@ export function buildLiqSizePercentiles(
 
 /** Rebuild the whole table from the recorded archive.
  *
- *  Reads day files NEWEST-FIRST (`LiqHistory.days()` is already sorted that
- *  way) and, within each day, walks the file newest-event-first too. A cheap
- *  per-(src,symbol,side) counter caps ingestion at `maxPrints` AS ROWS ARE
- *  READ — a busy pair's working set never grows past its own cap even while
- *  a quiet pair's whole 30-day window is still being read, and the kept rows
- *  are the NEWEST ones for that key by construction. Day files entirely
- *  older than the window are never opened at all. Mirrors the bot's own
+ *  Reads day files NEWEST-FIRST (`LiqHistory.dayFiles()` is sorted that way)
+ *  and, within each day, takes rows newest-first. Every row inside the window
+ *  is kept; past the window a key is topped up to `targetPrints` and no
+ *  further, so a busy pair's working set past the window never grows, while
+ *  a quiet pair reaches as far back as the archive goes. Mirrors the bot's own
  *  `LiqSizePercentileStore.rebuildLocal` exactly, applied here to the hub's
  *  install-wide archive instead of one process's local history. */
 export async function rebuildLiqPercentileTable(
   history: Pick<LiqHistory, "dayFiles" | "readLines">,
-  opts: { days?: number; maxPrints?: number; now?: number } = {},
+  opts: { days?: number; targetPrints?: number; /** @deprecated alias of targetPrints */ maxPrints?: number; now?: number } = {},
 ): Promise<LiqSizePercentileTable> {
   // v0.4.20 — STREAMED. Day files newest-first off the `stat` listing, each
-  // read a line at a time; a per-(src,symbol,side) reservoir keeps the newest
-  // `maxPrints` and stops collecting a key once a newer day has filled it.
-  // Day files entirely older than the window are never opened.
+  // read a line at a time.
+  // v0.4.23 — THE GREATER OF THE WINDOW AND THE PRINT FLOOR. Every row inside
+  // the window is kept; a row older than the window is kept only while its
+  // key is still under `targetPrints` (newest first, because the days are
+  // walked newest-first and each day's rows are taken newest-first). The
+  // walk therefore reaches the END of the archive — a thin pair may need the
+  // oldest day there is — and the archive's own retention is the bound.
   const now = opts.now ?? Date.now();
   const days = opts.days ?? LIQ_PCTL_WINDOW_DAYS;
-  const maxPrints = opts.maxPrints ?? LIQ_PCTL_MAX_PRINTS;
+  const targetPrints = opts.targetPrints ?? opts.maxPrints ?? LIQ_PCTL_TARGET_PRINTS;
   const cutoff = now - days * 86_400_000;
   const kept = new Map<string, LiqSizeSample[]>(); // newest-first per key
   for (const d of history.dayFiles()) {
     const dayStart = Date.parse(`${d.day}T00:00:00Z`);
-    if (!Number.isFinite(dayStart) || dayStart + 86_400_000 < cutoff) break; // older than the window — nothing further matters
+    if (!Number.isFinite(dayStart)) continue;
     const dayRows = new Map<string, LiqSizeSample[]>(); // oldest-first, as written
     for await (const e of history.readLines(d.day)) {
-      if (!(e.ts >= cutoff && e.ts <= now)) continue;
+      if (!(Number.isFinite(e.ts) && e.ts <= now)) continue;
       if (e.side !== "long" && e.side !== "short") continue;
       if (!(Number(e.sizeUsd) > 0)) continue;
       const src = e.src && String(e.src).trim() ? e.src : DEFAULT_SRC;
       const key = `${src}|${e.symbol}|${e.side}`;
-      if ((kept.get(key)?.length ?? 0) >= maxPrints) continue; // a newer day already filled this key
+      if (e.ts < cutoff && (kept.get(key)?.length ?? 0) >= targetPrints) continue; // past the window and this key is already at the floor
       let arr = dayRows.get(key);
       if (!arr) { arr = []; dayRows.set(key, arr); }
       arr.push({ ts: e.ts, symbol: e.symbol, side: e.side, sizeUsd: e.sizeUsd, src });
@@ -170,12 +198,17 @@ export async function rebuildLiqPercentileTable(
     for (const [key, arr] of dayRows) {
       let k = kept.get(key);
       if (!k) { k = []; kept.set(key, k); }
-      for (let i = arr.length - 1; i >= 0 && k.length < maxPrints; i--) k.push(arr[i]!);
+      arr.sort((a, b) => a.ts - b.ts);
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const r = arr[i]!;
+        if (r.ts >= cutoff || k.length < targetPrints) k.push(r);
+        else break;
+      }
     }
   }
   const rows: LiqSizeSample[] = [];
   for (const k of kept.values()) rows.push(...k);
-  return buildLiqSizePercentiles(rows, { days, now, maxPrints });
+  return buildLiqSizePercentiles(rows, { days, now, targetPrints });
 }
 
 /** Verify the SHAPE of a table before trusting it — a persisted snapshot

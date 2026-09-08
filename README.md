@@ -844,10 +844,12 @@ symbol, side), exactly what a bot's own trade history is keyed under),
 buffered and flushed every two seconds, retained 60 days.
 
 **The table** (`src/liq/percentiles.ts`) is a byte-for-byte port of the bot's
-own `src/liq/size-percentiles.ts` (`buildLiqSizePercentiles`): 30-day window,
-the newest 1,000 prints per (source, symbol, side), stops `[50,75,90,95,99]`,
-nearest-rank with interpolation between stored stops. Rebuilt once at boot and
-hourly thereafter, reading day files newest-first with a per-key cap applied
+own `src/liq/size-percentiles.ts` (`buildLiqSizePercentiles`): the greater of
+the 30-day window and 1,000 prints per (source, symbol, side) — every print
+inside the window, topped up from older days while a pair-side is under 1,000 —
+stops `[20,40,50,60,75,80,90,95,99]`, nearest-rank with interpolation between
+stored stops. Rebuilt a minute after boot and hourly thereafter, reading day
+files newest-first with the per-key floor applied
 AS ROWS ARE READ so a hyperactive pair's cost never grows past its own cap
 while a quiet pair's whole window is still being read; a day file entirely
 older than the window is never opened. The built table is persisted to
@@ -868,7 +870,7 @@ HUB_LIQ_RECORD=1                    # default ON — "=0" is the full off switch
 HUB_LIQ_SOURCES=                    # comma list of the 8 source ids; empty = all
 HUB_LIQ_RETENTION_DAYS=60
 HUB_LIQ_WINDOW_DAYS=30
-HUB_LIQ_MAX_PRINTS=1000
+HUB_LIQ_TARGET_PRINTS=1000   # the floor a pair-side is topped up to past the window (HUB_LIQ_MAX_PRINTS still reads)
 HUB_LIQ_REBUILD_MS=3600000          # 1h
 HUB_LIQ_FLUSH_MS=2000
 HUB_LIQ_PRUNE_MS=3600000            # 1h
@@ -1437,6 +1439,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.23 — **The sample is the greater of 30 days and 1,000 prints.** Operator: *"Should we do the greater of at least 1000 liq events and 30 days? To make sure to have a good sample?"* Every print inside the 30-day window is ranked (a busy pair is no longer cut to its newest 1,000), and a pair-side with fewer than 1,000 inside the window reaches further back, newest day first, until it has 1,000 or the archive runs out — the archive's own retention is the bound. `LIQ_PCTL_TARGET_PRINTS` replaces the cap; `liqSampleTake` is the one selection rule shared by the pure builder and the streaming day-walk; the table carries `targetPrints`. The bot builds the identical rule (v0.90.47) and the parity test proves it.
 - v0.4.22 — **The percentile table carries the 20th, 40th, 60th and 80th stops too.** Operator: *"one column with the pair name and then 20th, 40th, 60th, 80th, 90th and 95th percentile… maybe even add 99th"* — the bot's Screener shows the table per pair, so the hub serves every stop it shows: `[20, 40, 50, 60, 75, 80, 90, 95, 99]`. 50 and 75 stay so a stored bot percentile keeps its exact stop and a bot on the older list interpolates unchanged. The table is a superset; the wire shape is the same.
 - v0.4.21 — **A refused liquidation subscription is said on the Market data card.** The Bybit runner read only `allLiquidation.*` frames, so a subscribe the venue refused was an unread frame on an open socket and the source sat at "LIVE · 0 prints" looking exactly like a quiet market. The venue's own ack now rides the note (`N perp(s) subscribed · acknowledged`) and a refusal names the venue's own words. Context: a USDC/inverse source showing 0 prints minutes after a boot is usually rarity, not a fault — Bybit USDC perps and every inverse book liquidate a small fraction as often as USDT, and OKX lists no USDC swaps at all — and the note is what tells the two apart.
 - v0.4.20 — **The percentile rebuild is off the boot path and streams the archive.** v0.4.18 built the table synchronously at boot by reading every day file in full (twice: once to list, once to build) — on a 60-day archive of every print from every source that is gigabytes of JSON on the event loop before the hub answers; the bot shipped the same shape in v0.90.44 and stalled the operator's install. The first rebuild now runs a minute after boot (the persisted snapshot answers meanwhile), day files are listed by size alone, each day is streamed a line at a time newest-first keeping only the newest 1,000 prints per pair-side as it reads, and a rebuild never overlaps itself. The status card's prints-today is an in-memory count, not a re-read of every file per request.

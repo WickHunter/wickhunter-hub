@@ -13,7 +13,7 @@ import path from "node:path";
 import { test, summary, tmpDir } from "./helpers.mjs";
 import {
   buildLiqSizePercentiles, rebuildLiqPercentileTable, liqPercentileTableLooksValid,
-  countLiqPercentilePairSides, LIQ_PCTL_STOPS, LIQ_PCTL_WINDOW_DAYS, LIQ_PCTL_MAX_PRINTS,
+  countLiqPercentilePairSides, LIQ_PCTL_STOPS, LIQ_PCTL_WINDOW_DAYS, LIQ_PCTL_TARGET_PRINTS, liqSampleTake,
 } from "../dist/src/liq/percentiles.js";
 import { LiqHistory } from "../dist/src/liq/history.js";
 
@@ -79,15 +79,28 @@ await test("buildLiqSizePercentiles is byte-identical to the bot's own copy", as
   assert.deepEqual(hubTable.stops, [...LIQ_PCTL_STOPS]);
   const pairSides = countLiqPercentilePairSides(hubTable);
   assert.ok(pairSides >= 5 * 4 * 2 - 2, `expected close to every (src,symbol,side) populated, got ${pairSides}`);
-  // At least one row exercised the 1,000-print cap.
-  let sawCapped = false;
+  // v0.4.23 — the greater of the window and the print floor: at least one
+  // key holds MORE than the floor inside the window (nothing is capped any
+  // more), and the lone out-of-window print is a row of its own, because a
+  // pair-side under the floor reaches past the window.
+  let sawOverFloor = false;
   for (const bySymbol of Object.values(hubTable.rows)) {
     for (const bySide of Object.values(bySymbol)) {
-      for (const r of Object.values(bySide)) if (r.count === LIQ_PCTL_MAX_PRINTS) sawCapped = true;
+      for (const r of Object.values(bySide)) if (r.count > LIQ_PCTL_TARGET_PRINTS) sawOverFloor = true;
     }
   }
-  assert.ok(sawCapped, "the fixture must exercise the newest-1000 cap for the parity check to mean anything");
-  assert.ok(!hubTable.rows["bybit-usdt"]?.["OUTOFWINDOWUSDT"], "a row outside the 30-day window is excluded on both sides of the parity check");
+  assert.ok(sawOverFloor, "the fixture must hold a key with more than the floor inside the window for the parity check to mean anything");
+  assert.equal(hubTable.rows["bybit-usdt"]?.["OUTOFWINDOWUSDT"]?.long?.count, 1, "a thin pair reaches past the 30-day window, on both sides of the parity check");
+  assert.equal(hubTable.targetPrints, LIQ_PCTL_TARGET_PRINTS);
+});
+
+await test("liqSampleTake: every print inside the window, topped up to the floor from older ones, never more", () => {
+  const cutoff = 1_000;
+  const samples = (n, from) => Array.from({ length: n }, (_, i) => ({ ts: from - i })); // newest first
+  assert.equal(liqSampleTake([...samples(1_200, 2_200)], cutoff, 1_000), 1_200, "a busy key ranks everything inside the window, not the newest 1,000");
+  assert.equal(liqSampleTake([...samples(300, 1_300), ...samples(900, 999)], cutoff, 1_000), 1_000, "a thin key reaches back for exactly the shortfall");
+  assert.equal(liqSampleTake([...samples(300, 1_300), ...samples(50, 999)], cutoff, 1_000), 350, "…or as far as the archive goes");
+  assert.equal(liqSampleTake([...samples(1_000, 2_000), ...samples(50, 999)], cutoff, 1_000), 1_000, "a key already at the floor inside the window takes nothing older");
 });
 
 await test("interpolation between stored stops matches nearest-rank on the exact stops", () => {
@@ -101,16 +114,18 @@ await test("interpolation between stored stops matches nearest-rank on the exact
   assert.equal(row.usd[99], 99);
 });
 
-await test("a row outside the window, an unrecognised side, or a non-positive size is excluded", () => {
+await test("a future-dated row, an unrecognised side, or a non-positive size is excluded; an OLD row is kept while the key is under the floor", () => {
   const now = 100 * 86_400_000;
   const rows = [
-    { ts: now - 40 * 86_400_000, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 1_000 }, // too old
+    { ts: now + 1, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 1_000 }, // future-dated
     { ts: now, src: "bybit-usdt", symbol: "BTCUSDT", side: "sideways", sizeUsd: 1_000 },
     { ts: now, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: -5 },
     { ts: now, src: "bybit-usdt", symbol: "", side: "long", sizeUsd: 5 },
   ];
   const table = buildLiqSizePercentiles(rows, { now });
   assert.deepEqual(table.rows, {}, "every row was excluded for its own stated reason");
+  const old = buildLiqSizePercentiles([{ ts: now - 40 * 86_400_000, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 1_000 }], { now });
+  assert.equal(old.rows["bybit-usdt"]["BTCUSDT"]["long"].count, 1, "v0.4.23 — a 40-day-old print is the sample when the window holds nothing");
 });
 
 await test("an absent src defaults to bybit-usdt, matching the recorder's own convention", () => {
@@ -129,10 +144,10 @@ await test("liqPercentileTableLooksValid refuses a malformed shape", () => {
 
 // ── rebuildLiqPercentileTable: the day-walk, newest-first, per-key cap ─────
 
-await test("rebuildLiqPercentileTable reads day files newest-first and caps ingestion per (src,symbol,side) AS ROWS ARE READ", async () => {
+await test("rebuildLiqPercentileTable reads day files newest-first and ranks every print inside the window", async () => {
   const dir = tmpDir("liq-pctl-rebuild");
   const history = new LiqHistory(dir, 60);
-  const now = Date.parse("2026-09-07T00:00:00Z");
+  const now = Date.parse("2026-09-07T12:00:00Z"); // midday, so `now - i` ms stays inside the same day file
   const DAY = 86_400_000;
   // Three days of BTCUSDT longs, 800/day = 2,400 total, far over the
   // 1,000-print cap. The kept rows must be the newest 1,000 — i.e. all of
@@ -142,18 +157,45 @@ await test("rebuildLiqPercentileTable reads day files newest-first and caps inge
   // is that it need not).
   for (let d = 0; d < 3; d++) {
     for (let i = 0; i < 800; i++) {
-      history.record({ ts: now - d * DAY + i, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 100 + i });
+      history.record({ ts: now - d * DAY - i, src: "bybit-usdt", symbol: "BTCUSDT", side: "long", sizeUsd: 100 + i }); // never future-dated: `now` itself is the newest
     }
   }
   history.flush();
   assert.equal(history.days().length, 3);
 
-  const table = await rebuildLiqPercentileTable(history, { now, maxPrints: 1_000, days: 30 });
+  const table = await rebuildLiqPercentileTable(history, { now, targetPrints: 1_000, days: 30 });
   const row = table.rows["bybit-usdt"]["BTCUSDT"]["long"];
-  assert.equal(row.count, 1_000, "capped at the newest 1,000 prints for this key");
+  assert.equal(row.count, 2_400, "v0.4.23 — every print inside the window is ranked; the floor is not a cap");
 });
 
-await test("rebuildLiqPercentileTable never opens a day file entirely older than the window", async () => {
+await test("rebuildLiqPercentileTable tops a thin key up from PAST the window, newest first, and stops at the floor", async () => {
+  const dir = tmpDir("liq-pctl-rebuild-floor");
+  const history = new LiqHistory(dir, 90);
+  const now = Date.parse("2026-09-07T00:00:00Z");
+  const DAY = 86_400_000;
+  // 300 inside the window (day 0), 500 on day 40 and 500 on day 50 — the
+  // key needs 700 more: all of day 40 and the newest 200 of day 50.
+  for (let i = 0; i < 300; i++) history.record({ ts: now - i * 1_000, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: 10 });
+  for (let i = 0; i < 500; i++) history.record({ ts: now - 40 * DAY + i, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: 20 });
+  for (let i = 0; i < 500; i++) history.record({ ts: now - 50 * DAY + i, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: i < 300 ? 30 : 40 });
+  history.flush();
+  const table = await rebuildLiqPercentileTable(history, { now, targetPrints: 1_000, days: 30 });
+  const row = table.rows["bybit-usdt"]["THINUSDT"]["short"];
+  assert.equal(row.count, 1_000, "topped up to exactly the floor");
+  // The newest 200 of day 50 are the ones written last (i >= 300 → size 40),
+  // so no size-30 print reached the sample: the 20th percentile is the
+  // day-0 prints, the 99th is a size-40 print, and 30 never appears.
+  assert.equal(row.usd[20], 10);
+  assert.equal(row.usd[99], 40);
+  const viaRows = buildLiqSizePercentiles(
+    [...Array.from({ length: 300 }, (_, i) => ({ ts: now - i * 1_000, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: 10 })),
+     ...Array.from({ length: 500 }, (_, i) => ({ ts: now - 40 * DAY + i, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: 20 })),
+     ...Array.from({ length: 500 }, (_, i) => ({ ts: now - 50 * DAY + i, src: "bybit-usdt", symbol: "THINUSDT", side: "short", sizeUsd: i < 300 ? 30 : 40 }))],
+    { now, targetPrints: 1_000, days: 30 });
+  assert.deepEqual(table.rows, viaRows.rows, "the day-walk and the pure builder select the same sample");
+});
+
+await test("rebuildLiqPercentileTable reaches a day file older than the window for a pair that has nothing newer", async () => {
   const dir = tmpDir("liq-pctl-rebuild-bound");
   const history = new LiqHistory(dir, 60);
   const DAY = 86_400_000;
@@ -164,7 +206,7 @@ await test("rebuildLiqPercentileTable never opens a day file entirely older than
 
   const table = await rebuildLiqPercentileTable(history, { now, days: 30 });
   assert.ok(table.rows["bybit-usdt"]?.["NEWUSDT"], "the in-window pair is present");
-  assert.ok(!table.rows["bybit-usdt"]?.["OLDUSDT"], "the pair whose only day file is outside the window is absent");
+  assert.equal(table.rows["bybit-usdt"]?.["OLDUSDT"]?.long?.count, 1, "v0.4.23 — the pair whose only day file is outside the window is present, from that file");
 });
 
 await test("rebuildLiqPercentileTable and buildLiqSizePercentiles agree on a shared fixture (same function, different entry)", async () => {
