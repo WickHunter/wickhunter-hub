@@ -10,7 +10,7 @@ import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import { LiqHistory, LIQ_HISTORY_RETENTION_DAYS_DEFAULT } from "./history.js";
 import {
   rebuildLiqPercentileTable, liqPercentileTableLooksValid, countLiqPercentilePairSides,
-  LIQ_PCTL_WINDOW_DAYS, LIQ_PCTL_MAX_PRINTS,
+  LIQ_PCTL_WINDOW_DAYS, LIQ_PCTL_TARGET_PRINTS,
   type LiqSizePercentileTable,
 } from "./percentiles.js";
 import {
@@ -28,7 +28,8 @@ export interface LiqServiceConfig {
   sources: readonly LiqSourceId[];
   retentionDays: number;
   windowDays: number;
-  maxPrints: number;
+  /** v0.4.23 — the print floor a pair-side is topped up to past the window. */
+  targetPrints: number;
   /** How often the buffered archive is flushed to disk. */
   flushMs: number;
   /** How often day files older than `retentionDays` are pruned. */
@@ -53,7 +54,7 @@ export const DEFAULT_LIQ_SERVICE_CONFIG: LiqServiceConfig = {
   dataDir: "",
   retentionDays: LIQ_HISTORY_RETENTION_DAYS_DEFAULT,
   windowDays: LIQ_PCTL_WINDOW_DAYS,
-  maxPrints: LIQ_PCTL_MAX_PRINTS,
+  targetPrints: LIQ_PCTL_TARGET_PRINTS,
   flushMs: 2_000,
   pruneMs: 3_600_000,
   rebuildMs: 3_600_000,
@@ -132,7 +133,7 @@ export class LiqService {
     if (this.rebuilding) return; // an hourly tick never overlaps a run still walking the archive
     this.rebuilding = true;
     try {
-      this.table = await rebuildLiqPercentileTable(this.history, { days: this.cfg.windowDays, maxPrints: this.cfg.maxPrints, now: this.now() });
+      this.table = await rebuildLiqPercentileTable(this.history, { days: this.cfg.windowDays, targetPrints: this.cfg.targetPrints, now: this.now() });
       this.lastRebuildAt = this.now();
       this.saveSnapshot();
       this.log(`[liq] percentile table rebuilt: ${countLiqPercentilePairSides(this.table)} pair-side(s)`);

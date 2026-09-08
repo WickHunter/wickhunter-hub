@@ -13,6 +13,7 @@ export interface LiqEnv {
   HUB_LIQ_RETENTION_DAYS?: string;
   HUB_LIQ_WINDOW_DAYS?: string;
   HUB_LIQ_MAX_PRINTS?: string;
+  HUB_LIQ_TARGET_PRINTS?: string;
   HUB_LIQ_REBUILD_MS?: string;
   HUB_LIQ_FLUSH_MS?: string;
   HUB_LIQ_PRUNE_MS?: string;
@@ -56,7 +57,8 @@ export function liqServiceConfigFromEnv(env: LiqEnv = process.env as LiqEnv, dat
     sources: liqSourcesFromEnv(env),
     retentionDays: num(env.HUB_LIQ_RETENTION_DAYS, d.retentionDays, 1),
     windowDays: num(env.HUB_LIQ_WINDOW_DAYS, d.windowDays, 1),
-    maxPrints: num(env.HUB_LIQ_MAX_PRINTS, d.maxPrints, 1),
+    // v0.4.23 — `HUB_LIQ_TARGET_PRINTS`; the old `HUB_LIQ_MAX_PRINTS` still reads.
+    targetPrints: num(env.HUB_LIQ_TARGET_PRINTS ?? env.HUB_LIQ_MAX_PRINTS, d.targetPrints, 1),
     flushMs: num(env.HUB_LIQ_FLUSH_MS, d.flushMs, 500),
     pruneMs: num(env.HUB_LIQ_PRUNE_MS, d.pruneMs, 60_000),
     rebuildMs: num(env.HUB_LIQ_REBUILD_MS, d.rebuildMs, 60_000),
