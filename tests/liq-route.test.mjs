@@ -58,7 +58,7 @@ await test("a built table is served whole, with Cache-Control: no-store", async 
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
   assert.ok(res.body.table, "a built table is served");
-  assert.deepEqual(res.body.table.stops, [50, 75, 90, 95, 99]);
+  assert.deepEqual(res.body.table.stops, [20, 40, 50, 60, 75, 80, 90, 95, 99]);
   assert.equal(res.body.table.rows["bybit-usdt"]["BTCUSDT"]["long"].count, 2);
   const raw = await fetch(`${h.origin}/api/hub/liq-percentiles`, { headers: { "x-license": alice.token } });
   assert.equal(raw.headers.get("cache-control"), "no-store");

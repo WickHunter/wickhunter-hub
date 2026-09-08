@@ -31,7 +31,9 @@ export interface LiqSizeSample {
   src?: string;
 }
 
-export const LIQ_PCTL_STOPS = [50, 75, 90, 95, 99] as const;
+// v0.4.22 — the Screener shows the 20th–99th; 50 and 75 stay so a stored
+// bot percentile keeps its exact stop and older bots interpolate the same.
+export const LIQ_PCTL_STOPS = [20, 40, 50, 60, 75, 80, 90, 95, 99] as const;
 export type LiqPctlStop = (typeof LIQ_PCTL_STOPS)[number];
 
 /** Below this many samples for a (source, symbol, side), the caller should
