@@ -31,6 +31,11 @@ export type EmailFetch = (url: string, init: EmailFetchInit) => Promise<EmailFet
 
 export type SendEmailResult = { ok: true; id: string | null } | { ok: false; error: string };
 
+/** The operator's own walkthrough, "Welcome Email to First Login". Hardcoded on
+ *  purpose: one link, three placements (this email, the install page, the
+ *  website), all the same. */
+export const SETUP_VIDEO_URL = "https://www.youtube.com/watch?v=uaG8oZXLl_I";
+
 const RESEND_URL = "https://api.resend.com/emails";
 const POSTMARK_URL = "https://api.postmarkapp.com/email";
 
@@ -176,6 +181,9 @@ export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage
     ``,
     `Your page issues a fresh one-time install command each time you open it. Keep the link private — anyone who has it can install with your licence.`,
     ``,
+    `WATCH THE SETUP VIDEO (from this email to your first login)`,
+    `  ${SETUP_VIDEO_URL}`,
+    ``,
     `SET-UP IN FOUR STEPS`,
     ...SETUP_STEPS.map(([title, desc], i) => `${i + 1}. ${title} — ${desc}`),
     ``,
@@ -287,6 +295,7 @@ ${noticeHtml}
     <tr><td style="padding:0 0 8px">
       <a href="${escapeHtml(input.pageUrl)}" style="display:inline-block;font-family:${FONT};font-size:14px;font-weight:600;color:#ffffff;background-color:${ACCENT};text-decoration:none;padding:13px 22px;border-radius:10px">Open your install page</a>
     </td></tr>
+    <tr><td style="padding:0 0 14px"><a href="${SETUP_VIDEO_URL}" style="display:inline-block;font-family:${FONT};font-size:13px;font-weight:600;color:${ACCENT};background-color:#ffffff;border:1px solid ${ACCENT};text-decoration:none;padding:11px 18px;border-radius:10px">▶ Watch the 5-minute setup video</a></td></tr>
     <tr><td style="font-family:${FONT};font-size:12.5px;color:${DIM};line-height:1.5;padding:0 0 28px">Your page issues a fresh one-time install command each time you open it. Keep the link private — anyone who has it can install with your licence.</td></tr>
 
     <tr><td style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding:24px 0 12px;border-top:1px solid ${BORDER_SOFT}">Set-up in four steps</td></tr>
