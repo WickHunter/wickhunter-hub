@@ -88,6 +88,18 @@ export interface BillingServiceDeps {
   /** Fired after a licence is revoked here, so the server can tell the lease
    *  ledger exactly as the admin revoke route does. */
   onRevoke?: (licenseId: string, reason: string) => void;
+  /** Fired after a "hosting"-role event has updated its
+   *  `RoleSubscriptionRecord` (H4's isolation surface — see
+   *  `applyHostingEvent`'s header). Deliberately NOT the raw Stripe event:
+   *  src/hosting/service.ts derives every hosting lifecycle transition from
+   *  the ALREADY-CLASSIFIED, ALREADY-CORRECT `RoleSubscriptionRecord` this
+   *  file maintains, rather than re-parsing Stripe's wire format a second
+   *  time in a second module. A hook that throws propagates out of
+   *  `applyEvent`/`handleWebhook` exactly like any other failure here (500,
+   *  Stripe retries) — hosting's own store is its own idempotency boundary
+   *  for what that retry does (src/hosting/store.ts's `reserveInstance`),
+   *  so retrying this hook is always safe. */
+  onHostingEvent?: (customerKey: string, livemode: boolean) => void;
 }
 
 export interface WebhookReply {
@@ -124,6 +136,7 @@ export class BillingService {
   private readonly fetchLike: EmailFetch;
   private readonly log: (line: string) => void;
   private readonly onRevoke: (licenseId: string, reason: string) => void;
+  private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
 
   constructor(
     readonly dataDir: string,
@@ -137,6 +150,18 @@ export class BillingService {
     this.fetchLike = deps.fetchLike ?? realFetch;
     this.log = deps.log ?? ((line) => console.log(line));
     this.onRevoke = deps.onRevoke ?? (() => {});
+    this.onHostingEvent = deps.onHostingEvent ?? (() => {});
+  }
+
+  /** The one write path for a hosting-role record: persists it exactly as
+   *  `putRoleSubscription` always did, then fires the hosting hook. Every
+   *  `applyHostingEvent` branch calls this instead of `store.putRoleSubscription`
+   *  directly, so src/hosting/service.ts is told about EVERY hosting-role
+   *  event this file ever records, from one call site. */
+  private saveHostingRecord(rec: RoleSubscriptionRecord): void {
+    this.store.putRoleSubscription(rec);
+    try { this.onHostingEvent(rec.customerKey, rec.livemode); }
+    catch (err) { throw new Error(`hosting hook failed for ${rec.customerKey}: ${(err as Error).message}`); }
   }
 
   private get origin(): string {
@@ -474,7 +499,7 @@ export class BillingService {
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
         rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting checkout recorded; software licence untouched" };
       }
       case "invoice.paid":
@@ -489,7 +514,7 @@ export class BillingService {
         this.noteHostingCharge(rec, f.chargeId);
         this.noteHostingCharge(rec, f.paymentIntentId);
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting invoice recorded; software licence untouched" };
       }
       case "invoice.payment_failed": {
@@ -498,7 +523,7 @@ export class BillingService {
         if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
         rec.subscriptionStatus = "past_due";
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting marked past due; software licence untouched" };
       }
       case "customer.subscription.updated": {
@@ -509,7 +534,7 @@ export class BillingService {
         rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
         if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null && (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs)) rec.periodEndMs = f.currentPeriodEndMs;
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting status updated; software licence untouched" };
       }
       case "customer.subscription.deleted": {
@@ -518,7 +543,7 @@ export class BillingService {
         if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
         rec.subscriptionStatus = "canceled";
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting subscription ended; software licence untouched" };
       }
       case "charge.succeeded": {
@@ -528,7 +553,7 @@ export class BillingService {
         this.noteHostingCharge(rec, f.chargeId);
         this.noteHostingCharge(rec, f.paymentIntentId);
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting charge recorded; software licence untouched" };
       }
       case "charge.refunded": {
@@ -540,7 +565,7 @@ export class BillingService {
         const full = f.refunded || (f.amount !== null && f.amountRefunded !== null && f.amountRefunded >= f.amount);
         if (full) rec.refunded = true;
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: full ? "hosting full refund recorded; software licence untouched" : "hosting partial refund recorded; software licence untouched" };
       }
       case "charge.dispute.created": {
@@ -549,7 +574,7 @@ export class BillingService {
         if (!rec) return { outcome: "ignored", note: `hosting dispute on unknown charge ${f.chargeId || f.paymentIntentId || "?"} — software licence untouched either way` };
         rec.disputed = true;
         this.touchHosting(rec, ev, now);
-        this.store.putRoleSubscription(rec);
+        this.saveHostingRecord(rec);
         return { outcome: "applied", note: `hosting dispute recorded (${f.reason || "no reason"}); software licence untouched` };
       }
       default:

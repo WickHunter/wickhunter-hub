@@ -50,6 +50,7 @@ import type { BillingService } from "./billing/service.js";
 import type { CustomerRecord } from "./billing/store.js";
 import { emailReady } from "./billing/config.js";
 import { escapeHtml, sendEmail, type EmailFetch, type EmailMessage } from "./billing/email.js";
+import type { HostingService } from "./hosting/service.js";
 
 export const IDENTITIES_FILE = "customer-identities.v1.json";
 export const SIGNIN_TOKENS_FILE = "customer-signin-tokens.v1.json";
@@ -334,7 +335,12 @@ export interface SoftwareView {
 export interface CustomerStateView {
   email: string;
   software: SoftwareView[];
-  hosting: { available: false; note: string };
+  /** `HostingCustomerView` (src/hosting/service.ts) when a `HostingService`
+   *  is wired in, or the original H2 placeholder on any install that has
+   *  not deployed the hosting store yet — that shape is `{available:false}`
+   *  and stays wire-compatible with it: `available` is still the field a
+   *  caller checks first. */
+  hosting: { available: false; note: string } | import("./hosting/service.js").HostingCustomerView;
 }
 
 export type PortalOutcome = { ok: true; url: string } | { ok: false; status: number; error: string };
@@ -362,6 +368,10 @@ export class CustomerSessionService {
     private readonly licenses: LicenseStore,
     private readonly publicOrigin: string,
     deps: CustomerSessionServiceDeps = {},
+    /** Optional: null on an install that has not brought up the hosting
+     *  store. `dashboardState` falls back to the original H2 placeholder
+     *  when this is null, so nothing about this dependency is required. */
+    private readonly hosting: HostingService | null = null,
   ) {
     this.store = new CustomerSessionStore(dataDir, deps.randomBytes);
     this.now = deps.now ?? Date.now;
@@ -486,8 +496,37 @@ export class CustomerSessionService {
     return {
       email: identity.email,
       software,
-      hosting: { available: false, note: "Unleashed VPS Hosting is not available yet." },
+      hosting: this.hostingView(identity),
     };
+  }
+
+  /** `HostingService.customerView` keys on the exact `ownerId` a hosting
+   *  purchase used (a Stripe customer id or `email:<address>`), which this
+   *  identity does not itself carry — it is keyed by email only. Try every
+   *  key this identity could plausibly own (each matching software
+   *  CustomerRecord's own key, plus the bare `email:` form for a checkout
+   *  that never got a Stripe customer id attached), and use whichever one
+   *  actually has an instance; when none does, any of them answers the
+   *  same "no instance yet" shape (plans/price are account-independent), so
+   *  the first is fine. */
+  /** Public so server.ts's hosting action routes (checkout/cancel/resume)
+   *  can verify an `instanceId` belongs to the signed-in identity the same
+   *  way `dashboardState` resolves which owner key to read — see
+   *  `hostingView`'s docstring for why more than one key is tried. */
+  hostingOwnerCandidates(identity: CustomerIdentity): string[] {
+    const keys = matchingCustomerRecords(this.billing, identity.email).map((r) => r.key);
+    return [...new Set([...keys, `email:${normalizeCustomerEmail(identity.email)}`])];
+  }
+
+  private hostingView(identity: CustomerIdentity): CustomerStateView["hosting"] {
+    if (!this.hosting) return { available: false, note: "Unleashed VPS Hosting is not available yet." };
+    let fallback: ReturnType<HostingService["customerView"]> | null = null;
+    for (const key of this.hostingOwnerCandidates(identity)) {
+      const view = this.hosting.customerView(key);
+      if (!fallback) fallback = view;
+      if (view.hasInstance) return view;
+    }
+    return fallback ?? { available: false, note: "Unleashed VPS Hosting is not available yet." };
   }
 
   /** Ownership check shared by both mutating actions below: the caller must
