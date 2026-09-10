@@ -1564,6 +1564,36 @@ async function fbRefresh() {
       fbRefresh();
     };
     tr.children[7].appendChild(del);
+    // "add ability to export one or all… currently is just all" — one report,
+    // its evidence included, as a downloadable file. Same route as "Export
+    // all" (an `id` on it), kept simple (buffered, not streamed) because one
+    // report is bounded where the whole set is not.
+    const exportOne = document.createElement("button");
+    exportOne.type = "button";
+    exportOne.textContent = "Export";
+    exportOne.title = "Download this one report, with its evidence, as a file";
+    exportOne.onclick = async () => {
+      const original = exportOne.textContent;
+      try {
+        const res = await fetch(base + "/admin/api/feedback/export?id=" + encodeURIComponent(r.id), { headers: { "x-hub-admin": token } });
+        if (res.status === 401) { showGate("Wrong token — try again."); return; }
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || ("Export failed with HTTP " + res.status));
+        }
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "wickhunter-feedback-" + r.id + "-" + new Date().toISOString().slice(0, 10) + ".json";
+        a.rel = "noopener";
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        exportOne.textContent = "✕ " + (e.message || "failed");
+        setTimeout(() => { exportOne.textContent = original; }, 2000);
+      }
+    };
+    tr.children[7].appendChild(exportOne);
     rows.appendChild(tr);
     rows.appendChild(detailRow);
   }

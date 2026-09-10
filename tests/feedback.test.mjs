@@ -323,6 +323,28 @@ await test("export downloads the WHOLE set, logs included, as a named attachment
   assert.equal(anon.status, 401);
 });
 
+// v0.90.69-ish (liqhunter-private) — "add ability to export one or all…
+// currently is just all". `?id=` downloads that ONE report, logs and picture
+// included, in the SAME wrapper shape as the whole-set export.
+await test("export one — an id downloads that report alone, same shape as the whole set", async () => {
+  const rec = listFeedback(h.dataDir).find((x) => x.text === "chart blank while the hedge is open");
+  const res = await fetch(`${h.origin}/admin/api/feedback/export?id=${encodeURIComponent(rec.id)}`, { headers: ADMIN });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-disposition") ?? "", new RegExp(`attachment; filename="wickhunter-feedback-${rec.id}-\\d{4}-\\d{2}-\\d{2}\\.json"`));
+  const body = JSON.parse(await res.text());
+  assert.ok(body.exportedAt > 0);
+  assert.equal(body.reports.length, 1, "exactly the one report, not the whole set");
+  assert.equal(body.reports[0].id, rec.id);
+  assert.ok(Array.isArray(body.reports[0].logs) && body.reports[0].logs.length > 0, "logs ride the single-report export too");
+  assert.ok(body.reports[0].attachment.base64, "…and the picture");
+
+  const missing = await fetch(`${h.origin}/admin/api/feedback/export?id=does-not-exist`, { headers: ADMIN });
+  assert.equal(missing.status, 404);
+
+  const anon = await fetch(`${h.origin}/admin/api/feedback/export?id=${encodeURIComponent(rec.id)}`);
+  assert.equal(anon.status, 401, "the single-report download is admin-gated too");
+});
+
 await test("deleting a pictured report removes its separately stored evidence too", async () => {
   const rec = listFeedback(h.dataDir).find((x) => x.text === "chart blank while the hedge is open");
   const file = path.join(h.dataDir, "feedback-attachments", rec.attachment.file);

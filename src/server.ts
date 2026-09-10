@@ -2070,6 +2070,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, removed });
     }
     if (m === "GET" && p === "/admin/api/feedback/export") {
+      // "add ability to export one or all… currently is just all" — an `id`
+      // downloads that ONE report as a file, matching /detail's own read
+      // (same hydrated report — logs, diagnostics, picture) but served as a
+      // download rather than a browser-viewable JSON response, in the same
+      // shape as the whole-set export just below so a caller cannot tell
+      // them apart except by size. No `id` keeps the existing behaviour
+      // byte-for-byte.
+      const id = url.searchParams.get("id") ?? "";
+      if (id) {
+        const report = feedbackDetail(cfg.dataDir, id);
+        if (!report) return sendJson(res, 404, { ok: false, error: "unknown report id" });
+        const text = JSON.stringify({ exportedAt: Date.now(), hubVersion: HUB_VERSION, reports: [report] });
+        res.writeHead(200, {
+          "content-type": "application/json; charset=utf-8",
+          "content-disposition": `attachment; filename="wickhunter-feedback-${id}-${new Date().toISOString().slice(0, 10)}.json"`,
+          "content-length": Buffer.byteLength(text),
+          "cache-control": "no-store",
+        });
+        res.end(text);
+        return;
+      }
       // The whole set, LOGS INCLUDED — the file the operator hands to their
       // assistant for triage. Each row is hydrated and written separately so
       // export memory is bounded by one report instead of the whole evidence
