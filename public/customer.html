@@ -108,15 +108,60 @@
 
     <div id="softwareCards"></div>
 
-    <div class="card">
-      <div class="row" style="justify-content:space-between;margin-bottom:2px">
-        <span class="eyebrow">Hosting</span>
-        <span class="pill dim">Not available yet</span>
-      </div>
-      <p class="fine" style="margin-top:8px">Unleashed VPS Hosting is not available yet. Self-hosted installs (above) are unaffected.</p>
-    </div>
+    <div id="hostingCard"></div>
   </div>
 </div>
+
+<template id="hostingUnavailableTpl">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:2px">
+      <span class="eyebrow">Hosting</span>
+      <span class="pill dim">Not available yet</span>
+    </div>
+    <p class="fine" style="margin-top:8px">Unleashed VPS Hosting is not available yet. Self-hosted installs (above) are unaffected.</p>
+  </div>
+</template>
+
+<template id="hostingAddTpl">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:2px">
+      <span class="eyebrow">Hosting</span>
+      <span class="pill dim">No hosting yet</span>
+    </div>
+    <p class="fine" style="margin:8px 0 12px">Unleashed VPS Hosting — <span class="v-price"></span>/month in addition to your software license. Your own virtual server with Unleashed preinstalled, so you can run your bots without keeping your computer on. This is a separate hosting subscription, billed on its own schedule — it never replaces or restarts your software license above.</p>
+    <div class="row"><button class="btn v-add" type="button">Add VPS Hosting</button></div>
+    <p class="err v-add-err" hidden style="margin:10px 0 0"></p>
+    <p class="fine" style="margin-top:12px">Requires an eligible Unleashed software license. After payment you will choose <b>Start fresh</b> or <b>Move my existing setup</b> — both start with your bots paused until you finish setup and confirm your old installation (if any) has stopped, so the two never trade the same positions at once.</p>
+  </div>
+</template>
+
+<template id="hostingInstanceTpl">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <span class="eyebrow">Hosting</span>
+      <span class="pill v-stage-pill"></span>
+    </div>
+    <div class="kv">
+      <span class="k">Server</span><span class="v-id" style="font:12.5px var(--mono)"></span>
+      <span class="k">Region</span><span class="v-region"></span>
+      <span class="k">IP address</span><span class="v-ip"></span>
+      <span class="k">App URL</span><span class="v-url"></span>
+      <span class="k">Price</span><span class="v-price-line"></span>
+      <span class="k">Next renewal</span><span class="v-renewal"></span>
+    </div>
+    <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
+    <p class="err v-delete-note" hidden style="margin:6px 0 0"></p>
+    <p class="err v-fail-note" hidden style="margin:10px 0 0"></p>
+    <div class="row" style="margin-top:14px">
+      <a class="btn v-open" href="#" target="_blank" rel="noopener" hidden>Open server</a>
+      <button class="btn quiet v-cancel" type="button" hidden>Cancel renewal</button>
+      <button class="btn v-resume" type="button" hidden>Resume renewal</button>
+    </div>
+    <p class="ok v-action-ok" hidden style="margin-top:10px"></p>
+    <p class="err v-action-err" hidden style="margin-top:10px"></p>
+    <p class="fine" style="margin-top:12px">Stopping the server stops bot management only — it does not close exchange positions or cancel exchange orders. <span class="v-backup"></span></p>
+  </div>
+</template>
 
 <template id="softwareCardTpl">
   <div class="card">
@@ -240,12 +285,124 @@
     });
   }
 
+  function fmtDateTime(ms) { return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "—"; }
+  function fmtCountdown(ms, nowMs) {
+    if (!ms) return "—";
+    var diff = ms - nowMs;
+    if (diff <= 0) return "due now";
+    var h = Math.floor(diff / 3600000);
+    if (h < 48) return h + "h remaining";
+    return Math.floor(h / 24) + "d remaining";
+  }
+  var HOSTING_STAGE_LABEL = {
+    ordered: "Payment pending", provisioning: "Provisioning", bootstrapping: "Checking your installation",
+    ready: "Ready — finish setup", active: "Running", past_due: "Payment overdue",
+    cancel_scheduled: "Cancellation scheduled", suspended: "Suspended", restoring: "Restoring",
+    deleting: "Deletion in progress", deleted: "Terminated",
+  };
+  var HOSTING_STAGE_PILL = {
+    ready: "live", active: "live", past_due: "obs", cancel_scheduled: "obs", restoring: "obs",
+    suspended: "bad", deleting: "bad", deleted: "dim", ordered: "dim", provisioning: "dim", bootstrapping: "dim",
+  };
+
+  function renderHosting(hosting) {
+    var host = document.getElementById("hostingCard");
+    host.innerHTML = "";
+    if (!hosting || !hosting.available) {
+      host.appendChild(document.getElementById("hostingUnavailableTpl").content.firstElementChild.cloneNode(true));
+      return;
+    }
+    if (!hosting.hasInstance) {
+      var node = document.getElementById("hostingAddTpl").content.firstElementChild.cloneNode(true);
+      node.querySelector(".v-price").textContent = hosting.monthlyPriceLabel || "$15.00";
+      var addBtn = node.querySelector(".v-add");
+      var addErr = node.querySelector(".v-add-err");
+      addBtn.addEventListener("click", async function () {
+        addBtn.disabled = true; addErr.hidden = true;
+        var r = await api("/api/hosting/checkout", { method: "POST", body: "{}" });
+        addBtn.disabled = false;
+        if (!r.ok || !r.body || !r.body.ok) {
+          addErr.textContent = (r.body && r.body.error) || "could not start hosting checkout";
+          addErr.hidden = false;
+          return;
+        }
+        window.location.href = r.body.url;
+      });
+      host.appendChild(node);
+      return;
+    }
+    var inst = hosting.instance;
+    var node = document.getElementById("hostingInstanceTpl").content.firstElementChild.cloneNode(true);
+    var pillEl = node.querySelector(".v-stage-pill");
+    pillEl.className = "pill " + (HOSTING_STAGE_PILL[inst.stage] || "dim");
+    pillEl.textContent = HOSTING_STAGE_LABEL[inst.stage] || inst.stage;
+    node.querySelector(".v-id").textContent = inst.id;
+    node.querySelector(".v-region").textContent = inst.regionLabel || inst.region;
+    node.querySelector(".v-ip").textContent = inst.ip || "—";
+    node.querySelector(".v-url").textContent = inst.appUrl || "—";
+    node.querySelector(".v-price-line").textContent = inst.monthlyPriceLabel + "/month";
+    node.querySelector(".v-renewal").textContent = fmtDateTime(inst.paidThroughMs);
+    node.querySelector(".v-backup").textContent = inst.managedBackupsIncluded ? "Backups are included." : "No managed backups are included — export your settings while the server is active.";
+
+    var nowMs = Date.now();
+    if (inst.suspendAtMs && inst.stage !== "suspended" && inst.stage !== "deleted") {
+      var sNote = node.querySelector(".v-suspend-note");
+      sNote.hidden = false;
+      sNote.textContent = "Scheduled to suspend " + fmtDateTime(inst.suspendAtMs) + " (" + fmtCountdown(inst.suspendAtMs, nowMs) + ").";
+    }
+    if (inst.deleteAtMs && inst.stage !== "deleted") {
+      var dNote = node.querySelector(".v-delete-note");
+      dNote.hidden = false;
+      dNote.textContent = (inst.stage === "deleting" ? "Deleting — restoration no longer guaranteed. " : "Scheduled for permanent deletion ")
+        + fmtDateTime(inst.deleteAtMs) + " (" + fmtCountdown(inst.deleteAtMs, nowMs) + "). Data is not recoverable after deletion.";
+    }
+    if (inst.failureReason) {
+      var fNote = node.querySelector(".v-fail-note");
+      fNote.hidden = false;
+      fNote.textContent = inst.failureReason;
+    }
+
+    var openBtn = node.querySelector(".v-open");
+    if (inst.appUrl && (inst.stage === "ready" || inst.stage === "active")) { openBtn.href = inst.appUrl; openBtn.hidden = false; }
+
+    var okEl = node.querySelector(".v-action-ok");
+    var errEl = node.querySelector(".v-action-err");
+    var cancelBtn = node.querySelector(".v-cancel");
+    var resumeBtn = node.querySelector(".v-resume");
+    if (inst.stage !== "cancel_scheduled" && inst.stage !== "suspended" && inst.stage !== "deleting" && inst.stage !== "deleted") {
+      cancelBtn.hidden = false;
+      cancelBtn.addEventListener("click", async function () {
+        cancelBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
+        var r = await api("/api/hosting/" + inst.id + "/cancel", { method: "POST", body: "{}" });
+        cancelBtn.disabled = false;
+        if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not schedule cancellation"; errEl.hidden = false; return; }
+        okEl.textContent = "Cancellation scheduled. Suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + ".";
+        okEl.hidden = false;
+        setTimeout(function () { boot(); }, 1200);
+      });
+    }
+    if (inst.stage === "cancel_scheduled") {
+      resumeBtn.hidden = false;
+      resumeBtn.textContent = "Resume renewal";
+      resumeBtn.addEventListener("click", async function () {
+        resumeBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
+        var r = await api("/api/hosting/" + inst.id + "/resume-renewal", { method: "POST", body: "{}" });
+        resumeBtn.disabled = false;
+        if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not reverse the cancellation"; errEl.hidden = false; return; }
+        okEl.textContent = "Renewal resumed."; okEl.hidden = false;
+        setTimeout(function () { boot(); }, 1200);
+      });
+    }
+    host.appendChild(node);
+  }
+
   function showSignedIn(state) {
     loadingEl.hidden = true;
     signedOutEl.hidden = true;
     signedInEl.hidden = false;
     document.getElementById("accountEmail").textContent = state.email;
     renderSoftware(state.software || []);
+    renderHosting(state.hosting);
   }
 
   async function boot() {

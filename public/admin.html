@@ -230,6 +230,7 @@
     <button type="button" data-hub-page="market-data">Market data</button>
     <button type="button" data-hub-page="marketplace">Marketplace</button>
     <button type="button" data-hub-page="billing">Billing</button>
+    <button type="button" data-hub-page="hosting">Hosting</button>
     <button type="button" data-hub-page="system">System &amp; feedback</button>
   </nav>
 </header>
@@ -372,6 +373,29 @@
 </div>
 </section>
 
+<section class="hubpage" data-hub-page-panel="hosting" hidden>
+<h1 style="margin-top:2.2rem">Unleashed VPS Hosting <small>— instance lifecycle (H4/H5/H6)</small></h1>
+<div class="actions">
+  <button type="button" id="hostingRefreshBtn">Refresh</button>
+  <span id="hostingMeta" class="muted"></span>
+</div>
+
+<section class="configgroup" id="hostingPolicyCard">
+  <h2>Policy</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">Purchasable checkout/provisioning stays OFF until this is turned on — that master switch, the OS image id and the pinned release are launch inputs an operator supplies (see the delivery report). The Vultr API key is write-only over the wire, exactly like a Stripe secret key.</p>
+  <div class="configfields" id="hostingPolicyFields"></div>
+  <button type="button" id="hostingPolicySave" style="margin-top:.7rem">Save policy</button>
+  <span class="muted" id="hostingPolicyNote" style="margin-left:.5rem"></span>
+</section>
+
+<h2 style="margin:1.2rem 0 .2rem">Instances</h2>
+<p class="muted" style="margin:.2rem 0">Every hosted VPS, whatever its stage. Retry re-attempts provisioning on the same row (bounded, same as an automatic attempt). Force suspend/delete drive the SAME lease-guarded pipeline a real expiry uses — never a shortcut that skips it.</p>
+<div class="tbl"><table>
+  <thead><tr><th>Instance</th><th>Owner</th><th>Env</th><th>Stage</th><th>Region</th><th>Provider id</th><th>Paid through</th><th>Suspend at</th><th>Delete at</th><th>Note</th><th></th></tr></thead>
+  <tbody id="hostingInstanceRows"><tr><td colspan="11">loading&hellip;</td></tr></tbody>
+</table></div>
+</section>
+
 
 <section class="hubpage" data-hub-page-panel="licenses">
 <h1 style="margin-top:2.2rem">Licenses &amp; install commands</h1>
@@ -472,7 +496,7 @@
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
 
-const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "system"]);
+const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "hosting", "system"]);
 function showHubPage(wanted, remember) {
   const page = HUB_PAGES.has(wanted) ? wanted : "licenses";
   document.querySelectorAll("[data-hub-page-panel]").forEach((panel) => {
@@ -512,6 +536,7 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   billingConfigRefresh();
   billingCustomersRefresh();
   billingEventsRefresh();
+  hostingRefresh();
 };
 
 async function api(path, opts) {
@@ -775,7 +800,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); lqRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); };
+document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); lqRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); hostingRefresh(); };
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -2323,6 +2348,139 @@ async function billingEventsRefresh() {
     : '<div class="muted">no events yet</div>';
 }
 document.getElementById("billingEventsRefresh").onclick = billingEventsRefresh;
+
+// ── hosting (H4/H5/H6) ──────────────────────────────────────────────────
+const HOSTING_POLICY_NUMBER_FIELDS = [
+  ["monthlyPriceCents", "Monthly price (cents)", "Proposed price — see the delivery report for the launch-input status."],
+  ["renewalGraceHours", "Renewal grace (hours)", "Nonpayment grace before suspension. Default 72."],
+  ["retentionHours", "Retention (hours)", "How long a suspended instance is retained before deletion. Default 168."],
+  ["readinessRecheckHours", "Readiness recheck (hours)", "How often a ready instance's region is re-probed."],
+  ["bootstrapTokenTtlMinutes", "Bootstrap token TTL (minutes)", ""],
+  ["maximumConcurrentProvisionJobs", "Max concurrent provision jobs", ""],
+  ["maximumProjectedMonthlyProviderCostCents", "Cost ceiling (cents/mo, 0 = none)", ""],
+];
+function renderHostingPolicyCard(policy, secrets) {
+  const wrap = document.getElementById("hostingPolicyFields");
+  wrap.innerHTML = "";
+  for (const [name, label, help] of HOSTING_POLICY_NUMBER_FIELDS) {
+    const input = document.createElement("input");
+    input.type = "number"; input.min = "0"; input.dataset.field = name;
+    input.value = policy[name] != null ? policy[name] : "";
+    wrap.appendChild(billingConfigField(label, input, help));
+  }
+  wrap.appendChild(billingConfigField("Plan id", billingTextField("planId", policy.planId, "vc2-1c-2gb")));
+  wrap.appendChild(billingConfigField("Plan label", billingTextField("planLabel", policy.planLabel, "1 vCPU / 2 GB RAM / 55 GB SSD")));
+  wrap.appendChild(billingConfigField("OS id", billingTextField("osId", policy.osId, "required before provisioning can be enabled")));
+  wrap.appendChild(billingConfigField("Release ref", billingTextField("releaseRef", policy.releaseRef, "a pinned git ref/tag/digest — never “latest”")));
+  wrap.appendChild(billingConfigField("Provider account ref", billingTextField("providerAccountRef", policy.providerAccountRef, "")));
+  const vultrInput = document.createElement("input");
+  vultrInput.type = "password"; vultrInput.autocomplete = "off"; vultrInput.dataset.field = "vultrApiKey";
+  vultrInput.placeholder = secrets && secrets.vultrApiKey.configured ? "configured (…" + secrets.vultrApiKey.last4 + ") — leave blank to keep" : "not configured";
+  wrap.appendChild(billingConfigField("Vultr API key", vultrInput, "Write-only — never echoed back in full."));
+  const regionsInput = document.createElement("input");
+  regionsInput.type = "text"; regionsInput.autocomplete = "off"; regionsInput.dataset.field = "regions";
+  regionsInput.value = (policy.regions || []).map((r) => r.id + ":" + r.label).join(", ");
+  wrap.appendChild(billingConfigField("Regions (ordered, primary first)", regionsInput, "id:label, id:label — index 0 is tried first, later entries are the fallback (H6: tried at most once)."));
+  const card = document.createElement("div");
+  card.className = "configfield";
+  const label2 = document.createElement("label");
+  const cb = document.createElement("input");
+  cb.type = "checkbox"; cb.dataset.field = "provisioningEnabled"; cb.checked = !!policy.provisioningEnabled;
+  cb.style.cssText = "width:auto;min-height:auto;margin-right:.4rem;vertical-align:middle";
+  label2.appendChild(cb);
+  label2.appendChild(document.createTextNode("Provisioning enabled (master switch — stays off until osId and releaseRef are set)"));
+  card.appendChild(label2);
+  wrap.appendChild(card);
+}
+function parseHostingRegions(text) {
+  return text.split(",").map((s) => s.trim()).filter(Boolean).map((s) => {
+    const i = s.indexOf(":");
+    return i === -1 ? { id: s, label: s } : { id: s.slice(0, i).trim(), label: s.slice(i + 1).trim() || s.slice(0, i).trim() };
+  });
+}
+document.getElementById("hostingPolicySave").onclick = async () => {
+  const wrap = document.getElementById("hostingPolicyFields");
+  const policy = {};
+  const secrets = {};
+  for (const input of wrap.querySelectorAll("[data-field]")) {
+    const name = input.dataset.field;
+    if (name === "vultrApiKey") { if (input.value !== "") secrets.vultrApiKey = input.value; continue; }
+    if (name === "regions") { policy.regions = parseHostingRegions(input.value); continue; }
+    if (input.type === "checkbox") policy[name] = input.checked;
+    else if (input.type === "number") { if (input.value !== "") policy[name] = Number(input.value); }
+    else policy[name] = input.value;
+  }
+  const note = document.getElementById("hostingPolicyNote");
+  note.textContent = "Saving…";
+  try {
+    const body = { policy };
+    if (Object.keys(secrets).length) body.secrets = secrets;
+    await api("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify(body) });
+    note.textContent = "Saved.";
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") note.textContent = e.message;
+  }
+};
+
+const HOSTING_STAGE_BADGE = {
+  ready: "live", active: "live", past_due: "test", cancel_scheduled: "test", restoring: "test",
+  suspended: "revoked", deleting: "revoked", deleted: "muted", ordered: "muted", provisioning: "muted", bootstrapping: "muted",
+};
+async function hostingInstanceAction(id, action, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  const reason = prompt("Reason for the audit log (shown to no one but the admin panel):", "") || "";
+  try {
+    await api("/admin/api/hosting/instances/" + encodeURIComponent(id) + "/" + action, { method: "POST", body: JSON.stringify({ reason }) });
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") alert(e.message);
+  }
+}
+async function hostingRefresh() {
+  const meta = document.getElementById("hostingMeta");
+  try {
+    const policyData = await api("/admin/api/hosting/policy");
+    renderHostingPolicyCard(policyData.policy, policyData.secrets);
+  } catch (e) {
+    if (e.message === "unauthorized") return;
+  }
+  const rows = document.getElementById("hostingInstanceRows");
+  let d;
+  try { d = await api("/admin/api/hosting/instances"); }
+  catch (e) { if (e.message === "unauthorized") return; rows.innerHTML = '<tr><td colspan="11">unavailable</td></tr>'; return; }
+  const instances = d.instances || [];
+  meta.textContent = instances.length + " instance(s)";
+  if (!instances.length) { rows.innerHTML = '<tr><td colspan="11">no hosting instances yet</td></tr>'; return; }
+  rows.innerHTML = "";
+  for (const inst of instances) {
+    const badge = '<span class="custbadge ' + (HOSTING_STAGE_BADGE[inst.stage] || "muted") + '">' + esc(inst.stage) + "</span>";
+    const note = [inst.failureReason, inst.cancellationReason].filter(Boolean).map(esc).join(" · ");
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="name">' + esc(inst.id) + "</td>" +
+      "<td>" + esc(inst.ownerId) + "</td>" +
+      "<td>" + esc(inst.environment) + "</td>" +
+      "<td>" + badge + "</td>" +
+      "<td>" + esc(inst.region) + "</td>" +
+      "<td>" + esc(inst.providerInstanceId || "—") + "</td>" +
+      "<td>" + esc(fmt(inst.paidThroughMs)) + "</td>" +
+      "<td>" + esc(fmt(inst.suspendAtMs)) + "</td>" +
+      "<td>" + esc(fmt(inst.deleteAtMs)) + "</td>" +
+      '<td style="max-width:220px;overflow-wrap:anywhere">' + (note || "—") + "</td>" +
+      "<td></td>";
+    const actions = tr.lastElementChild;
+    const retryBtn = document.createElement("button"); retryBtn.type = "button"; retryBtn.textContent = "Retry";
+    retryBtn.onclick = () => hostingInstanceAction(inst.id, "retry");
+    const suspendBtn = document.createElement("button"); suspendBtn.type = "button"; suspendBtn.textContent = "Force suspend";
+    suspendBtn.onclick = () => hostingInstanceAction(inst.id, "force-suspend", "Force-suspend " + inst.id + "? This powers the VPS off through the provider.");
+    const deleteBtn = document.createElement("button"); deleteBtn.type = "button"; deleteBtn.textContent = "Force delete";
+    deleteBtn.onclick = () => hostingInstanceAction(inst.id, "force-delete", "PERMANENTLY delete " + inst.id + " and its server data? This cannot be undone.");
+    actions.appendChild(retryBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(suspendBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(deleteBtn);
+    rows.appendChild(tr);
+  }
+}
+document.getElementById("hostingRefreshBtn").onclick = hostingRefresh;
 
 showGate();
 </script>

@@ -155,6 +155,18 @@ import {
   readUpgradeStatus,
   writeUpgradeStatus,
 } from "./operations.js";
+import { HostingService, type HostingServiceDeps } from "./hosting/service.js";
+import {
+  readHostingPolicy,
+  writeHostingPolicy,
+  applyHostingPolicyPatch,
+  readHostingSecrets,
+  writeHostingSecrets,
+  applySecretPatch,
+  maskedHostingSecrets,
+  HostingPolicyError,
+} from "./hosting/policy.js";
+import { classifyProbeStatus, type ProbeResult } from "./hosting/readiness.js";
 
 /** The provider fetcher for the market-cap producer. A separate shape from the
  *  candles' `FetchLike` because this one carries an API-key HEADER — which is
@@ -204,6 +216,12 @@ export interface Hub {
    *  separate from admin auth and from BillingStore's per-Stripe-customer
    *  records (see src/customer-sessions.ts). */
   customerSessions: CustomerSessionService;
+  /** Unleashed VPS Hosting (H4/H5/H6): the durable instance lifecycle store,
+   *  provider adapter and billing-derived state machine. Always
+   *  constructed; provisioning stays off until `hosting.policy()
+   *  .provisioningEnabled` is true AND a provider key is configured (see
+   *  src/hosting/). */
+  hosting: HostingService;
   /** One install per licence, decided at check-in (see src/seats.ts). */
   seats: SeatStore;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
@@ -260,6 +278,14 @@ export interface HubDeps {
    *  and the admin-auth backoff, so a suite can drive an exact window/backoff
    *  edge without waiting out a real timer. Production is Date.now. */
   rateLimitNow?: () => number;
+  /** Injectable so hosting tests never reach a real provider/Stripe/email
+   *  endpoint and can drive an exact deadline/DST edge. `hostingProvider`
+   *  defaults to a refusing stub in production until a Vultr key is
+   *  configured; a suite passes `FakeProvider`. */
+  hostingNow?: HostingServiceDeps["now"];
+  hostingFetch?: HostingServiceDeps["fetchLike"];
+  hostingRandomBytes?: HostingServiceDeps["randomBytes"];
+  hostingProvider?: HostingServiceDeps["provider"];
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -328,6 +354,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // Always built. With no keys on file every route answers "not configured",
   // and nothing else here changes: a hub that never sells anything runs
   // exactly as before.
+  // `hostingRef` is a forward reference: `HostingService` needs `billing`
+  // (to read the "hosting" RoleSubscriptionRecord it reconciles from — see
+  // src/hosting/service.ts's header), so it is constructed AFTER `billing`,
+  // but `billing`'s own `onHostingEvent` hook needs to call into it. The
+  // closure below reads `hostingRef` lazily, at CALL time (a webhook can
+  // only ever arrive after `createHub` has fully returned), never at
+  // construction time.
+  let hostingRef: HostingService | null = null;
   const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
@@ -336,7 +370,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try { licenseLeases?.observeRevocation(licenseId, `license revoked by billing: ${reason}`); }
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
+    onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
   });
+  // ── Unleashed VPS Hosting (H4/H5/H6) ──────────────────────────────────────
+  const hosting = new HostingService(cfg.dataDir, billing, store, cfg.publicOrigin, {
+    now: deps.hostingNow,
+    fetchLike: deps.hostingFetch,
+    randomBytes: deps.hostingRandomBytes,
+    provider: deps.hostingProvider,
+  });
+  hostingRef = hosting;
   // ── customer sessions: one central sign-in, downstream of a real billing
   // customer (H2). See src/customer-sessions.ts's header for the boundary
   // this deliberately keeps from admin auth and from BillingStore's own
@@ -345,7 +388,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     now: deps.customerSessionNow,
     fetchLike: deps.customerSessionFetch,
     randomBytes: deps.customerSessionRandomBytes,
-  });
+  }, hosting);
   // A dedicated per-EMAIL bucket for sign-in issuance (README/H2: "rate-
   // limited per email and per IP"); per-IP reuses `generalIpLimiter` below,
   // the existing "everything else public" bucket — there was no per-email
@@ -516,7 +559,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
         || p === "/api/billing/plans" || p === "/billing"
         || p === "/api/hub/liq-percentiles"
-        || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state") return true;
+        || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
+        || p === "/api/hosting/options" || p === "/api/hosting") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
     }
@@ -531,6 +575,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // /api/billing/portal-session (licence-token-authenticated) is.
       if (p === "/api/customer/signin" || p === "/api/customer/install-command"
         || p === "/api/customer/portal" || p === "/api/customer/signout") return true;
+      // Hosting customer actions (cookie-session-authenticated, like the
+      // three above) and the bootstrap-token-authenticated readiness
+      // callback (an instance-scoped credential, like the welcome/install
+      // token routes above it).
+      if (p === "/api/hosting/checkout") return true;
+      if (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal"))) return true;
+      if (p.startsWith("/api/hosting/instances/") && p.endsWith("/readiness")) return true;
       return false;
     }
     return false;
@@ -626,6 +677,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/customer/install-command") return customerInstallCommand(req, res);
     if (m === "POST" && p === "/api/customer/portal") return customerPortal(req, res);
     if (m === "POST" && p === "/api/customer/signout") return customerSignout(req, res);
+    // ── hosting (H4/H5/H6) ───────────────────────────────────────────────
+    if (m === "GET" && p === "/api/hosting/options") return hostingOptions(res);
+    if (m === "GET" && p === "/api/hosting") return hostingState(req, res);
+    if (m === "POST" && p === "/api/hosting/checkout") return hostingCheckout(req, res);
+    if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/cancel")) return hostingCancel(req, res, p);
+    if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/resume-renewal")) return hostingResumeRenewal(req, res, p);
+    if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/readiness")) return hostingReadinessCallback(req, res, p);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
     sendJson(res, 404, { ok: false, error: "not found" });
@@ -1227,6 +1285,111 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const raw = sessionCookieFrom(req.headers.cookie);
     if (raw) customerSessions.store.revokeSession(raw, customerSessions.nowMs());
     sendJson(res, 200, { ok: true }, { "cache-control": "no-store", "set-cookie": clearSessionCookie() });
+  }
+
+  // ── hosting (H4/H5/H6) ───────────────────────────────────────────────────
+  // Every mutating route below re-derives the caller's set of candidate
+  // owner ids from the SAME signed-in session `dashboardState` uses
+  // (`customerSessions.hostingOwnerCandidates`) and then asks
+  // `HostingService.owned`/action methods to verify the specific
+  // `instanceId` in the URL actually belongs to one of them — never trusts
+  // an id in the path alone. See CustomerStateView.hosting for the public
+  // read shape; these are the actions on top of it.
+
+  function hostingOptions(res: ServerResponse): void {
+    const policy = hosting.policy();
+    sendJson(res, 200, {
+      ok: true,
+      monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
+      priceIsProposed: true,
+      regions: policy.regions,
+      planId: policy.planId,
+      planLabel: policy.planLabel,
+      managedBackupsIncluded: policy.managedBackupsIncluded,
+      purchasable: policy.provisioningEnabled,
+    }, { "cache-control": "no-store" });
+  }
+
+  function hostingState(req: IncomingMessage, res: ServerResponse): void {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    let best: ReturnType<typeof hosting.customerView> | null = null;
+    for (const key of customerSessions.hostingOwnerCandidates(identity)) {
+      const view = hosting.customerView(key);
+      if (!best) best = view;
+      if (view.hasInstance) { best = view; break; }
+    }
+    sendJson(res, 200, { ok: true, hosting: best ?? { available: true, hasInstance: false, note: null, plans: [], monthlyPriceLabel: "", instance: null } }, { "cache-control": "no-store" });
+  }
+
+  async function hostingCheckout(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    // Every candidate owner key is checked for an EXISTING instance first —
+    // reusing the FIRST software-eligible key with none is what actually
+    // starts a checkout. This is the double-click/HOSTING_ALREADY_EXISTS
+    // guard from the customer's own side; `HostingStore.reserveInstance`'s
+    // atomic check is the one that is actually load-bearing under a race.
+    const candidates = customerSessions.hostingOwnerCandidates(identity);
+    let ownerId = candidates[0] ?? `email:${identity.email}`;
+    for (const key of candidates) if (hosting.store.activeInstanceForOwner(key, "live") || hosting.store.activeInstanceForOwner(key, "test")) { ownerId = key; break; }
+    const r = hosting.checkoutUrl(ownerId, identity.email);
+    if (!r.ok) return sendJson(res, r.code === "SOFTWARE_LICENSE_REQUIRED" ? 403 : r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, url: r.value.url }, { "cache-control": "no-store" });
+  }
+
+  async function hostingCancel(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    const instanceId = p.slice("/api/hosting/".length, -"/cancel".length);
+    const owner = hostingResolveOwner(identity, instanceId);
+    if (!owner) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" }, { "cache-control": "no-store" });
+    const r = await hosting.cancel(owner, instanceId);
+    if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, suspendAt: r.value.suspendAt, deleteAt: r.value.deleteAt }, { "cache-control": "no-store" });
+  }
+
+  async function hostingResumeRenewal(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    const instanceId = p.slice("/api/hosting/".length, -"/resume-renewal".length);
+    const owner = hostingResolveOwner(identity, instanceId);
+    if (!owner) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" }, { "cache-control": "no-store" });
+    const r = await hosting.resumeRenewal(owner, instanceId);
+    if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, stage: r.value.stage }, { "cache-control": "no-store" });
+  }
+
+  /** Which of the identity's candidate owner keys actually owns this
+   *  instance — `null` if none does (a stranger's id, or a typo). */
+  function hostingResolveOwner(identity: CustomerIdentity, instanceId: string): string | null {
+    const row = hosting.store.getInstance(instanceId);
+    if (!row) return null;
+    return customerSessions.hostingOwnerCandidates(identity).includes(row.ownerId) ? row.ownerId : null;
+  }
+
+  /** POST /api/hosting/instances/:id/readiness — the ONLY hosting route
+   *  that is neither customer-session nor admin-token authenticated: the
+   *  bootstrap script on the instance itself calls it, carrying the
+   *  short-lived per-generation token minted at provisioning time
+   *  (`HostingService.reportReadiness` verifies it against the STORED
+   *  hash). */
+  async function hostingReadinessCallback(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const instanceId = p.slice("/api/hosting/instances/".length, -"/readiness".length);
+    const body = await readJsonBody(req);
+    if (body === null || typeof body.token !== "string" || typeof body.generation !== "number" || !Array.isArray(body.results)) {
+      return sendJson(res, 400, { ok: false, error: "expected {token, generation, results: [{venueId, status|outcome}]}" }, { "cache-control": "no-store" });
+    }
+    const results: ProbeResult[] = [];
+    for (const r of body.results) {
+      if (!r || typeof r !== "object" || typeof (r as any).venueId !== "string") continue;
+      const status = typeof (r as any).status === "number" ? (r as any).status : null;
+      if (status === null) continue;
+      results.push({ venueId: (r as any).venueId, outcome: classifyProbeStatus(status) });
+    }
+    const r = hosting.reportReadiness(instanceId, body.token, body.generation, results);
+    if (!r.ok) return sendJson(res, 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, ready: r.value.ready }, { "cache-control": "no-store" });
   }
 
   function readLatest(): SignedReleaseManifest | null {
@@ -2093,6 +2256,60 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       catch (err) { console.warn(`[license-lease] could not audit revocation ${body.id}: ${(err as Error).message}`); }
       return sendJson(res, 200, { ok: true });
     }
+
+    // ── hosting admin (H6) ────────────────────────────────────────────────
+    if (m === "GET" && p === "/admin/api/hosting/policy") {
+      return sendJson(res, 200, { ok: true, policy: hosting.policy(), secrets: maskedHostingSecrets(readHostingSecrets(cfg.dataDir)) }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p === "/admin/api/hosting/policy") {
+      const body = await readJsonBody(req);
+      if (body === null) return sendJson(res, 400, { ok: false, error: "bad policy patch body" });
+      try {
+        const current = hosting.policy();
+        const next = applyHostingPolicyPatch(current, body.policy ?? {});
+        next.updatedAtMs = rateLimitNow();
+        writeHostingPolicy(cfg.dataDir, next);
+        if (body.secrets !== undefined) writeHostingSecrets(cfg.dataDir, applySecretPatch(readHostingSecrets(cfg.dataDir), body.secrets));
+        return sendJson(res, 200, { ok: true, policy: next, secrets: maskedHostingSecrets(readHostingSecrets(cfg.dataDir)) }, { "cache-control": "no-store" });
+      } catch (err) {
+        if (err instanceof HostingPolicyError) return sendJson(res, 400, { ok: false, error: err.message });
+        throw err;
+      }
+    }
+    if (m === "GET" && p === "/admin/api/hosting/instances") {
+      const rows = hosting.store.instances().sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+      return sendJson(res, 200, { ok: true, instances: rows }, { "cache-control": "no-store" });
+    }
+    if (m === "GET" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/outbox")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/outbox".length);
+      return sendJson(res, 200, { ok: true, jobs: hosting.store.outboxFor(id) }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/retry")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/retry".length);
+      const r = hosting.adminRetryProvisioning(id, rateLimitNow());
+      return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, error: r.error });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/force-suspend")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/force-suspend".length);
+      const body = await readJsonBody(req);
+      const r = hosting.adminForceSuspend(id, typeof body?.reason === "string" ? body.reason : "", rateLimitNow());
+      return r.ok ? sendJson(res, 200, { ok: true, note: "suspend job queued — drained on the next hosting tick" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, error: r.error });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/force-delete")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/force-delete".length);
+      const body = await readJsonBody(req);
+      const r = hosting.adminForceDelete(id, typeof body?.reason === "string" ? body.reason : "", rateLimitNow());
+      return r.ok ? sendJson(res, 200, { ok: true, note: "delete job queued — an operator-forced delete is still processed through the ordinary lease-guarded pipeline" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, error: r.error });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/hold")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/hold".length);
+      if (!hosting.store.getInstance(id)) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" });
+      // `HostingInstanceRow.deletionHoldUntilMs` exists in the store schema
+      // (H4's suggested record shape) but nothing in the delete pipeline
+      // reads it yet — see the delivery report's known gaps. Returning 501
+      // rather than silently accepting the hold and doing nothing with it.
+      return sendJson(res, 501, { ok: false, error: "deletion holds are not yet wired into the delete pipeline — see the delivery report" });
+    }
     sendJson(res, 404, { ok: false, error: "not found" });
   }
 
@@ -2106,6 +2323,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     licenseLeases,
     billing,
     customerSessions,
+    hosting,
     seats,
     listen: () =>
       new Promise<number>((resolve, reject) => {
@@ -2124,6 +2342,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           // full off switch — the service still exists (so the route answers
           // `table: null` rather than 500) but records nothing.
           if (cfg.liqRecord ?? true) liq.start();
+          // Same rule: hosting's periodic reconciliation only runs once the
+          // hub is serving. A suite drives `hosting.tick()` directly instead
+          // of calling `listen()` when it wants a hermetic clock, so this
+          // never fires unexpectedly in a test.
+          hosting.start();
           resolve((server.address() as AddressInfo).port);
         });
       }),
@@ -2132,6 +2355,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         candles.stop();
         marketCaps?.stop();
         liq.stop();
+        hosting.stop();
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),
