@@ -46,12 +46,22 @@
 //   admin    POST /admin/api/feedback/delete     {id} or {ids:[...]} -> gone for good
 //   admin    GET  /admin/api/feedback/export     full JSON download, logs included
 //   admin    POST /admin/api/upgrade             self-upgrade: git pull + install-hub.sh (detached)
+//   public   POST /api/customer/signin           {email} -> {ok:true} always; mails a 15-min sign-in link (H2)
+//   public   GET  /customer/signin?token=        burns the token, sets the session cookie, 302 -> /customer
+//   session  GET  /customer                      static dashboard shell (public/customer.html)
+//   session  GET  /api/customer/state            licence + (placeholder) hosting view for the signed-in identity
+//   session  POST /api/customer/install-command  {customerKey} -> a fresh one-time install command
+//   session  POST /api/customer/portal           {customerKey} -> a Customer Portal session, as JSON
+//   session  POST /api/customer/signout          revokes the presented session, clears the cookie
+//   admin    POST /admin/api/customers/signin-link {email} -> a raw sign-in link (bounced-email fallback)
 //
 // "keyed" = a valid, unexpired, unrevoked LHK1 token in ?key= — or, on the
 // community routes, in an `x-license` header, which is what the bot sends and
 // what keeps a token out of an access log. "admin" = the
-// HUB_ADMIN_TOKEN in an x-hub-admin header, compared constant-time. No
-// sessions, no cookies anywhere.
+// HUB_ADMIN_TOKEN in an x-hub-admin header, compared constant-time — no
+// sessions, no cookies, ever, and a customer session cookie is never even
+// read by an admin route (see src/customer-sessions.ts). "session" = the
+// `wh_customer_session` HttpOnly cookie minted by the sign-in exchange above.
 //
 // SECRETS IN URLS: download/install keys ride in the query string by design
 // (curl-pasteable), so this file must never log a raw req.url — log the
@@ -96,6 +106,15 @@ import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
 import { DEFAULT_SEAT_POLICY, SeatStore } from "./seats.js";
 import type { BillingMode } from "./billing/config.js";
+import {
+  CustomerSessionService,
+  buildSessionCookie,
+  clearSessionCookie,
+  normalizeCustomerEmail,
+  sessionCookieFrom,
+  type CustomerIdentity,
+  type CustomerSessionServiceDeps,
+} from "./customer-sessions.js";
 import {
   AdminBackoffLimiter,
   DEFAULT_ADMIN_AUTH_POLICY,
@@ -180,6 +199,11 @@ export interface Hub {
   /** Stripe -> licence -> install page. Always constructed; does nothing
    *  until the admin page is given keys (see src/billing/). */
   billing: BillingService;
+  /** The central customer dashboard's identity/session state (H2): a
+   *  magic-link sign-in scoped to a durable owner id, kept deliberately
+   *  separate from admin auth and from BillingStore's per-Stripe-customer
+   *  records (see src/customer-sessions.ts). */
+  customerSessions: CustomerSessionService;
   /** One install per licence, decided at check-in (see src/seats.ts). */
   seats: SeatStore;
   /** Bind cfg.host:cfg.port (port 0 ok for tests); resolves to the bound port. */
@@ -224,6 +248,11 @@ export interface HubDeps {
   billingFetch?: BillingServiceDeps["fetchLike"];
   billingNow?: BillingServiceDeps["now"];
   billingRandomBytes?: BillingServiceDeps["randomBytes"];
+  /** Injectable so customer sign-in tests never reach an email provider and
+   *  can drive an exact 15-minute token / 30-day session edge. */
+  customerSessionFetch?: CustomerSessionServiceDeps["fetchLike"];
+  customerSessionNow?: CustomerSessionServiceDeps["now"];
+  customerSessionRandomBytes?: CustomerSessionServiceDeps["randomBytes"];
   /** Injectable seat clock: a seat frees after 30 minutes of silence, which a
    *  suite cannot wait out. */
   seatNow?: () => number;
@@ -308,6 +337,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
   });
+  // ── customer sessions: one central sign-in, downstream of a real billing
+  // customer (H2). See src/customer-sessions.ts's header for the boundary
+  // this deliberately keeps from admin auth and from BillingStore's own
+  // per-Stripe-customer, per-mode records.
+  const customerSessions = new CustomerSessionService(cfg.dataDir, billing, store, cfg.publicOrigin, {
+    now: deps.customerSessionNow,
+    fetchLike: deps.customerSessionFetch,
+    randomBytes: deps.customerSessionRandomBytes,
+  });
+  // A dedicated per-EMAIL bucket for sign-in issuance (README/H2: "rate-
+  // limited per email and per IP"); per-IP reuses `generalIpLimiter` below,
+  // the existing "everything else public" bucket — there was no per-email
+  // dimension anywhere in this Hub to reuse. 5 requests per 15 minutes is
+  // generous against an honest retry (the token itself lasts 15 minutes)
+  // and tight against a flood of one address's inbox.
+  const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
@@ -470,13 +515,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
         || p === "/api/billing/plans" || p === "/billing"
-        || p === "/api/hub/liq-percentiles") return true;
+        || p === "/api/hub/liq-percentiles"
+        || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
     }
     if (m === "POST") {
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
       if (p === "/api/billing/portal-session") return true;
+      // /api/customer/signin also spends the dedicated per-email bucket
+      // (`customerSigninEmailLimiter`) inside its own handler — this is the
+      // per-IP half, the same "everything else public" bucket every other
+      // unauthenticated POST here shares. The three cookie-authenticated
+      // routes are here too, for the same defence-in-depth reason
+      // /api/billing/portal-session (licence-token-authenticated) is.
+      if (p === "/api/customer/signin" || p === "/api/customer/install-command"
+        || p === "/api/customer/portal" || p === "/api/customer/signout") return true;
       return false;
     }
     return false;
@@ -564,6 +618,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p.startsWith("/welcome/") && p.endsWith("/portal")) return welcomePortal(p, res);
     if (m === "POST" && p === "/api/billing/portal-session") return billingPortalSession(req, res);
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
+    // ── customer sessions (H2) ──────────────────────────────────────────
+    if (m === "GET" && p === "/customer") return customerPage(res);
+    if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
+    if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
+    if (m === "GET" && p === "/api/customer/state") return customerState(req, res);
+    if (m === "POST" && p === "/api/customer/install-command") return customerInstallCommand(req, res);
+    if (m === "POST" && p === "/api/customer/portal") return customerPortal(req, res);
+    if (m === "POST" && p === "/api/customer/signout") return customerSignout(req, res);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
     sendJson(res, 404, { ok: false, error: "not found" });
@@ -1084,6 +1146,87 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Wick Hunter Unleashed</title>
 <style>html,body{margin:0;background:#0a0c12;color:#e9ecf5;font:15px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}.w{max-width:560px;margin:60px auto;padding:0 18px}.c{background:#11141d;border:1px solid #212736;border-radius:14px;padding:22px}h1{font-size:20px;margin:0 0 10px}p{color:#96a0b8;margin:0}</style></head>
 <body><div class="w"><div class="c"><h1>Wick Hunter Unleashed</h1><p>${safe}</p></div></div></body></html>`;
+  }
+
+  // ── customer sessions (H2) ────────────────────────────────────────────
+  // Identity/session/dashboard routes only — no provisioning, no hosting
+  // checkout, no emails beyond the sign-in link. See src/customer-sessions.ts.
+
+  function customerPage(res: ServerResponse): void {
+    const html = fs.readFileSync(path.join(cfg.publicDir, "customer.html"));
+    sendHtml(res, 200, html.toString("utf8"));
+  }
+
+  /** GET /customer/signin?token=. A magic-link GET that burns the token —
+   *  the SAME shape `/install/<token>` already uses on this Hub, and the
+   *  token is single-use so a scanner's prefetch costs at worst one extra
+   *  "request a new link" round trip, never a session it can act on unless
+   *  it also controls the recipient's inbox. */
+  function customerSigninExchange(req: IncomingMessage, url: URL, res: ServerResponse): void {
+    const token = url.searchParams.get("token") ?? "";
+    if (!token) return sendHtml(res, 400, notFoundPage("this sign-in link is missing its token — copy the whole link from the email."));
+    const r = customerSessions.exchangeToken(token, clientIp(req));
+    if (!r.ok) return sendHtml(res, r.status, notFoundPage(r.text));
+    res.writeHead(302, { location: "/customer", "set-cookie": r.cookie, "cache-control": "no-store" });
+    res.end();
+  }
+
+  async function customerRequestSignin(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJsonBody(req);
+    const email = typeof body?.email === "string" ? body.email.trim() : "";
+    if (!email || email.length > 254 || !email.includes("@") || /[\r\n]/.test(email)) {
+      return sendJson(res, 400, { ok: false, error: "enter a valid email address" }, { "cache-control": "no-store" });
+    }
+    // The dedicated per-email bucket, checked AFTER the body is read (the
+    // key lives in the body) but BEFORE anything state-changing —
+    // `requestSignin` is the first call that could mint a token or send an
+    // email. The per-IP half already ran in the pre-dispatch block.
+    const rate = customerSigninEmailLimiter.take(normalizeCustomerEmail(email), rateLimitNow());
+    if (!rate.ok) return sendRateLimited(res, rate, "sign-in requests for this address");
+    await customerSessions.requestSignin(email);
+    // Deliberately the SAME reply whether or not the address matched a
+    // billing customer — see CustomerSessionService.requestSignin's own
+    // docstring; an attacker must not be able to enumerate customers by
+    // watching which addresses get a different answer.
+    sendJson(res, 200, { ok: true, message: "If that email has a Wick Hunter account, a sign-in link is on its way." }, { "cache-control": "no-store" });
+  }
+
+  function authenticatedCustomer(req: IncomingMessage): CustomerIdentity | null {
+    return customerSessions.authenticate(sessionCookieFrom(req.headers.cookie));
+  }
+
+  function customerState(req: IncomingMessage, res: ServerResponse): void {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, ...customerSessions.dashboardState(identity) }, { "cache-control": "no-store" });
+  }
+
+  async function customerInstallCommand(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    const body = await readJsonBody(req);
+    const customerKey = typeof body?.customerKey === "string" ? body.customerKey : "";
+    if (!customerKey) return sendJson(res, 400, { ok: false, error: "expected {customerKey}" }, { "cache-control": "no-store" });
+    const r = customerSessions.installCommand(identity, customerKey, readLatest() !== null);
+    if (!r.ok) return sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, command: r.command }, { "cache-control": "no-store" });
+  }
+
+  async function customerPortal(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    const body = await readJsonBody(req);
+    const customerKey = typeof body?.customerKey === "string" ? body.customerKey : "";
+    if (!customerKey) return sendJson(res, 400, { ok: false, error: "expected {customerKey}" }, { "cache-control": "no-store" });
+    const r = await customerSessions.portalUrlFor(identity, customerKey);
+    if (!r.ok) return sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, url: r.url }, { "cache-control": "no-store" });
+  }
+
+  function customerSignout(req: IncomingMessage, res: ServerResponse): void {
+    const raw = sessionCookieFrom(req.headers.cookie);
+    if (raw) customerSessions.store.revokeSession(raw, customerSessions.nowMs());
+    sendJson(res, 200, { ok: true }, { "cache-control": "no-store", "set-cookie": clearSessionCookie() });
   }
 
   function readLatest(): SignedReleaseManifest | null {
@@ -1928,6 +2071,18 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const limit = Number(url.searchParams.get("limit") ?? 100);
       return sendJson(res, 200, { ok: true, events: billing.events(Number.isFinite(limit) ? limit : 100) }, { "cache-control": "no-store" });
     }
+    // The bounced/undeliverable-email fallback (H2): mints the same kind of
+    // sign-in token `POST /api/customer/signin` would, but hands the raw
+    // link back to the admin instead of emailing it — the "dev/admin-only
+    // print the link" path the brief calls acceptable behind admin auth.
+    if (m === "POST" && p === "/admin/api/customers/signin-link") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.email !== "string" || !body.email) {
+        return sendJson(res, 400, { ok: false, error: "expected {email}" });
+      }
+      const r = customerSessions.adminIssueLink(body.email);
+      return r.ok ? sendJson(res, 200, { ok: true, url: r.url }, { "cache-control": "no-store" }) : sendJson(res, 404, { ok: false, error: r.error });
+    }
     if (m === "POST" && p === "/admin/api/licenses/revoke") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.id !== "string" || !body.id) {
@@ -1950,6 +2105,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     candleKey,
     licenseLeases,
     billing,
+    customerSessions,
     seats,
     listen: () =>
       new Promise<number>((resolve, reject) => {

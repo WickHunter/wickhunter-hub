@@ -996,6 +996,27 @@ export class BillingService {
     return { ok: false, status: 404, error: "billing management is not configured — email support" };
   }
 
+  /** The customer-session dashboard's counterpart to `portalRedirect` (H2):
+   *  the CALLER (`src/customer-sessions.ts`) has already proved ownership —
+   *  a signed-in session whose identity email matches the record's email —
+   *  so this skips the page-token lookup and opens the session directly off
+   *  the customer key. Kept in this class rather than reimplemented there
+   *  because the Stripe call itself (`stripePortalSessionUrl`) and its "no
+   *  secret key -> static login link -> nothing" fallback order must stay
+   *  the ONE place that decides it; see that method's docstring for the
+   *  still-unscoped-by-product portal caveat, which applies here exactly as
+   *  it does to every other caller. */
+  async portalRedirectForCustomer(customerKey: string, returnUrl: string): Promise<PortalResult> {
+    const rec = this.store.getCustomer(customerKey);
+    if (!rec) return { ok: false, status: 404, error: "unknown customer" };
+    const cfg = this.config();
+    const m = cfg.stripe[rec.livemode ? "live" : "test"];
+    const url = await this.stripePortalSessionUrl(rec, m, returnUrl);
+    if (url) return { ok: true, url };
+    if (m.portalUrl) return { ok: true, url: m.portalUrl };
+    return { ok: false, status: 404, error: "billing management is not configured — email support" };
+  }
+
   /** POST /api/billing/portal-session (v0.4.16) — the token-proved
    *  counterpart to `portalRedirect`'s page-token flow, for a running bot's
    *  own Settings page (liqhunter-private's `POST /api/license/portal`

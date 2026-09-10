@@ -2245,6 +2245,7 @@ async function billingCustomersRefresh() {
       setTimeout(() => { resend.disabled = false; resend.textContent = "Resend welcome"; }, 2500);
     };
     tr.lastElementChild.appendChild(resend);
+    tr.lastElementChild.appendChild(signinLinkButton(c.email));
     rows.appendChild(tr);
 
     const card = document.createElement("div");
@@ -2261,10 +2262,46 @@ async function billingCustomersRefresh() {
     cardResend.textContent = "Resend welcome";
     cardResend.onclick = resend.onclick;
     card.appendChild(cardResend);
+    card.appendChild(signinLinkButton(c.email));
     cards.appendChild(card);
   }
 }
 document.getElementById("billingCustomersRefresh").onclick = billingCustomersRefresh;
+
+// H2's bounced/undeliverable-email fallback: mint a customer-account sign-in
+// link and show it to the admin to hand-deliver, rather than emailing it (a
+// bounced address is exactly the one this can't mail to). Never creates an
+// identity for an email with no billing customer on file — the admin route
+// itself refuses that, this just surfaces the refusal.
+function signinLinkButton(email) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "Sign-in link";
+  btn.style.marginLeft = ".35rem";
+  btn.onclick = async () => {
+    btn.disabled = true;
+    let out;
+    try {
+      const r = await api("/admin/api/customers/signin-link", { method: "POST", body: JSON.stringify({ email }) });
+      out = r.url;
+    } catch (e) {
+      out = e.message === "unauthorized" ? null : ("error: " + e.message);
+    }
+    btn.disabled = false;
+    if (out === null) return;
+    let box = btn.nextElementSibling;
+    if (!box || !box.classList || !box.classList.contains("signinlinkbox")) {
+      box = document.createElement("input");
+      box.className = "signinlinkbox";
+      box.readOnly = true;
+      box.style.cssText = "display:block;width:100%;margin-top:.35rem;font-size:.78rem";
+      btn.insertAdjacentElement("afterend", box);
+    }
+    box.value = out;
+    box.select();
+  };
+  return btn;
+}
 
 function billingEventOutcomeClass(outcome) {
   return outcome === "applied" ? "ops-ok" : (outcome === "error" || outcome === "signature") ? "ops-bad" : "ops-warn";
