@@ -17,6 +17,14 @@
 // honoured — real money is never ignored because a switch was left on test.
 import path from "node:path";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
+import {
+  isStripePriceId,
+  isStripeProductId,
+  type BillingRole,
+  type ModeRoleConfig,
+  type RoleAllowlist,
+} from "./roles.js";
+export type { BillingRole, ModeRoleConfig, RoleAllowlist } from "./roles.js";
 
 export const BILLING_CONFIG_FILE = "billing-config.v1.json";
 
@@ -48,15 +56,24 @@ export interface Plan {
    *  3650 days (ten years), which the operator has accepted as the term. */
   lifetime: boolean;
   description: string;
+  /** Which product this plan buys. Every plan defined before this field
+   *  existed is "software" (the only product the Hub has ever sold) — a
+   *  missing/unreadable value on load resolves there, never guessed toward
+   *  "hosting". Read by the billing-role dispatcher (roles.ts) as the
+   *  binding aid for a checkout.session.completed event, which carries no
+   *  price/product id inline in its webhook payload; every other event
+   *  type is classified from real price/product ids instead and never
+   *  consults this field. */
+  role: BillingRole;
 }
 
 export const MAX_LICENSE_DAYS = 3650;
 export const PLAN_KEY_RE = /^[a-z][a-z0-9-]{0,23}$/;
 
 const DEFAULT_PLAN_LIST: Plan[] = [
-  { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time." },
-  { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free." },
-  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment." },
+  { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time.", role: "software" },
+  { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free.", role: "software" },
+  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment.", role: "software" },
 ];
 export const DEFAULT_PLANS: readonly Plan[] = Object.freeze(DEFAULT_PLAN_LIST.map((p) => Object.freeze({ ...p })));
 
@@ -112,12 +129,19 @@ export interface BillingConfig {
   stripe: Record<BillingMode, StripeModeConfig>;
   email: EmailConfig;
   policy: BillingPolicy;
+  /** The authoritative product-role mapping (src/billing/roles.ts):
+   *  Stripe price/product ids that grant "software" or "hosting", kept
+   *  SEPARATELY per mode because a test-mode id and a live-mode id are
+   *  different Stripe objects in different accounts. Empty by default on
+   *  every existing install — see roles.ts's header for what that means. */
+  roles: Record<BillingMode, ModeRoleConfig>;
   /** The public website, for links in emails and on the welcome page. */
   siteOrigin: string;
   updatedAtMs: number | null;
 }
 
 const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhookSecret: "", paymentLinkUrl: "", paymentLinks: {}, portalUrl: "" };
+const EMPTY_ROLES: ModeRoleConfig = { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } };
 
 export const DEFAULT_BILLING_POLICY: BillingPolicy = {
   graceDays: 7,
@@ -137,6 +161,7 @@ export function defaultBillingConfig(): BillingConfig {
     stripe: { test: { ...EMPTY_MODE, paymentLinks: {} }, live: { ...EMPTY_MODE, paymentLinks: {} } },
     email: { provider: "none", apiKey: "", from: "", replyTo: "" },
     policy: { ...DEFAULT_BILLING_POLICY },
+    roles: { test: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } }, live: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } } },
     siteOrigin: "",
     updatedAtMs: null,
   };
@@ -179,18 +204,38 @@ function plansFrom(raw: unknown): Plan[] {
 
 /** Read the file, tolerating any missing field (a hub upgraded from a version
  *  that wrote fewer keys must not lose the ones it has). */
+/** Tolerant load of one mode's role allowlists: an unreadable or absent
+ *  entry is EMPTY, never a guess at what it might have meant — an empty
+ *  hosting allowlist is the documented backward-compatible default (see
+ *  roles.ts), so falling back to it on a read error is always safe. Any
+ *  string that does not look like a Stripe price/product id is dropped
+ *  rather than failing the whole config load. */
+function roleAllowlistFrom(raw: unknown): RoleAllowlist {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const priceIds = Array.isArray(o.priceIds) ? o.priceIds.filter(isStripePriceId) : [];
+  const productIds = Array.isArray(o.productIds) ? o.productIds.filter(isStripeProductId) : [];
+  return { priceIds: [...new Set(priceIds)], productIds: [...new Set(productIds)] };
+}
+
+function modeRoleConfigFrom(raw: unknown): ModeRoleConfig {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return { software: roleAllowlistFrom(o.software), hosting: roleAllowlistFrom(o.hosting) };
+}
+
 export function readBillingConfig(dataDir: string): BillingConfig {
   const raw = readJson<Record<string, unknown>>(path.join(dataDir, BILLING_CONFIG_FILE), {});
   const d = defaultBillingConfig();
   const stripe = (raw.stripe && typeof raw.stripe === "object" ? raw.stripe : {}) as Record<string, unknown>;
   const email = (raw.email && typeof raw.email === "object" ? raw.email : {}) as Record<string, unknown>;
   const policy = (raw.policy && typeof raw.policy === "object" ? raw.policy : {}) as Record<string, unknown>;
+  const roles = (raw.roles && typeof raw.roles === "object" ? raw.roles : {}) as Record<string, unknown>;
   const provider = str(email.provider);
   return {
     v: 1,
     mode: raw.mode === "live" ? "live" : "test",
     plans: plansFrom(raw.plans),
     stripe: { test: modeFrom(stripe.test), live: modeFrom(stripe.live) },
+    roles: { test: modeRoleConfigFrom(roles.test), live: modeRoleConfigFrom(roles.live) },
     email: {
       provider: (EMAIL_PROVIDERS as readonly string[]).includes(provider) ? (provider as EmailProvider) : "none",
       apiKey: str(email.apiKey),
@@ -286,7 +331,17 @@ export function validatePlans(raw: unknown): Plan[] {
       throw new BillingConfigError(`plan ${key}: a lifetime plan cannot also renew — set interval to null`);
     }
     const description = typeof o.description === "string" ? o.description.trim().slice(0, 120) : "";
-    out.push({ key, name, amountCents: amount as number, currency, interval, licenseDays, lifetime, description });
+    // A stored file written before roles existed carries no `role` at all —
+    // that MUST resolve to "software" (the only product this Hub has ever
+    // sold), never throw: `plansFrom` resets the WHOLE plan list to the
+    // built-in defaults on any validation error, which would silently wipe
+    // an operator's configured pricing the first time this code runs against
+    // an older file. An explicit, unreadable value is refused instead: that
+    // can only happen from a hand-edited admin patch, which is exactly where
+    // a mistake should be reported, not guessed past.
+    const role = o.role === undefined ? "software" : o.role === "software" || o.role === "hosting" ? o.role : "bad";
+    if (role === "bad") throw new BillingConfigError(`plan ${key}: role must be "software" or "hosting"`);
+    out.push({ key, name, amountCents: amount as number, currency, interval, licenseDays, lifetime, description, role });
   }
   return out;
 }
@@ -340,6 +395,48 @@ function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unk
 
 /** Apply an admin patch to a config. Throws BillingConfigError with a message
  *  safe to show the operator; on success returns the NEW config (unsaved). */
+function roleAllowlistPatch(mode: BillingMode, role: BillingRole, current: RoleAllowlist, patch: unknown): RoleAllowlist {
+  if (patch === undefined) return current;
+  if (!patch || typeof patch !== "object") throw new BillingConfigError(`roles.${mode}.${role} must be an object`);
+  const p = patch as Record<string, unknown>;
+  const label = `${mode} ${role}`;
+  const readIds = (v: unknown, field: string, check: (x: unknown) => x is string, prefix: string): string[] => {
+    if (v === undefined) return field === "priceIds" ? [...current.priceIds] : [...current.productIds];
+    if (!Array.isArray(v)) throw new BillingConfigError(`${label}.${field} must be an array of Stripe ${prefix} ids`);
+    const out: string[] = [];
+    for (const id of v) {
+      if (!check(id)) throw new BillingConfigError(`${label}.${field}: ${JSON.stringify(id)} does not look like a Stripe ${prefix} id`);
+      if (!out.includes(id)) out.push(id);
+    }
+    return out;
+  };
+  return {
+    priceIds: readIds(p.priceIds, "priceIds", isStripePriceId, "price_"),
+    productIds: readIds(p.productIds, "productIds", isStripeProductId, "prod_"),
+  };
+}
+
+/** Validate + apply one mode's role patch, then refuse an id appearing on
+ *  BOTH lists — the same misconfiguration `classifyRole` refuses live at
+ *  request time (roles.ts: an id claiming two roles is "unknown", never a
+ *  guess), caught here instead so it is reported to the admin immediately
+ *  rather than discovered later as an event nobody can explain. */
+function applyRoleModePatch(mode: BillingMode, current: ModeRoleConfig, patch: unknown): ModeRoleConfig {
+  if (patch === undefined) return current;
+  if (!patch || typeof patch !== "object") throw new BillingConfigError(`roles.${mode} must be an object`);
+  const p = patch as Record<string, unknown>;
+  const next: ModeRoleConfig = {
+    software: roleAllowlistPatch(mode, "software", current.software, p.software),
+    hosting: roleAllowlistPatch(mode, "hosting", current.hosting, p.hosting),
+  };
+  const overlapPrice = next.software.priceIds.find((id) => next.hosting.priceIds.includes(id));
+  const overlapProduct = next.software.productIds.find((id) => next.hosting.productIds.includes(id));
+  if (overlapPrice || overlapProduct) {
+    throw new BillingConfigError(`${mode}: ${overlapPrice ?? overlapProduct} is listed under both software and hosting — an id can only ever grant one role`);
+  }
+  return next;
+}
+
 export function applyBillingPatch(current: BillingConfig, patch: Record<string, unknown>, now = Date.now()): BillingConfig {
   const next: BillingConfig = {
     ...current,
@@ -347,6 +444,10 @@ export function applyBillingPatch(current: BillingConfig, patch: Record<string, 
     stripe: {
       test: { ...current.stripe.test, paymentLinks: { ...current.stripe.test.paymentLinks } },
       live: { ...current.stripe.live, paymentLinks: { ...current.stripe.live.paymentLinks } },
+    },
+    roles: {
+      test: { software: { ...current.roles.test.software }, hosting: { ...current.roles.test.hosting } },
+      live: { software: { ...current.roles.live.software }, hosting: { ...current.roles.live.hosting } },
     },
     email: { ...current.email },
     policy: { ...current.policy },
@@ -360,6 +461,12 @@ export function applyBillingPatch(current: BillingConfig, patch: Record<string, 
     const s = patch.stripe as Record<string, unknown>;
     next.stripe.test = applyModePatch("test", next.stripe.test, s.test);
     next.stripe.live = applyModePatch("live", next.stripe.live, s.live);
+  }
+  if (patch.roles !== undefined) {
+    if (!patch.roles || typeof patch.roles !== "object") throw new BillingConfigError("roles must be an object");
+    const r = patch.roles as Record<string, unknown>;
+    next.roles.test = applyRoleModePatch("test", next.roles.test, r.test);
+    next.roles.live = applyRoleModePatch("live", next.roles.live, r.live);
   }
   if (patch.email !== undefined) {
     if (!patch.email || typeof patch.email !== "object") throw new BillingConfigError("email must be an object");
@@ -452,6 +559,13 @@ export function maskedBillingConfig(cfg: BillingConfig, publicOrigin: string, re
       webhookLive: `${origin}/api/billing/stripe/live`,
     },
     stripe: { test: maskMode(cfg.stripe.test), live: maskMode(cfg.stripe.live) },
+    // Price/product ids are not secrets (they identify what is being sold,
+    // not who can act as the account) and are echoed in full so the admin
+    // page can show them back.
+    roles: {
+      test: { software: { ...cfg.roles.test.software }, hosting: { ...cfg.roles.test.hosting } },
+      live: { software: { ...cfg.roles.live.software }, hosting: { ...cfg.roles.live.hosting } },
+    },
     email: { provider: cfg.email.provider, apiKey: maskSecret(cfg.email.apiKey), from: cfg.email.from, replyTo: cfg.email.replyTo },
     policy: { ...cfg.policy },
     siteOrigin: cfg.siteOrigin,

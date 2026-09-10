@@ -134,15 +134,29 @@ export interface InvoiceFacts {
    *  has paid THROUGH. Stable across Stripe API versions, unlike the
    *  subscription's own `current_period_end`, which moved in 2025. */
   periodEndMs: number | null;
+  /** Every price/product id named on the invoice's own lines — a line's
+   *  `price` object is inline in the webhook payload (no fetch needed) and
+   *  is what the billing-role dispatcher (roles.ts) classifies this event
+   *  against. Deduplicated; empty when no line carries a readable price. */
+  priceIds: string[];
+  productIds: string[];
 }
 
 export function invoiceFacts(o: Obj): InvoiceFacts {
   let periodEnd: number | null = null;
   const lines = asObj(o.lines);
   const data = Array.isArray(lines.data) ? lines.data : [];
+  const priceIds = new Set<string>();
+  const productIds = new Set<string>();
   for (const line of data) {
-    const end = asNum(asObj(asObj(line).period).end);
+    const l = asObj(line);
+    const end = asNum(asObj(l.period).end);
     if (end !== null && (periodEnd === null || end > periodEnd)) periodEnd = end;
+    const price = asObj(l.price);
+    const priceId = asStr(price.id);
+    if (priceId) priceIds.add(priceId);
+    const productId = asId(price.product);
+    if (productId) productIds.add(productId);
   }
   // 2025-03-31.basil moved `invoice.subscription` under `parent`; read both.
   const parent = asObj(o.parent);
@@ -158,6 +172,8 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
     billingReason: asStr(o.billing_reason),
     paid: o.paid === true || asStr(o.status) === "paid",
     periodEndMs: periodEnd === null ? null : periodEnd * 1000,
+    priceIds: [...priceIds],
+    productIds: [...productIds],
   };
 }
 
@@ -169,16 +185,27 @@ export interface SubscriptionFacts {
   /** Present on older API versions at the top level, on newer ones per item. */
   currentPeriodEndMs: number | null;
   endedAtMs: number | null;
+  /** Every price/product id named on the subscription's own items — inline
+   *  in the webhook payload, no fetch needed. See InvoiceFacts.priceIds. */
+  priceIds: string[];
+  productIds: string[];
 }
 
 export function subscriptionFacts(o: Obj): SubscriptionFacts {
   let periodEnd = asNum(o.current_period_end);
-  if (periodEnd === null) {
-    const items = asObj(o.items);
-    for (const item of Array.isArray(items.data) ? items.data : []) {
-      const end = asNum(asObj(item).current_period_end);
-      if (end !== null && (periodEnd === null || end > periodEnd)) periodEnd = end;
-    }
+  const items = asObj(o.items);
+  const itemList = Array.isArray(items.data) ? items.data : [];
+  const priceIds = new Set<string>();
+  const productIds = new Set<string>();
+  for (const item of itemList) {
+    const it = asObj(item);
+    const end = asNum(it.current_period_end);
+    if (end !== null && (periodEnd === null || end > periodEnd)) periodEnd = end;
+    const price = asObj(it.price);
+    const priceId = asStr(price.id);
+    if (priceId) priceIds.add(priceId);
+    const productId = asId(price.product);
+    if (productId) productIds.add(productId);
   }
   const ended = asNum(o.ended_at);
   return {
@@ -188,6 +215,8 @@ export function subscriptionFacts(o: Obj): SubscriptionFacts {
     cancelAtPeriodEnd: o.cancel_at_period_end === true,
     currentPeriodEndMs: periodEnd === null ? null : periodEnd * 1000,
     endedAtMs: ended === null ? null : ended * 1000,
+    priceIds: [...priceIds],
+    productIds: [...productIds],
   };
 }
 
@@ -195,6 +224,11 @@ export interface ChargeFacts {
   chargeId: string;
   customerId: string;
   paymentIntentId: string;
+  /** Set when this charge was generated from an invoice (the ordinary
+   *  subscription-billing case) — the join key the billing-role dispatcher
+   *  uses to find the role an earlier `invoice.paid` already recorded for
+   *  this exact invoice, without re-deciding anything or calling Stripe. */
+  invoiceId: string;
   email: string;
   amount: number | null;
   amountRefunded: number | null;
@@ -207,6 +241,7 @@ export function chargeFacts(o: Obj): ChargeFacts {
     chargeId: asStr(o.id),
     customerId: asId(o.customer),
     paymentIntentId: asId(o.payment_intent),
+    invoiceId: asId(o.invoice),
     email: (asStr(billing.email) || asStr(o.receipt_email)).trim().toLowerCase(),
     amount: asNum(o.amount),
     amountRefunded: asNum(o.amount_refunded),

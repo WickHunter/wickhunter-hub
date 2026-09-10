@@ -1,6 +1,15 @@
 // src/billing/store.ts
 // Durable billing state beside the licence registry:
-//   data/billing-customers.v1.json   one row per Stripe customer -> licence
+//   data/billing-customers.v1.json          one row per Stripe customer -> SOFTWARE licence
+//   data/billing-role-subscriptions.v1.json one row per (customer, role) for every NON-software
+//                                            product — see roles.ts; software stays in the file
+//                                            above, byte-for-byte as it always was
+//   data/billing-role-index.v1.json         object id (subscription/invoice/payment-intent) ->
+//                                            the role it was classified as, so a later refund or
+//                                            dispute on the SAME object resolves its role without
+//                                            re-deciding anything or calling Stripe
+//   data/billing-role-migration.v1.json     one-shot marker: has the pre-dispatcher customer file
+//                                            been folded into the role index yet
 //   data/billing-tokens.v1.json      install-page and one-time install tokens (HASHED)
 //   data/billing-events.v1.jsonl     every webhook event received, with its outcome
 //   data/billing-events-seen.v1.json bounded set of event ids, for idempotent replay
@@ -11,11 +20,15 @@ import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, readJson, writeJsonAtomic } from "../jsonfile.js";
+import type { BillingRole } from "./roles.js";
 
 export const CUSTOMERS_FILE = "billing-customers.v1.json";
 export const TOKENS_FILE = "billing-tokens.v1.json";
 export const EVENTS_FILE = "billing-events.v1.jsonl";
 export const EVENTS_SEEN_FILE = "billing-events-seen.v1.json";
+export const ROLE_SUBSCRIPTIONS_FILE = "billing-role-subscriptions.v1.json";
+export const ROLE_INDEX_FILE = "billing-role-index.v1.json";
+export const ROLE_MIGRATION_MARKER_FILE = "billing-role-migration.v1.json";
 
 /** How many event ids we remember. Stripe retries for up to three days; this
  *  is years of a small shop's events, and the ledger keeps the full history. */
@@ -66,7 +79,12 @@ export interface TokenRecord {
   revokedAtMs: number | null;
 }
 
-export type EventOutcome = "applied" | "ignored" | "duplicate" | "error" | "signature";
+// "unclassified" is its OWN outcome, distinct from "ignored": an ignored
+// event was understood and correctly has nothing to do (a partial refund, an
+// unhandled type); an unclassified one could not be matched to EITHER
+// product role at all and is recorded for the operator to reconcile by hand
+// (roles.ts's "unknown" — see its header for exactly when that fires).
+export type EventOutcome = "applied" | "ignored" | "duplicate" | "error" | "signature" | "unclassified";
 
 export interface EventRecord {
   id: string;
@@ -81,6 +99,31 @@ export type ConsumeResult =
   | { ok: true; rec: TokenRecord }
   | { ok: false; reason: "unknown" | "used" | "expired" | "revoked" };
 
+/** One (customer, role) subscription record for every role OTHER than
+ *  "software" — software keeps living on CustomerRecord exactly as before
+ *  (H1's "byte-for-byte unchanged"). A hosting record never implies a
+ *  software one exists, and never touches one. */
+export interface RoleSubscriptionRecord {
+  key: string; // `${customerKey}::${role}`
+  customerKey: string;
+  role: BillingRole;
+  livemode: boolean;
+  subscriptionId: string | null;
+  subscriptionStatus: string | null;
+  /** What the customer has paid THROUGH for this role — this role's OWN
+   *  figure, never blended with any other role's. */
+  periodEndMs: number | null;
+  chargeIds: string[];
+  disputed: boolean;
+  refunded: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+  lastEventType: string | null;
+  lastEventAtMs: number | null;
+}
+
+export const roleSubscriptionKey = (customerKey: string, role: BillingRole): string => `${customerKey}::${role}`;
+
 const hashToken = (raw: string): string => createHash("sha256").update(raw).digest("hex");
 
 /** Plain-object maps with no prototype: keys arrive from Stripe and from the
@@ -94,12 +137,19 @@ export class BillingStore {
   private readonly tokensFile: string;
   private readonly eventsFile: string;
   private readonly seenFile: string;
+  private readonly roleSubscriptionsFile: string;
+  private readonly roleIndexFile: string;
+  private readonly roleMigrationFile: string;
 
   constructor(readonly dataDir: string, private readonly randomBytes: (n: number) => Buffer = nodeRandomBytes) {
     this.customersFile = path.join(dataDir, CUSTOMERS_FILE);
     this.tokensFile = path.join(dataDir, TOKENS_FILE);
     this.eventsFile = path.join(dataDir, EVENTS_FILE);
     this.seenFile = path.join(dataDir, EVENTS_SEEN_FILE);
+    this.roleSubscriptionsFile = path.join(dataDir, ROLE_SUBSCRIPTIONS_FILE);
+    this.roleIndexFile = path.join(dataDir, ROLE_INDEX_FILE);
+    this.roleMigrationFile = path.join(dataDir, ROLE_MIGRATION_MARKER_FILE);
+    this.migrateLegacySoftwareRoles();
   }
 
   // ── customers ─────────────────────────────────────────────────────────────
@@ -134,6 +184,100 @@ export class BillingStore {
     if (!e) return null;
     for (const rec of Object.values(this.customers())) if (rec.email === e) return rec;
     return null;
+  }
+
+  // ── role subscriptions (every role other than "software") ──────────────────
+  // Software stays on `customers()` above, byte-for-byte as it always was —
+  // these exist so a hosting (or any future non-software) subscription has
+  // somewhere to live that a software handler never reads or writes.
+
+  roleSubscriptions(): Record<string, RoleSubscriptionRecord> {
+    return bare(readJson<Record<string, RoleSubscriptionRecord>>(this.roleSubscriptionsFile, {}));
+  }
+
+  getRoleSubscription(customerKey: string, role: BillingRole): RoleSubscriptionRecord | null {
+    return this.roleSubscriptions()[roleSubscriptionKey(customerKey, role)] ?? null;
+  }
+
+  putRoleSubscription(rec: RoleSubscriptionRecord): void {
+    const all = this.roleSubscriptions();
+    all[rec.key] = rec;
+    writeJsonAtomic(this.roleSubscriptionsFile, all);
+  }
+
+  findRoleSubscriptionByCharge(role: BillingRole, id: string): RoleSubscriptionRecord | null {
+    if (!id) return null;
+    for (const rec of Object.values(this.roleSubscriptions())) if (rec.role === role && rec.chargeIds.includes(id)) return rec;
+    return null;
+  }
+
+  // ── role index ───────────────────────────────────────────────────────────
+  // object id (a Stripe subscription/invoice/payment-intent/checkout-session
+  // id) -> the role it was classified as. Populated the moment ANY event
+  // carrying that id is classified, so a LATER event naming only that id (a
+  // refund knows only the charge/payment-intent, a dispute only the charge)
+  // resolves its role from what was already decided — never re-classifying,
+  // never guessing, never calling Stripe. Bounded exactly like `seenFile`:
+  // years of a small shop's objects fit inside the cap, and role churn on one
+  // object is rare enough that eviction losing the oldest entries is fine —
+  // the WORST case on eviction is falling back to `classifyRole`'s own
+  // documented default (software while hosting is unconfigured; "unknown"
+  // once it is), never a wrong answer standing in for a right one.
+  private readonly MAX_ROLE_INDEX_ENTRIES = 5000;
+
+  private roleIndex(): Record<string, { role: BillingRole; atMs: number }> {
+    return bare(readJson<Record<string, { role: BillingRole; atMs: number }>>(this.roleIndexFile, {}));
+  }
+
+  roleFor(objectId: string): BillingRole | null {
+    if (!objectId) return null;
+    return this.roleIndex()[objectId]?.role ?? null;
+  }
+
+  /** Record (or confirm) an object's role. A SECOND role for an id already
+   *  indexed under a DIFFERENT role is refused — silently overwriting it
+   *  would let one misclassified event quietly relabel every later refund or
+   *  dispute on the same object. The caller decides what a refusal means
+   *  (service.ts treats it as "unknown" and records it for reconciliation,
+   *  the same as any other classification conflict). */
+  noteRole(objectId: string, role: BillingRole, now = Date.now()): boolean {
+    if (!objectId) return true;
+    const all = this.roleIndex();
+    const existing = all[objectId];
+    if (existing && existing.role !== role) return false;
+    if (existing) return true; // already recorded, agrees — nothing to write
+    all[objectId] = { role, atMs: now };
+    const ids = Object.keys(all);
+    if (ids.length > this.MAX_ROLE_INDEX_ENTRIES) {
+      ids.sort((a, b) => all[a]!.atMs - all[b]!.atMs);
+      for (const old of ids.slice(0, ids.length - this.MAX_ROLE_INDEX_ENTRIES)) delete all[old];
+    }
+    writeJsonAtomic(this.roleIndexFile, all);
+    return true;
+  }
+
+  /** One-shot, marker-guarded: fold every pre-dispatcher `CustomerRecord`'s
+   *  known object ids (its subscription and every charge it has seen) into
+   *  the role index as "software" — the "explicit legacy software mappings
+   *  handle older customers" the dispatcher relies on (roles.ts), so an
+   *  existing customer's refund or dispute keeps resolving to software from
+   *  the role index even after an operator configures a hosting allowlist
+   *  and the Hub-wide "no hosting configured -> default software" safety net
+   *  (also in roles.ts) stops applying. Runs once per process at
+   *  construction — cheap (one JSON read/write for the whole file) and
+   *  correct to re-run if the marker is ever lost: it can only ever ADD
+   *  "software" entries for ids no role has been recorded for yet, via the
+   *  same conflict-refusing `noteRole` every live event goes through, so a
+   *  re-run can never silently overwrite a role an operator's later
+   *  configuration has already assigned. */
+  private migrateLegacySoftwareRoles(): void {
+    if (fs.existsSync(this.roleMigrationFile)) return;
+    const now = Date.now();
+    for (const rec of Object.values(this.customers())) {
+      if (rec.subscriptionId) this.noteRole(rec.subscriptionId, "software", rec.createdAtMs);
+      for (const chargeId of rec.chargeIds) this.noteRole(chargeId, "software", rec.createdAtMs);
+    }
+    writeJsonAtomic(this.roleMigrationFile, { migratedAtMs: now });
   }
 
   // ── events ────────────────────────────────────────────────────────────────
