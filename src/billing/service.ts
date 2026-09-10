@@ -41,7 +41,8 @@ import {
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
-import { BillingStore, type CustomerRecord, type EventOutcome, type EventRecord } from "./store.js";
+import { BillingStore, roleSubscriptionKey, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import {
   chargeFacts,
   checkoutFacts,
@@ -55,10 +56,28 @@ import {
 } from "./stripe.js";
 
 export { BillingConfigError } from "./config.js";
+export type { BillingRole } from "./roles.js";
 export type { BillingMode } from "./config.js";
 
 const DAY_MS = 86_400_000;
 const STRIPE_PORTAL_SESSIONS_URL = "https://api.stripe.com/v1/billing_portal/sessions";
+
+/** Every event type this Hub ever acts on, of EITHER role — the set the
+ *  webhook subscribes to (README, "Register two webhook endpoints"). An
+ *  event outside this set is "ignored — event type not handled" without
+ *  ever reaching the role dispatcher: there is nothing here to classify. */
+const DISPATCHED_EVENT_TYPES = new Set([
+  "checkout.session.completed",
+  "checkout.session.async_payment_succeeded",
+  "invoice.paid",
+  "invoice.payment_succeeded",
+  "invoice.payment_failed",
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
+  "charge.succeeded",
+  "charge.refunded",
+  "charge.dispute.created",
+]);
 
 export interface BillingServiceDeps {
   now?: () => number;
@@ -255,6 +274,36 @@ export class BillingService {
   /** Pure-ish: no signature, no dedupe — the suite drives this directly. */
   async applyEvent(ev: StripeEvent, cfg: BillingConfig = this.config()): Promise<ApplyResult> {
     if (!ev.livemode && cfg.mode !== "test") return { outcome: "ignored", note: "test-mode event while the Hub is in LIVE mode" };
+    if (!DISPATCHED_EVENT_TYPES.has(ev.type)) return { outcome: "ignored", note: "event type not handled" };
+
+    // ── the billing-role dispatcher (H1) ────────────────────────────────────
+    // Classify BEFORE touching any state. This is the fix: every handler
+    // below this point used to run for EVERY event on EVERY customer,
+    // treating "this Stripe customer" and "the software subscription" as one
+    // fact — which a second, unrelated subscription (hosting) on the same
+    // customer breaks (see roles.ts's header and
+    // tests/billing-roles.test.mjs's first section, "the defect this file
+    // exists to prevent"). Only a "software" classification reaches the
+    // pre-dispatcher switch below, byte-for-byte unchanged in what it does.
+    const mode: BillingMode = ev.livemode ? "live" : "test";
+    const classified = this.classify(ev, mode, cfg);
+    let role: ClassifiedRole = classified.role;
+    if (role !== "unknown") {
+      const now = this.now();
+      for (const id of classified.objectIds) {
+        // noteRole refuses (without writing) when this exact object id was
+        // already recorded under a DIFFERENT role — an anomaly (a Stripe id
+        // does not change what it identifies) this Hub has never observed,
+        // but a wrong role applied to live money is worse than an event
+        // parked for the operator to look at by hand.
+        if (!this.store.noteRole(id, role, now)) { role = "unknown"; break; }
+      }
+    }
+    if (role === "unknown") {
+      return { outcome: "unclassified", note: `${ev.type}: could not attribute this event to a product role — recorded for reconciliation, applied to neither software nor hosting` };
+    }
+    if (role === "hosting") return this.applyHostingEvent(ev);
+
     switch (ev.type) {
       case "checkout.session.completed":
       case "checkout.session.async_payment_succeeded":
@@ -279,7 +328,236 @@ export class BillingService {
     }
   }
 
-  // ── handlers ──────────────────────────────────────────────────────────────
+  /** Every id the given ids array names, minus blanks — object ids arrive as
+   *  `""` from `asId`/`asStr` on an absent field, and an empty string must
+   *  never reach `store.noteRole`/`roleFor` (it would let every event with a
+   *  blank field collide on one shared "" key). */
+  private roleFromIndex(ids: readonly string[]): BillingRole | null {
+    for (const id of ids) {
+      if (!id) continue;
+      const r = this.store.roleFor(id);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  /** `metadata.plan` (already read by every checkout handler, v0.4.15) joined
+   *  to the Hub's OWN plan catalogue — the "binding aid" the dispatcher may
+   *  consult once id matching is inconclusive (roles.ts's rule 4). Not the
+   *  sole authority: an id match always wins over this, and this never fires
+   *  at all for invoice/subscription events, which carry real price ids. */
+  private planRoleOf(metadata: Record<string, string>, cfg: BillingConfig): BillingRole | null {
+    const key = this.planKeyOf(metadata, cfg);
+    return key ? planByKey(cfg, key)?.role ?? null : null;
+  }
+
+  /** The dispatcher itself: which role this ONE event belongs to, and every
+   *  object id it names (so the caller can remember the decision for a later
+   *  event — a refund or dispute — that carries no price/product id of its
+   *  own and can only identify itself by charge/payment-intent/invoice id).
+   *
+   *  Ordering, and why: invoice and subscription events carry real,
+   *  authoritative price/product ids INLINE in the webhook payload (Stripe
+   *  expands `price` on both line items and subscription items by default —
+   *  no fetch needed), so those are classified from the ids first and the
+   *  role index is consulted only if that comes back "unknown" (an id an
+   *  operator has not yet allowlisted on either side, or removed from one).
+   *  Charge and dispute events carry NO price/product id at all, so the
+   *  index — populated by the invoice/subscription event that always
+   *  precedes them chronologically for a real charge — is checked FIRST;
+   *  falling through to `classifyRole` with empty facts is still correct
+   *  when the index has nothing (the day-1 default, or "unknown"). */
+  private classify(ev: StripeEvent, mode: BillingMode, cfg: BillingConfig): { role: ClassifiedRole; objectIds: string[] } {
+    const rcfg: ModeRoleConfig = cfg.roles[mode];
+    switch (ev.type) {
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded": {
+        const f = checkoutFacts(ev.object);
+        const objectIds = [f.sessionId, f.subscriptionId, f.paymentIntentId].filter(Boolean);
+        const role = classifyRole({ priceIds: [], productIds: [], planRole: this.planRoleOf(f.metadata, cfg) }, rcfg);
+        return { role, objectIds };
+      }
+      case "invoice.paid":
+      case "invoice.payment_succeeded":
+      case "invoice.payment_failed": {
+        const f = invoiceFacts(ev.object);
+        const objectIds = [f.subscriptionId, f.invoiceId, f.chargeId, f.paymentIntentId].filter(Boolean);
+        const fresh = classifyRole({ priceIds: f.priceIds, productIds: f.productIds, planRole: null }, rcfg);
+        const role = fresh !== "unknown" ? fresh : this.roleFromIndex(objectIds) ?? "unknown";
+        return { role, objectIds };
+      }
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const f = subscriptionFacts(ev.object);
+        const objectIds = [f.subscriptionId].filter(Boolean);
+        const fresh = classifyRole({ priceIds: f.priceIds, productIds: f.productIds, planRole: null }, rcfg);
+        const role = fresh !== "unknown" ? fresh : this.roleFromIndex(objectIds) ?? "unknown";
+        return { role, objectIds };
+      }
+      case "charge.succeeded":
+      case "charge.refunded": {
+        const f = chargeFacts(ev.object);
+        const objectIds = [f.chargeId, f.paymentIntentId, f.invoiceId].filter(Boolean);
+        const role = this.roleFromIndex(objectIds) ?? classifyRole({ priceIds: [], productIds: [], planRole: null }, rcfg);
+        return { role, objectIds };
+      }
+      case "charge.dispute.created": {
+        const f = disputeFacts(ev.object);
+        const objectIds = [f.chargeId, f.paymentIntentId].filter(Boolean);
+        const role = this.roleFromIndex(objectIds) ?? classifyRole({ priceIds: [], productIds: [], planRole: null }, rcfg);
+        return { role, objectIds };
+      }
+      default:
+        return { role: "unknown", objectIds: [] };
+    }
+  }
+
+  // ── hosting handlers (role: "hosting") ───────────────────────────────────
+  // Deliberately minimal: this is H1's isolation fix, not the hosting
+  // lifecycle (H4/H5/H6 — suspension, deletion, notices, a durable
+  // transactional store). Every handler here does exactly one thing: record
+  // what Stripe proved onto THIS role's OWN record, keyed by (customer,
+  // "hosting"), and never read or write a CustomerRecord/licence. That is
+  // what makes "hosting purchase, payment failure, cancellation, refund and
+  // dispute leave software ID, expiry and status correct" hold.
+
+  private findHostingCustomer(customerId: string, email: string): RoleSubscriptionRecord | null {
+    const key = customerId || (email ? `email:${email}` : "");
+    return key ? this.store.getRoleSubscription(key, "hosting") : null;
+  }
+
+  private ensureHostingCustomer(customerId: string, email: string, livemode: boolean, now: number): RoleSubscriptionRecord {
+    const key = customerId || `email:${email}`;
+    const existing = this.store.getRoleSubscription(key, "hosting");
+    if (existing) return existing;
+    return {
+      key: roleSubscriptionKey(key, "hosting"),
+      customerKey: key,
+      role: "hosting",
+      livemode,
+      subscriptionId: null,
+      subscriptionStatus: null,
+      periodEndMs: null,
+      chargeIds: [],
+      disputed: false,
+      refunded: false,
+      createdAtMs: now,
+      updatedAtMs: now,
+      lastEventType: null,
+      lastEventAtMs: null,
+    };
+  }
+
+  private touchHosting(rec: RoleSubscriptionRecord, ev: StripeEvent, now: number): void {
+    rec.lastEventType = ev.type;
+    rec.lastEventAtMs = now;
+    rec.updatedAtMs = now;
+  }
+
+  private noteHostingCharge(rec: RoleSubscriptionRecord, id: string): void {
+    if (id && !rec.chargeIds.includes(id)) {
+      rec.chargeIds.push(id);
+      if (rec.chargeIds.length > 50) rec.chargeIds.splice(0, rec.chargeIds.length - 50);
+    }
+  }
+
+  private applyHostingEvent(ev: StripeEvent): ApplyResult {
+    const now = this.now();
+    switch (ev.type) {
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded": {
+        const f = checkoutFacts(ev.object);
+        if (f.mode !== "subscription" && f.mode !== "payment") return { outcome: "ignored", note: `hosting checkout mode ${f.mode || "?"}` };
+        if (f.paymentStatus === "unpaid") return { outcome: "ignored", note: "hosting checkout not confirmed yet (async_payment_succeeded will follow)" };
+        if (!f.customerId && !f.email) return { outcome: "ignored", note: "hosting checkout carried neither a customer nor an email" };
+        const rec = this.ensureHostingCustomer(f.customerId, f.email, ev.livemode, now);
+        rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
+        rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting checkout recorded; software licence untouched" };
+      }
+      case "invoice.paid":
+      case "invoice.payment_succeeded": {
+        const f = invoiceFacts(ev.object);
+        if (!f.paid) return { outcome: "ignored", note: "hosting invoice not paid" };
+        if (!f.customerId && !f.email) return { outcome: "ignored", note: "hosting invoice carried neither a customer nor an email" };
+        const rec = this.ensureHostingCustomer(f.customerId, f.email, ev.livemode, now);
+        rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
+        rec.subscriptionStatus = "active";
+        if (f.periodEndMs !== null && (rec.periodEndMs === null || f.periodEndMs > rec.periodEndMs)) rec.periodEndMs = f.periodEndMs;
+        this.noteHostingCharge(rec, f.chargeId);
+        this.noteHostingCharge(rec, f.paymentIntentId);
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting invoice recorded; software licence untouched" };
+      }
+      case "invoice.payment_failed": {
+        const f = invoiceFacts(ev.object);
+        const rec = this.findHostingCustomer(f.customerId, f.email);
+        if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
+        rec.subscriptionStatus = "past_due";
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting marked past due; software licence untouched" };
+      }
+      case "customer.subscription.updated": {
+        const f = subscriptionFacts(ev.object);
+        const rec = this.findHostingCustomer(f.customerId, "");
+        if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
+        rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
+        rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
+        if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null && (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs)) rec.periodEndMs = f.currentPeriodEndMs;
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting status updated; software licence untouched" };
+      }
+      case "customer.subscription.deleted": {
+        const f = subscriptionFacts(ev.object);
+        const rec = this.findHostingCustomer(f.customerId, "");
+        if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
+        rec.subscriptionStatus = "canceled";
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting subscription ended; software licence untouched" };
+      }
+      case "charge.succeeded": {
+        const f = chargeFacts(ev.object);
+        const rec = this.findHostingCustomer(f.customerId, f.email);
+        if (!rec) return { outcome: "ignored", note: "hosting customer not known yet (checkout/invoice will attribute later charges)" };
+        this.noteHostingCharge(rec, f.chargeId);
+        this.noteHostingCharge(rec, f.paymentIntentId);
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: "hosting charge recorded; software licence untouched" };
+      }
+      case "charge.refunded": {
+        const f = chargeFacts(ev.object);
+        const rec = this.findHostingCustomer(f.customerId, f.email)
+          ?? this.store.findRoleSubscriptionByCharge("hosting", f.chargeId)
+          ?? this.store.findRoleSubscriptionByCharge("hosting", f.paymentIntentId);
+        if (!rec) return { outcome: "ignored", note: "hosting customer not known — software licence untouched either way" };
+        const full = f.refunded || (f.amount !== null && f.amountRefunded !== null && f.amountRefunded >= f.amount);
+        if (full) rec.refunded = true;
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: full ? "hosting full refund recorded; software licence untouched" : "hosting partial refund recorded; software licence untouched" };
+      }
+      case "charge.dispute.created": {
+        const f = disputeFacts(ev.object);
+        const rec = this.store.findRoleSubscriptionByCharge("hosting", f.chargeId) ?? this.store.findRoleSubscriptionByCharge("hosting", f.paymentIntentId);
+        if (!rec) return { outcome: "ignored", note: `hosting dispute on unknown charge ${f.chargeId || f.paymentIntentId || "?"} — software licence untouched either way` };
+        rec.disputed = true;
+        this.touchHosting(rec, ev, now);
+        this.store.putRoleSubscription(rec);
+        return { outcome: "applied", note: `hosting dispute recorded (${f.reason || "no reason"}); software licence untouched` };
+      }
+      default:
+        return { outcome: "ignored", note: "event type not handled" };
+    }
+  }
+
+  // ── handlers (role: "software" — pre-dispatcher, byte-for-byte unchanged) ─
 
   private async onCheckout(ev: StripeEvent, cfg: BillingConfig): Promise<ApplyResult> {
     const f = checkoutFacts(ev.object);
@@ -661,7 +939,26 @@ export class BillingService {
    *  licence, answered as JSON — v0.4.16). Returns the session url or null —
    *  NEVER throws; a refusal or a network failure is logged and the caller
    *  decides what to fall back to, exactly as this did inline before it had
-   *  a second call site. */
+   *  a second call site.
+   *
+   *  PORTAL SCOPING (H1, checked, not built): both callers below open a
+   *  session with only `customer` set — no `configuration` parameter — which
+   *  means Stripe's DEFAULT Customer Portal configuration decides what the
+   *  session shows. By default that is EVERY subscription on the customer,
+   *  so once a hosting subscription exists on the same Stripe customer as a
+   *  software one, a software-context portal session (opened from the
+   *  software install page, `rec` here is always a `CustomerRecord` — i.e.
+   *  always the software side, since there is no hosting-facing portal entry
+   *  point in this Hub yet) would let that customer manage/cancel hosting
+   *  from a page whose own copy never mentions it, and vice versa once a
+   *  hosting portal entry point is built. Stripe's own fix for this is a
+   *  SEPARATE Portal Configuration per product (restricted via its own
+   *  `products` list) referenced by a `configuration` id on the session
+   *  request — not built here because there is no hosting portal caller yet
+   *  to scope (H2, out of scope for H1) and no product's Portal Configuration
+   *  to reference until an operator creates one in Stripe. Any future
+   *  hosting-facing portal call site MUST pass its own role's Portal
+   *  Configuration id rather than reusing this call unscoped. */
   private async stripePortalSessionUrl(rec: CustomerRecord, m: StripeModeConfig, returnUrl: string): Promise<string | null> {
     if (!m.secretKey || !rec.stripeCustomerId) return null;
     try {

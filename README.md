@@ -208,12 +208,64 @@ Both are additive and read-only: neither one issues, extends or revokes a
 licence, and an app built before v0.4.16 keeps working exactly as it did
 (`GET /billing`'s email-based Customer Portal login stays up for it).
 
+### Billing-role isolation (before a second product exists)
+
+`src/billing/roles.ts` classifies every webhook event as **software**,
+**hosting**, or **unknown** — BEFORE any existing handler runs — by matching
+the event's own Stripe price/product ids against a per-mode allowlist
+(`GET/POST /admin/api/billing/config`'s new `roles.{test,live}.{software,
+hosting}.{priceIds,productIds}`). This exists because every handler above
+was written for exactly one product and treats "this Stripe customer" and
+"the software subscription" as the same fact — true only until a second,
+unrelated Stripe subscription (hosting, or anything else) lands on the same
+customer. Without the dispatcher, that second subscription's
+`invoice.paid`/`customer.subscription.updated` events would overwrite the
+software customer's subscription id and paid-through date, and a refund or
+dispute on the second product's charge could revoke the still-paid software
+licence.
+
+**Only a `software` classification reaches the handlers above, byte-for-byte
+unchanged.** A `hosting` classification is recorded on its own file
+(`data/billing-role-subscriptions.v1.json`, keyed `customer::role`) and never
+touches a `CustomerRecord` or a licence — deliberately minimal (no
+suspend/delete lifecycle; that is future work, not this dispatcher). An
+`unknown` classification (an id that matches neither list, once a hosting
+allowlist has been configured — see below) is recorded to the events ledger
+and applied to neither role.
+
+**Day 1, this changes nothing.** Every install today has an EMPTY hosting
+allowlist (nothing has ever needed one), and while it stays empty every event
+still defaults to `software` exactly as it always has. The moment an operator
+configures even one hosting price or product id, that safety net is gone and
+every event must resolve through the allowlists — or a plan's own `role`
+field (`checkout.session.completed` carries no price id in its webhook
+payload at all, so its only signal is `metadata.plan` joined to the Hub's own
+plan catalogue; register a plan with `role: "hosting"` the same way a
+software plan is registered, via `plans` + "Create in Stripe") — or it is
+`unknown`.
+
+A `data/billing-role-index.v1.json` remembers which role an object id (a
+subscription/invoice/charge/payment-intent) was classified as, so a later
+refund or dispute — which names only a charge, never a price — resolves
+without re-deciding anything or calling Stripe. A pre-existing install's
+`billing-customers.v1.json` is folded into that index as `software` once,
+one-shot and marker-guarded (`data/billing-role-migration.v1.json`), at
+`BillingService` construction.
+
+**Not built here** (the isolation is; the hosting product is not): a durable
+hosting lifecycle (suspend/grace/delete), a hosting customer dashboard or
+portal entry point, notices/emails. See `src/billing/roles.ts` and
+`tests/billing-roles.test.mjs` for the full design and its acceptance tests.
+
 ### Where billing data lives
 
 | Path | What | Loss means |
 | --- | --- | --- |
-| `data/billing-config.v1.json` | mode, Stripe keys for both modes, email provider, policy — mode 0600 | re-enter keys on the admin page |
-| `data/billing-customers.v1.json` | Stripe customer → licence, subscription status, charge ids, welcome state | a later event re-creates the customer with a NEW licence; restore from backup instead |
+| `data/billing-config.v1.json` | mode, Stripe keys for both modes, email provider, policy, **product-role allowlists** — mode 0600 | re-enter keys (and role ids) on the admin page |
+| `data/billing-customers.v1.json` | Stripe customer → SOFTWARE licence, subscription status, charge ids, welcome state | a later event re-creates the customer with a NEW licence; restore from backup instead |
+| `data/billing-role-subscriptions.v1.json` | one row per (customer, role) for every NON-software product (e.g. hosting) | that product's subscription state is lost; the software side above is untouched |
+| `data/billing-role-index.v1.json` | object id → the role it was classified as, so a later refund/dispute resolves without re-deciding | a later refund/dispute on an old object may fall back to the day-1 default instead of its recorded role |
+| `data/billing-role-migration.v1.json` | one-shot marker: has the pre-dispatcher customer file been folded into the role index | the migration re-runs harmlessly (it can only ADD entries no role has claimed yet) |
 | `data/billing-tokens.v1.json` | page and one-time install tokens, **hashed** | every emailed link stops working; use Resend welcome |
 | `data/billing-events.v1.jsonl` | every webhook event and its outcome | audit history only |
 | `data/billing-events-seen.v1.json` | bounded id set for idempotent replay | a Stripe retry could re-apply an old event (extensions are idempotent; a refund would re-revoke the same licence) |
@@ -1439,6 +1491,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.25 — **Billing events are classified software vs. hosting before any licence handler runs (H1).** `src/billing/roles.ts` + the dispatcher in `service.ts`: per-mode (test/live) Stripe price/product-id allowlists in `BillingConfig.roles`, `Plan.role` (defaults `software`) as the checkout binding aid, an object-id → role index (`data/billing-role-index.v1.json`) so a refund/dispute naming only a charge resolves without re-deciding, per-`(customer, role)` rows for non-software products (`data/billing-role-subscriptions.v1.json`), one-shot marker-guarded migration folding every existing customer into `software`. While the hosting allowlist is empty everything classifies `software`, byte-for-byte as before; an id on neither list is `unclassified` — recorded, applied to no role. Reproduced first: a second subscription on the same Stripe customer overwrote the software subscription id, moved its period, and a refund of the other product revoked the licence. `tests/billing-roles.test.mjs`.
 - v0.4.24 — The setup video ("Install Wick Hunter Unleashed on Vultr | Welcome Email to First Login") is linked from the welcome email (secondary button + text) and from the install page above the command. One hardcoded URL, `SETUP_VIDEO_URL` in `src/billing/email.ts`.
 - v0.4.23 — **The sample is the greater of 30 days and 1,000 prints.** Operator: *"Should we do the greater of at least 1000 liq events and 30 days? To make sure to have a good sample?"* Every print inside the 30-day window is ranked (a busy pair is no longer cut to its newest 1,000), and a pair-side with fewer than 1,000 inside the window reaches further back, newest day first, until it has 1,000 or the archive runs out — the archive's own retention is the bound. `LIQ_PCTL_TARGET_PRINTS` replaces the cap; `liqSampleTake` is the one selection rule shared by the pure builder and the streaming day-walk; the table carries `targetPrints`. The bot builds the identical rule (v0.90.47) and the parity test proves it.
 - v0.4.22 — **The percentile table carries the 20th, 40th, 60th and 80th stops too.** Operator: *"one column with the pair name and then 20th, 40th, 60th, 80th, 90th and 95th percentile… maybe even add 99th"* — the bot's Screener shows the table per pair, so the hub serves every stop it shows: `[20, 40, 50, 60, 75, 80, 90, 95, 99]`. 50 and 75 stay so a stored bot percentile keeps its exact stop and a bot on the older list interpolates unchanged. The table is a superset; the wire shape is the same.
