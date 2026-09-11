@@ -49,16 +49,27 @@ const HOUR = 60 * 60 * 1000;
 /** Pure. Throws on a non-finite anchor — an invalid entitlement instant must
  *  never silently produce `NaN` deadlines that compare `false` against every
  *  clock check downstream (a bug there would read as "never due", the
- *  fail-open direction, which is the wrong default for a delete pipeline). */
-export function deadlines(paidThrough: number, reason: HostingEndReason, policy: DeadlinePolicyHours): HostingDeadlines {
+ *  fail-open direction, which is the wrong default for a delete pipeline).
+ *
+ *  `heldForMs` (default 0) is the ONLY concession this pure policy makes to
+ *  an admin deletion hold (HostingService.adminHoldDeletion/
+ *  adminReleaseHold): it shifts every deadline forward by exactly that many
+ *  milliseconds, so a hold PAUSES the countdown rather than resetting it —
+ *  releasing a hold re-derives from the ORIGINAL anchor plus how long the
+ *  hold was actually in effect, never from "now". If the original deadline
+ *  had already elapsed by the time the hold was placed, the shift cannot
+ *  push it back into the future — pausing a clock that already ran out does
+ *  not un-run it, and the caller is expected to let deletion proceed. */
+export function deadlines(paidThrough: number, reason: HostingEndReason, policy: DeadlinePolicyHours, heldForMs = 0): HostingDeadlines {
   if (!Number.isFinite(paidThrough)) throw new Error("hosting deadlines: invalid entitlement anchor (paidThrough is not finite)");
+  if (!Number.isFinite(heldForMs) || heldForMs < 0) throw new Error("hosting deadlines: heldForMs must be a non-negative finite number");
   const suspendAt = paidThrough + (reason === "renewal_unpaid" ? policy.renewalGraceHours * HOUR : 0);
   const deleteAt = suspendAt + policy.retentionHours * HOUR;
   const [threeDaysHours, oneDayHours] = policy.reminderHoursBeforeDelete;
   return {
-    suspendAt,
-    deleteAt,
-    threeDaysAt: deleteAt - (threeDaysHours ?? 72) * HOUR,
-    oneDayAt: deleteAt - (oneDayHours ?? 24) * HOUR,
+    suspendAt: suspendAt + heldForMs,
+    deleteAt: deleteAt + heldForMs,
+    threeDaysAt: deleteAt - (threeDaysHours ?? 72) * HOUR + heldForMs,
+    oneDayAt: deleteAt - (oneDayHours ?? 24) * HOUR + heldForMs,
   };
 }
