@@ -20,11 +20,53 @@ export interface MarketplaceRequiredInput {
   readonly safeValue?: string;
 }
 
+/** Every state a Hub administrator can be shown for the bridge itself —
+ * kept as ONE closed union with ONE distinct sentence per state so a
+ * private-service outage is structurally incapable of rendering the same
+ * way as an admin-token problem (which never reaches this path at all —
+ * that is a 401 on the Hub's OWN admin auth, handled before this module is
+ * ever called) or as a rejected bridge credential (`"invalid"`, unchanged).
+ * `"incompatible"` is new: the private service answered, authenticated,
+ * and returned a well-formed envelope whose `schemaVersion` this Hub does
+ * not speak — a PROTOCOL fact, distinct from `"unavailable"` (no usable
+ * answer at all) and from `"invalid"` (the bridge credential itself was
+ * refused). Conflating any of these back into one bucket is exactly the
+ * failure HUB-03 exists to close. */
+export type MarketplaceBridgeState = "connected" | "unconfigured" | "invalid" | "incompatible" | "unavailable";
+
+/** HUB-03: "show mismatched app/API/worker protocol versions and guide the
+ * operator to update the exact component" — computed ONCE, server-side,
+ * from facts the private service already publishes (`build`, `worker`),
+ * never re-derived by the browser from raw JSON. `worker.buildState` is the
+ * private service's OWN comparison of its worker's build against its API's
+ * build (`operator-status.ts`, app repo) — this module never recomputes
+ * that judgement, only renders it. The Hub's OWN package version is
+ * reported for context but is DELIBERATELY never compared numerically
+ * against the API's — the Hub and the private Marketplace API are
+ * independently released components in separate repositories with no
+ * shared version scheme, and asserting they "should" match would be a
+ * guess this module has no standing to make. */
+export interface MarketplaceVersionCompatibility {
+  readonly state: "aligned" | "mismatched" | "unknown";
+  readonly hub: { readonly version: string };
+  readonly api: { readonly version: string | null; readonly commit: string | null } | null;
+  readonly worker: {
+    readonly version: string | null;
+    readonly buildCommit: string | null;
+    readonly buildState: "matched" | "missing" | "mismatched" | null;
+  } | null;
+  /** One plain sentence per actionable finding, each naming the EXACT
+   * component to update ("the private Marketplace API", "the private
+   * Marketplace worker", or "this Hub") — never a bare "mismatch" with
+   * nothing to act on. Empty when nothing here is actionable. */
+  readonly guidance: readonly string[];
+}
+
 export interface MarketplaceStatusBridgeSnapshot {
   readonly schemaVersion: 1;
   readonly generatedAtMs: number;
   readonly bridge: {
-    readonly state: "connected" | "unconfigured" | "invalid" | "unavailable";
+    readonly state: MarketplaceBridgeState;
     readonly originConfigured: boolean;
     readonly credentialConfigured: boolean;
     readonly refusal: string | null;
@@ -32,6 +74,8 @@ export interface MarketplaceStatusBridgeSnapshot {
   readonly upstream: Readonly<Record<string, unknown>> | null;
   readonly requiredInputs: readonly MarketplaceRequiredInput[];
   readonly readinessBlockers: readonly string[];
+  /** `null` whenever `upstream` is `null` — there is nothing to compare. */
+  readonly versionCompatibility: MarketplaceVersionCompatibility | null;
 }
 
 export interface MarketplaceStatusFetchResponse {
@@ -209,9 +253,19 @@ function inputOf(value: unknown, explicitSecrets: readonly string[]): Marketplac
   };
 }
 
+/** The exact operator-status wire contract this Hub's bridge speaks — kept
+ * as a named constant (rather than the bare literal the schema check used
+ * to compare against inline) because HUB-03's version-mismatch sentence
+ * needs to quote it and a test needs to drive that comparison. Mirrors the
+ * app repo's own `MARKETPLACE_OPERATOR_STATUS_SCHEMA` export
+ * (`src/marketplace-hub/operator-status.ts`) — the two are independent
+ * repos, so this is a value this Hub commits to on its own, not an import. */
+export const MARKETPLACE_STATUS_SCHEMA = "wickhunter-marketplace-operator-status/v1";
+const SCHEMA_VERSION_SHAPE = /^wickhunter-marketplace-operator-status\/v\d{1,4}$/;
+
 const UPSTREAM_FIELDS = [
   "schemaVersion", "generatedAtMs", "build", "service", "feature", "api", "alphaClient", "worker",
-  "storage", "outbox", "bybitDemo", "moonPay", "readiness",
+  "storage", "outbox", "subscriptionBilling", "bybitDemo", "moonPay", "readiness", "latency",
 ] as const;
 
 function recordOf(value: unknown): Record<string, unknown> | null {
@@ -273,10 +327,58 @@ function sanitizeStorage(value: unknown, explicitSecrets: readonly string[]): un
   return clean;
 }
 
+function versionRecordOf(value: unknown): { version: string | null; commit: string | null } | null {
+  const row = recordOf(value);
+  if (row === null) return null;
+  return {
+    version: typeof row.version === "string" && row.version.length > 0 && row.version.length <= 64 ? row.version : null,
+    commit: typeof row.commit === "string" && /^[a-f0-9]{7,64}$/i.test(row.commit) ? row.commit : null,
+  };
+}
+
+const WORKER_BUILD_STATES = ["matched", "missing", "mismatched"] as const;
+
+/** Pure (v0.80.6-style — a caller may only call it): HUB-03's exact ask,
+ * "show mismatched app/API/worker protocol versions and guide the operator
+ * to update the exact component", built from the ALREADY-SANITIZED
+ * `upstream.build`/`upstream.worker` so it can never see a secret this
+ * module has not already redacted. */
+export function marketplaceVersionCompatibility(
+  hubVersion: string,
+  upstream: Readonly<Record<string, unknown>>,
+): MarketplaceVersionCompatibility {
+  const api = versionRecordOf(upstream.build);
+  const workerRow = recordOf(upstream.worker);
+  const buildState = workerRow !== null && typeof workerRow.buildState === "string"
+    && (WORKER_BUILD_STATES as readonly string[]).includes(workerRow.buildState)
+    ? workerRow.buildState as (typeof WORKER_BUILD_STATES)[number] : null;
+  const worker = workerRow === null ? null : {
+    version: typeof workerRow.version === "string" && workerRow.version.length > 0 && workerRow.version.length <= 64 ? workerRow.version : null,
+    buildCommit: typeof workerRow.buildCommit === "string" && /^[a-f0-9]{7,64}$/i.test(workerRow.buildCommit) ? workerRow.buildCommit : null,
+    buildState,
+  };
+  const guidance: string[] = [];
+  if (api === null) {
+    guidance.push("The private Marketplace API has not reported a build — update or restart the private Marketplace API service.");
+  }
+  if (buildState === "mismatched") {
+    guidance.push("The private Marketplace worker is running a different build than the private Marketplace API — update the private Marketplace WORKER service to the same commit as the API.");
+  } else if (buildState === "missing" || (workerRow !== null && buildState === null)) {
+    guidance.push("The private Marketplace worker has not reported a build — update or restart the private Marketplace WORKER service.");
+  } else if (workerRow === null) {
+    guidance.push("The private Marketplace status did not report a worker — update or restart the private Marketplace WORKER service.");
+  }
+  const state: MarketplaceVersionCompatibility["state"] =
+    api === null || worker === null || buildState === null ? "unknown"
+      : buildState === "matched" ? "aligned" : "mismatched";
+  return { state, hub: { version: hubVersion }, api, worker, guidance };
+}
+
 export async function fetchMarketplaceStatus(
   config: MarketplaceStatusBridgeConfig,
   fetcher: MarketplaceStatusFetch,
   now = Date.now,
+  hubVersion = "0.0.0",
 ): Promise<MarketplaceStatusBridgeSnapshot> {
   const generatedAtMs = now();
   const base = {
@@ -286,11 +388,11 @@ export async function fetchMarketplaceStatus(
   };
   if (config.refusals.length > 0) return {
     ...base, bridge: { state: "invalid", originConfigured: config.origin !== null, credentialConfigured: config.credential !== null, refusal: config.refusals.join(" ") },
-    upstream: null, readinessBlockers: config.refusals,
+    upstream: null, readinessBlockers: config.refusals, versionCompatibility: null,
   };
   if (config.origin === null || config.credential === null) return {
     ...base, bridge: { state: "unconfigured", originConfigured: config.origin !== null, credentialConfigured: config.credential !== null, refusal: "The Marketplace status bridge is not configured." },
-    upstream: null, readinessBlockers: ["The private Marketplace service cannot be inspected from this Hub."],
+    upstream: null, readinessBlockers: ["The private Marketplace service cannot be inspected from this Hub."], versionCompatibility: null,
   };
   let upstreamStatus: number | null = null;
   try {
@@ -312,8 +414,27 @@ export async function fetchMarketplaceStatus(
     if (envelope.ok !== true || envelope.status === null || typeof envelope.status !== "object"
       || Array.isArray(envelope.status)) throw new Error("private Marketplace status envelope was invalid");
     const row = envelope.status as Record<string, unknown>;
-    if (row.schemaVersion !== "wickhunter-marketplace-operator-status/v1") {
-      throw new Error("private Marketplace status schema was unsupported");
+    if (typeof row.schemaVersion !== "string" || !SCHEMA_VERSION_SHAPE.test(row.schemaVersion)) {
+      throw new Error("private Marketplace status schema was unreadable");
+    }
+    if (row.schemaVersion !== MARKETPLACE_STATUS_SCHEMA) {
+      // A well-formed, AUTHENTICATED answer whose protocol this Hub does not
+      // speak is a fact about the two builds, never about the credential —
+      // HUB-03: "never conflate an unavailable service with an invalid
+      // credential", extended to a THIRD, equally distinct case. The value
+      // reaching the sentence below has already matched SCHEMA_VERSION_SHAPE
+      // above, so it is a small fixed-pattern token, never arbitrary text.
+      return {
+        schemaVersion: 1, generatedAtMs,
+        bridge: {
+          state: "incompatible", originConfigured: true, credentialConfigured: true,
+          refusal: `This Hub speaks Marketplace operator-status protocol ${MARKETPLACE_STATUS_SCHEMA}; the private Marketplace API answered ${row.schemaVersion}. Update whichever of this Hub or the private Marketplace API is on the older protocol so both report the same value.`,
+        },
+        upstream: null,
+        requiredInputs: staticInputs(config),
+        readinessBlockers: ["The private Marketplace API's operator-status protocol version does not match this Hub's bridge — no readiness claim can be made until they agree."],
+        versionCompatibility: null,
+      };
     }
     const explicitSecrets = [config.credential];
     const upstream: Record<string, unknown> = {};
@@ -351,6 +472,7 @@ export async function fetchMarketplaceStatus(
       upstream,
       requiredInputs: [...localInputs, ...remoteInputs],
       readinessBlockers: [...new Set(blockers)],
+      versionCompatibility: marketplaceVersionCompatibility(hubVersion, upstream),
     };
   } catch {
     const credentialRefused = upstreamStatus === 401 || upstreamStatus === 403 || upstreamStatus === 503;
@@ -372,6 +494,7 @@ export async function fetchMarketplaceStatus(
       readinessBlockers: [credentialRefused
         ? "The Marketplace status credential is not accepted on both services; no readiness claim can be made."
         : "The private Marketplace API/worker status is unavailable; no readiness claim can be made."],
+      versionCompatibility: null,
     };
   }
 }

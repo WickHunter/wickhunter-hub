@@ -842,7 +842,7 @@ document.getElementById("upgradeHub").onclick = async () => {
 health().then((h) => { document.getElementById("hubVer").textContent = h && h.version ? "hub v" + h.version : ""; });
 
 function shortSha(v) { return v ? String(v).slice(0, 12) : "unknown"; }
-function stateClass(v) { return /^(connected|configured|current|matches|succeeded|ready|running)$/.test(String(v)) ? "ops-ok" : /^(missing|invalid|failed|unavailable|differs|diverged|behind)$/.test(String(v)) ? "ops-bad" : "ops-warn"; }
+function stateClass(v) { return /^(connected|configured|current|matches|matched|aligned|succeeded|ready|running)$/.test(String(v)) ? "ops-ok" : /^(missing|invalid|failed|unavailable|incompatible|mismatched|differs|diverged|behind)$/.test(String(v)) ? "ops-bad" : "ops-warn"; }
 
 async function opsRefresh() {
   const box = document.getElementById("hubOps");
@@ -874,6 +874,21 @@ async function opsRefresh() {
 
 function renderStatusCard(title, value) {
   return '<div class="opscard"><h2>' + esc(title) + '</h2><div class="logtail">' + esc(JSON.stringify(value, null, 2)) + '</div></div>';
+}
+
+// HUB-03: a plain sentence per component naming what to update, rather than
+// the raw JSON `renderStatusCard` prints for everything else — this is the
+// one card an operator needs to be able to read at a glance.
+function renderVersionCompatibilityCard(vc) {
+  const api = vc.api ? "v" + esc(vc.api.version || "unknown") + (vc.api.commit ? " (" + esc(vc.api.commit.slice(0, 12)) + ")" : "") : "not reported";
+  const worker = vc.worker ? "v" + esc(vc.worker.version || "unknown") + (vc.worker.buildCommit ? " (" + esc(vc.worker.buildCommit.slice(0, 12)) + ")" : "") + " — " + esc(vc.worker.buildState || "unknown") : "not reported";
+  const guidance = (vc.guidance || []).length
+    ? '<ul>' + vc.guidance.map((g) => '<li>' + esc(g) + '</li>').join("") + '</ul>'
+    : '<p>The private Marketplace API and worker report matching builds.</p>';
+  return '<div class="opscard"><h2>Version compatibility</h2><p class="' + stateClass(vc.state) + '">' + esc(vc.state) + '</p>' +
+    '<dl><dt>This Hub</dt><dd>v' + esc(vc.hub.version) + '</dd>' +
+    '<dt>Private Marketplace API</dt><dd>' + api + '</dd>' +
+    '<dt>Private Marketplace worker</dt><dd>' + worker + '</dd></dl>' + guidance + '</div>';
 }
 
 async function leaseRefresh() {
@@ -920,13 +935,20 @@ async function mktRefresh() {
   let d;
   try { d = (await api("/admin/api/marketplace-status")).marketplace; }
   catch (e) { if (e.message !== "unauthorized") summary.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>'; return; }
-  const bridge = d.bridge || {}, upstream = d.upstream || null;
+  const bridge = d.bridge || {}, upstream = d.upstream || null, vc = d.versionCompatibility || null;
   meta.textContent = "bridge " + (bridge.state || "unknown") + " · refreshed " + fmt(d.generatedAtMs) + " UTC";
   let cards = '<div class="opscard"><h2>Private bridge</h2><p class="' + stateClass(bridge.state) + '">' + esc(bridge.state || "unknown") + '</p><p>' + esc(bridge.refusal || "Dedicated loopback credential accepted; only sanitized status is rendered.") + '</p></div>';
   if (upstream) {
-    for (const name of ["build", "service", "feature", "api", "alphaClient", "worker", "storage", "outbox", "bybitDemo", "moonPay", "readiness"]) {
+    if (vc) cards += renderVersionCompatibilityCard(vc);
+    for (const name of ["build", "service", "feature", "api", "alphaClient", "worker", "storage", "outbox", "subscriptionBilling", "bybitDemo", "moonPay", "readiness", "latency"]) {
       if (upstream[name] !== undefined) cards += renderStatusCard(name, upstream[name]);
     }
+  } else if (bridge.state === "incompatible") {
+    // A DIFFERENT sentence from the plain-unavailable card below on purpose
+    // (HUB-03): the private service answered and authenticated — this is a
+    // protocol-version disagreement, never a network or credential problem,
+    // and the exact refusal above already names which schema each side sent.
+    cards += '<div class="opscard ops-bad"><h2>Private service protocol mismatch</h2><p>The private Marketplace API answered, but this Hub cannot read its operator-status protocol version. No service, migration, worker, Demo evidence, or MoonPay readiness claim can be made until the two agree. See the bridge sentence above for which side to update.</p></div>';
   } else {
     cards += '<div class="opscard ops-bad"><h2>Private service unavailable</h2><p>No service, migration, worker, Demo evidence, or MoonPay readiness claim can be made. Use the exact checklist below.</p></div>';
   }

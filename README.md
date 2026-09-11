@@ -1162,6 +1162,11 @@ app's `/hub/` path — if that is your setup, use the existing
 `nginx/hub.locations.conf` (included from inside your app's own
 `server { listen 443 ssl; ... }` block) instead; see "Operator runbook" below.
 
+This is for the Hub itself only. The private Marketplace API/worker service
+is a separate process with its own reverse proxy — see "Marketplace
+operations bridge" under "Operator runbook" for
+`deploy/nginx-marketplace-site.conf` / `nginx/marketplace-api.locations.conf`.
+
 ```
 cp deploy/nginx-hub-site.conf /etc/nginx/sites-available/wickhunter-hub.conf
 # edit server_name and the ssl_certificate/ssl_certificate_key paths
@@ -1285,11 +1290,23 @@ Set the same `HUB_MARKETPLACE_STATUS_CREDENTIAL` on the private Marketplace
 service. The bridge accepts only an exact loopback origin, always uses the fixed
 `GET /api/marketplace/operator/status` path and server-side bearer, and never
 sends that credential to the browser. The panel shows exact required variable
-names plus configured/missing/invalid/defaulted state, service/migration/worker,
-Bybit Demo evidence and crypto-only MoonPay readiness. It also shows state-only
-proof that the public alpha origin is reachable, the distributed intent verifier
-matches the live signer, and the Marketplace feature grant is confirmed for the
-alpha licence cohort. Raw origins, keyrings and credentials never cross the
+names plus configured/missing/invalid/defaulted state, service/migration/worker
+(including its per-lane delivery/reconcile/stream/billing pass health and
+build state), subscription-billing renewal health, sanitized copy-delivery
+latency percentiles, Bybit Demo evidence and crypto-only MoonPay readiness. It
+also shows state-only proof that the public alpha origin is reachable, the
+distributed intent verifier matches the live signer, and the Marketplace
+feature grant is confirmed for the alpha licence cohort. A dedicated **Version
+compatibility** card compares this Hub's own version against the private
+API's and worker's reported builds and names the exact service to update on a
+mismatch (`marketplaceVersionCompatibility` in `src/marketplace-status.ts`) —
+it deliberately never compares this Hub's version against the API's
+numerically, since the two are independently released components. A private
+service answering a DIFFERENT operator-status protocol version than this Hub
+speaks is its own bridge state (`incompatible`), with a sentence naming both
+versions and which side to update — never rendered as a generic
+"unavailable" or as a rejected bridge credential (`invalid`); all three read
+differently on purpose. Raw origins, keyrings and credentials never cross the
 bridge. The feature remains alpha-only (`betaIncluded:false`). If the private
 service is absent, it says unavailable and renders the static setup checklist,
 including all three alpha-client inputs, without claiming readiness. Older
@@ -1310,6 +1327,35 @@ token, but it does **not** reload the already-running nginx. For the feedback-v2
 rollout, upgrade and restart Hub v0.3.17 first, run `nginx -t`, reload nginx, and
 only then distribute the app build that requires the `evidenceSchema: 2`
 acknowledgement. That order avoids false “sent” results and proxy-side `413`s.
+
+**This is the reverse proxy for the Hub's own admin/licensing surface only —
+the SEPARATE private Marketplace API/worker service (app repo,
+`src/marketplace-hub`) needs its OWN reverse proxy, and that is
+`deploy/nginx-marketplace-site.conf` (standalone site) or
+`nginx/marketplace-api.locations.conf` (include form, same layout choice as
+above).** That is where `LIQHUNTER_MARKETPLACE_URL` — the exact public HTTPS
+origin distributed to alpha app installs — must actually resolve, and it must
+be its own dedicated origin at path `/` (the origin's own validator refuses a
+path prefix, so it cannot be mounted under this Hub's `/hub/`). There is no
+separate host/port to configure for the persistent copier/provider stream
+(MP-09): the app derives its WebSocket URL from that same origin by swapping
+the scheme and appending `/api/marketplace/stream`, so getting that one
+origin right is the whole job. The shipped config:
+
+- upgrades `/api/marketplace/stream` to WebSocket with `proxy_buffering off`
+  (a buffered frame is a delayed frame) and a `90s` idle timeout — well above
+  the server's own 3-second heartbeat, so a healthy connection is never cut,
+  while a genuinely stalled one is still reclaimed rather than held forever;
+- disables buffering on every other Marketplace route too, so an ordinary
+  delivery-fetch response is never held back;
+- keeps `access_log off` throughout, the same defense-in-depth rule as
+  `hub.locations.conf` above, even though today's Marketplace routes put no
+  ticket or licence token in a URL a default log format would record;
+- refuses `GET /api/marketplace/operator/status` at the public edge with a
+  bare `404` — that route is this Hub's own server-to-server status bridge
+  (`HUB_MARKETPLACE_STATUS_ORIGIN`), which is validated to be a LOOPBACK
+  origin specifically so it never needs to cross the public internet at all;
+  it stays refused here even though it is separately bearer-gated.
 
 ### 2. Issue a key
 
@@ -1491,6 +1537,15 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.29 — **HUB-01/02/03: the sanitized operations bridge carries the delivery/maintenance-role facts it was already receiving and never relaying, and a protocol mismatch finally reads as a protocol mismatch.** `src/marketplace-status.ts`, `public/admin.html`, `nginx/`, `deploy/`.
+  * **HUB-01 — two fields the private service was already publishing were dropped on the floor.** `UPSTREAM_FIELDS` gained `subscriptionBilling` (the maintenance-role renewal worker's health and oldest-pending-command age, BILL-02) and `latency` (MP-01's sanitized copy-delivery percentile histograms — count/p50/p95/p99/max/invalidCount, no traceId, no payload, no subscriber identity ever present in that shape to begin with) — both already sanitized generically by the existing walk, so this is two names added to an allowlist, not new redaction logic. The admin page's card loop and `renderStatusCard` needed the same two names. **Deployment commit** (`build.commit`) and **stage names** (`worker.lanes[].name`/`worker.passes[].name`, MP-02's four fixed lanes) were already relayed — confirmed by test, not assumed.
+  * **HUB-01/HUB-03 — protocol version.** The bridge's own wire-contract version (`MARKETPLACE_STATUS_SCHEMA`, mirroring the app repo's `MARKETPLACE_OPERATOR_STATUS_SCHEMA`) used to be checked with a bare `!==` inside the same `try` as everything else, so a private service on an OLDER OR NEWER operator-status schema fell into the generic catch block and rendered as plain `"unavailable"` — indistinguishable from a dead process, a network partition, or a bad credential. It is now its own bridge state, `"incompatible"`, checked BEFORE credential/authentication classification (it can only be reached once the response has already authenticated and parsed), with a sentence quoting both the expected and the received schema token and naming that either side may be the one to update. The received value is validated against a fixed shape (`/^wickhunter-marketplace-operator-status\/v\d{1,4}$/`) before it is ever echoed, so a malformed or hostile value still renders as a plain `unavailable` refusal with nothing reflected.
+  * **HUB-03 — a real "which build to update" answer, not raw JSON.** `marketplaceVersionCompatibility(hubVersion, upstream)` (pure, exported, `src/marketplace-status.ts`) reads the already-sanitized `build`/`worker` facts and produces one sentence per actionable finding, each naming the exact component — "update the private Marketplace WORKER service", "update or restart the private Marketplace API service" — never a bare "versions differ". **It deliberately never compares this Hub's own version against the private API's numerically**: the two are independently released, independently versioned components in separate repositories, and asserting they "should" match would be a guess this module has no standing to make; only the worker's own `buildState` (the private service's own judgement, computed against ITS OWN API build) is treated as ground truth for "aligned"/"mismatched". `public/admin.html` renders it as a dedicated **Version compatibility** card ahead of the raw per-component JSON dumps.
+  * **"Never conflate an unavailable service with an invalid credential" — now provably three-way, not two-way.** `bridge.state` is `connected | unconfigured | invalid | incompatible | unavailable`, each with its own sentence and its own admin-page card text; a Hub administrator's own wrong admin token never reaches this code at all (a 401 on the Hub's separate top-level admin auth, unchanged). Pinned in `tests/marketplace-status.test.mjs` with a mutation check: reverting the schema-mismatch branch to its old bare throw turns exactly the new `incompatible`-state test red and nothing else, confirming the three states were genuinely indistinguishable before this release.
+  * **HUB-02 — the private Marketplace API had no reviewed reverse-proxy config in this repo at all.** `deploy/nginx-marketplace-site.conf` (standalone TLS site) and `nginx/marketplace-api.locations.conf` (include form, same choice this repo already offers for its own admin surface) proxy the private API/worker's public origin — the SAME origin `LIQHUNTER_MARKETPLACE_URL` already names, since MP-09's stream has no separate host/port: the app derives its WebSocket URL by swapping that one origin's scheme and appending `/api/marketplace/stream` (`marketplaceStreamWsUrl`, app repo). The stream location gets `proxy_http_version 1.1` + `Upgrade`/`Connection: upgrade` + `proxy_buffering off` (a buffered frame is a delayed frame) + a `90s` idle timeout — well above the private server's own 3-second heartbeat (`STREAM_HEARTBEAT_MS`), so a healthy connection is never cut while a genuinely stalled one is still reclaimed. Every route keeps `access_log off`, the same defense-in-depth rule this repo's own `hub.locations.conf` already applies, even though today's Marketplace routes carry no ticket or licence token in a URL a default log format would record (checked: `POST /api/marketplace/stream-ticket`'s licence token rides the `x-license` HEADER, never a query string; the WS ticket itself rides the post-upgrade `hello` message body, never the upgrade URL — the module's own header comment states that as a rule, not an accident). `GET /api/marketplace/operator/status` — this Hub's own loopback-only status-bridge target — is refused with a bare `404` at the public edge, ahead of the general proxy, so the one route that is supposed to never cross the public internet cannot even be reached from it, on top of already being bearer-gated. `tests/marketplace-nginx.test.mjs` (new) pins the balance, the WS upgrade shape, the buffering/timeout/log properties, and the refusal, on the real shipped files (this box has no `nginx` binary to run `nginx -t` against, the same constraint the Hub's own nginx files already lived under with no test at all before this release).
+  * **HUB-02 — verification key material, the stream endpoint's own origin, and per-service role routing were already there.** `MARKETPLACE_INTENT_KEY_ID`/`MARKETPLACE_INTENT_SIGNING_SEED` (worker role) and `LIQHUNTER_MARKETPLACE_URL`/`LIQHUNTER_MARKETPLACE_INTENT_PUBLIC_KEYS` (alpha-client distribution, generated automatically from the signing key) were already defined in `marketplace-inputs.ts` with correct API/worker/common role routing (`MARKETPLACE_ROLE_INPUT_NAMES`) before this release — confirmed rather than re-added. Nothing needed adding on the config-plane side; the gap was entirely the missing reverse proxy above. `install-hub.sh`'s idempotency is untouched (no changes to that script); the new nginx files are, like the existing ones, appended by hand, never by the installer.
+  * ⚠ **What the app side still needs to add, named exactly**: `operator-status.ts`'s DTO (app repo) has no field carrying the app-INSTALL's own protocol/build facts for a genuine three-way "app/API/worker" comparison — today's DTO only carries the private API's and worker's own builds, which is what HUB-03's version-compatibility card compares. If a genuine customer-app-vs-Marketplace-API protocol version needs surfacing here later (distinct from the operator-status wire-schema check this release already closes), it needs its own field on that DTO, e.g. `protocol: { streamVersion: number, streamAccepted: readonly number[] }`, since the stream's `STREAM_PROTOCOL_VERSION` (currently hardcoded to `1` on both the server in `stream-server.ts` and the client in `marketplace-stream-client.ts`, with no live drift possible yet) is not published anywhere this bridge can read today.
+  * Suites: `marketplace-status.test.mjs` 12 checks (was 8), `marketplace-nginx.test.mjs` 11 checks (new) — `tests/run-all.mjs` needs no registration step (it globs `tests/*.test.mjs`); 51/51 suites green.
 - v0.4.28 — **The admin deletion hold is real, and the provider cost ceiling refuses a checkout before it makes a promise it cannot keep.** Both were named as gaps in v0.4.27's own changelog entry.
   * **Deletion hold**: `HostingInstanceRow.deletionHold: {by, atMs, reason} | null` (replaces the unused `deletionHoldUntilMs` field the schema shipped with) — set/cleared through `updateInstance`'s existing CAS, so it is one atomic write like every other transition here. `POST /admin/api/hosting/instances/:id/hold` and `.../release-hold` replace the 501 stub. While held, `drainDelete` refuses to commit `deleting`/`deleted` however overdue `deleteAtMs` is (an admin's own force-delete is refused the same way, by name, rather than silently going nowhere in the outbox), and the two deletion-countdown reminder emails (3-day/1-day) are suppressed — every other template is unrelated to an impending delete and still sends. `adminReleaseHold` re-derives suspend/delete/reminder deadlines from the row's own already-stored `suspendAtMs` (inverted through `deadlines()`'s own arithmetic — never re-read from `paidThroughMs`, which could have drifted) shifted forward by exactly how long the hold was in effect (`deadlines()` gained a `heldForMs` parameter, default 0, so every existing call site is unaffected): a hold PAUSES the countdown rather than resetting it. If the recomputed deadline had already elapsed by the time the hold was placed, deletion proceeds on the very next tick with the ordinary single "terminated" email — a fresh 3-day/1-day reminder for a deadline already gone would be dishonest, so those are skipped rather than re-queued with a past `availableAtMs`. The customer's hosting card shows "This server is on hold by support." with no suspend/delete dates while held (`HostingInstanceView.onHold`); the admin instances table gained a Hold column (who, when, hover for the reason) and a Hold/Release button per row, plus the projected-vs-ceiling line described below.
   * ⚠ **Found while building the hold: `applyBillingSignal`'s nonpayment branch re-derived and re-queued a brand-new suspend/delete/reminder set from `paidThroughMs` on literally every reconcile pass** (a subscription reads `past_due` on every tick until something else changes it, and unlike its `scheduledCancel`/`ended` neighbours three lines away, this branch had no "already scheduled with this exact reason" guard) — harmless churn on an ordinary install (the numbers keep coming out the same), but it is exactly what silently overwrote a released hold's held-time-shifted deadline back to the un-shifted one on the very next tick, discovered by a test that placed a hold, released it, and found the recomputed-in-the-past deadline had queued two fresh reminder emails nobody asked for. Fixed by the same idempotency check its neighbours already had; one line, and it is a correctness fix independent of the hold feature, not a hold-specific workaround.

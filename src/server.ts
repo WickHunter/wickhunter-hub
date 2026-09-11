@@ -1775,7 +1775,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, ...operationsStatus(true) }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p === "/admin/api/marketplace-status") {
-      const status = await fetchMarketplaceStatus(marketplaceStatusConfig, marketplaceStatusFetch);
+      const status = await fetchMarketplaceStatus(marketplaceStatusConfig, marketplaceStatusFetch, Date.now, HUB_VERSION);
       return sendJson(res, 200, { ok: true, marketplace: status }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p === "/admin/api/marketplace-config") {

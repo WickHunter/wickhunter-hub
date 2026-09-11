@@ -4,6 +4,8 @@ import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import {
   fetchMarketplaceStatus,
   marketplaceStatusBridgeFromEnv,
+  marketplaceVersionCompatibility,
+  MARKETPLACE_STATUS_SCHEMA,
 } from "../dist/src/marketplace-status.js";
 
 const bridgeSecret = "status-bridge-secret-value-1234567890";
@@ -247,6 +249,87 @@ await test("a private credential refusal is distinguished from a network outage 
   assert.equal(refused.requiredInputs.find((v) => v.name === "HUB_MARKETPLACE_STATUS_CREDENTIAL").state, "invalid");
   assert.equal(JSON.stringify(refused).includes(bridgeSecret), false);
   assert.equal(JSON.stringify(refused).includes(databaseSecret), false);
+});
+
+await test("connected snapshot relays subscriptionBilling/latency and computes a version-compatibility card from build/worker", async () => {
+  const withNewFields = structuredClone(modernPrivateEnvelope);
+  withNewFields.status.worker = { state: "running", passes: [], version: "0.5.1", buildCommit: "b".repeat(40), buildState: "matched" };
+  withNewFields.status.subscriptionBilling = { state: "healthy", oldestPendingCommandAgeMs: null };
+  withNewFields.status.latency = { distributions: { copyDelivery: { count: 12, p50Ms: 40, p95Ms: 90, p99Ms: 140, maxMs: 200, countOver200ms: 0, invalidCount: 0 } }, completedCount: 12, incompleteCount: 0, liveCount: 1 };
+  const result = await fetchMarketplaceStatus(config, async () => ({
+    ok: true, status: 200, text: async () => JSON.stringify(withNewFields),
+  }), () => 1_700_000_000_200, "0.4.29");
+  assert.equal(result.bridge.state, "connected");
+  assert.deepEqual(result.upstream.subscriptionBilling, { state: "healthy", oldestPendingCommandAgeMs: null });
+  assert.equal(result.upstream.latency.completedCount, 12);
+  assert.equal(result.upstream.latency.distributions.copyDelivery.p99Ms, 140);
+  assert.ok(result.versionCompatibility);
+  assert.equal(result.versionCompatibility.state, "aligned");
+  assert.equal(result.versionCompatibility.hub.version, "0.4.29");
+  assert.equal(result.versionCompatibility.api.version, "0.3.3");
+  assert.equal(result.versionCompatibility.worker.version, "0.5.1");
+  assert.equal(result.versionCompatibility.worker.buildState, "matched");
+  assert.deepEqual(result.versionCompatibility.guidance, []);
+});
+
+await test("a mismatched worker build names the WORKER by name, never a bare mismatch", async () => {
+  const mismatched = structuredClone(modernPrivateEnvelope);
+  mismatched.status.worker = { state: "running", passes: [], version: "0.5.0", buildCommit: "c".repeat(40), buildState: "mismatched" };
+  const result = await fetchMarketplaceStatus(config, async () => ({
+    ok: true, status: 200, text: async () => JSON.stringify(mismatched),
+  }));
+  assert.equal(result.versionCompatibility.state, "mismatched");
+  assert.ok(result.versionCompatibility.guidance.some((g) => /WORKER/.test(g) && /update/i.test(g)));
+  assert.equal(result.versionCompatibility.guidance.some((g) => /API service/.test(g)), false, "only the worker is at fault here");
+});
+
+await test("a private schema version this Hub does not speak is an INCOMPATIBLE bridge state, distinct from unavailable and invalid, and echoes only a validated small token", async () => {
+  const olderSchema = structuredClone(modernPrivateEnvelope);
+  olderSchema.status.schemaVersion = "wickhunter-marketplace-operator-status/v0";
+  const result = await fetchMarketplaceStatus(config, async () => ({
+    ok: true, status: 200, text: async () => JSON.stringify(olderSchema),
+  }));
+  assert.equal(result.bridge.state, "incompatible");
+  assert.notEqual(result.bridge.state, "unavailable");
+  assert.notEqual(result.bridge.state, "invalid");
+  assert.equal(result.upstream, null);
+  assert.equal(result.versionCompatibility, null);
+  assert.match(result.bridge.refusal, new RegExp(MARKETPLACE_STATUS_SCHEMA.replace(/[/]/g, "\\/")));
+  assert.match(result.bridge.refusal, /v0/);
+  assert.ok(result.readinessBlockers.some((v) => /protocol version/.test(v)));
+
+  // A hostile/garbage schema string is never echoed verbatim — only a value
+  // already matching the fixed shape reaches the sentence.
+  const hostile = structuredClone(modernPrivateEnvelope);
+  hostile.status.schemaVersion = `<script>${bridgeSecret}</script>`;
+  const hostileResult = await fetchMarketplaceStatus(config, async () => ({
+    ok: true, status: 200, text: async () => JSON.stringify(hostile),
+  }));
+  assert.equal(hostileResult.bridge.state, "unavailable");
+  assert.equal(JSON.stringify(hostileResult).includes("<script>"), false);
+  assert.equal(JSON.stringify(hostileResult).includes(bridgeSecret), false);
+});
+
+await test("marketplaceVersionCompatibility (pure): never compares the Hub's own version against the API's numerically", () => {
+  const aligned = marketplaceVersionCompatibility("0.4.29", {
+    build: { version: "9.9.9", commit: "d".repeat(40) },
+    worker: { version: "9.9.9", buildCommit: "d".repeat(40), buildState: "matched" },
+  });
+  assert.equal(aligned.state, "aligned");
+  assert.deepEqual(aligned.guidance, [], "a Hub/API version difference alone is not a finding — they are independent components");
+
+  const missingWorker = marketplaceVersionCompatibility("0.4.29", { build: { version: "1.0.0", commit: "e".repeat(40) } });
+  assert.equal(missingWorker.state, "unknown");
+  assert.ok(missingWorker.guidance.some((g) => /WORKER/.test(g)));
+
+  const missingApi = marketplaceVersionCompatibility("0.4.29", { worker: { version: "1.0.0", buildCommit: "e".repeat(40), buildState: "matched" } });
+  assert.equal(missingApi.state, "unknown");
+  assert.ok(missingApi.guidance.some((g) => /Marketplace API/.test(g)));
+
+  const nothing = marketplaceVersionCompatibility("0.4.29", {});
+  assert.equal(nothing.api, null);
+  assert.equal(nothing.worker, null);
+  assert.equal(nothing.state, "unknown");
 });
 
 summary("marketplace-status");
