@@ -43,6 +43,7 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, roleSubscriptionKey, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
+import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
   chargeFacts,
   checkoutFacts,
@@ -301,6 +302,21 @@ export class BillingService {
     if (!ev.livemode && cfg.mode !== "test") return { outcome: "ignored", note: "test-mode event while the Hub is in LIVE mode" };
     if (!DISPATCHED_EVENT_TYPES.has(ev.type)) return { outcome: "ignored", note: "event type not handled" };
 
+    // ── B15: a foreign product's event must never touch a licence ──────────
+    // Runs BEFORE the role dispatcher and before any store write of any
+    // kind (including the role index below) — see
+    // foreign-product-family.ts's header for why this cannot be left to
+    // roles.ts's own defaults. checkout/invoice/subscription events are the
+    // only ones that ever carry `metadata` this Hub reads; charge/dispute
+    // events carry none of this app's correlation metadata and are
+    // unaffected by this check, exactly as the role dispatcher already
+    // treats them (they resolve through the role INDEX, populated by the
+    // invoice/subscription event that preceded them — which this check will
+    // already have refused, so nothing downstream ever indexes a foreign
+    // charge either).
+    const foreignFamilyNote = this.foreignProductFamilyNote(ev);
+    if (foreignFamilyNote) return { outcome: "ignored", note: foreignFamilyNote };
+
     // ── the billing-role dispatcher (H1) ────────────────────────────────────
     // Classify BEFORE touching any state. This is the fix: every handler
     // below this point used to run for EVERY event on EVERY customer,
@@ -374,6 +390,33 @@ export class BillingService {
   private planRoleOf(metadata: Record<string, string>, cfg: BillingConfig): BillingRole | null {
     const key = this.planKeyOf(metadata, cfg);
     return key ? planByKey(cfg, key)?.role ?? null : null;
+  }
+
+  /** B15's gate: the refusal reason for a foreign event's `productFamily`
+   *  metadata, or `null` when it carries none (see
+   *  foreign-product-family.ts). Reads the exact metadata bag each event
+   *  type carries the tag in — a checkout session's own `metadata`, an
+   *  invoice's correlating subscription metadata (three documented Stripe
+   *  API shapes; see `invoiceFacts`), or a subscription's own top-level
+   *  `metadata`. `charge.*`/`dispute.*` events carry none of this app's
+   *  correlation metadata (Stripe does not copy an invoice's or a
+   *  subscription's metadata onto the charge or the dispute it produces),
+   *  so they fall through untouched — the same as every other Hub event. */
+  private foreignProductFamilyNote(ev: StripeEvent): string | null {
+    switch (ev.type) {
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded":
+        return foreignProductFamilyRefusal({ productFamily: checkoutFacts(ev.object).metadata.productFamily ?? "" });
+      case "invoice.paid":
+      case "invoice.payment_succeeded":
+      case "invoice.payment_failed":
+        return foreignProductFamilyRefusal({ productFamily: invoiceFacts(ev.object).metadata.productFamily ?? "" });
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted":
+        return foreignProductFamilyRefusal({ productFamily: subscriptionFacts(ev.object).metadata.productFamily ?? "" });
+      default:
+        return null;
+    }
   }
 
   /** The dispatcher itself: which role this ONE event belongs to, and every

@@ -64,6 +64,12 @@ const asNum = (v: unknown): number | null => (typeof v === "number" && Number.is
 /** Stripe expands references inline or leaves an id string; accept both. */
 const asId = (v: unknown): string => (typeof v === "string" ? v : asStr(asObj(v).id));
 
+function strMap(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(asObj(v))) if (typeof val === "string") out[k] = val;
+  return out;
+}
+
 export interface StripeEvent {
   id: string;
   type: string;
@@ -104,8 +110,7 @@ export interface CheckoutFacts {
 
 export function checkoutFacts(o: Obj): CheckoutFacts {
   const details = asObj(o.customer_details);
-  const meta: Record<string, string> = {};
-  for (const [k, v] of Object.entries(asObj(o.metadata))) if (typeof v === "string") meta[k] = v;
+  const meta = strMap(o.metadata);
   return {
     sessionId: asStr(o.id),
     mode: asStr(o.mode),
@@ -140,6 +145,16 @@ export interface InvoiceFacts {
    *  against. Deduplicated; empty when no line carries a readable price. */
   priceIds: string[];
   productIds: string[];
+  /** The correlating subscription's own metadata — where a marketplace
+   *  invoice's `productFamily` tag lives (foreign-product-family.ts). An
+   *  Invoice does not carry `metadata` of its own that round-trips a
+   *  subscription's tags reliably across Stripe API versions, so this reads
+   *  the SAME three documented shapes, oldest first, that the app's own
+   *  `invoiceCorrelationMetadata` (marketplace-hub/rail-stripe.ts) reads:
+   *  `subscription_details.metadata`, then (the 2025-03-31.basil reshape)
+   *  `parent.subscription_details.metadata`, then the first line's own
+   *  `metadata` — never guessed, never merged across the three. */
+  metadata: Record<string, string>;
 }
 
 export function invoiceFacts(o: Obj): InvoiceFacts {
@@ -161,6 +176,13 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
   // 2025-03-31.basil moved `invoice.subscription` under `parent`; read both.
   const parent = asObj(o.parent);
   const subscriptionId = asId(o.subscription) || asId(asObj(parent.subscription_details).subscription);
+  const subDetailsMeta = strMap(asObj(o.subscription_details).metadata);
+  const parentSubDetailsMeta = strMap(asObj(parent.subscription_details).metadata);
+  const firstLine = data.length > 0 ? asObj(data[0]) : {};
+  const firstLineMeta = strMap(firstLine.metadata);
+  const metadata = Object.keys(subDetailsMeta).length ? subDetailsMeta
+    : Object.keys(parentSubDetailsMeta).length ? parentSubDetailsMeta
+    : firstLineMeta;
   return {
     invoiceId: asStr(o.id),
     customerId: asId(o.customer),
@@ -174,6 +196,7 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
     periodEndMs: periodEnd === null ? null : periodEnd * 1000,
     priceIds: [...priceIds],
     productIds: [...productIds],
+    metadata,
   };
 }
 
@@ -189,6 +212,11 @@ export interface SubscriptionFacts {
    *  in the webhook payload, no fetch needed. See InvoiceFacts.priceIds. */
   priceIds: string[];
   productIds: string[];
+  /** The Subscription object's own top-level `metadata` — where a
+   *  marketplace subscription's `productFamily` tag lives (the app's own
+   *  Stripe rail writes it there directly, not nested; see
+   *  foreign-product-family.ts). */
+  metadata: Record<string, string>;
 }
 
 export function subscriptionFacts(o: Obj): SubscriptionFacts {
@@ -217,6 +245,7 @@ export function subscriptionFacts(o: Obj): SubscriptionFacts {
     endedAtMs: ended === null ? null : ended * 1000,
     priceIds: [...priceIds],
     productIds: [...productIds],
+    metadata: strMap(o.metadata),
   };
 }
 
