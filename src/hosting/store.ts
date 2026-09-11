@@ -58,6 +58,20 @@ export interface ReadinessRecord {
   regionTried: string;
 }
 
+/** An admin's durable claim that this instance must never move toward
+ *  `deleting`/`deleted` — see `HostingService.adminHoldDeletion`/
+ *  `adminReleaseHold` (src/hosting/service.ts). `atMs` is the instant the
+ *  hold was FIRST placed and never moves on a repeated hold call (it is
+ *  what a release measures elapsed-held-time against — never "by" alone,
+ *  since "who" is for the admin panel/audit trail and carries no policy
+ *  meaning). `reason` is customer-safe text ("on hold by support" is the
+ *  default the customer card shows; the admin panel may show more). */
+export interface HostingDeletionHold {
+  by: string;
+  atMs: number;
+  reason: string;
+}
+
 export interface HostingInstanceRow {
   id: string;
   /** Billing customer key — the SAME key space as
@@ -80,6 +94,14 @@ export interface HostingInstanceRow {
   generation: number;
   providerAccountRef: string;
   providerInstanceId: string | null;
+  /** The provider's own monthly cost for `planId`, in cents — captured
+   *  once from `provider.listPlans()` the first time this instance is
+   *  provisioned (`HostingService.drainProvision`), never guessed and
+   *  never defaulted to 0. `null` until captured; `HostingService.
+   *  projectedMonthlyProviderCostCents()` treats any non-deleted instance
+   *  with a `null` here as making the WHOLE projection unknown, since
+   *  silently treating an unread cost as free would understate spend. */
+  providerPlanMonthlyCostCents: number | null;
   label: string;
   ip: string | null;
   appUrl: string | null;
@@ -91,7 +113,11 @@ export interface HostingInstanceRow {
   cancellationReason: "renewal_unpaid" | "intentional_cancellation" | null;
   suspendAtMs: number | null;
   deleteAtMs: number | null;
-  deletionHoldUntilMs: number | null;
+  /** Non-null while an admin deletion hold is in effect — see
+   *  `HostingDeletionHold`. `HostingService.tick()`'s delete pipeline
+   *  (`drainDelete`) refuses to transition this row toward
+   *  `deleting`/`deleted` while this is set, whatever `deleteAtMs` says. */
+  deletionHold: HostingDeletionHold | null;
   irreversibleDeleteCommittedAtMs: number | null;
   providerDeletedAtMs: number | null;
   terminatedAtMs: number | null;
@@ -290,6 +316,7 @@ export class HostingStore {
         generation: 1,
         providerAccountRef: "",
         providerInstanceId: null,
+        providerPlanMonthlyCostCents: null,
         label: "",
         ip: null,
         appUrl: null,
@@ -301,7 +328,7 @@ export class HostingStore {
         cancellationReason: null,
         suspendAtMs: null,
         deleteAtMs: null,
-        deletionHoldUntilMs: null,
+        deletionHold: null,
         irreversibleDeleteCommittedAtMs: null,
         providerDeletedAtMs: null,
         terminatedAtMs: null,

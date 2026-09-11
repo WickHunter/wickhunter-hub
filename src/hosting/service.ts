@@ -34,7 +34,7 @@ import type { RoleSubscriptionRecord } from "../billing/store.js";
 import type { EmailConfig } from "../billing/config.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
-import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage } from "./store.js";
+import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold } from "./store.js";
 import { readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
 import { deadlines, type HostingDeadlines, type HostingEndReason } from "./deadlines.js";
 import { readinessVerdict, type ProbeResult, type ReadinessVerdict } from "./readiness.js";
@@ -162,6 +162,9 @@ export class HostingService {
     if (this.store.activeInstanceForOwner(ownerId, environment)) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "you already have a hosting instance — manage it from this page" };
     const planKey = this.hostingPlanKeys()[0];
     if (!planKey) return { ok: false, code: "PROVISIONING_DISABLED", error: "hosting is not yet configured for purchase on this Hub" };
+    const policy = this.policy();
+    const ceilingRefusal = this.costCeilingRefusal(policy.planId, policy);
+    if (ceilingRefusal) return { ok: false, code: "PROVISIONING_DISABLED", error: ceilingRefusal };
     const url = `${this.origin}/buy?plan=${encodeURIComponent(planKey)}${email ? `&prefilled_email=${encodeURIComponent(email)}` : ""}`;
     return { ok: true, value: { url } };
   }
@@ -299,7 +302,16 @@ export class HostingService {
       return;
     }
     if (nonpaying && !TERMINAL_ISH.has(instance.stage) && instance.cancellationReason !== "intentional_cancellation") {
-      this.scheduleEnd(instance, "renewal_unpaid", instance.paidThroughMs ?? nowMs, policy, nowMs);
+      // Idempotent, matching `scheduledCancel`'s own guard three lines up
+      // (and `ended`'s below): a subscription answers "past_due" on EVERY
+      // reconcile pass until something else changes it, so without this
+      // check `scheduleEnd` re-derived and re-queued a brand new
+      // suspend/delete/reminder set from `paidThroughMs` on every single
+      // tick — pointless churn on an ordinary install, and it is what
+      // would have silently overwritten an admin deletion hold's release
+      // (`adminReleaseHold`'s held-time-shifted deadlines) on the very
+      // next tick, since this path knows nothing about a hold.
+      if (instance.cancellationReason !== "renewal_unpaid") this.scheduleEnd(instance, "renewal_unpaid", instance.paidThroughMs ?? nowMs, policy, nowMs);
       return;
     }
     if (ended && instance.cancellationReason === null && !TERMINAL_ISH.has(instance.stage)) {
@@ -545,7 +557,21 @@ export class HostingService {
       case "provision": return this.drainProvision(row, nowMs);
       case "suspend": return this.drainSuspend(row, nowMs);
       case "delete": return this.drainDelete(row, nowMs);
-      case "email": return this.drainEmail(row, String((job.payload as any).template ?? ""), nowMs);
+      case "email": {
+        const template = String((job.payload as any).template ?? "");
+        // "Reminders about deletion are suppressed while held" (the
+        // deletion hold's own contract): a countdown email is dishonest
+        // while the countdown itself is paused. The other templates
+        // (overdue/cancellation_scheduled/suspended/etc.) are unrelated to
+        // an impending delete and still send normally. Nothing is lost —
+        // `adminReleaseHold` re-derives and re-queues fresh reminder jobs
+        // against the recomputed deadlines once released.
+        if (row.deletionHold && (template === "three_days" || template === "one_day")) {
+          this.log(`[hosting] ${row.id}: "${template}" deletion reminder suppressed — on an admin deletion hold (by ${row.deletionHold.by})`);
+          return;
+        }
+        return this.drainEmail(row, template, nowMs);
+      }
       default: return;
     }
   }
@@ -558,6 +584,7 @@ export class HostingService {
     const provider = this.provider();
     if (!provider) { this.log(`[hosting] ${row.id}: no provider configured — cannot provision`); return; }
     if (row.provisionAttempts >= MAX_PROVISION_ATTEMPTS) { this.failProvisioning(row, `setup failed after ${row.provisionAttempts} attempts`, nowMs); return; }
+    await this.captureProviderPlanQuote(row, provider, nowMs);
 
     const label = hostingInstanceLabel(row.id, row.generation);
     this.store.updateInstance(row.id, row.version, (d) => { d.stage = "provisioning"; d.label = label; d.provisionAttempts += 1; }, nowMs);
@@ -621,6 +648,81 @@ export class HostingService {
     }, nowMs);
   }
 
+  /** Records `providerPlanMonthlyCostCents` on the row from
+   *  `provider.listPlans()` the first time this instance is provisioned —
+   *  best-effort: a failed or empty read leaves it `null` (unknown), which
+   *  keeps `projectedMonthlyProviderCostCents()` honest (unknown, not 0)
+   *  rather than blocking provisioning itself over a cost-accounting read.
+   *  No-op once a quote is already recorded — this is a one-time capture,
+   *  not a live re-price on every provision attempt. */
+  private async captureProviderPlanQuote(row: HostingInstanceRow, provider: HostingProvider, nowMs: number): Promise<void> {
+    if (row.providerPlanMonthlyCostCents !== null) return;
+    try {
+      const plans = await provider.listPlans();
+      const match = plans.find((p) => p.id === row.planId);
+      if (!match) { this.log(`[hosting] ${row.id}: provider does not list plan "${row.planId}" — cost ceiling projection stays unknown for this instance`); return; }
+      const current = this.store.getInstance(row.id);
+      if (current && current.providerPlanMonthlyCostCents === null) {
+        this.store.updateInstance(current.id, current.version, (d) => { d.providerPlanMonthlyCostCents = match.monthlyCostCents; }, nowMs);
+      }
+    } catch (err) {
+      this.log(`[hosting] ${row.id}: could not read the provider's plan quote (${(err as Error).message}) — cost ceiling projection stays unknown for this instance`);
+    }
+  }
+
+  /** Sum of `providerPlanMonthlyCostCents` across every non-deleted
+   *  instance — suspended/past_due/cancel_scheduled/restoring rows count
+   *  too (they either still hold a provider resource or will create one
+   *  again on restore; only `deleted` truly has none). ANY non-deleted
+   *  instance whose quote was never captured makes the WHOLE projection
+   *  unknown — never silently 0, which would understate spend and let the
+   *  ceiling check pass when it should refuse. */
+  projectedMonthlyProviderCostCents(): { known: true; cents: number } | { known: false } {
+    let total = 0;
+    for (const row of this.store.instances()) {
+      if (row.stage === "deleted") continue;
+      if (row.providerPlanMonthlyCostCents === null) return { known: false };
+      total += row.providerPlanMonthlyCostCents;
+    }
+    return { known: true, cents: total };
+  }
+
+  /** The most recently captured provider quote for `planId`, from ANY
+   *  instance that has ever recorded one (deleted included — the figure is
+   *  a fact about the PLAN, not about that particular instance's
+   *  lifecycle). Used to estimate what a not-yet-created instance of the
+   *  SAME plan would cost, without a live provider call — see
+   *  `costCeilingRefusal`. `null` = this plan has never been quoted on this
+   *  Hub. */
+  private lastKnownPlanQuoteCents(planId: string): number | null {
+    let best: { updatedAtMs: number; cents: number } | null = null;
+    for (const row of this.store.instances()) {
+      if (row.planId !== planId || row.providerPlanMonthlyCostCents === null) continue;
+      if (!best || row.updatedAtMs > best.updatedAtMs) best = { updatedAtMs: row.updatedAtMs, cents: row.providerPlanMonthlyCostCents };
+    }
+    return best?.cents ?? null;
+  }
+
+  /** Refuses (by name) admitting one more instance of `planId` when a
+   *  non-zero cost ceiling is configured and doing so would push the
+   *  projected monthly provider spend over it — checked with NO provider
+   *  call (that is the whole point: `checkoutUrl` must never hand a
+   *  customer a payment link that provisioning would go on to refuse).
+   *  0 = no ceiling (existing semantics). An UNKNOWN current projection or
+   *  an UNKNOWN plan quote both refuse too — never guessed as 0 cost,
+   *  which would silently let real spend past the ceiling; the customer
+   *  sees an honest "not available right now" rather than a payment prompt
+   *  that cannot be fulfilled. */
+  private costCeilingRefusal(planId: string, policy: HostingPolicy): string | null {
+    if (policy.maximumProjectedMonthlyProviderCostCents <= 0) return null; // 0 = no ceiling configured
+    const current = this.projectedMonthlyProviderCostCents();
+    if (!current.known) return "hosting is at its provider cost ceiling — the current projected provider spend could not be verified";
+    const quote = this.lastKnownPlanQuoteCents(planId);
+    if (quote === null) return "hosting is at its provider cost ceiling — this plan's provider cost has not yet been recorded";
+    if (current.cents + quote > policy.maximumProjectedMonthlyProviderCostCents) return "hosting is at its provider cost ceiling";
+    return null;
+  }
+
   private failProvisioning(row: HostingInstanceRow, reason: string, nowMs: number): void {
     this.store.updateInstance(row.id, row.version, (d) => { d.operationalHealth = "unhealthy"; d.failureReason = reason; }, nowMs);
     this.store.enqueue({ hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation, jobType: "email", dedupeKey: `email:setup_failure:${row.id}:g${row.generation}`, availableAtMs: nowMs, payload: { template: "setup_failure" } }, nowMs);
@@ -659,6 +761,17 @@ export class HostingService {
       // this generation/version combo genuinely has no fresher evidence.
       const current = this.store.getInstance(row.id);
       if (!current || current.stage === "deleted" || (current.deleteAtMs !== null && nowMs < current.deleteAtMs)) { this.store.releaseLease(row.id, claim.token, nowMs); return; }
+      if (current.deletionHold) {
+        // An admin deletion hold refuses this transition outright, however
+        // overdue `deleteAtMs` is — "tick() never transitions a held
+        // instance to deleting/deleted". Nothing is lost: releasing the
+        // hold (adminReleaseHold) re-derives fresh deadlines from the
+        // ORIGINAL anchor and re-queues a delete job of its own, so this
+        // attempt simply has nothing to do while held.
+        this.log(`[hosting] ${current.id}: delete deadline reached but the instance is on an admin deletion hold (by ${current.deletionHold.by}) — not deleting; release the hold to resume`);
+        this.store.releaseLease(row.id, claim.token, nowMs);
+        return;
+      }
       if (current.stage === "restoring" || current.cancellationReason === null && current.stage !== "suspended" && current.stage !== "past_due" && current.stage !== "cancel_scheduled") {
         this.store.releaseLease(row.id, claim.token, nowMs); return;
       }
@@ -841,6 +954,11 @@ export class HostingService {
     const row = this.store.getInstance(instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
     if (row.stage === "deleted") return { ok: false, code: "NOT_CANCELLABLE", error: "already deleted" };
+    // `drainDelete` would refuse this transition anyway while held — refuse
+    // it HERE too, by name, so an admin gets an immediate answer rather
+    // than a delete request that silently goes nowhere once it reaches the
+    // outbox (see drainDelete's own `deletionHold` guard).
+    if (row.deletionHold) return { ok: false, code: "NOT_CANCELLABLE", error: "this instance is on an admin deletion hold — release the hold before forcing deletion" };
     const fresh = this.store.updateInstance(instanceId, row.version, (d) => {
       d.cancellationReason = d.cancellationReason ?? "intentional_cancellation";
       d.suspendAtMs = d.suspendAtMs ?? nowMs;
@@ -851,6 +969,90 @@ export class HostingService {
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
     this.store.enqueue({ hostingInstanceId: fresh.id, lifecycleVersion: fresh.lifecycleVersion, generation: fresh.generation, jobType: "delete", dedupeKey: `admin-delete:${fresh.id}:v${fresh.lifecycleVersion}`, availableAtMs: nowMs, payload: {} }, nowMs);
     return { ok: true, value: null };
+  }
+
+  /** POST /admin/api/hosting/instances/:id/hold. Places (or refreshes) a
+   *  deletion hold — see `HostingDeletionHold` and `drainDelete`'s guard.
+   *  Idempotent and safe to call on an already-held instance: `by`/`reason`
+   *  are updated but `atMs` (the instant `adminReleaseHold` measures
+   *  elapsed-held-time from) is NEVER moved forward by a repeat call, or a
+   *  string of "still reviewing" hold refreshes would quietly reset the
+   *  clock `deadlines()`'s `heldForMs` depends on. */
+  adminHoldDeletion(instanceId: string, by: string, reason: string, nowMs = this.now()): HostingActionResult<null> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
+    if (row.stage === "deleted") return { ok: false, code: "NOT_CANCELLABLE", error: "already deleted — nothing to hold" };
+    const fresh = this.store.updateInstance(instanceId, row.version, (d) => {
+      const hold: HostingDeletionHold = { by: by || "support", atMs: d.deletionHold?.atMs ?? nowMs, reason: reason || "on hold by support" };
+      d.deletionHold = hold;
+    }, nowMs);
+    if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+    this.log(`[hosting] ${fresh.id}: deletion hold placed by ${fresh.deletionHold!.by} — ${fresh.deletionHold!.reason}`);
+    return { ok: true, value: null };
+  }
+
+  /** POST /admin/api/hosting/instances/:id/release-hold. Clears the hold
+   *  and — when the row is mid an expiry pipeline (`cancellationReason` +
+   *  `suspendAtMs` set) — re-derives suspend/delete/reminder deadlines from
+   *  the ORIGINAL nonpayment/cancel anchor (never from `nowMs`), shifted
+   *  forward by exactly how long the hold was in effect
+   *  (`deadlines()`'s `heldForMs`). The anchor is recovered from the row's
+   *  OWN already-stored `suspendAtMs` (inverting `deadlines()`'s own
+   *  arithmetic) rather than re-reading `paidThroughMs`, so this is exact
+   *  even if something unrelated moved `paidThroughMs` afterward.
+   *
+   *  If the recomputed delete deadline is already in the past — the hold
+   *  was placed at or after the original deadline had effectively arrived
+   *  — deletion proceeds on the very next tick, with the ordinary single
+   *  "terminated" email `drainDelete` sends on completion: pausing a clock
+   *  that had already run out does not un-run it, and re-sending a "3 days
+   *  left"/"1 day left" reminder for a deadline that is already gone would
+   *  be dishonest. */
+  adminReleaseHold(instanceId: string, nowMs = this.now()): HostingActionResult<null> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
+    if (!row.deletionHold) return { ok: false, code: "NOT_CANCELLABLE", error: "this instance is not on hold" };
+    const heldForMs = Math.max(0, nowMs - row.deletionHold.atMs);
+    if (row.cancellationReason && row.suspendAtMs !== null) {
+      const policy = this.policy();
+      const anchor = row.cancellationReason === "renewal_unpaid" ? row.suspendAtMs - policy.renewalGraceHours * HOUR : row.suspendAtMs;
+      const d = deadlines(anchor, row.cancellationReason, policy, heldForMs);
+      const fresh = this.store.updateInstance(instanceId, row.version, (draft) => {
+        draft.deletionHold = null;
+        draft.suspendAtMs = d.suspendAt;
+        draft.deleteAtMs = d.deleteAt;
+        draft.lifecycleVersion += 1;
+      }, nowMs);
+      if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+      this.store.obsoletePendingJobsOlderThan(fresh.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+      this.requeueDeadlineJobsAfterHold(fresh, d, nowMs);
+      this.log(`[hosting] ${fresh.id}: deletion hold released after ${(heldForMs / HOUR).toFixed(1)}h held — delete deadline now ${new Date(d.deleteAt).toISOString()}`);
+      return { ok: true, value: null };
+    }
+    // No expiry pipeline on record (a hold placed pre-emptively, or on an
+    // instance whose deadlines were never set) — just clear the hold; there
+    // is nothing to re-arm.
+    const fresh = this.store.updateInstance(instanceId, row.version, (draft) => { draft.deletionHold = null; }, nowMs);
+    if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+    return { ok: true, value: null };
+  }
+
+  /** The reminder/suspend/delete jobs a released hold re-arms. Deliberately
+   *  NOT `queueDeadlineJobs` (which also fires the immediate "overdue"/
+   *  "cancellation_scheduled" notice — appropriate when an expiry pipeline
+   *  FIRST begins, not on every hold release): the suspend/reminder jobs
+   *  are skipped entirely once the recomputed delete deadline has already
+   *  elapsed (see `adminReleaseHold`'s docstring) so the customer gets the
+   *  one honest "terminated" email instead of a burst of stale reminders;
+   *  the delete job is always (re)queued, whatever its `availableAtMs`. */
+  private requeueDeadlineJobsAfterHold(row: HostingInstanceRow, d: HostingDeadlines, nowMs: number): void {
+    const base = { hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation };
+    if (d.deleteAt > nowMs) {
+      this.store.enqueue({ ...base, jobType: "email", dedupeKey: `email:three_days:${row.id}:v${row.lifecycleVersion}`, availableAtMs: d.threeDaysAt, payload: { template: "three_days" } }, nowMs);
+      this.store.enqueue({ ...base, jobType: "email", dedupeKey: `email:one_day:${row.id}:v${row.lifecycleVersion}`, availableAtMs: d.oneDayAt, payload: { template: "one_day" } }, nowMs);
+      this.store.enqueue({ ...base, jobType: "suspend", dedupeKey: `suspend:${row.id}:v${row.lifecycleVersion}`, availableAtMs: d.suspendAt, payload: {} }, nowMs);
+    }
+    this.store.enqueue({ ...base, jobType: "delete", dedupeKey: `delete:${row.id}:v${row.lifecycleVersion}`, availableAtMs: d.deleteAt, payload: {} }, nowMs);
   }
 
   // ── views ────────────────────────────────────────────────────────────────
@@ -883,6 +1085,11 @@ export interface HostingInstanceView {
   deleteAtMs: number | null;
   cancellationReason: string | null;
   failureReason: string | null;
+  /** True while an admin deletion hold is in effect on this instance. When
+   *  true, `suspendAtMs`/`deleteAtMs` are masked to `null` (no dates) and
+   *  `failureReason` carries the one customer-safe sentence — see
+   *  `instanceView`. */
+  onHold: boolean;
   monthlyPriceLabel: string;
   managedBackupsIncluded: boolean;
 }
@@ -896,12 +1103,21 @@ export interface HostingCustomerView {
 }
 
 function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number): HostingInstanceView {
+  // On hold: no dates ("Scheduled for permanent deletion at …" would be a
+  // lie — the pipeline is paused), and the one customer-safe sentence in
+  // place of any real failureReason (an operational failure note is not
+  // what is going on here, and stacking both would read as two problems).
+  const onHold = row.deletionHold !== null;
   return {
     id: row.id, stage: row.stage, operationalHealth: row.operationalHealth,
     region: row.region, regionLabel: policy.regions.find((r) => r.id === row.region)?.label ?? row.region,
     ip: row.ip, appUrl: row.appUrl, planLabel: policy.planLabel,
-    paidThroughMs: row.paidThroughMs, suspendAtMs: row.suspendAtMs, deleteAtMs: row.deleteAtMs,
-    cancellationReason: row.cancellationReason, failureReason: row.failureReason,
+    paidThroughMs: row.paidThroughMs,
+    suspendAtMs: onHold ? null : row.suspendAtMs,
+    deleteAtMs: onHold ? null : row.deleteAtMs,
+    cancellationReason: row.cancellationReason,
+    failureReason: onHold ? "This server is on hold by support." : row.failureReason,
+    onHold,
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
   };
 }

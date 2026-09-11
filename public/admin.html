@@ -378,6 +378,7 @@
 <div class="actions">
   <button type="button" id="hostingRefreshBtn">Refresh</button>
   <span id="hostingMeta" class="muted"></span>
+  <span id="hostingCostMeta" class="muted"></span>
 </div>
 
 <section class="configgroup" id="hostingPolicyCard">
@@ -391,8 +392,8 @@
 <h2 style="margin:1.2rem 0 .2rem">Instances</h2>
 <p class="muted" style="margin:.2rem 0">Every hosted VPS, whatever its stage. Retry re-attempts provisioning on the same row (bounded, same as an automatic attempt). Force suspend/delete drive the SAME lease-guarded pipeline a real expiry uses — never a shortcut that skips it.</p>
 <div class="tbl"><table>
-  <thead><tr><th>Instance</th><th>Owner</th><th>Env</th><th>Stage</th><th>Region</th><th>Provider id</th><th>Paid through</th><th>Suspend at</th><th>Delete at</th><th>Note</th><th></th></tr></thead>
-  <tbody id="hostingInstanceRows"><tr><td colspan="11">loading&hellip;</td></tr></tbody>
+  <thead><tr><th>Instance</th><th>Owner</th><th>Env</th><th>Stage</th><th>Region</th><th>Provider id</th><th>Paid through</th><th>Suspend at</th><th>Delete at</th><th>Hold</th><th>Note</th><th></th></tr></thead>
+  <tbody id="hostingInstanceRows"><tr><td colspan="12">loading&hellip;</td></tr></tbody>
 </table></div>
 </section>
 
@@ -2467,25 +2468,57 @@ async function hostingInstanceAction(id, action, confirmMsg) {
     if (e.message !== "unauthorized") alert(e.message);
   }
 }
+async function hostingHoldAction(id) {
+  const by = prompt("Your name/initials (kept on the hold record):", "") || "support";
+  const reason = prompt('Reason for the hold. The customer sees only "on hold by support" — this text is for the admin panel/audit log.', "") || "";
+  try {
+    await api("/admin/api/hosting/instances/" + encodeURIComponent(id) + "/hold", { method: "POST", body: JSON.stringify({ by: by, reason: reason }) });
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") alert(e.message);
+  }
+}
+async function hostingReleaseHoldAction(id) {
+  if (!confirm("Release the deletion hold on " + id + "? Suspend/delete deadlines resume from where they originally left off (shifted forward by however long this was held) — not reset to a fresh countdown.")) return;
+  try {
+    await api("/admin/api/hosting/instances/" + encodeURIComponent(id) + "/release-hold", { method: "POST", body: "{}" });
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") alert(e.message);
+  }
+}
+function fmtCents(cents) { return "$" + (cents / 100).toFixed(2); }
 async function hostingRefresh() {
   const meta = document.getElementById("hostingMeta");
+  const costMeta = document.getElementById("hostingCostMeta");
   try {
     const policyData = await api("/admin/api/hosting/policy");
     renderHostingPolicyCard(policyData.policy, policyData.secrets);
+    const ceiling = policyData.policy.maximumProjectedMonthlyProviderCostCents;
+    const projected = policyData.projectedMonthlyProviderCostCents;
+    if (!ceiling) {
+      costMeta.textContent = "projected provider cost: " + (projected && projected.known ? fmtCents(projected.cents) : "unknown") + " (no ceiling configured)";
+    } else if (projected && projected.known) {
+      costMeta.textContent = "projected provider cost: " + fmtCents(projected.cents) + " of " + fmtCents(ceiling) + " ceiling" + (projected.cents > ceiling ? " — OVER CEILING" : "");
+    } else {
+      costMeta.textContent = "projected provider cost: unknown (an instance's provider quote was never captured) — new checkouts are refused while this is unknown and the ceiling is nonzero";
+    }
   } catch (e) {
     if (e.message === "unauthorized") return;
   }
   const rows = document.getElementById("hostingInstanceRows");
   let d;
   try { d = await api("/admin/api/hosting/instances"); }
-  catch (e) { if (e.message === "unauthorized") return; rows.innerHTML = '<tr><td colspan="11">unavailable</td></tr>'; return; }
+  catch (e) { if (e.message === "unauthorized") return; rows.innerHTML = '<tr><td colspan="12">unavailable</td></tr>'; return; }
   const instances = d.instances || [];
   meta.textContent = instances.length + " instance(s)";
-  if (!instances.length) { rows.innerHTML = '<tr><td colspan="11">no hosting instances yet</td></tr>'; return; }
+  if (!instances.length) { rows.innerHTML = '<tr><td colspan="12">no hosting instances yet</td></tr>'; return; }
   rows.innerHTML = "";
   for (const inst of instances) {
     const badge = '<span class="custbadge ' + (HOSTING_STAGE_BADGE[inst.stage] || "muted") + '">' + esc(inst.stage) + "</span>";
     const note = [inst.failureReason, inst.cancellationReason].filter(Boolean).map(esc).join(" · ");
+    const hold = inst.deletionHold;
+    const holdCell = hold ? '<span class="custbadge revoked" title="' + esc(hold.reason) + '">held by ' + esc(hold.by) + " · " + esc(fmt(hold.atMs)) + "</span>" : "—";
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td class="name">' + esc(inst.id) + "</td>" +
@@ -2497,6 +2530,7 @@ async function hostingRefresh() {
       "<td>" + esc(fmt(inst.paidThroughMs)) + "</td>" +
       "<td>" + esc(fmt(inst.suspendAtMs)) + "</td>" +
       "<td>" + esc(fmt(inst.deleteAtMs)) + "</td>" +
+      "<td>" + holdCell + "</td>" +
       '<td style="max-width:220px;overflow-wrap:anywhere">' + (note || "—") + "</td>" +
       "<td></td>";
     const actions = tr.lastElementChild;
@@ -2507,6 +2541,18 @@ async function hostingRefresh() {
     const deleteBtn = document.createElement("button"); deleteBtn.type = "button"; deleteBtn.textContent = "Force delete";
     deleteBtn.onclick = () => hostingInstanceAction(inst.id, "force-delete", "PERMANENTLY delete " + inst.id + " and its server data? This cannot be undone.");
     actions.appendChild(retryBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(suspendBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(deleteBtn);
+    if (inst.stage !== "deleted") {
+      actions.appendChild(document.createTextNode(" "));
+      if (hold) {
+        const releaseBtn = document.createElement("button"); releaseBtn.type = "button"; releaseBtn.textContent = "Release hold";
+        releaseBtn.onclick = () => hostingReleaseHoldAction(inst.id);
+        actions.appendChild(releaseBtn);
+      } else {
+        const holdBtn = document.createElement("button"); holdBtn.type = "button"; holdBtn.textContent = "Hold";
+        holdBtn.onclick = () => hostingHoldAction(inst.id);
+        actions.appendChild(holdBtn);
+      }
+    }
     rows.appendChild(tr);
   }
 }

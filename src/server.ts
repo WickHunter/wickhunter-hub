@@ -2280,7 +2280,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
     // ── hosting admin (H6) ────────────────────────────────────────────────
     if (m === "GET" && p === "/admin/api/hosting/policy") {
-      return sendJson(res, 200, { ok: true, policy: hosting.policy(), secrets: maskedHostingSecrets(readHostingSecrets(cfg.dataDir)) }, { "cache-control": "no-store" });
+      // `projectedMonthlyProviderCostCents` rides the SAME response the
+      // admin policy card already reads (the ceiling it is measured
+      // against is right there in `policy`) — `{known:false}` means at
+      // least one non-deleted instance's provider quote has never been
+      // captured (see HostingService.projectedMonthlyProviderCostCents).
+      return sendJson(res, 200, { ok: true, policy: hosting.policy(), secrets: maskedHostingSecrets(readHostingSecrets(cfg.dataDir)), projectedMonthlyProviderCostCents: hosting.projectedMonthlyProviderCostCents() }, { "cache-control": "no-store" });
     }
     if (m === "POST" && p === "/admin/api/hosting/policy") {
       const body = await readJsonBody(req);
@@ -2322,14 +2327,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const r = hosting.adminForceDelete(id, typeof body?.reason === "string" ? body.reason : "", rateLimitNow());
       return r.ok ? sendJson(res, 200, { ok: true, note: "delete job queued — an operator-forced delete is still processed through the ordinary lease-guarded pipeline" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, error: r.error });
     }
+    // A deletion hold (`HostingService.adminHoldDeletion`/`adminReleaseHold`)
+    // — `/release-hold` is checked as its OWN `endsWith`, never derived by
+    // stripping a suffix off the `/hold` branch: "…/release-hold" does NOT
+    // match `endsWith("/hold")` (the character before "hold" there is "-",
+    // not "/"), so the two routes cannot collide, but keeping them as two
+    // independent checks (rather than one clever shared one) is what makes
+    // that obviously true on inspection.
     if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/hold")) {
       const id = p.slice("/admin/api/hosting/instances/".length, -"/hold".length);
-      if (!hosting.store.getInstance(id)) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" });
-      // `HostingInstanceRow.deletionHoldUntilMs` exists in the store schema
-      // (H4's suggested record shape) but nothing in the delete pipeline
-      // reads it yet — see the delivery report's known gaps. Returning 501
-      // rather than silently accepting the hold and doing nothing with it.
-      return sendJson(res, 501, { ok: false, error: "deletion holds are not yet wired into the delete pipeline — see the delivery report" });
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by.trim().slice(0, 80) : "";
+      const reason = typeof body?.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+      const r = hosting.adminHoldDeletion(id, by, reason, rateLimitNow());
+      return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/release-hold")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/release-hold".length);
+      const r = hosting.adminReleaseHold(id, rateLimitNow());
+      return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error });
     }
     sendJson(res, 404, { ok: false, error: "not found" });
   }
