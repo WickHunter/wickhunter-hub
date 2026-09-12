@@ -104,6 +104,26 @@ export interface SeedDeps {
   sign(bytes: Buffer): Buffer;
   /** null when the venue lists the symbol, a reason string when it does not. */
   symbolKnown(venue: VenueId, symbol: string): boolean;
+  /** ── v0.4.31 — NEVER SERVE A MINUTE ONLY A WEBSOCKET HAS SEEN ─────────────
+   *
+   *  A minute a websocket closed by ORDERING (WEEX, Bitget, Bitunix all state
+   *  no closure of their own — see stream.ts) can be short a trade that lands
+   *  in the venue's book a moment after the ordering fact already published
+   *  the bar. `store.coverage(...).lastClosedMs` is the newest minute ANY
+   *  writer put on disk; this is the newest minute the CALLER's own REST
+   *  fetch has actually looked at and is willing to vouch for.
+   *
+   *  Optional, and absence means exactly what it always meant before this
+   *  field existed: no clamp, trust `coverage.lastClosedMs` outright — which
+   *  is also what every EXISTING caller in this repo's own tests still gets,
+   *  since none of them collects over a websocket. A present function
+   *  returning `Infinity` means the same thing for one particular (venue,
+   *  symbol): "nothing here can be drifting, do not cap it". A present
+   *  function returning `-Infinity` (or any number below every held candle)
+   *  means "REST has never looked at this symbol at all this run" and the
+   *  clamp below naturally empties `rows`, which the EXISTING "empty result
+   *  is 503, never 200 with nothing" rule already answers correctly. */
+  restConfirmedMs?(venue: VenueId, symbol: string): number;
 }
 
 /** Largest window one response may carry. 30 days of 1m is 43,200 rows, which
@@ -142,6 +162,15 @@ export function buildSeed(req: SeedRequest, deps: SeedDeps): SeedOutcome {
     return { ok: false, code: 503, error: `collector has no data yet for ${venue} ${symbol}` };
   }
 
+  // ── v0.4.31 — NEVER SERVE A MINUTE ONLY A WEBSOCKET HAS SEEN ────────────
+  // `coverage.lastClosedMs` says what the STORE holds; it does not say what
+  // THIS caller's own REST fetch has confirmed. Clamping here — once, before
+  // `readWindow` — is what keeps every downstream field (`rows`, `gaps`,
+  // `lastClosedMs` on the wire) honest about the same frontier: a websocket
+  // row past this point is simply never read off disk for this response.
+  const restCap = deps.restConfirmedMs ? deps.restConfirmedMs(venue, symbol) : Infinity;
+  const confirmedLastClosedMs = Math.min(coverage.lastClosedMs, restCap);
+
   // ── WHY THE WINDOW IS CLAMPED TO lastClosedMs ───────────────────────────
   // Gaps mean "missing history inside the window that we could not fill". The
   // stretch of a window that lies AFTER our newest closed candle is not missing
@@ -149,16 +178,23 @@ export function buildSeed(req: SeedRequest, deps: SeedDeps): SeedOutcome {
   // and `lastClosedMs` states precisely where we stop. Reporting it as a gap
   // would put an unfillable gap on every single response and train the reader
   // to ignore the field that carries the real ones.
-  const scanTo = Math.min(floorMinute(toMs), coverage.lastClosedMs);
+  const scanTo = Math.min(floorMinute(toMs), confirmedLastClosedMs);
   const { rows, gaps } = deps.store.readWindow(venue, symbol, fromMs, scanTo);
 
   // ── NEVER 200 WITH EMPTY ROWS ───────────────────────────────────────────
   // The contract forbids it, because "I hold nothing" and "this window is
   // genuinely empty" would become the same answer. A window entirely before we
   // began collecting the pair lands here, and 503 is the honest reply: come
-  // back, the collector may have backfilled it by then.
+  // back, the collector may have backfilled it by then. A symbol whose store
+  // holds data but whose REST fetch has never confirmed any of it this run
+  // (`restCap` below every held candle) lands here too, for the same reason.
   if (rows.length === 0) {
-    return { ok: false, code: 503, error: `no closed candles held for ${venue} ${symbol} in the requested window` };
+    return {
+      ok: false, code: 503,
+      error: restCap < coverage.firstClosedMs
+        ? `${venue} ${symbol}: not yet REST-confirmed — the collector has not reconciled this symbol since it last started`
+        : `no closed candles held for ${venue} ${symbol} in the requested window`,
+    };
   }
 
   // ── THE NEW-LISTING TRAP ────────────────────────────────────────────────
@@ -178,7 +214,7 @@ export function buildSeed(req: SeedRequest, deps: SeedDeps): SeedOutcome {
     interval: SEED_INTERVAL,
     fromMs,
     toMs,
-    lastClosedMs: coverage.lastClosedMs,
+    lastClosedMs: confirmedLastClosedMs,
     rows,
     gaps,
     keyId: deps.keyId,

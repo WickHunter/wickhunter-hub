@@ -89,6 +89,33 @@ export interface CollectorOptions {
    *  being merged with it: a single number they set must mean what it says on
    *  every venue, including when it is LOWER than these. */
   perVenueRequestsPerSecond?: Partial<Record<VenueId, number>>;
+  /** ── v0.4.31 — HOW FAR A WEBSOCKET WRITE MAY OUTRUN OUR OWN REST CHECK ────
+   *
+   *  A closed minute this collector wrote from ITS OWN REST fetch is trusted
+   *  outright — REST is the venue's book of record, which is exactly what a
+   *  bot's own seed cross-check reads. A closed minute a WEBSOCKET wrote is a
+   *  CLAIM: on WEEX (and Bitget/Bitunix, which never state closure at all) a
+   *  bar is only "closed" because a LATER tick arrived, and a trade landing in
+   *  the bar's last milliseconds can settle into the venue's own REST book
+   *  after that ordering fact already published the bar — the bar closes
+   *  short, permanently, until something goes back and asks REST again.
+   *
+   *  `restConfirmedMs` (below) is the newest minute this run's OWN REST fetch
+   *  has actually looked at for a symbol; `buildSeed` never serves past it, so
+   *  a websocket-only minute cannot reach a bot. This is what lets the served
+   *  frontier catch back up: once a websocket write has pushed a symbol's
+   *  store PAST what REST has confirmed by this many minutes, `workQueue`
+   *  queues a small `"reconcile"` request that re-reads exactly the
+   *  unconfirmed span from the venue's own historical endpoint and OVERWRITES
+   *  whatever the websocket wrote — `CandleStore.write` already always takes
+   *  the LAST value written for a slot, so no store change was needed for the
+   *  overwrite itself, only the scheduling that makes it happen.
+   *
+   *  10 matches the WS-fold horizon this was built against (a WEEX bar closes
+   *  on the very next tick, so the drift is normally one minute); it is a
+   *  ceiling on STALENESS, not on correctness — `buildSeed`'s clamp is what
+   *  guarantees correctness, and holds even if this number were much larger. */
+  reconcileWsGapMinutes: number;
 }
 
 export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
@@ -116,7 +143,15 @@ export const DEFAULT_COLLECTOR_OPTIONS: CollectorOptions = {
   symbolRefreshMs: 15 * 60_000,
   stallAfterMs: 10 * 60_000,
   failingAfter: 5,
+  reconcileWsGapMinutes: 5,
 };
+
+/** Ceiling on how large a SINGLE reconcile request may be, independent of
+ *  `reconcileWsGapMinutes`: a symbol that fell far behind — a long collector
+ *  outage, a huge roster starving its turn for many ticks — still converges,
+ *  just over more than one pass, instead of asking for an arbitrarily large
+ *  range the way an unbounded gap would. */
+const RECONCILE_MAX_SPAN_MINUTES = 60;
 
 /** How stale a symbol's tail may be and still count as SEEDABLE.
  *
@@ -157,7 +192,11 @@ interface CandleWorkItem {
   symbol: string;
   startMs: number;
   endMs: number;
-  kind: "tail" | "backfill" | "repair";
+  /** "reconcile" — v0.4.31: a span the store already holds (usually written by
+   *  a websocket) that this collector's OWN REST fetch has not yet looked at.
+   *  Always a plain historical fetch (never `recent`), because the whole point
+   *  is the venue's settled book of record, not its current/forming page. */
+  kind: "tail" | "backfill" | "repair" | "reconcile";
   /** Use the venue's newest-page endpoint. Existing tails still require the
    *  exact first missing minute before any returned row may be written. */
   recent?: boolean;
@@ -210,6 +249,12 @@ export class VenueCollector {
    * five safe pages per minute, preserving insertion order would backfill the
    * first five symbols to retention before any later listing received a page. */
   private weexBackfillCursor = 0;
+  /** Fairness cursor for `reconcile` items, the same shape as `cursor` above
+   *  but kept separate: reconcile-due and tail-due are different populations
+   *  (a symbol can be tail-current and still reconcile-due, or vice versa),
+   *  so rotating them together would let one list's size distort the other's
+   *  round-robin. */
+  private reconcileCursor = 0;
 
   // ── RATE STATE ────────────────────────────────────────────────────────────
   /** Current adaptive rate. Starts at the configured ceiling and only ever
@@ -227,12 +272,42 @@ export class VenueCollector {
    *  newest page or jumping over the gap. */
   private forceHistoricalTail = new Set<string>();
 
+  /** ── v0.4.31 — THE REST-CONFIRMED FRONTIER, PER SYMBOL, THIS PROCESS ──────
+   *
+   *  Newest minute openMs this collector has ITSELF looked at via a REST fetch
+   *  (tail, backfill, repair or reconcile — see `noteCoverage`). NEVER moved by
+   *  a websocket write (`noteStoredCandles` does not touch it): that asymmetry
+   *  is the whole mechanism `buildSeed`'s clamp depends on.
+   *
+   *  GRANDFATHERED at construction, from a cheap SHALLOW store read (first/last
+   *  day file only — never the deep scan `coverage()` does), for every symbol
+   *  already on disk: that is a claim about history predating this run's own
+   *  writers, not about a live websocket write, and refusing to trust it would
+   *  black a healthy venue out for a full reconcile cycle on every restart. A
+   *  symbol NOT in this map is UNCONFIRMED (`restConfirmedMs` answers null),
+   *  which only matters for a symbol `wsWrittenMs` (below) also names — see
+   *  there for why an unconfirmed symbol websockets have never touched is left
+   *  alone rather than treated as reconcile-due. */
+  private restFrontier = new Map<string, number>();
+
+  /** Newest minute openMs a WEBSOCKET write has EVER put in the store for this
+   *  symbol, this process's lifetime. This is the population `workQueue`'s
+   *  reconcile trigger scopes itself to: a symbol nothing but REST has ever
+   *  written to keeps `restFrontier` in lockstep with `coverage.lastClosedMs`
+   *  by construction (REST is the only writer), so it can never need a
+   *  reconcile and must never be treated as though it might — a symbol whose
+   *  coverage came from somewhere else entirely (a migration, a hand-seeded
+   *  store, a test fixture) is exactly the case v0.4.31's own gate exists to
+   *  leave undisturbed rather than second-guess. */
+  private wsWrittenMs = new Map<string, number>();
+
   constructor(
     readonly venue: VenueId,
     private readonly store: CandleStore,
     private readonly stateDir: string,
     private readonly opts: CollectorOptions = DEFAULT_COLLECTOR_OPTIONS,
     now = Date.now(),
+    private readonly log: (message: string) => void = (m) => console.log(`[candles] ${m}`),
   ) {
     this.symbolsFile = path.join(stateDir, venue, "symbols.json");
     this.startedAt = now;
@@ -241,6 +316,30 @@ export class VenueCollector {
     for (const [sym, rec] of Object.entries(file.symbols ?? {})) {
       if (rec && typeof rec.symbol === "string") this.tracked.set(sym, rec);
     }
+    for (const sym of this.tracked.keys()) {
+      const shallow = this.store.coverage(this.venue, sym, false);
+      if (shallow.lastClosedMs !== null) this.restFrontier.set(sym, shallow.lastClosedMs);
+    }
+  }
+
+  /** For `buildSeed`'s clamp: the newest minute safe to serve for `symbol`, or
+   *  null when this run's own REST fetch has never looked at it yet. */
+  restConfirmedMs(symbol: string): number | null {
+    return this.restFrontier.get(symbol) ?? null;
+  }
+
+  /** Advance the confirmed frontier from candles this collector itself just
+   *  fetched over REST. Never called for a websocket write — see the field's
+   *  own doc comment for why that asymmetry is the whole point. Monotonic: a
+   *  backfill or repair touching OLDER history can only ever raise this toward
+   *  the truth, never past it, because every REST-derived write's candles are
+   *  bounded at `newestClosed` the same way every other write is. */
+  private noteRestFrontier(symbol: string, candles: readonly Candle[]): void {
+    let newest = this.restFrontier.get(symbol) ?? null;
+    for (const c of candles) {
+      if (newest === null || c.openMs > newest) newest = c.openMs;
+    }
+    if (newest !== null) this.restFrontier.set(symbol, newest);
   }
 
   private persistSymbols(): void {
@@ -295,10 +394,15 @@ export class VenueCollector {
     finally { this.coveragePrime = null; }
   }
 
+  /** Called ONLY after a write this collector made from its OWN REST fetch
+   *  (tail/backfill/repair/reconcile, inside `tick()`). `noteStoredCandles`
+   *  below is the websocket's entry point and deliberately does not call this
+   *  — see `restFrontier`'s doc comment for why the two must stay separate. */
   private noteCoverage(symbol: string, candles: readonly Candle[], newlyFilled: number): void {
     if (candles.length === 0) return;
     const c = this.coverage(symbol);
     this.updateCoverage(symbol, c, candles, newlyFilled);
+    this.noteRestFrontier(symbol, candles);
   }
 
   /** A stream write may land between yielded coverage scans. Update an already
@@ -307,6 +411,16 @@ export class VenueCollector {
    *  websocket callback. */
   noteStoredCandles(symbol: string, candles: readonly Candle[], written: number, newlyFilled: number): void {
     if (candles.length === 0 || written === 0) return;
+    // v0.4.31 — record BEFORE the partial-write early return below: even a
+    // partially-rejected batch proves a websocket wrote SOMETHING for this
+    // symbol just now, which is the only fact `workQueue`'s reconcile trigger
+    // needs. Over-approximating from the whole input batch (rather than only
+    // the accepted rows, which are not separated out here) can only make a
+    // reconcile fire a little earlier than strictly necessary — never later,
+    // and never wrongly skipped.
+    let newestWs = this.wsWrittenMs.get(symbol) ?? null;
+    for (const c of candles) if (newestWs === null || c.openMs > newestWs) newestWs = c.openMs;
+    if (newestWs !== null) this.wsWrittenMs.set(symbol, newestWs);
     // A store gate may reject an early/invalid subset. Without the accepted
     // rows themselves, updating first/last from the input would publish a
     // candle that is not on disk. Drop a primed row for the next yielding scan.
@@ -441,6 +555,13 @@ export class VenueCollector {
     // poisons a seed while the symbol reads deep and current) and less urgent
     // than a stale tail (which fails the bot's own verification outright).
     const repair: typeof tail = [];
+    // RECONCILE sits with tail, ahead of repair: it is the other half of
+    // "freshness before depth" now that freshness can come from a websocket.
+    // `buildSeed`'s clamp already makes a missed reconcile SAFE (the served
+    // frontier just goes stale, never wrong), so this queue exists purely to
+    // keep that staleness bounded — see `reconcileWsGapMinutes`'s doc comment.
+    const reconcile: typeof tail = [];
+    const reconcileGapMs = Math.max(1, this.opts.reconcileWsGapMinutes) * MINUTE_MS;
 
     for (const rec of this.tracked.values()) {
       if (rec.delisted || !rec.tradable) continue;
@@ -489,6 +610,37 @@ export class VenueCollector {
           recent, requireStart: recent,
         });
       }
+      // ── RECONCILE (v0.4.31) ─────────────────────────────────────────────
+      // Scoped to `wsWrittenMs` ON PURPOSE: a symbol a websocket has never
+      // touched can only have gained its coverage from THIS collector's own
+      // REST writes (or, in a test fixture, a direct store write nobody here
+      // vouched for) — in neither case is there a websocket-fold claim to
+      // re-check, and `restFrontier` already tracks such a symbol in lockstep
+      // with `cov.lastClosedMs` for the ordinary REST case regardless. Without
+      // this scope, EVERY tracked symbol with no prior REST activity from
+      // this exact process would read as "unconfirmed" and queue a reconcile
+      // on its very first tick — including a whole venue's roster after an
+      // ordinary restart, competing with backfill/repair for no reason.
+      //
+      // Within that population: `confirmed` (this run's own REST frontier) is
+      // undefined only when a websocket wrote a symbol's first-ever candle
+      // before this collector's REST side ever looked at it — treated as an
+      // infinite gap, due at once, bounded to `reconcileWsGapMinutes` of
+      // lookback, the same guard a brand-new listing already gets against
+      // re-fetching a whole page for one minute.
+      if (this.wsWrittenMs.has(rec.symbol)) {
+        const confirmed = this.restFrontier.get(rec.symbol);
+        const gapMs = confirmed === undefined ? Infinity : cov.lastClosedMs - confirmed;
+        if (gapMs >= reconcileGapMs) {
+          const wanted = confirmed === undefined
+            ? cov.lastClosedMs - (this.opts.reconcileWsGapMinutes - 1) * MINUTE_MS
+            : confirmed + MINUTE_MS;
+          const floor = cov.lastClosedMs - (RECONCILE_MAX_SPAN_MINUTES - 1) * MINUTE_MS;
+          const startMs = Math.max(wanted, floor, cov.firstClosedMs ?? wanted);
+          const endMs = cov.lastClosedMs;
+          if (endMs >= startMs) reconcile.push({ symbol: rec.symbol, startMs, endMs, kind: "reconcile" });
+        }
+      }
       if (cov.interiorMissing > 0) {
         const hole = this.oldestHole(rec.symbol, now);
         // A FULL PAGE FORWARD FROM THE HOLE, exactly the shape of a tail
@@ -523,6 +675,12 @@ export class VenueCollector {
       tail.push(...tail.splice(0, k));
     }
     this.cursor++;
+    // Same fairness for reconcile, own cursor (see its declaration for why).
+    if (reconcile.length > 0) {
+      const k = this.reconcileCursor % reconcile.length;
+      reconcile.push(...reconcile.splice(0, k));
+    }
+    this.reconcileCursor++;
     // Keep the established ordering for every existing venue. WEEX's very low
     // historical lane needs its own fair cursor: a first 100-row page makes a
     // pair materially more useful, while serial 30-day digging leaves later
@@ -533,7 +691,7 @@ export class VenueCollector {
       const k = this.weexBackfillCursor % backfill.length;
       backfill.push(...backfill.splice(0, k));
     }
-    return [...tail, ...repair, ...backfill];
+    return [...tail, ...reconcile, ...repair, ...backfill];
   }
 
   /** How many requests this collector may issue in a window of `tickMs`, at the
@@ -609,7 +767,7 @@ export class VenueCollector {
     budget: number,
     now = Date.now(),
     deps: { clock?: () => number; sleep?: (ms: number) => Promise<void>; deadlineMs?: number } = {},
-  ): Promise<{ requests: number; written: number }> {
+  ): Promise<{ requests: number; written: number; corrected: number }> {
     const clock = deps.clock ?? Date.now;
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const deadlineMs = deps.deadlineMs ?? Infinity;
@@ -618,7 +776,7 @@ export class VenueCollector {
     // point of a cooldown is silence.
     if (this.cooling(clock())) {
       this.lastPollAt = now;
-      return { requests: 0, written: 0 };
+      return { requests: 0, written: 0, corrected: 0 };
     }
 
     if (
@@ -634,7 +792,7 @@ export class VenueCollector {
       } catch (err) {
         if (isRateLimit(err)) {
           this.noteRateLimited(err, clock(), now, "symbol list");
-          return { requests: 0, written: 0 };
+          return { requests: 0, written: 0, corrected: 0 };
         }
         this.lastError = { message: (err as Error).message, at: now };
         this.consecutiveFailures++;
@@ -655,6 +813,10 @@ export class VenueCollector {
     let requests = 0;
     let written = 0;
     let weexBackfillAttempts = 0;
+    // v0.4.31 — how many already-stored candles a reconcile fetch changed the
+    // VALUES of this pass. Logged once at the end rather than per item: one
+    // line an operator can watch for is more useful than a burst of them.
+    let correctedThisPass = 0;
     this.lastPollAt = now;
 
     for (const item of queue) {
@@ -707,7 +869,28 @@ export class VenueCollector {
             if (closed.length === 0) this.forceHistoricalTail.add(item.symbol);
           }
         }
+        // ── v0.4.31 — WHAT DID A RECONCILE ACTUALLY CHANGE? ─────────────────
+        // Read BEFORE writing: this is the only place that needs to know what
+        // a slot held a moment ago, so it is not paid on every ordinary
+        // tail/backfill/repair write, only on the item built specifically to
+        // catch a websocket-written value REST disagrees with. `store.write`
+        // itself needs no change to perform the overwrite — the last write to
+        // a slot has always won — this is purely for the operator-facing count.
+        let priorByOpen: Map<number, [number, number, number, number, number, number]> | null = null;
+        if (item.kind === "reconcile" && closed.length > 0) {
+          const prior = this.store.readWindow(this.venue, item.symbol, item.startMs, item.endMs);
+          priorByOpen = new Map(prior.rows.map((r) => [r[0], r]));
+        }
         const w = this.store.write(this.venue, item.symbol, closed, newestClosed);
+        if (priorByOpen) {
+          for (const c of closed) {
+            const before = priorByOpen.get(c.openMs);
+            if (before && (before[1] !== c.open || before[2] !== c.high
+              || before[3] !== c.low || before[4] !== c.close || before[5] !== c.volume)) {
+              correctedThisPass++;
+            }
+          }
+        }
         written += w.written;
         this.candlesWritten += w.newlyFilled;
         this.noteCoverage(item.symbol, closed, w.newlyFilled);
@@ -769,7 +952,10 @@ export class VenueCollector {
       }
     }
     this.weexBackfillCursor += weexBackfillAttempts;
-    return { requests, written };
+    if (correctedThisPass > 0) {
+      this.log(`${this.venue}: ${correctedThisPass} WS-folded rows corrected from REST this pass`);
+    }
+    return { requests, written, corrected: correctedThisPass };
   }
 
   /** Drop day files older than the retention horizon, for every symbol we hold

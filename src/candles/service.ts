@@ -191,7 +191,10 @@ export class CandleService {
         requestsPerSecond: venueRps,
         minRequestsPerSecond: Math.min(venueRps, cfg.options.minRequestsPerSecond),
       };
-      this.collectors.set(v, new VenueCollector(v, this.store, path.join(cfg.dataDir, "candles"), venueOpts, deps.now?.() ?? Date.now()));
+      this.collectors.set(v, new VenueCollector(
+        v, this.store, path.join(cfg.dataDir, "candles"), venueOpts, deps.now?.() ?? Date.now(),
+        (m) => (this.deps.log ?? console.log)(`[candles] ${m}`),
+      ));
     }
   }
 
@@ -451,6 +454,19 @@ export class CandleService {
         // candles happened, and a bot backtesting the window still wants them.
         return c.isTracked(symbol) || this.store.coverage(venue, symbol).lastClosedMs !== null;
       },
+      // v0.4.31 — never serve a minute only a websocket has seen. A venue with
+      // no LIVE collector (store-only, e.g. an old archive) has no websocket
+      // writing to it either, so nothing here can be drifting: `Infinity`
+      // means "no cap", the same answer `symbolKnown` gives that population
+      // above. A collector that HAS never confirmed this symbol via REST this
+      // run answers `-Infinity` here (below every held candle), which
+      // `buildSeed` reads as "nothing safe to serve yet" — see
+      // `VenueCollector.restConfirmedMs`'s own doc comment.
+      restConfirmedMs: (venue, symbol) => {
+        const c = this.collectors.get(venue);
+        if (!c) return Infinity;
+        return c.restConfirmedMs(symbol) ?? -Infinity;
+      },
     });
   }
 
@@ -602,6 +618,7 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     symbolRefreshMs: numOr(env.HUB_CANDLE_SYMBOL_REFRESH_MS, DEFAULT_COLLECTOR_OPTIONS.symbolRefreshMs),
     stallAfterMs: numOr(env.HUB_CANDLE_STALL_AFTER_MS, DEFAULT_COLLECTOR_OPTIONS.stallAfterMs),
     failingAfter: numOr(env.HUB_CANDLE_FAILING_AFTER, DEFAULT_COLLECTOR_OPTIONS.failingAfter),
+    reconcileWsGapMinutes: numOr(env.HUB_CANDLE_RECONCILE_GAP_MIN, DEFAULT_COLLECTOR_OPTIONS.reconcileWsGapMinutes),
     perVenueRequestsPerSecond,
   };
 }

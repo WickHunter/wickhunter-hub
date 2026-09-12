@@ -513,10 +513,29 @@ applies its usual settlement gate. Set `HUB_CANDLE_STREAM=-weex` to keep WEEX
 REST-only. Existing venues remain controlled by `HUB_CANDLE_STREAM`. An empty
 `HUB_CANDLE_VENUES` still disables every collector, including WEEX.
 
+**A websocket-written minute is never served until this collector's own REST
+fetch has looked at it too (v0.4.31).** WEEX (and Bitget/Bitunix, which never
+state closure of their own) close a bar by ORDERING — a later tick arrives, so
+the venue "moved on" — and a trade can still land in the venue's book a moment
+after that ordering fact already published the bar, leaving that bar short on
+volume forever unless something goes back and asks again. A collector now
+tracks, per symbol, the newest minute its OWN REST fetch has confirmed; once a
+websocket write pushes a symbol's store more than `HUB_CANDLE_RECONCILE_GAP_MIN`
+minutes past that, a small `historyKlines` request re-reads exactly the
+unconfirmed span and overwrites it (the last write to a slot always won, so no
+store change was needed for the overwrite itself). `/api/candles/seed` never
+reports `lastClosedMs` past what THIS collector's own REST fetch has confirmed
+for that symbol, so a websocket-only minute is either corrected before it is
+ever served or simply not served yet — never served short. This is scoped to
+symbols an active websocket stream has actually written to; a plain REST venue,
+or one with the stream off, is unaffected and issues no extra requests.
+
 Optional: `HUB_CANDLE_RETENTION_DAYS` (30), `HUB_CANDLE_RPS` (3.2),
 `HUB_CANDLE_SYMBOL_REFRESH_MS` (15m), `HUB_CANDLE_STALL_AFTER_MS` (10m),
 `HUB_CANDLE_FAILING_AFTER` (5), `HUB_CANDLE_TICK_MS` (60s),
 `HUB_CANDLE_TAIL_FILL_MIN` (150 — how much backlog a tail request waits for),
+`HUB_CANDLE_RECONCILE_GAP_MIN` (5 — how far a websocket write may outrun this
+collector's own REST confirmation before a reconcile request fires),
 `HUB_CANDLE_SIGNER` (`license`) and `HUB_CANDLE_KEY_ID` (derived from the
 signer) — both covered under **Signing key** above; read the four-step order
 there before touching either.
@@ -1537,6 +1556,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.31 — **Served candles are the venue's REST book, never a websocket fold.** Field report (WEEX, NBISUSDT): the websocket's `ClosureBuffer` closes a bar by ORDERING — WEEX (and Bitget/Bitunix) state no closure of their own, so a bar publishes once the venue's stream has moved past it — and a trade settling into the venue's book a moment after that ordering fact already published the bar leaves the stored volume short forever; the bot's own live cross-check caught it (`o/h/l/c` identical, volume 0.65 vs the venue's REST `historyKlines` 0.71) and discarded the whole seed. `VenueCollector.restConfirmedMs(symbol)` is the newest minute THIS collector's own REST fetch (tail/backfill/repair/reconcile) has actually looked at — never advanced by a websocket write, which is the whole mechanism — grandfathered at construction from a cheap shallow store read so a restart does not black a healthy venue out. A new `"reconcile"` work item (priority alongside `tail`, ahead of `repair`) fires once a symbol a websocket has ACTUALLY written to (`wsWrittenMs`, scoped so a plain REST venue is untouched and issues no extra requests) drifts more than `HUB_CANDLE_RECONCILE_GAP_MIN` (5) minutes ahead of that frontier — five so a served seed trails the venue by less than the bot's own fifteen-minute request margin (liqhunter v0.90.80); it re-reads exactly the unconfirmed span from the venue's settled `historyKlines` endpoint — never the current/forming page — and overwrites it (`CandleStore.write` already always takes the last value written to a slot, so no store change was needed for the overwrite itself, only the scheduling). `buildSeed` clamps `lastClosedMs` (and every row/gap computed from it) to `restConfirmedMs`, so a websocket-only minute is either corrected first or simply not served yet — never served short; a symbol with nothing REST-confirmed at all answers its existing `503`, now naming the reason. `tests/candle-reconcile.test.mjs` (3 checks) reproduces the NBISUSDT numbers exactly, pins that the served frontier never names a websocket-only minute, and proves a REST-only symbol never queues a reconcile request at all. Wire contract v1 is unchanged — this is a freshness/correctness fix, not a new field.
 - v0.4.30 — **B15: a marketplace invoice can never reach the licence billing.** `src/billing/foreign-product-family.ts` (pure) is called by `applyEvent` before the role dispatcher and before any mint/extend/revoke: an event whose metadata carries a `productFamily` other than this Hub's own (the app's `marketplace_strategy` in particular) is refused by name and recorded once per event id as `ignored` (HTTP 200) — the same acknowledge-and-refuse policy the unknown-event path already had. Why the role dispatcher did not cover it: on an install with hosting unconfigured, an event matching no price/product id defaults to `software` by design (H1), so a marketplace `checkout.session.completed` minted a licence and a marketplace `invoice.paid` extended an unrelated customer's expiry (both reproduced under mutation). `InvoiceFacts`/`SubscriptionFacts` carry `metadata` (the app's three-shape invoice precedence). `tests/foreign-product-family.test.mjs` drives the real HTTP route.
 - v0.4.29 — **HUB-01/02/03: the sanitized operations bridge carries the delivery/maintenance-role facts it was already receiving and never relaying, and a protocol mismatch finally reads as a protocol mismatch.** `src/marketplace-status.ts`, `public/admin.html`, `nginx/`, `deploy/`.
   * **HUB-01 — two fields the private service was already publishing were dropped on the floor.** `UPSTREAM_FIELDS` gained `subscriptionBilling` (the maintenance-role renewal worker's health and oldest-pending-command age, BILL-02) and `latency` (MP-01's sanitized copy-delivery percentile histograms — count/p50/p95/p99/max/invalidCount, no traceId, no payload, no subscriber identity ever present in that shape to begin with) — both already sanitized generically by the existing walk, so this is two names added to an allowlist, not new redaction logic. The admin page's card loop and `renderStatusCard` needed the same two names. **Deployment commit** (`build.commit`) and **stage names** (`worker.lanes[].name`/`worker.passes[].name`, MP-02's four fixed lanes) were already relayed — confirmed by test, not assumed.
