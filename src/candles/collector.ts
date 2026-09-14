@@ -976,8 +976,16 @@ export class VenueCollector {
     const horizon = now - this.opts.retentionDays * DAY_MS;
     let removed = 0;
     for (const symbol of this.store.symbols(this.venue)) {
-      removed += this.store.prune(this.venue, symbol, horizon);
-      this.coverageCache.delete(symbol);
+      const symbolRemoved = this.store.prune(this.venue, symbol, horizon);
+      removed += symbolRemoved;
+      // The first completed tick prunes too. Retained files have not changed,
+      // so keep their exact coverage instead of repeating a cold roster scan.
+      if (symbolRemoved > 0) {
+        this.coverageCache.delete(symbol);
+        // The oldest cached repair gap may have belonged to a deleted day.
+        // Re-evaluate it before repair can recreate expired history.
+        this.holeCache.delete(symbol);
+      }
     }
     return removed;
   }
