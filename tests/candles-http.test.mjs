@@ -547,6 +547,44 @@ await test("retention preserves warm coverage unless that symbol actually loses 
   assert.equal(pruned.interiorMissing, 1, "retained-day gaps remain visible after invalidation");
 });
 
+await test("retention invalidates an expired cached repair gap only when that symbol loses files", async () => {
+  const dataDir = tmpDir("retention-repair-gap");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const day = 1440 * MINUTE_MS;
+  const retainedDay = DAY0 + day;
+  const before = retainedDay + day - 1;
+  const after = before + 2;
+  const venue = stubVenue({ symbols: ["AAAUSDT"], now: after });
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, {
+    ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 1, tailFillMinutes: 1_000_000,
+  }, before);
+  await collector.refreshSymbols(venue.fetchLike, before);
+  store.write("bitget", "AAAUSDT", [
+    mk(DAY0, 0), mk(DAY0 + 2 * MINUTE_MS, 2),
+    mk(retainedDay, 0), mk(retainedDay + 2 * MINUTE_MS, 2),
+  ]);
+  let gapScans = 0;
+  const diskWindow = store.readWindow.bind(store);
+  store.readWindow = (...args) => { gapScans++; return diskWindow(...args); };
+  const deps = now => ({ clock: () => now, sleep: async () => {} });
+  // A zero request budget still prepares the oldest gap used by real repair
+  // work. Keep the following prune within that gap cache's ten-minute TTL.
+  await collector.tick(venue.fetchLike, 0, before, deps(before));
+  assert.equal(gapScans, 1);
+  assert.equal(collector.prune(before), 0);
+  await collector.tick(venue.fetchLike, 0, before, deps(before));
+  assert.equal(gapScans, 1, "a no-op prune preserves the warm repair-gap cache too");
+  assert.equal(collector.prune(after), 1, "crossing midnight expires the older day file");
+  await collector.tick(venue.fetchLike, 1, after, deps(after));
+  const repairs = venue.state.requests.filter(url => url.includes("history-candles")).map(url => new URL(url));
+  assert.equal(repairs.length, 1);
+  assert.equal(Number(repairs[0].searchParams.get("startTime")), retainedDay + MINUTE_MS,
+    "repair must target the retained day's gap instead of refetching the expired cached gap");
+  assert.equal(gapScans, 2, "actual removal re-evaluates the oldest remaining hole");
+  assert.equal(diskWindow("bitget", "AAAUSDT", DAY0, DAY0 + day - MINUTE_MS).rows.length, 0,
+    "repair does not resurrect the pruned day");
+});
+
 await test("stream writes maintain a primed exact cache without inventing or double-counting rows", async () => {
   const dataDir = tmpDir("coverage-stream");
   const store = new CandleStore(`${dataDir}/candles`);

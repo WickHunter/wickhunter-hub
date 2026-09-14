@@ -12,11 +12,16 @@ Retention now invalidates only symbols for which `CandleStore.prune()` reports
 an actual file deletion. The regression first failed because a no-op pass
 rescanned both warm symbols. It also proves that deleting one symbol's expired
 day file rescans that symbol alone and recomputes its bounds, count and interior
-gap, while an unaffected symbol keeps its exact cached coverage. Retention days,
+gap, while an unaffected symbol keeps its exact cached coverage. The adjacent
+repair-gap cache is invalidated on actual removal too: a second regression
+primed an old gap, crossed midnight by two milliseconds, and proved that its
+ten-minute cache incorrectly refetched the expired day. The fix recomputes the
+remaining gap and preserves both caches on a no-op pass. Retention days,
 REST frontiers, stream behavior and request rates are unchanged. Package,
 lockfile and runtime identity move to v0.4.34; the admin footer reads that served
-identity. Build, all 53 suites, and the focused 78-check candle suite passed on
-this Mac with Bash 5 and the real app percentile module.
+identity. Build, all 53 suites, and the focused 79-check candle suite passed on
+this Mac with Bash 5 and the real app percentile module, including both the
+exact-coverage and expired-repair regressions.
 
 Before this follow-up, deployed v0.4.33 (`df9058d`) was verified at 19:51:11 UTC:
 all 29 candle sockets were open, and all six venues had advancing stored-close

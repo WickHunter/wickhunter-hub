@@ -20,6 +20,8 @@ file. The first completed collector tick previously discarded the freshly warmed
 coverage for every symbol, even when retention removed nothing, causing another
 cold scan before candle diagnostics and collection could continue. Symbols that
 lose files still receive an exact scan with correct bounds, counts and gaps.
+Their cached repair gap is also discarded, so the next request cannot restore
+an expired day by following an old gap.
 
 ## v0.4.33 — bounded candle-stream snapshot writes
 
@@ -1591,7 +1593,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
-- v0.4.34 — Retain warm exact coverage for symbols whose retention pass removes no files; invalidate and rescan only symbols that actually lose day files. Preserve retention policy, gap reporting, stream behavior and REST provenance.
+- v0.4.34 — Retain warm exact coverage and repair-gap caches for symbols whose retention pass removes no files; invalidate both only for symbols that actually lose day files. Recompute the oldest retained gap instead of refetching an expired one. Preserve retention policy, gap reporting, stream behavior and REST provenance.
 
 - v0.4.33 — Batch a native candle frame's closed rows by symbol, fixing the 499 synchronous store calls caused by each Bitget startup snapshot. Extend WEEX's bounded deferred-settlement buffer and timer to every native candle stream, so live closes wait for the clock-skew grace instead of disappearing. Keep the forming tail, REST-confirmed provenance, collector configuration and request budgets. Stream counters count settled rows after a successful store call, not write calls or deferred rows.
 

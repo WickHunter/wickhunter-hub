@@ -980,7 +980,12 @@ export class VenueCollector {
       removed += symbolRemoved;
       // The first completed tick prunes too. Retained files have not changed,
       // so keep their exact coverage instead of repeating a cold roster scan.
-      if (symbolRemoved > 0) this.coverageCache.delete(symbol);
+      if (symbolRemoved > 0) {
+        this.coverageCache.delete(symbol);
+        // The oldest cached repair gap may have belonged to a deleted day.
+        // Re-evaluate it before repair can recreate expired history.
+        this.holeCache.delete(symbol);
+      }
     }
     return removed;
   }
