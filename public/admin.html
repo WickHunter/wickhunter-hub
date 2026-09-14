@@ -1409,6 +1409,12 @@ async function cdRefresh() {
     }
 
     html += '<div class="detail">' + esc(h.detail) + "</div>";
+    const stream = (data.streams || []).find(s => s.venue === v.venue);
+    html += '<div class="detail">' + (stream
+      ? 'WebSocket: ' + stream.open + '/' + stream.sockets + ' sockets open · '
+        + stream.symbols + ' symbols · ' + stream.closedCandles + ' closed candles received · '
+        + stream.holding + ' pending confirmation. REST reconciliation remains active.'
+      : 'WebSocket not running for this venue. Candle collection uses REST.') + '</div>';
     html += '<div class="buckets">'
       + '<span class="bkt b-seedable"><b>' + v.counts.seedable + "</b> seedable</span>"
       + '<span class="bkt b-backfilling"><b>' + v.counts.backfilling + "</b> backfilling</span>"

@@ -188,6 +188,10 @@ interface SymbolsFile {
   symbols: Record<string, TrackedSymbol>;
 }
 
+interface RestFrontierFile {
+  restConfirmed: Record<string, number>;
+}
+
 interface CandleWorkItem {
   symbol: string;
   startMs: number;
@@ -234,6 +238,7 @@ export class VenueCollector {
   private coverageCache = new Map<string, SymbolCoverage>();
   private coveragePrime: Promise<void> | null = null;
   private readonly symbolsFile: string;
+  private readonly restFrontierFile: string;
 
   private lastPollAt: number | null = null;
   private lastSuccessAt: number | null = null;
@@ -272,23 +277,22 @@ export class VenueCollector {
    *  newest page or jumping over the gap. */
   private forceHistoricalTail = new Set<string>();
 
-  /** ── v0.4.31 — THE REST-CONFIRMED FRONTIER, PER SYMBOL, THIS PROCESS ──────
+  /** ── v0.4.31 — THE REST-CONFIRMED FRONTIER, PER SYMBOL ────────────────────
    *
    *  Newest minute openMs this collector has ITSELF looked at via a REST fetch
    *  (tail, backfill, repair or reconcile — see `noteCoverage`). NEVER moved by
    *  a websocket write (`noteStoredCandles` does not touch it): that asymmetry
    *  is the whole mechanism `buildSeed`'s clamp depends on.
    *
-   *  GRANDFATHERED at construction, from a cheap SHALLOW store read (first/last
-   *  day file only — never the deep scan `coverage()` does), for every symbol
-   *  already on disk: that is a claim about history predating this run's own
-   *  writers, not about a live websocket write, and refusing to trust it would
-   *  black a healthy venue out for a full reconcile cycle on every restart. A
-   *  symbol NOT in this map is UNCONFIRMED (`restConfirmedMs` answers null),
-   *  which only matters for a symbol `wsWrittenMs` (below) also names — see
-   *  there for why an unconfirmed symbol websockets have never touched is left
-   *  alone rather than treated as reconcile-due. */
+   *  Persisted only after this collector has completed a REST fetch. A store
+   *  row alone is not enough evidence: it may have been written by the
+   *  websocket, including immediately before a process restart. A missing or
+   *  stale frontier is therefore conservatively reconciled from REST on the
+   *  next pass. */
   private restFrontier = new Map<string, number>();
+  /** Symbols that existed before this process started but have no durable
+   *  REST frontier. Their on-disk rows need one conservative restart check. */
+  private restartCandidates = new Set<string>();
 
   /** Newest minute openMs a WEBSOCKET write has EVER put in the store for this
    *  symbol, this process's lifetime. This is the population `workQueue`'s
@@ -297,8 +301,8 @@ export class VenueCollector {
    *  by construction (REST is the only writer), so it can never need a
    *  reconcile and must never be treated as though it might — a symbol whose
    *  coverage came from somewhere else entirely (a migration, a hand-seeded
-   *  store, a test fixture) is exactly the case v0.4.31's own gate exists to
-   *  leave undisturbed rather than second-guess. */
+   *  store, a test fixture) is conservatively treated as needing one REST
+   *  confirmation after restart. */
   private wsWrittenMs = new Map<string, number>();
 
   constructor(
@@ -310,15 +314,21 @@ export class VenueCollector {
     private readonly log: (message: string) => void = (m) => console.log(`[candles] ${m}`),
   ) {
     this.symbolsFile = path.join(stateDir, venue, "symbols.json");
+    this.restFrontierFile = path.join(stateDir, venue, "rest-frontier.json");
     this.startedAt = now;
     this.effectiveRps = opts.requestsPerSecond;
     const file = readJson<SymbolsFile>(this.symbolsFile, { symbols: {} });
     for (const [sym, rec] of Object.entries(file.symbols ?? {})) {
       if (rec && typeof rec.symbol === "string") this.tracked.set(sym, rec);
     }
+    const frontierFile = readJson<RestFrontierFile>(this.restFrontierFile, { restConfirmed: {} });
+    for (const [sym, openMs] of Object.entries(frontierFile.restConfirmed ?? {})) {
+      if (this.tracked.has(sym) && Number.isSafeInteger(openMs) && openMs > 0 && openMs % MINUTE_MS === 0) {
+        this.restFrontier.set(sym, openMs);
+      }
+    }
     for (const sym of this.tracked.keys()) {
-      const shallow = this.store.coverage(this.venue, sym, false);
-      if (shallow.lastClosedMs !== null) this.restFrontier.set(sym, shallow.lastClosedMs);
+      if (!this.restFrontier.has(sym)) this.restartCandidates.add(sym);
     }
   }
 
@@ -339,7 +349,13 @@ export class VenueCollector {
     for (const c of candles) {
       if (newest === null || c.openMs > newest) newest = c.openMs;
     }
-    if (newest !== null) this.restFrontier.set(symbol, newest);
+    if (newest !== null && newest !== (this.restFrontier.get(symbol) ?? null)) {
+      this.restFrontier.set(symbol, newest);
+      this.restartCandidates.delete(symbol);
+      writeJsonAtomic(this.restFrontierFile, {
+        restConfirmed: Object.fromEntries(this.restFrontier),
+      });
+    }
   }
 
   private persistSymbols(): void {
@@ -611,25 +627,21 @@ export class VenueCollector {
         });
       }
       // ── RECONCILE (v0.4.31) ─────────────────────────────────────────────
-      // Scoped to `wsWrittenMs` ON PURPOSE: a symbol a websocket has never
-      // touched can only have gained its coverage from THIS collector's own
-      // REST writes (or, in a test fixture, a direct store write nobody here
-      // vouched for) — in neither case is there a websocket-fold claim to
-      // re-check, and `restFrontier` already tracks such a symbol in lockstep
-      // with `cov.lastClosedMs` for the ordinary REST case regardless. Without
-      // this scope, EVERY tracked symbol with no prior REST activity from
-      // this exact process would read as "unconfirmed" and queue a reconcile
-      // on its very first tick — including a whole venue's roster after an
-      // ordinary restart, competing with backfill/repair for no reason.
+      // A websocket write is the normal reason for a gap, but after restart
+      // that in-memory fact is gone. A missing or stale durable frontier is
+      // enough to require one bounded REST check of the rows already on disk.
+      // A symbol with a durable frontier at or beyond its held coverage needs
+      // no work. A symbol with no prior REST activity, or with coverage newer
+      // than that frontier, queues a bounded reconcile. This means a direct
+      // store migration also receives one conservative REST confirmation.
+      // The durable frontier prevents repeat work for rows previously checked
+      // by REST, while missing/stale state is reconciled.
       //
-      // Within that population: `confirmed` (this run's own REST frontier) is
-      // undefined only when a websocket wrote a symbol's first-ever candle
-      // before this collector's REST side ever looked at it — treated as an
-      // infinite gap, due at once, bounded to `reconcileWsGapMinutes` of
-      // lookback, the same guard a brand-new listing already gets against
-      // re-fetching a whole page for one minute.
-      if (this.wsWrittenMs.has(rec.symbol)) {
-        const confirmed = this.restFrontier.get(rec.symbol);
+      // A missing frontier is treated as an infinite gap, due at once, but is
+      // still bounded to `reconcileWsGapMinutes` of lookback.
+      const confirmed = this.restFrontier.get(rec.symbol);
+      if (this.wsWrittenMs.has(rec.symbol) || this.restartCandidates.has(rec.symbol)
+        || (cov.lastClosedMs !== null && confirmed !== undefined && confirmed < cov.lastClosedMs)) {
         const gapMs = confirmed === undefined ? Infinity : cov.lastClosedMs - confirmed;
         if (gapMs >= reconcileGapMs) {
           const wanted = confirmed === undefined

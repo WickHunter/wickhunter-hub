@@ -1115,6 +1115,19 @@ await test("the admin candles route needs the admin token and reports every venu
   assert.deepEqual(r.body.venues.map((v) => v.venue), [...VENUE_IDS]);
   assert.ok(r.body.venues.every((v) => v.configured === false), "every one says 'no collector configured'");
   assert.ok(typeof r.body.seedPublicKey === "string" && r.body.seedPublicKey.length > 0, "public key offered for pairing");
+  assert.deepEqual(r.body.streams, [], "no running sockets is distinct from a healthy REST collector");
+});
+
+await test("admin candle diagnostics expose live stream counters without changing seed truth", async () => {
+  const original = h.candles.streamStatus;
+  const live = [{ venue: "bitget", sockets: 2, open: 1, symbols: 75, closedCandles: 900, holding: 4 }];
+  h.candles.streamStatus = () => live;
+  try {
+    const r = await jsonReq(`${h.origin}/admin/api/candles`, { headers: { "x-hub-admin": h.cfg.adminToken } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.streams, live);
+    assert.equal(r.body.enabled, false, "stream counters never manufacture collector availability");
+  } finally { h.candles.streamStatus = original; }
 });
 
 await test("the admin page carries the per-exchange panel and refreshes it with the rest", async () => {
@@ -1122,6 +1135,8 @@ await test("the admin page carries the per-exchange panel and refreshes it with 
   assert.match(page, /id="venues"/, "a container for the venue cards");
   assert.match(page, /admin\/api\/candles/, "wired to the status route");
   assert.match(page, /NO COLLECTOR/, "an unconfigured venue says so rather than showing zeroes");
+  assert.match(page, /sockets open/, "the venue card exposes socket coverage");
+  assert.match(page, /REST reconciliation remains active/, "a live socket does not replace REST confirmation");
   for (const field of ["seedable", "backfilling", "gapped", "Oldest candle", "Newest candle", "Missing minutes", "Worst gaps", "New in 24h"]) {
     assert.ok(page.includes(field), `panel states ${field}`);
   }
