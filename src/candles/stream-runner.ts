@@ -4,7 +4,7 @@
 // `stream.ts` owns the PROTOCOL: what a frame means and when a minute is
 // closed. This file owns what a CLOSED CANDLE does once the connection layer
 // (`../net/socket-pool.ts`) hands it a frame: turning ticks into closed bars
-// through `ClosureBuffer`, and WEEX's cross-connection deferred-settlement
+// through `ClosureBuffer`, and cross-connection deferred-settlement
 // batching. The sockets, chunking, reconnect/backoff and ping themselves are
 // `SocketPool` — the SAME class `src/liq/stream-runner.ts` uses for the
 // liquidation feed, so there is exactly one reconnect implementation in this
@@ -18,9 +18,9 @@
 // fetched it. If every socket dies and stays dead, the collector's existing tail
 // work repairs the gap on its own schedule and nobody has to notice.
 //
-// That is also why nothing here retries a WRITE or tracks what it missed. A
-// dropped frame is a gap, and this codebase already has exactly one mechanism
-// for gaps.
+// A logically closed minute can wait briefly for the local clock-skew grace;
+// failed writes are never retried. A dropped frame is a gap, and this codebase
+// already has exactly one mechanism for gaps.
 //
 // ── ONE SOCKET IS NOT ENOUGH, AND NEITHER IS ONE PER SYMBOL ────────────────
 // Symbols are chunked at the venue's own documented topic cap
@@ -57,7 +57,7 @@ export interface StreamRunnerDeps {
   /** First reconnect delay; doubles per consecutive failure to the ceiling. */
   reconnectMs?: number;
   reconnectMaxMs?: number;
-  /** How often WEEX's logically closed, but not yet skew-safe, minute is
+  /** How often a logically closed, but not yet skew-safe, minute is
    *  reconsidered. Injected only so clock-driven tests do not wait a second. */
   settleFlushMs?: number;
 }
@@ -68,17 +68,17 @@ interface ConnExtra {
 }
 
 const DEFAULT_SETTLE_FLUSH_MS = 1_000;
-/** Normally one row: WEEX advances N while the store still admits only N-1.
+/** Normally one row: the venue closes N-1 while the store still admits N-2.
  *  Three leaves bounded room for clock movement and duplicate snapshots while
  *  still refusing an unbounded remote-input queue. Oldest rows win because
  *  they become eligible first and preserve a contiguous tail. */
-const MAX_WEEX_DEFERRED_PER_SYMBOL = 3;
+const MAX_DEFERRED_PER_SYMBOL = 3;
 
 export class VenueStreamRunner {
   private readonly pool: SocketPool<ConnExtra>;
   private readonly now: () => number;
   private settleTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly weexDeferred = new Map<string, Map<number, Candle>>();
+  private readonly deferred = new Map<string, Map<number, Candle>>();
 
   constructor(private readonly deps: StreamRunnerDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -89,8 +89,8 @@ export class VenueStreamRunner {
       onMessage: (c, data) => this.ingest(c, data),
       onDiscard: (c) => c.extra.buf.clear(),
       onBeforeResync: (wanted) => {
-        for (const symbol of this.weexDeferred.keys()) {
-          if (!wanted.has(symbol)) this.weexDeferred.delete(symbol);
+        for (const symbol of this.deferred.keys()) {
+          if (!wanted.has(symbol)) this.deferred.delete(symbol);
         }
       },
       log: deps.log,
@@ -104,9 +104,9 @@ export class VenueStreamRunner {
    *  calling it again re-chunks only if the symbol set actually changed, so a
    *  scheduler may call it as often as it likes. */
   start(): void {
-    if (this.deps.adapter.id === "weex" && !this.settleTimer) {
+    if (!this.settleTimer) {
       this.settleTimer = setInterval(
-        () => this.flushWeexDeferred(),
+        () => this.flushDeferred(),
         Math.max(1, this.deps.settleFlushMs ?? DEFAULT_SETTLE_FLUSH_MS),
       );
       this.settleTimer.unref();
@@ -117,7 +117,7 @@ export class VenueStreamRunner {
   stop(): void {
     this.pool.stop();
     if (this.settleTimer) { clearInterval(this.settleTimer); this.settleTimer = null; }
-    this.weexDeferred.clear();
+    this.deferred.clear();
   }
 
   resync(): void { this.pool.resync(); }
@@ -131,51 +131,32 @@ export class VenueStreamRunner {
     let ticks: StreamTick[];
     try { ticks = this.deps.adapter.parse(data); } catch { return; }
 
-    // WEEX opens each subscription with a snapshot containing hundreds of
-    // already-closed rows. `CandleStore.write` durably rewrites a whole day
-    // file, so calling it once per row turns a 301-row snapshot across a full
-    // roster into tens of thousands of synchronous file rewrites. Keep the
-    // batching local to WEEX: one received frame becomes at most one durable
-    // write per symbol, while every existing venue retains its exact delivery
-    // behaviour. Incremental WEEX frames normally contain one row; a row the
-    // ordering rule just closed waits here until the shared skew-safe store
-    // boundary admits it.
-    if (this.deps.adapter.id === "weex") {
-      const notAfterMs = settledOpenMs(this.now());
-      const closedBySymbol = new Map<string, Map<number, Candle>>();
-      this.takeSettledWeexDeferred(notAfterMs, closedBySymbol);
-      const assigned = new Set(c.symbols);
-      for (const t of ticks) {
-        if (!assigned.has(t.symbol)) continue;
-        const done = c.extra.buf.push(t);
-        if (!done) continue;
-        if (done.candle.openMs <= notAfterMs) {
-          this.addReadyWeex(closedBySymbol, done.symbol, done.candle);
-          this.weexDeferred.get(done.symbol)?.delete(done.candle.openMs);
-        } else {
-          this.deferWeex(done.symbol, done.candle);
-        }
-      }
-      this.writeWeexReady(closedBySymbol, notAfterMs);
-      return;
-    }
-
+    // Bitget opens candle1m with 500 rows; WEEX also sends a historical
+    // snapshot. A store call per closed row rewrites a whole day file hundreds
+    // of times per symbol and can starve health and shutdown for the roster.
+    // Batch each frame by symbol, preserving its closed prefix and tail.
+    // Every venue can close N-1 while the local skew guard still admits only
+    // N-2. Retain that complete row until the shared timer makes it eligible;
+    // never defer a forming observation or advance the REST frontier here.
+    const notAfterMs = settledOpenMs(this.now());
+    const closedBySymbol = new Map<string, Map<number, Candle>>();
+    this.takeSettledDeferred(notAfterMs, closedBySymbol);
+    const assigned = new Set(c.symbols);
     for (const t of ticks) {
+      if (!assigned.has(t.symbol)) continue;
       const done = c.extra.buf.push(t);
       if (!done) continue;
-      try {
-        // `settledOpenMs` is the SAME gate REST output passes, applied here too
-        // rather than trusted from the stream — so a venue that published a bar
-        // early cannot put a forming candle in the store by this route either.
-        this.deps.write(done.symbol, [done.candle], settledOpenMs(this.now()));
-        c.extra.closedCandles++;
-      } catch (e) {
-        this.deps.log?.(`${this.deps.adapter.id}: could not store ${done.symbol} — ${(e as Error)?.message ?? "unknown"}`);
+      if (done.candle.openMs <= notAfterMs) {
+        this.addReady(closedBySymbol, done.symbol, done.candle);
+        this.deferred.get(done.symbol)?.delete(done.candle.openMs);
+      } else {
+        this.defer(done.symbol, done.candle);
       }
     }
+    this.writeReady(closedBySymbol, notAfterMs);
   }
 
-  private addReadyWeex(
+  private addReady(
     ready: Map<string, Map<number, Candle>>,
     symbol: string,
     candle: Candle,
@@ -185,14 +166,14 @@ export class VenueStreamRunner {
     byOpen.set(candle.openMs, candle);
   }
 
-  private deferWeex(symbol: string, candle: Candle): void {
-    let byOpen = this.weexDeferred.get(symbol);
-    if (!byOpen) { byOpen = new Map(); this.weexDeferred.set(symbol, byOpen); }
+  private defer(symbol: string, candle: Candle): void {
+    let byOpen = this.deferred.get(symbol);
+    if (!byOpen) { byOpen = new Map(); this.deferred.set(symbol, byOpen); }
     if (byOpen.has(candle.openMs)) {
       byOpen.set(candle.openMs, candle);
       return;
     }
-    if (byOpen.size >= MAX_WEEX_DEFERRED_PER_SYMBOL) {
+    if (byOpen.size >= MAX_DEFERRED_PER_SYMBOL) {
       const newest = Math.max(...byOpen.keys());
       if (candle.openMs >= newest) return;
       byOpen.delete(newest);
@@ -200,21 +181,21 @@ export class VenueStreamRunner {
     byOpen.set(candle.openMs, candle);
   }
 
-  private takeSettledWeexDeferred(
+  private takeSettledDeferred(
     notAfterMs: number,
     ready: Map<string, Map<number, Candle>>,
   ): void {
-    for (const [symbol, byOpen] of this.weexDeferred) {
+    for (const [symbol, byOpen] of this.deferred) {
       for (const [openMs, candle] of byOpen) {
         if (openMs > notAfterMs) continue;
-        this.addReadyWeex(ready, symbol, candle);
+        this.addReady(ready, symbol, candle);
         byOpen.delete(openMs);
       }
-      if (!byOpen.size) this.weexDeferred.delete(symbol);
+      if (!byOpen.size) this.deferred.delete(symbol);
     }
   }
 
-  private writeWeexReady(ready: Map<string, Map<number, Candle>>, notAfterMs: number): void {
+  private writeReady(ready: Map<string, Map<number, Candle>>, notAfterMs: number): void {
     for (const [symbol, byOpen] of ready) {
       const candles = [...byOpen.values()].sort((a, b) => a.openMs - b.openMs);
       if (!candles.length) continue;
@@ -228,12 +209,12 @@ export class VenueStreamRunner {
     }
   }
 
-  private flushWeexDeferred(): void {
-    if (!this.pool.running || this.deps.adapter.id !== "weex" || !this.weexDeferred.size) return;
+  private flushDeferred(): void {
+    if (!this.pool.running || !this.deferred.size) return;
     const notAfterMs = settledOpenMs(this.now());
     const ready = new Map<string, Map<number, Candle>>();
-    this.takeSettledWeexDeferred(notAfterMs, ready);
-    this.writeWeexReady(ready, notAfterMs);
+    this.takeSettledDeferred(notAfterMs, ready);
+    this.writeReady(ready, notAfterMs);
   }
 
   /** For the admin panel and the tests. */
@@ -246,7 +227,7 @@ export class VenueStreamRunner {
       symbols: s.symbols,
       closedCandles: this.pool.connections.reduce((n, c) => n + c.extra.closedCandles, 0),
       holding: this.pool.connections.reduce((n, c) => n + c.extra.buf.size(), 0)
-        + [...this.weexDeferred.values()].reduce((n, rows) => n + rows.size, 0),
+        + [...this.deferred.values()].reduce((n, rows) => n + rows.size, 0),
     };
   }
 }

@@ -18,9 +18,12 @@
 //  4. NOTHING THROWS OUT. A parse failure, a store failure, or a socket that
 //     cannot open must leave the process alive and degrade to REST.
 import assert from "node:assert/strict";
-import { test, summary } from "./helpers.mjs";
+import fs from "node:fs";
+import { test, summary, tmpDir } from "./helpers.mjs";
 import { VenueStreamRunner } from "../dist/src/candles/stream-runner.js";
 import { STREAM_ADAPTERS } from "../dist/src/candles/stream.js";
+import { CandleStore, DAY_MS } from "../dist/src/candles/store.js";
+import { VenueCollector, DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/collector.js";
 
 const MIN = 60_000;
 const T0 = 1786650720000;
@@ -45,6 +48,34 @@ const bitgetFrame = (openMs, close) =>
     action: "update", arg: { instId: "BTCUSDT" },
     data: [[String(openMs), "1", "2", "0.5", String(close), "3", "9", "9"]],
   });
+
+// Observed on Bitget's public candle1m stream: each subscription starts with
+// 500 ascending rows. Across the production roster, per-row writes rewrote
+// roughly 27 GB of day files before the event loop could answer health.
+const bitgetSnapshot = (firstOpenMs, count = 500) => JSON.stringify({
+  action: "snapshot", arg: { instId: "BTCUSDT" },
+  data: Array.from({ length: count }, (_, i) => [
+    String(firstOpenMs + i * MIN), "1", "2", "0.5", String(10 + i), "3", "9", "9",
+  ]),
+});
+
+function nativeClosingFrames(venue, openMs, symbol = "BTCUSDT") {
+  if (venue === "bitget") return [openMs, openMs + MIN].map(t => JSON.stringify({
+    action: "update", arg: { instId: symbol }, data: [[String(t), "1", "2", "0.5", "1.5", "3"]],
+  }));
+  if (venue === "bitunix") return [openMs, openMs + MIN].map(t => JSON.stringify({
+    ch: "market_kline_1min", symbol, ts: t + 30_000,
+    data: { o: "1", h: "2", l: "0.5", c: "1.5", b: "3" },
+  }));
+  if (venue === "bybit") return [JSON.stringify({
+    topic: `kline.1.${symbol}`,
+    data: [{ start: openMs, open: "1", high: "2", low: "0.5", close: "1.5", volume: "3", confirm: true }],
+  })];
+  return [JSON.stringify({
+    e: "kline", s: symbol, st: 1,
+    k: { t: openMs, i: "1m", o: "1", h: "2", l: "0.5", c: "1.5", v: "3", x: true },
+  })];
+}
 
 const weexFrame = (openMs, close) =>
   JSON.stringify({
@@ -112,6 +143,165 @@ await test("symbols are chunked at the venue's own topic cap", () => {
   assert.equal(st.sockets, made.length);
   r.stop();
   assert.ok(made.every((s) => s.closed), "stop closes every socket");
+});
+
+await test("Bitget's 500-row startup snapshot writes once and preserves every closed row across midnight", () => {
+  const dir = tmpDir("bitget-snapshot");
+  const store = new CandleStore(dir);
+  const { factory, made } = fakeSockets();
+  const first = Math.floor(T0 / DAY_MS) * DAY_MS + DAY_MS - 10 * MIN;
+  const wrote = [];
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.bitget,
+    symbols: () => ["BTCUSDT"],
+    write: (symbol, candles, notAfterMs) => {
+      wrote.push({ symbol, candles, notAfterMs });
+      store.write("bitget", symbol, candles, notAfterMs);
+    },
+    socket: factory,
+    now: () => first + 502 * MIN,
+  });
+  try {
+    r.start();
+    made[0].h.onOpen();
+    made[0].h.onMessage(bitgetSnapshot(first));
+    assert.equal(wrote.length, 1, "499 closed rows must not cause 499 synchronous store calls");
+    assert.equal(wrote[0].candles.length, 499);
+    const rows = store.readWindow("bitget", "BTCUSDT", first, first + 499 * MIN).rows;
+    assert.equal(rows.length, 499, "all closed rows survive the real day-file boundary");
+    assert.deepEqual(rows.map(row => row[0]), Array.from({ length: 499 }, (_, i) => first + i * MIN));
+    assert.equal(rows[0][4], 10);
+    assert.equal(rows.at(-1)[4], 508);
+    assert.equal(r.status().closedCandles, 499, "status counts candles, not durable batches");
+    assert.equal(r.status().holding, 1, "the snapshot's final observation remains forming");
+    made[0].h.onMessage(bitgetFrame(first + 500 * MIN, 999));
+    assert.equal(wrote.length, 2, "the next live minute is still written immediately");
+    assert.equal(wrote[1].candles[0].openMs, first + 499 * MIN);
+    assert.equal(wrote[1].candles[0].close, 509);
+  } finally {
+    r.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("Bitget snapshot batching excludes an unsettled close from both storage and counters", () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  const r = new VenueStreamRunner({
+    adapter: STREAM_ADAPTERS.bitget,
+    symbols: () => ["BTCUSDT"],
+    write: (symbol, candles, notAfterMs) => wrote.push({ symbol, candles, notAfterMs }),
+    socket: factory,
+    // N is forming, N-1 is logically closed, but the clock-skew guard only
+    // admits N-2. The closed tail must wait for the settlement timer.
+    now: () => T0 + 499 * MIN + 30_000,
+  });
+  try {
+    r.start();
+    made[0].h.onOpen();
+    made[0].h.onMessage(bitgetSnapshot(T0));
+    assert.equal(wrote.length, 1);
+    assert.equal(wrote[0].candles.length, 498);
+    assert.equal(wrote[0].candles.at(-1).openMs, T0 + 497 * MIN);
+    assert.ok(wrote[0].candles.every(c => c.openMs <= wrote[0].notAfterMs));
+    assert.equal(r.status().closedCandles, 498, "a clock-skew rejection is not counted as stored");
+    assert.equal(r.status().holding, 2, "one deferred close plus the forming tail");
+  } finally { r.stop(); }
+});
+
+for (const venue of ["bitget", "bitunix", "bybit", "binance", "aster"]) {
+  await test(`${venue} retains a native live close until clock-only settlement, without asserting REST provenance`, async () => {
+    const dir = tmpDir(`${venue}-settlement`);
+    const store = new CandleStore(dir);
+    const collector = new VenueCollector(venue, store, dir, DEFAULT_COLLECTOR_OPTIONS, T0);
+    const { factory, made } = fakeSockets();
+    const wrote = [];
+    let clock = T0 + MIN + 30_000;
+    const r = new VenueStreamRunner({
+      adapter: STREAM_ADAPTERS[venue], symbols: () => ["BTCUSDT"],
+      socket: factory, now: () => clock, settleFlushMs: 5,
+      write: (symbol, candles, notAfterMs) => {
+        wrote.push({ symbol, candles });
+        const result = store.write(venue, symbol, candles, notAfterMs);
+        collector.noteStoredCandles(symbol, candles, result.written, result.newlyFilled);
+      },
+    });
+    try {
+      r.start(); made[0].h.onOpen();
+      for (const frame of nativeClosingFrames(venue, T0)) made[0].h.onMessage(frame);
+      assert.equal(wrote.length, 0, "a venue close cannot bypass the local one-minute grace");
+      assert.equal(r.status().closedCandles, 0, "deferred candles are not counted as stored");
+      assert.equal(store.readWindow(venue, "BTCUSDT", T0, T0).rows.length, 0);
+      clock += MIN;
+      await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(wrote.length, 1, "the timer must store the close without another venue frame");
+      assert.equal(wrote[0].candles.length, 1);
+      assert.equal(wrote[0].candles[0].openMs, T0);
+      assert.equal(store.readWindow(venue, "BTCUSDT", T0, T0 + MIN).rows.length, 1,
+        "the next forming observation, if any, never reaches disk");
+      assert.equal(r.status().closedCandles, 1);
+      assert.equal(collector.restConfirmedMs("BTCUSDT"), null, "a deferred WS write still cannot establish REST provenance");
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(wrote.length, 1, "later timer ticks never replay the flushed row");
+    } finally {
+      r.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+await test("native deferred closes stay bounded, survive reconnect and re-sharding, and discard removed symbols", async () => {
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  let clock = T0 + MIN + 30_000;
+  let symbols = ["BTCUSDT"];
+  const r = new VenueStreamRunner({
+    adapter: { ...STREAM_ADAPTERS.bybit, maxTopicsPerConnection: 1 },
+    symbols: () => symbols, socket: factory, now: () => clock,
+    settleFlushMs: 5, reconnectMs: 5, reconnectMaxMs: 5,
+    write: (symbol, candles) => wrote.push({ symbol, candles }),
+  });
+  try {
+    r.start(); made[0].h.onOpen();
+    for (let i = 0; i < 7; i++) made[0].h.onMessage(nativeClosingFrames("bybit", T0 + i * MIN)[0]);
+    made[0].h.onMessage(nativeClosingFrames("bybit", T0, "UNASSIGNEDUSDT")[0]);
+    assert.equal(r.status().holding, 3, "only the three oldest complete rows of an assigned symbol are retained");
+    const duplicate = JSON.parse(nativeClosingFrames("bybit", T0)[0]);
+    duplicate.data[0].close = "1.75";
+    made[0].h.onMessage(JSON.stringify(duplicate));
+    assert.equal(r.status().holding, 3, "duplicate confirmations replace a row rather than growing the queue");
+    made[0].h.onClose(1006);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.ok(made.length >= 2, "an ordinary reconnect occurred");
+    symbols = ["AAAUSDT", "BTCUSDT"];
+    r.resync();
+    assert.equal(r.status().sockets, 2, "BTC moves to a different owner after re-sharding");
+    clock += 10 * MIN;
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(wrote.length, 1);
+    assert.deepEqual(wrote[0].candles.map(c => c.openMs), [T0, T0 + MIN, T0 + 2 * MIN]);
+    assert.equal(wrote[0].candles[0].close, 1.75);
+    assert.equal(r.status().closedCandles, 3, "the replacement shard owns the flushed rows' counter");
+
+    const btcSocket = made.at(-1);
+    const nextClose = T0 + 10 * MIN;
+    btcSocket.h.onMessage(nativeClosingFrames("bybit", nextClose)[0]);
+    assert.equal(r.status().holding, 1);
+    symbols = ["AAAUSDT"];
+    r.resync();
+    clock += MIN;
+    btcSocket.h.onMessage(nativeClosingFrames("bybit", nextClose)[0]);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(wrote.length, 1, "removal and a retired callback cannot restore a discarded deferred row");
+
+    const aaaSocket = made.at(-1);
+    aaaSocket.h.onMessage(nativeClosingFrames("bybit", T0 + 11 * MIN, "AAAUSDT")[0]);
+    assert.equal(r.status().holding, 1);
+    r.stop();
+    clock += MIN;
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(wrote.length, 1, "stop cancels deferred work for native streams too");
+  } finally { r.stop(); }
 });
 
 await test("WEEX shards its 100 documented channels, replies to ping, and stores only an advanced bar", () => {

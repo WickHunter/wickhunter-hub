@@ -1,5 +1,41 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.33 follow-up: Bitget snapshot startup starvation
+
+On 2026-09-14, enabling all six supported native candle streams on the VPS
+bound the Hub port but made health and graceful shutdown unresponsive. The
+failed process used 164.5 CPU seconds over 181.3 seconds and peaked at 305.7 MB;
+there was no kernel OOM event. The operator restored the previous stream config.
+
+A separate, credentialless one-symbol probe confirmed that Bitget opens its
+`candle1m` subscription with 500 ascending rows. The existing closure buffer
+produced 499 synchronous store calls for that single frame. At the observed
+783-symbol roster this projects to 390,717 day-file rewrites, roughly 27 GB of
+written buffers. One-symbol probes of the other native adapters stayed responsive.
+
+The runner now batches settled closed rows by symbol within each frame. The
+audit also found that all other native streams dropped live closes arriving
+inside the local one-minute clock-skew grace. WEEX's existing bounded settlement
+path is now shared: retain up to three complete rows per symbol, flush eligible
+rows every second, preserve them across reconnect/re-sharding, and discard them
+on symbol removal or stop. Forming observations never enter that queue. REST
+alone advances `rest-frontier.json`; no rates, signer, enabled venues or
+production flags change in this patch. A counter increments by settled rows
+after a successful store call, never by deferred rows or write calls.
+
+The 500-row regression first failed with `499 !== 1`. Its real-store fixture
+covers midnight and preserves the closed prefix and forming tail. Native frames
+from Bitget/Bitunix's ordering-based protocols and Bybit/Binance/Aster's explicit
+confirmations prove that a clock-only timer flushes each complete close into a
+real store without advancing REST provenance. Another fixture pins the cap,
+duplicates, reconnect/re-sharding, counter ownership, removal and stop. Build
+and all 53 suites passed on this Mac using Bash 5 and the real app percentile
+module. The focused stream-runner suite passed 21 checks; independent review
+also passed the stream protocol and REST reconciliation suites. The admin
+footer derives its version from health, so package/lockfile and `src/version.ts`
+move together to v0.4.33. Production rollout and all-venue live counter checks
+remain separate from this local validation.
+
 GitHub base: `b893589` (v0.4.31), fetched again on 2026-09-14.
 Related app and Go work uses `codex/account-assignment-audit` in
 `WickHunter/liqhunter-private` and `WickHunter/wickhunterunleashed-go`.
