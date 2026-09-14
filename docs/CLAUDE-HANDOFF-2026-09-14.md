@@ -1,5 +1,46 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.36 follow-up: REST accounting must match storage admission
+
+The deployed v0.4.35 fairness fix advanced the previously starved Bitget/WEEX
+BTC frontiers, but a separate post-deploy seed check found Bitunix and Aster
+both declaring 2026-09-14 20:56 UTC as their frontier with that exact last slot
+missing. A read-only disk check at 21:05:33 UTC confirmed real rows at 20:55
+and 20:57, no 20:56 slot, and the durable frontier at 20:56 on both venues.
+This was not a cached-gap or client price-validation error.
+
+The startup tick captured 20:57:33 before its yielding coverage scan. New WS
+rows could arrive during that scan, causing reconciliation to request beyond
+that captured time's 20:55 settlement cutoff. `dropUnclosed()` admitted the
+merely closed 20:56 row; `store.write()` rejected it for the extra minute of
+clock-skew grace. Coverage, correction counts and the durable REST frontier
+then incorrectly used the pre-write array. The same discrepancy could falsely
+count a correction of a WS grace row already on disk without writing its REST
+value.
+
+The collector now filters REST rows to the captured store cutoff before recent
+contiguity selection, correction comparison, writing and accounting. The store
+retains its own admission gate. Real CandleStore and Bitunix/Aster adapter
+regressions advance the clock three minutes during coverage preparation and
+three more while the REST request is pending. They cover an absent grace row,
+a different WS value already present, cache/disk/frontier agreement, a seed
+without a false trailing gap, and a later tick that actually writes and credits
+the newly settled data. Short, grace-only and empty responses cannot credit
+the requested end; a WEEX cold current-page fixture applies settlement before
+choosing its contiguous suffix.
+
+No stored data or frontier is rewritten. Existing gaps heal through ordinary
+reconciliation/repair. The existing maximum-observed REST watermark remains;
+this change does not introduce per-slot provenance or alter handling of an
+interior omission in a REST response. All rates, budgets, backoff, fair queue
+ordering, signing and app depth/gap checks remain unchanged. Package and served
+runtime identity move to v0.4.36; the admin footer reads that served version.
+Build and all 53 Hub suites passed on this Mac with Bash 5 and the real app
+percentile module. The focused reconciliation suite now passes 16 checks;
+independent review and its separate focused run found no blocking issue.
+This local change has not deployed or modified production; root owns rollout
+and the subsequent signed-seed/frontier recovery check.
+
 ## v0.4.35 follow-up: fair reconciliation under a changing due set
 
 At 20:47–20:49 UTC on 2026-09-14, v0.4.34 kept all 29 native candle sockets

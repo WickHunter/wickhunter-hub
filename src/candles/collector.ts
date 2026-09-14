@@ -852,10 +852,12 @@ export class VenueCollector {
         const page = item.recent && adapter.fetchRecentKlines
           ? await adapter.fetchRecentKlines(fetchLike, item.symbol, item.startMs, item.endMs)
           : await adapter.fetchKlines(fetchLike, item.symbol, item.startMs, item.endMs);
-        // TWO GATES, both against our own clock rather than the venue's word:
-        // dropUnclosed here, and `notAfterMs` inside store.write. A forming bar
-        // has to get past both, and neither asks the venue what it sent.
-        let closed = dropUnclosed(page.candles, now);
+        // Use the store's captured settlement cutoff for every downstream
+        // decision, including contiguity, corrections, coverage and provenance.
+        // A yielding scan or slow request can observe newer WS/REST rows, but
+        // crediting the merely closed grace minute would confirm a value that
+        // this tick's store.write rejects. The store keeps its own gate too.
+        let closed = dropUnclosed(page.candles, now).filter((row) => row.openMs <= newestClosed);
         if (item.recent) {
           const unique = [...new Map(closed.map((row) => [row.openMs, row])).values()]
             .sort((a, b) => a.openMs - b.openMs);
