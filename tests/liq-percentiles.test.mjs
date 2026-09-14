@@ -10,6 +10,7 @@
 // byte-identical JSON output on a shared, varied fixture.
 import assert from "node:assert/strict";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { test, summary, tmpDir } from "./helpers.mjs";
 import {
   buildLiqSizePercentiles, rebuildLiqPercentileTable, liqPercentileTableLooksValid,
@@ -17,7 +18,10 @@ import {
 } from "../dist/src/liq/percentiles.js";
 import { LiqHistory } from "../dist/src/liq/history.js";
 
-const BOT_MODULE_PATH = "/home/user/liqhunter-private/dist/liq/size-percentiles.js";
+// Keep the CI checkout default, but let local audits prove parity against the
+// actual app checkout (including paths with spaces) without editing fixtures.
+const BOT_MODULE_PATH = pathToFileURL(path.resolve(process.env.LIQHUNTER_BOT_MODULE
+  ?? "/home/user/liqhunter-private/dist/liq/size-percentiles.js")).href;
 
 function seededRandom(seed) {
   let s = seed >>> 0;

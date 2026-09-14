@@ -36,6 +36,7 @@ function weexRow(openMs, o, h, l, c, v) {
  *  same class of drift it exists to correct. */
 function fixture(overrides = {}) {
   const store = new CandleStore(tmpDir("reconcile-store"));
+  const stateDir = tmpDir("reconcile-state");
   const historyCalls = [];
   const recentCalls = [];
   let historyRows = [];
@@ -56,14 +57,14 @@ function fixture(overrides = {}) {
     if (u.pathname.endsWith("/klines")) { recentCalls.push(u); return response(recentRows); }
     throw new Error(`unexpected URL ${url}`);
   };
-  const collector = new VenueCollector("weex", store, tmpDir("reconcile-state"), {
+  const collector = new VenueCollector("weex", store, stateDir, {
     ...DEFAULT_COLLECTOR_OPTIONS,
     requestsPerSecond: 100,
     minRequestsPerSecond: 0.1,
     reconcileWsGapMinutes: overrides.reconcileWsGapMinutes ?? 10,
   }, NOW);
   return {
-    store, collector, fetchLike, historyCalls, recentCalls,
+    store, collector, stateDir, fetchLike, historyCalls, recentCalls,
     setHistory(rows) { historyRows = rows; },
     setRecent(rows) { recentRows = rows; },
   };
@@ -125,6 +126,46 @@ await test("a websocket write is never served before this collector's own REST f
   assert.equal(after.payload.lastClosedMs, wsOpenMs);
   assert.deepEqual(after.payload.rows, [[wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71]],
     "served at 0.71, never at the websocket's 0.65");
+});
+
+await test("a restart never grandfathers a websocket-only row, and the next REST pass recovers it", async () => {
+  const f = fixture({ reconcileWsGapMinutes: 1 });
+  await f.collector.refreshSymbols(f.fetchLike, NOW);
+
+  const wsOpenMs = NOW - 5 * MINUTE_MS;
+  const wsCandle = { openMs: wsOpenMs, open: 224.73, high: 224.75, low: 224.66, close: 224.66, volume: 0.65 };
+  const w = f.store.write("weex", "NBISUSDT", [wsCandle], settledOpenMs(NOW));
+  f.collector.noteStoredCandles("NBISUSDT", [wsCandle], w.written, w.newlyFilled);
+
+  // A new process must trust only the durable REST frontier. The old
+  // shallow-store grandfathering treated this websocket-only row as confirmed.
+  const restarted = new VenueCollector("weex", f.store, f.stateDir, {
+    ...DEFAULT_COLLECTOR_OPTIONS,
+    requestsPerSecond: 100,
+    minRequestsPerSecond: 0.1,
+    reconcileWsGapMinutes: 1,
+  }, NOW);
+  assert.equal(restarted.restConfirmedMs("NBISUSDT"), null,
+    "a websocket-only disk row is not REST-confirmed after restart");
+  const before = buildSeed(
+    { venue: "weex", symbol: "NBISUSDT", fromMs: wsOpenMs, toMs: wsOpenMs },
+    seedDepsFor({ ...f, collector: restarted }),
+  );
+  assert.equal(before.ok, false, "the restart still refuses the unconfirmed row instead of serving it");
+
+  f.setHistory([weexRow(wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71)]);
+  const result = await restarted.tick(f.fetchLike, 5, NOW, { sleep: async () => {} });
+  assert.equal(result.corrected, 1, "restart queues the unconfirmed row for REST reconciliation");
+  assert.equal(restarted.restConfirmedMs("NBISUSDT"), wsOpenMs,
+    "the REST frontier advances only after the recovery fetch");
+
+  const checked = new VenueCollector("weex", f.store, f.stateDir, {
+    ...DEFAULT_COLLECTOR_OPTIONS,
+    requestsPerSecond: 100,
+    minRequestsPerSecond: 0.1,
+  }, NOW);
+  assert.equal(checked.restConfirmedMs("NBISUSDT"), wsOpenMs,
+    "a REST-confirmed frontier survives a later restart");
 });
 
 await test("the served lastClosedMs never names a minute only the websocket has seen", async () => {

@@ -8,6 +8,20 @@ runs on the same VPS as the bot (its own systemd unit, loopback-only on
 Zero runtime dependencies: node builtins only. TypeScript + a hermetic test
 suite gate every commit: `npx tsc && node tests/run-all.mjs`.
 
+For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
+`dist/liq/size-percentiles.js` when running tests. The percentile parity test
+still compares the real app implementation. Local audit results and remaining
+deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
+
+## v0.4.32 — candle provenance and WebSocket visibility
+
+The admin candle panel now shows each running venue stream's socket coverage,
+symbol count, received closes and pending confirmations. REST collection health
+alone previously concealed whether a WebSocket was running. REST-confirmed
+frontiers now persist across restarts; disk rows without that proof are
+reconciled before they can be served as confirmed history. The percentile parity test also accepts
+`LIQHUNTER_BOT_MODULE` for validating another local app checkout.
+
 ## Licence extension at check-in (v0.3.19)
 
 `npm run extend -- --to 2026-09-30` (or the admin page's "Extend every active
@@ -1555,6 +1569,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.32 — Expose each venue's live WebSocket counters in authenticated candle diagnostics and the admin panel; persist REST-confirmed candle frontiers so restart cannot trust WebSocket-only disk rows. Keep collector defaults and reconcile missing provenance within the existing budget. Allow `LIQHUNTER_BOT_MODULE` to point the parity test at a local app checkout.
 
 - v0.4.31 — **Served candles are the venue's REST book, never a websocket fold.** Field report (WEEX, NBISUSDT): the websocket's `ClosureBuffer` closes a bar by ORDERING — WEEX (and Bitget/Bitunix) state no closure of their own, so a bar publishes once the venue's stream has moved past it — and a trade settling into the venue's book a moment after that ordering fact already published the bar leaves the stored volume short forever; the bot's own live cross-check caught it (`o/h/l/c` identical, volume 0.65 vs the venue's REST `historyKlines` 0.71) and discarded the whole seed. `VenueCollector.restConfirmedMs(symbol)` is the newest minute THIS collector's own REST fetch (tail/backfill/repair/reconcile) has actually looked at — never advanced by a websocket write, which is the whole mechanism — grandfathered at construction from a cheap shallow store read so a restart does not black a healthy venue out. A new `"reconcile"` work item (priority alongside `tail`, ahead of `repair`) fires once a symbol a websocket has ACTUALLY written to (`wsWrittenMs`, scoped so a plain REST venue is untouched and issues no extra requests) drifts more than `HUB_CANDLE_RECONCILE_GAP_MIN` (5) minutes ahead of that frontier — five so a served seed trails the venue by less than the bot's own fifteen-minute request margin (liqhunter v0.90.80); it re-reads exactly the unconfirmed span from the venue's settled `historyKlines` endpoint — never the current/forming page — and overwrites it (`CandleStore.write` already always takes the last value written to a slot, so no store change was needed for the overwrite itself, only the scheduling). `buildSeed` clamps `lastClosedMs` (and every row/gap computed from it) to `restConfirmedMs`, so a websocket-only minute is either corrected first or simply not served yet — never served short; a symbol with nothing REST-confirmed at all answers its existing `503`, now naming the reason. `tests/candle-reconcile.test.mjs` (3 checks) reproduces the NBISUSDT numbers exactly, pins that the served frontier never names a websocket-only minute, and proves a REST-only symbol never queues a reconcile request at all. Wire contract v1 is unchanged — this is a freshness/correctness fix, not a new field.
 - v0.4.30 — **B15: a marketplace invoice can never reach the licence billing.** `src/billing/foreign-product-family.ts` (pure) is called by `applyEvent` before the role dispatcher and before any mint/extend/revoke: an event whose metadata carries a `productFamily` other than this Hub's own (the app's `marketplace_strategy` in particular) is refused by name and recorded once per event id as `ignored` (HTTP 200) — the same acknowledge-and-refuse policy the unknown-event path already had. Why the role dispatcher did not cover it: on an install with hosting unconfigured, an event matching no price/product id defaults to `software` by design (H1), so a marketplace `checkout.session.completed` minted a licence and a marketplace `invoice.paid` extended an unrelated customer's expiry (both reproduced under mutation). `InvoiceFacts`/`SubscriptionFacts` carry `metadata` (the app's three-shape invoice precedence). `tests/foreign-product-family.test.mjs` drives the real HTTP route.

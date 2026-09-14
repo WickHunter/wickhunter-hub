@@ -1984,6 +1984,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         candleKeyId: CANDLE_KEY_ID,
         candlePublicKey,
         venues: candles.status(),
+        streams: candles.streamStatus(),
       });
     }
     // One-line-per-source liquidation recorder status: which venues are
