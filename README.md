@@ -13,6 +13,16 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.35 — fair REST confirmation of streamed candles
+
+Reconciliation now resumes after the last symbol actually attempted in the
+stable tracked roster. Rotating the changing due list by one position per tick
+let frequently revisited symbols displace untouched peers, leaving their signed
+seed frontiers stale despite current WebSocket candles. Failed requests yield
+their turn, while cooldowns and passes consumed by other work preserve it.
+The same request limits, backoff, work priorities and REST confirmation rules
+remain in force; no candle values or stored frontiers are fabricated.
+
 ## v0.4.34 — retain coverage when pruning changes nothing
 
 Retention now invalidates a symbol's exact coverage only when it removes a day
@@ -1592,6 +1602,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.35 — Anchor reconciliation to the last attempted symbol in the full tracked roster, so changing due sets cannot starve untouched symbols. Preserve turns through zero-budget, deadline, cooldown and tail-only passes; retain all request limits, backoff and REST provenance gates.
 
 - v0.4.34 — Retain warm exact coverage and repair-gap caches for symbols whose retention pass removes no files; invalidate both only for symbols that actually lose day files. Recompute the oldest retained gap instead of refetching an expired one. Preserve retention policy, gap reporting, stream behavior and REST provenance.
 
