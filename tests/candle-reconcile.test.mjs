@@ -31,11 +31,9 @@ function weexRow(openMs, o, h, l, c, v) {
   return [String(openMs), String(o), String(h), String(l), String(c), String(v)];
 }
 
-/** One collector + fake WEEX fetchLike, tracking exactly one symbol. Fails the
- *  test outright if a reconcile ever reaches the CURRENT-page endpoint: the
- *  venue's settled book of record is `historyKlines`, never `klines`, and a
- *  reconcile that read the still-updating current page would just repeat the
- *  same class of drift it exists to correct. */
+/** One collector + fake WEEX fetchLike, tracking exactly one symbol. WEEX's
+ * documented 1,000-row current page is accepted for the bounded recent
+ * reconcile only when the collector proves the exact settled range. */
 function fixture(overrides = {}) {
   const store = new CandleStore(tmpDir("reconcile-store"));
   const stateDir = tmpDir("reconcile-state");
@@ -52,10 +50,8 @@ function fixture(overrides = {}) {
     }
     if (u.pathname.endsWith("/apiTradingSymbols")) return response(["NBISUSDT"]);
     if (u.pathname.endsWith("/historyKlines")) { historyCalls.push(u); return response(historyRows); }
-    // The current-page endpoint: never used by a reconcile (see below), but a
-    // real cold "nothing at all yet" tail item legitimately reaches it — it
-    // is tracked, not refused, so the reconcile-specific tests can assert
-    // `recentCalls.length === 0` rather than relying on an exception.
+    // Both a recent reconcile and a cold/tail fill may use this current page;
+    // the collector owns exact-start, completeness and settlement admission.
     if (u.pathname.endsWith("/klines")) { recentCalls.push(u); return response(recentRows); }
     throw new Error(`unexpected URL ${url}`);
   };
@@ -63,6 +59,7 @@ function fixture(overrides = {}) {
     ...DEFAULT_COLLECTOR_OPTIONS,
     requestsPerSecond: 100,
     minRequestsPerSecond: 0.1,
+    retentionDays: overrides.retentionDays ?? 0,
     reconcileWsGapMinutes: overrides.reconcileWsGapMinutes ?? 10,
   }, NOW);
   return {
@@ -107,14 +104,12 @@ await test("a websocket write is never served before this collector's own REST f
 
   // The venue's REST book disagrees on volume only — o/h/l/c match exactly,
   // which is exactly the operator's reproduction.
-  f.setHistory([weexRow(wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71)]);
+  f.setRecent([weexRow(wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71)]);
   const result = await f.collector.tick(f.fetchLike, 5, NOW, { sleep: async () => {} });
 
   assert.equal(result.corrected, 1, "tick() reports the one row whose value it corrected");
-  const reconcileCall = f.historyCalls.find((u) =>
-    Number(u.searchParams.get("startTime")) === wsOpenMs && Number(u.searchParams.get("endTime")) === wsOpenMs);
-  assert.ok(reconcileCall, "a request spanning exactly the unconfirmed minute was made");
-  assert.equal(f.recentCalls.length, 0, "a reconcile never reads the venue's current/forming page");
+  assert.equal(f.historyCalls.length, 0, "recent reconciliation does not spend the weight-5 history route");
+  assert.equal(f.recentCalls.length, 1, "the proved recent range uses one weight-1 current page");
 
   const { rows } = f.store.readWindow("weex", "NBISUSDT", wsOpenMs, wsOpenMs);
   assert.deepEqual(rows, [[wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71]],
@@ -128,6 +123,29 @@ await test("a websocket write is never served before this collector's own REST f
   assert.equal(after.payload.lastClosedMs, wsOpenMs);
   assert.deepEqual(after.payload.rows, [[wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71]],
     "served at 0.71, never at the websocket's 0.65");
+});
+
+await test("WEEX current-page reconciliation requires the complete exact settled range", async () => {
+  const f = fixture({ reconcileWsGapMinutes: 2 });
+  await f.collector.refreshSymbols(f.fetchLike, NOW);
+  const rows = [NOW - 6 * MINUTE_MS, NOW - 5 * MINUTE_MS].map((openMs) => ({
+    openMs, open: 10, high: 11, low: 9, close: 10, volume: 1,
+  }));
+  const written = f.store.write("weex", "NBISUSDT", rows, settledOpenMs(NOW));
+  f.collector.noteStoredCandles("NBISUSDT", rows, written.written, written.newlyFilled);
+  f.setRecent([weexRow(rows[1].openMs, 10, 11, 9, 10, 2)]);
+  const partial = await f.collector.tick(f.fetchLike, 5, NOW, { sleep: async () => {} });
+  assert.equal(partial.corrected, 0);
+  assert.equal(f.collector.restConfirmedMs("NBISUSDT"), null,
+    "a suffix missing the requested first minute establishes no REST frontier");
+  assert.equal(f.historyCalls.length, 0);
+  assert.equal(f.recentCalls.length, 1);
+
+  f.setRecent(rows.map((row) => weexRow(row.openMs, 10, 11, 9, 10, 2)));
+  const complete = await f.collector.tick(f.fetchLike, 5, NOW + MINUTE_MS, { sleep: async () => {} });
+  assert.equal(complete.corrected, 2);
+  assert.equal(f.collector.restConfirmedMs("NBISUSDT"), rows[1].openMs,
+    "only the complete contiguous settled comparison advances provenance");
 });
 
 await test("a restart never grandfathers a websocket-only row, and the next REST pass recovers it", async () => {
@@ -155,7 +173,7 @@ await test("a restart never grandfathers a websocket-only row, and the next REST
   );
   assert.equal(before.ok, false, "the restart still refuses the unconfirmed row instead of serving it");
 
-  f.setHistory([weexRow(wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71)]);
+  f.setRecent([weexRow(wsOpenMs, 224.73, 224.75, 224.66, 224.66, 0.71)]);
   const result = await restarted.tick(f.fetchLike, 5, NOW, { sleep: async () => {} });
   assert.equal(result.corrected, 1, "restart queues the unconfirmed row for REST reconciliation");
   assert.equal(restarted.restConfirmedMs("NBISUSDT"), wsOpenMs,
@@ -195,7 +213,7 @@ await test("the served lastClosedMs never names a minute only the websocket has 
 
   // REST confirms only the first two minutes this pass (a bounded reconcile,
   // matching `reconcileWsGapMinutes`/`RECONCILE_MAX_SPAN_MINUTES`).
-  f.setHistory([
+  f.setRecent([
     weexRow(base, 10, 10, 10, 10, 1),
     weexRow(base + MINUTE_MS, 10, 10, 10, 10, 1),
   ]);
@@ -204,7 +222,7 @@ await test("the served lastClosedMs never names a minute only the websocket has 
   await f2.collector.refreshSymbols(f2.fetchLike, NOW);
   const w2 = f2.store.write("weex", "NBISUSDT", wsCandles.slice(0, 2), settledOpenMs(NOW));
   f2.collector.noteStoredCandles("NBISUSDT", wsCandles.slice(0, 2), w2.written, w2.newlyFilled);
-  f2.setHistory([
+  f2.setRecent([
     weexRow(base, 10, 10, 10, 10, 1),
     weexRow(base + MINUTE_MS, 10, 10, 10, 10, 1),
   ]);
@@ -294,13 +312,17 @@ function fairnessFixture(venue, count, opts = {}) {
       symbol, quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true,
     })) });
     if (u.pathname.endsWith("/apiTradingSymbols")) return response(state.listed);
-    assert.ok(u.pathname.endsWith("/history-candles") || u.pathname.endsWith("/historyKlines"), "reconcile uses history only");
+    assert.ok(u.pathname.endsWith("/history-candles") || u.pathname.endsWith("/historyKlines")
+      || (venue === "weex" && u.pathname.endsWith("/klines")), "reconcile uses a proved REST candle route");
     const symbol = u.searchParams.get("symbol");
     state.calls.push(symbol);
     const refused = state.refuse.get(symbol);
     if (refused === "error") throw new Error("fixture request failure");
     if (refused === "429") return { ok: false, status: 429, json: async () => ({}), headers: { get: () => null } };
-    const rows = refused === "empty" ? [] : store.readWindow(venue, symbol, Number(u.searchParams.get("startTime")), Number(u.searchParams.get("endTime"))).rows;
+    const rows = refused === "empty" ? [] : venue === "weex" && u.pathname.endsWith("/klines")
+      ? [...(held.get(symbol)?.values() ?? [])].sort((a, b) => a.openMs - b.openMs)
+        .map(c => [c.openMs, c.open, c.high, c.low, c.close, c.volume])
+      : store.readWindow(venue, symbol, Number(u.searchParams.get("startTime")), Number(u.searchParams.get("endTime"))).rows;
     return response(venue === "bitget" ? { code: "00000", data: rows } : rows);
   };
   const put = (symbol, t) => {

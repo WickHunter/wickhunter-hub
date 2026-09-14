@@ -1,5 +1,31 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.38: WEEX native demand fairness under continuous reconciliation
+
+Live v0.4.37 verification registered 225 hourly WEEX demands but wrote no
+native frontier. The path and demand registration were correct: 239 symbols
+were continuously due for routine REST reconciliation, and the collector put
+that unbounded queue ahead of every timeframe item.
+
+WEEX reconciliation now uses `/capi/v3/market/klines` at documented weight 1
+when its bounded requested span lies inside the newest 1,000-row page. The
+collector filters by the captured settlement cutoff and requires every exact,
+contiguous requested minute before it writes or advances provenance. Older
+reconciliation retains `historyKlines` and weight 5.
+
+Tail and recent repair remain the freshness lane. Demanded native pages and
+recent reconciliation alternate in the cheap lane; five cheap turns share the
+same allowance with one weight-5 old repair, old reconciliation, or 1m
+backfill turn. Persistent old repairs rotate by actual attempts. The total
+WEEX allowance remains 25 weight/minute with the same pacing, adaptive cooldown
+and Retry-After handling. The signed v1 and v2 wire contracts are unchanged.
+
+The virtual regression holds 239 reconciles and old interior holes continuously
+due while 225 12-hour demands wait. Across four passes it observed
+native/reconcile/repair request counts of 5/5/3, 6/5/2, 5/5/3 and 6/5/2; each
+pass spent 21–25 weight and persisted native frontier progress. Focused
+reconciliation/timeframe suites and the complete 54-suite gate pass.
+
 ## v0.4.37: timeframe-specific Optimized history
 
 The Hub now has a separate signed v2 path on the existing candle-seed route

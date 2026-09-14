@@ -414,6 +414,92 @@ await test("WEEX mixed cold work gives native and legacy history equal request-w
   assert.ok(native <= legacy * 5 + 1, "only the final partial block may exceed the equal-weight ratio by one page");
 });
 
+await test("WEEX demanded native history progresses across sustained 239-symbol reconcile and old-repair queues", async () => {
+  const h = history("weex-live-fairness");
+  const symbols = Array.from({ length: 239 }, (_, i) => `LIVE${String(i).padStart(3, "0")}USDT`);
+  const collector = new VenueCollector("weex", h.minutes, `${h.root}/state`, {
+    ...DEFAULT_COLLECTOR_OPTIONS,
+    requestsPerSecond: ADAPTERS.weex.publicRequestsPerSecond,
+    minRequestsPerSecond: Math.min(DEFAULT_COLLECTOR_OPTIONS.minRequestsPerSecond,
+      ADAPTERS.weex.publicRequestsPerSecond),
+    retentionDays: 0,
+    reconcileWsGapMinutes: 5,
+    symbolRefreshMs: DAY,
+  }, NOW, () => {}, h.value);
+  const roster = async (url) => ({ ok: true, status: 200, json: async () =>
+    url.includes("apiTradingSymbols") ? symbols : { symbols: symbols.map((symbol) => ({
+      symbol, quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL",
+      forwardContractFlag: true, status: "TRADING",
+    })) } });
+  await collector.refreshSymbols(roster, NOW);
+
+  let passNow = NOW;
+  let current = settledOpenMs(passNow);
+  const held = new Map();
+  for (const symbol of symbols) {
+    // A persistent old interior hole proves routine repair cannot regain the
+    // old unconditional priority and starve demanded native work either.
+    const rows = [candle(current - 300 * MINUTE_MS),
+      ...Array.from({ length: 5 }, (_, i) => candle(current - (4 - i) * MINUTE_MS, i))];
+    const w = h.minutes.write("weex", symbol, rows, current);
+    collector.noteStoredCandles(symbol, rows, w.written, w.newlyFilled);
+    held.set(symbol, rows);
+  }
+  const nativeOpen = Math.floor((current - DAY) / (12 * HOUR)) * 12 * HOUR;
+  for (const symbol of symbols.slice(0, 225)) {
+    const out = h.value.request("weex", symbol, 720, nativeOpen, nativeOpen,
+      passNow, current, "seed-1", sign);
+    assert.equal(out.ok, false, "cold native request registers bounded demand");
+  }
+
+  const perPass = [];
+  for (let pass = 0; pass < 4; pass++) {
+    if (pass > 0) {
+      passNow += MINUTE_MS;
+      current = settledOpenMs(passNow);
+      for (const symbol of symbols) {
+        const row = candle(current, pass + 10);
+        const w = h.minutes.write("weex", symbol, [row], current);
+        collector.noteStoredCandles(symbol, [row], w.written, w.newlyFilled);
+        held.get(symbol).push(row);
+      }
+    }
+    const urls = [];
+    const plan = collector.workBudgetFor(60_000);
+    let clock = passNow;
+    const ran = await collector.tick(async (url) => {
+      urls.push(url);
+      const u = new URL(url);
+      const symbol = u.searchParams.get("symbol");
+      if (u.pathname.endsWith("/historyKlines")) return { ok: true, status: 200, json: async () => [] };
+      if (u.searchParams.get("interval") === "12h") {
+        return { ok: true, status: 200,
+          json: async () => [[nativeOpen, "100", "102", "99", "101", "2"]] };
+      }
+      const rows = held.get(symbol) ?? [];
+      return { ok: true, status: 200,
+        json: async () => rows.map((row) => [row.openMs, row.open, row.high, row.low, row.close, row.volume]) };
+    }, collector.budgetFor(60_000), passNow, {
+      clock: () => clock, sleep: async (ms) => { clock += ms; }, deadlineMs: 48_000,
+      maxRequests: plan.maxRequests, maxWeight: plan.maxWeight, weightPerSecond: plan.weightPerSecond,
+    });
+    const native = urls.filter((url) => new URL(url).searchParams.get("interval") === "12h").length;
+    const reconcile = urls.filter((url) => new URL(url).searchParams.get("interval") === "1m"
+      && new URL(url).pathname.endsWith("/klines")).length;
+    const repair = urls.filter((url) => new URL(url).pathname.endsWith("/historyKlines")).length;
+    const weight = native + reconcile + repair * 5;
+    perPass.push({ native, reconcile, repair, requests: ran.requests, weight });
+    assert.ok(native > 0, `pass ${pass + 1} advances demanded native history`);
+    assert.ok(reconcile > 0, `pass ${pass + 1} advances routine recent reconciliation`);
+    assert.ok(repair > 0, `pass ${pass + 1} advances old interior repair`);
+    assert.ok(weight <= 25, `pass ${pass + 1} stays inside the shared 25-weight envelope`);
+  }
+  assert.ok(fs.existsSync(`${h.root}/higher/native-frontier.v2.json`),
+    "native progress is durable during a production-sized competing sweep");
+  assert.ok(perPass.reduce((sum, pass) => sum + pass.native, 0) >= 16);
+  console.log(`    weex-live-fairness=${JSON.stringify(perPass)}`);
+});
+
 await test("warm 700-pair cache serves complete history without venue work", () => {
   const h = history("load700");
   const symbols = Array.from({ length: 700 }, (_, i) => `PAIR${String(i).padStart(3, "0")}USDT`);
