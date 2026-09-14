@@ -773,4 +773,126 @@ const weex: VenueAdapter = {
   },
 };
 
+// ── NATIVE HIGHER-TIMEFRAME HISTORY (v0.4.37) ─────────────────────────────
+// These are deliberately explicit venue facts. An absent interval means the
+// timeframe cache must aggregate a compatible smaller interval; it must never
+// discover support by probing production or by retrying a parameter error.
+const NATIVE_TIMEFRAMES: Record<VenueId, readonly number[]> = {
+  // Bybit v5 Get Kline documents these exact tokens (daily is `D`).
+  bybit: [3, 5, 15, 30, 60, 120, 240, 360, 720, 1440],
+  // Bitunix public kline docs and the app's field-verified pager prove these.
+  bitunix: [3, 5, 15, 30, 60, 120, 240, 1440],
+  // Bitget v2 history-candles documents these finished market-candle grains.
+  bitget: [3, 5, 15, 30, 60, 240, 360, 720, 1440],
+  // Binance USD-M uses the documented standard kline interval tokens.
+  binance: [3, 5, 15, 30, 60, 120, 240, 360, 720, 1440],
+  // Aster public /fapi/v1/klines: field-verified interval-by-interval in the
+  // app adapter; 180m is absent and folds from 60m.
+  aster: [3, 5, 15, 30, 60, 120, 240, 360, 720, 1440],
+  // WEEX v3 Get Kline documents a newest 1000-row page. Restrict native use to
+  // intervals where the configured 30-day window fits in that one page; older
+  // paging continues through the proven 1m history endpoint and aggregation.
+  weex: [60, 240, 720, 1440],
+};
+
+export function nativeTimeframeIntervals(venue: VenueId): readonly number[] {
+  return NATIVE_TIMEFRAMES[venue];
+}
+
+export function nativeTimeframePageLimit(venue: VenueId): number {
+  if (venue === "bitget" || venue === "bitunix") return 200;
+  return 1000;
+}
+
+function nativeToken(venue: VenueId, interval: number): string {
+  if (!NATIVE_TIMEFRAMES[venue].includes(interval)) throw new Error(`${venue} has no proved native ${interval}m candle interval`);
+  if (venue === "bybit") return interval === 1440 ? "D" : String(interval);
+  if (venue === "bitget") return interval < 60 ? `${interval}m`
+    : interval === 60 ? "1H" : interval === 240 ? "4H" : interval === 360 ? "6H"
+      : interval === 720 ? "12H" : "1D";
+  if (venue === "bitunix" || venue === "aster" || venue === "binance" || venue === "weex") return interval < 60 ? `${interval}m`
+    : interval === 1440 ? "1d" : `${interval / 60}h`;
+  throw new Error(`${venue} native timeframe token is not configured`);
+}
+
+/** Fetch one proved native higher-timeframe page. It intentionally returns the
+ * same KlinePage shape as 1m so the collector's single pacing/backoff lane owns
+ * accounting. Closure/alignment are enforced again by TimeframeHistory.record. */
+export async function fetchNativeTimeframeKlines(
+  fetchLike: FetchLike, venue: VenueId, symbol: string, interval: number, startMs: number, endMs: number,
+): Promise<KlinePage> {
+  const token = nativeToken(venue, interval);
+  const span = interval * MINUTE_MS;
+  const limit = nativeTimeframePageLimit(venue);
+  if (venue === "bybit") {
+    const body = (await getJson(fetchLike, `https://api.bybit.com/v5/market/kline?category=linear&symbol=${encodeURIComponent(symbol)}`
+      + `&interval=${token}&start=${startMs}&end=${endMs + span - 1}&limit=${limit}`)) as {
+        retCode?: unknown; retMsg?: unknown; result?: { list?: unknown[] };
+      };
+    if (body.retCode !== undefined && body.retCode !== 0) {
+      const detail = `bybit retCode ${String(body.retCode)}: ${String(body.retMsg ?? "")}`;
+      throw rateLimited(body.retCode, body.retMsg) ? new RateLimitError(detail) : new Error(detail);
+    }
+    const list = asArray(body.result?.list);
+    const candles = list.map((raw) => {
+      const r = raw as unknown[]; return Array.isArray(r) && r.length >= 6 ? candle(r[0], r[1], r[2], r[3], r[4], r[5]) : null;
+    }).filter((c): c is Candle => c !== null);
+    return { candles: sortOldestFirst(candles), empty: list.length === 0 };
+  }
+  if (venue === "bitget") {
+    const body = (await getJson(fetchLike, `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(symbol)}`
+      + `&productType=usdt-futures&granularity=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`)) as {
+        code?: unknown; msg?: unknown; data?: unknown[];
+      };
+    if (body.code !== undefined && String(body.code) !== "00000") {
+      const detail = `bitget code ${String(body.code)}: ${String(body.msg ?? "")}`;
+      throw rateLimited(body.code, body.msg) ? new RateLimitError(detail) : new Error(detail);
+    }
+    const list = asArray(body.data);
+    const candles = list.map((raw) => {
+      const r = raw as unknown[]; return Array.isArray(r) && r.length >= 6 ? candle(r[0], r[1], r[2], r[3], r[4], r[5]) : null;
+    }).filter((c): c is Candle => c !== null);
+    return { candles: sortOldestFirst(candles), empty: list.length === 0 };
+  }
+  if (venue === "bitunix") {
+    const body = (await getJson(fetchLike, `https://fapi.bitunix.com/api/v1/futures/market/kline?symbol=${encodeURIComponent(symbol)}`
+      + `&interval=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`)) as {
+        code?: unknown; msg?: unknown; data?: unknown[];
+      };
+    if (body.code !== undefined && Number(body.code) !== 0) {
+      const detail = `bitunix code ${String(body.code)}: ${String(body.msg ?? "")}`;
+      throw rateLimited(body.code, body.msg) ? new RateLimitError(detail) : new Error(detail);
+    }
+    const list = asArray(body.data);
+    const candles = list.map((raw) => {
+      const r = raw as Record<string, unknown>;
+      return candle(r.time, r.open, r.high, r.low, r.close, r.quoteVol);
+    }).filter((c): c is Candle => c !== null);
+    return { candles: sortOldestFirst(candles), empty: list.length === 0 };
+  }
+  if (venue === "binance") {
+    const { body, slowDown } = await binanceGet(fetchLike, `${BINANCE_BASE}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}`
+      + `&interval=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`);
+    const list = asArray(body);
+    const candles = list.map((raw) => {
+      const r = raw as unknown[]; return Array.isArray(r) && r.length >= 6 ? candle(r[0], r[1], r[2], r[3], r[4], r[5]) : null;
+    }).filter((c): c is Candle => c !== null);
+    return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
+  }
+  if (venue === "aster") {
+    const { body, slowDown } = await asterGet(fetchLike, `${ASTER_BASE}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}`
+      + `&interval=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`);
+    const list = asArray(body);
+    const candles = list.map((raw) => {
+      const r = raw as unknown[]; return Array.isArray(r) && r.length >= 6 ? candle(r[0], r[1], r[2], r[3], r[4], r[5]) : null;
+    }).filter((c): c is Candle => c !== null);
+    return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
+  }
+  if (venue === "weex") {
+    const url = `${WEEX_BASE}/capi/v3/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${token}&limit=${limit}`;
+    return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
+  }
+  throw new Error(`${venue} has no proved native ${interval}m candle reader`);
+}
+
 export const ADAPTERS: Record<VenueId, VenueAdapter> = { bybit, bitunix, bitget, binance, aster, weex };

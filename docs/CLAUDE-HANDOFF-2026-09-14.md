@@ -1,5 +1,54 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.37: timeframe-specific Optimized history
+
+The Hub now has a separate signed v2 path on the existing candle-seed route
+when `interval` is greater than one. Omitted interval and explicit `1` still
+execute `buildSeed` and serialize the pinned v1 payload unchanged. The exact v2
+wire contract, closure math, canonical signature keys, provenance tuples,
+native support and cold limitations are in `docs/TIMEFRAME-SEED-V2.md`.
+
+Higher timeframe slots persist under `data/candle-timeframes-v2`, separate from
+the v1 fixed-minute store. Each slot includes native/aggregate provenance and
+the base interval. Native REST frontiers and census-generation identities are
+atomic sidecars. A delisted spelling that returns gets a new generation and
+loses its old higher-timeframe cache before reuse. Higher retention is the
+configured minute retention plus one full UTC day of bucket padding; v1 files
+and pruning are untouched.
+
+Bybit, Bitunix, Bitget, Binance, Aster and WEEX have explicit native interval
+maps. Unsupported widths fold from the largest compatible native divisor, then
+from complete REST-confirmed 1m rows. No coarse bar is expanded and no partial
+bucket is stored. Native target rows outrank aggregates and later native reads
+can correct them. REST writes invalidate only overlapping aggregate buckets;
+websocket rows wait for the existing REST reconcile frontier.
+
+The native demand queue is coalesced and bounded. It joins each existing venue
+collector after live tails, reconciliation and interior-gap repair. Demanded
+timeframe pages and background 1m depth interleave by request weight, alternating
+which history lane goes first, and share the existing budget, pacing, request-weight alarm,
+Retry-After and cooldown. WEEX uses its documented weight-1, 1,000-row current
+kline page for 1h/4h/12h/1d inside the existing 25-weight/minute half-share.
+The deterministic 48-second pass serves 21 native pages with no competing work
+(34-minute optimistic 700-pair floor) or 11 native plus two weight-5 legacy
+pages with continuous 1m backfill (64-minute optimistic floor). Urgent work,
+retries and client verification increase those cold times; only warm-cache
+startup speed is claimed. Primary URLs and the sanitized WEEX exchangeInfo
+proof are recorded in `docs/TIMEFRAME-SEED-V2.md`.
+
+`tests/timeframe-history.test.mjs` covers v1 byte compatibility, canonical v2
+signatures and ETags, all six native readers, closed/forming alignment, gaps,
+native and aggregate provenance, persisted frontiers, relisting invalidation,
+pre-relist minute fencing, Bitunix carried opens, malformed restore refusal,
+incremental correction, bounded demand state, grace retry, shared 429 cooldown,
+and weighted history fairness. A native 700-pair load serves 24 hourly bars per
+pair in roughly 0.1 seconds without scanning available deep 1m rows. A separate
+700 × 720 hourly minute-backed materialization completes in 16–24 seconds
+with one minute-base read per pair. Build and focused suite passed before the
+full Hub gate; the final `npm test` passed all 54 suites using the required
+compiled app percentile module. No VPS or deployment was touched; the only
+public checks were the bounded read-only WEEX facts documented above.
+
 ## v0.4.36 follow-up: REST accounting must match storage admission
 
 The deployed v0.4.35 fairness fix advanced the previously starved Bitget/WEEX

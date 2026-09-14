@@ -14,6 +14,9 @@ import { STREAM_ADAPTERS } from "./stream.js";
 import { VenueStreamRunner, type SocketFactory } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
 import {
+  TimeframeHistory, isTimeframeInterval, type TimeframeInterval, type TimeframeOutcome,
+} from "./timeframe.js";
+import {
   buildSnapshot, isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs,
   snapshotExpiresAtMs, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
   type SnapshotSigned,
@@ -147,6 +150,7 @@ const SNAPSHOT_RETRY_TTL_MS = 5 * MINUTE_MS;
 
 export class CandleService {
   readonly store: CandleStore;
+  readonly timeframeHistory: TimeframeHistory;
   private readonly collectors = new Map<VenueId, VenueCollector>();
   private readonly fetchLike: FetchLike;
   private timer: NodeJS.Timeout | null = null;
@@ -172,6 +176,9 @@ export class CandleService {
 
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
     this.store = new CandleStore(path.join(cfg.dataDir, "candles"));
+    this.timeframeHistory = new TimeframeHistory(
+      path.join(cfg.dataDir, "candle-timeframes-v2"), this.store, cfg.options.retentionDays,
+    );
     this.fetchLike = deps.fetchLike ?? realFetch;
     for (const v of cfg.venues) {
       // v0.2.1 — the collector's START TIME comes from the injected clock, not
@@ -194,6 +201,7 @@ export class CandleService {
       this.collectors.set(v, new VenueCollector(
         v, this.store, path.join(cfg.dataDir, "candles"), venueOpts, deps.now?.() ?? Date.now(),
         (m) => (this.deps.log ?? console.log)(`[candles] ${m}`),
+        this.timeframeHistory,
       ));
     }
   }
@@ -315,7 +323,11 @@ export class CandleService {
       // never got a turn at all.
       await Promise.all([...this.collectors.values()].map(async (c) => {
         try {
-          await c.tick(this.fetchLike, c.budgetFor(this.cfg.tickMs), now, { clock, sleep, deadlineMs });
+          const plan = c.workBudgetFor(this.cfg.tickMs);
+          await c.tick(this.fetchLike, c.budgetFor(this.cfg.tickMs), now, {
+            clock, sleep, deadlineMs, maxRequests: plan.maxRequests,
+            maxWeight: plan.maxWeight, weightPerSecond: plan.weightPerSecond,
+          });
         } catch {
           // A collector's own tick already records its errors in health(); an
           // unexpected throw must never stop the other venues from running.
@@ -327,6 +339,7 @@ export class CandleService {
       if (now - this.lastPruneAt >= DAY_MS) {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);
+        this.timeframeHistory.prune(now);
       }
     } finally { /* the public wrapper releases the shared in-flight promise */ }
   }
@@ -468,6 +481,24 @@ export class CandleService {
         return c.restConfirmedMs(symbol) ?? -Infinity;
       },
     });
+  }
+
+  /** Signed timeframe-specific history. Registering missing native work is
+   * non-blocking; the existing collector scheduler spends its next fair turn. */
+  timeframeSeed(req: SeedRequest & { interval: number }): TimeframeOutcome {
+    if (!isTimeframeInterval(req.interval)) {
+      return { ok: false, code: 400, error: "unsupported timeframe interval" };
+    }
+    const collector = this.collectors.get(req.venue);
+    if (collector && !collector.isTracked(req.symbol) && this.store.coverage(req.venue, req.symbol).lastClosedMs === null) {
+      return { ok: false, code: 404, error: `symbol ${req.symbol} is not listed on ${req.venue}` };
+    }
+    const minuteRestFrontier = collector ? collector.restConfirmedMs(req.symbol) : Infinity;
+    return this.timeframeHistory.request(
+      req.venue, req.symbol, req.interval as TimeframeInterval, req.fromMs, req.toMs,
+      (this.deps.now ?? Date.now)(), minuteRestFrontier,
+      this.cfg.keyId, this.deps.sign,
+    );
   }
 
   /** Per-exchange status for the admin panel. Every venue in VENUE_IDS gets a
