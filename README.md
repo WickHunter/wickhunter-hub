@@ -13,6 +13,19 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.33 — bounded candle-stream snapshot writes
+
+Bitget opens each candle subscription with 500 historical rows. The stream
+runner now batches each frame's settled closed candles by symbol before writing
+the day files. A 500-row snapshot makes one store call instead of 499, avoiding
+hundreds of thousands of synchronous writes when the full roster starts.
+Incremental closes write as soon as the local clock-skew grace allows. Every
+native venue now shares the bounded settlement buffer that WEEX already used:
+a complete close arriving during the grace period waits for a one-second timer,
+instead of being dropped. Forming observations remain excluded, and REST
+remains the only source of confirmed seed provenance.
+The admin footer reads the served v0.4.33 identity from `/api/health`.
+
 ## v0.4.32 — candle provenance and WebSocket visibility
 
 The admin candle panel now shows each running venue stream's socket coverage,
@@ -1569,6 +1582,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.33 — Batch a native candle frame's closed rows by symbol, fixing the 499 synchronous store calls caused by each Bitget startup snapshot. Extend WEEX's bounded deferred-settlement buffer and timer to every native candle stream, so live closes wait for the clock-skew grace instead of disappearing. Keep the forming tail, REST-confirmed provenance, collector configuration and request budgets. Stream counters count settled rows after a successful store call, not write calls or deferred rows.
 
 - v0.4.32 — Expose each venue's live WebSocket counters in authenticated candle diagnostics and the admin panel; persist REST-confirmed candle frontiers so restart cannot trust WebSocket-only disk rows. Keep collector defaults and reconcile missing provenance within the existing budget. Allow `LIQHUNTER_BOT_MODULE` to point the parity test at a local app checkout.
 
