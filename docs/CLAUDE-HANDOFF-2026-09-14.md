@@ -1,5 +1,30 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.34 follow-up: do not repeat unaffected coverage scans
+
+The v0.4.33 deployment kept health responsive with all six candle streams
+enabled, but candle diagnostics encountered a second slow exact-coverage scan.
+Source inspection found that the first completed collector tick runs retention,
+and `VenueCollector.prune()` discarded every coverage-cache entry even when no
+file was removed. This is independent of the stream batching/settlement fix.
+
+Retention now invalidates only symbols for which `CandleStore.prune()` reports
+an actual file deletion. The regression first failed because a no-op pass
+rescanned both warm symbols. It also proves that deleting one symbol's expired
+day file rescans that symbol alone and recomputes its bounds, count and interior
+gap, while an unaffected symbol keeps its exact cached coverage. Retention days,
+REST frontiers, stream behavior and request rates are unchanged. Package,
+lockfile and runtime identity move to v0.4.34; the admin footer reads that served
+identity. Build, all 53 suites, and the focused 78-check candle suite passed on
+this Mac with Bash 5 and the real app percentile module.
+
+Before this follow-up, deployed v0.4.33 (`df9058d`) was verified at 19:51:11 UTC:
+all 29 candle sockets were open, and all six venues had advancing stored-close
+counters, including Binance at 1,388 after its delayed startup. Health remained
+responsive during the cold scans. No current venue errors or rate-limit hits
+were reported. This v0.4.34 cache fix still needs its own deployment identity
+check; it changes neither those stream settings nor their settlement logic.
+
 ## v0.4.33 follow-up: Bitget snapshot startup starvation
 
 On 2026-09-14, enabling all six supported native candle streams on the VPS

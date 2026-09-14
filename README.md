@@ -13,6 +13,14 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.34 — retain coverage when pruning changes nothing
+
+Retention now invalidates a symbol's exact coverage only when it removes a day
+file. The first completed collector tick previously discarded the freshly warmed
+coverage for every symbol, even when retention removed nothing, causing another
+cold scan before candle diagnostics and collection could continue. Symbols that
+lose files still receive an exact scan with correct bounds, counts and gaps.
+
 ## v0.4.33 — bounded candle-stream snapshot writes
 
 Bitget opens each candle subscription with 500 historical rows. The stream
@@ -1582,6 +1590,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.34 — Retain warm exact coverage for symbols whose retention pass removes no files; invalidate and rescan only symbols that actually lose day files. Preserve retention policy, gap reporting, stream behavior and REST provenance.
 
 - v0.4.33 — Batch a native candle frame's closed rows by symbol, fixing the 499 synchronous store calls caused by each Bitget startup snapshot. Extend WEEX's bounded deferred-settlement buffer and timer to every native candle stream, so live closes wait for the clock-skew grace instead of disappearing. Keep the forming tail, REST-confirmed provenance, collector configuration and request budgets. Stream counters count settled rows after a successful store call, not write calls or deferred rows.
 
