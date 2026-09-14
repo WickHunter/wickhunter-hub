@@ -13,6 +13,23 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.38 — demanded WEEX timeframe work cannot starve
+
+WEEX reconciliation ranges that fit inside the documented newest 1,000-row
+page now use that weight-1 route. The Hub accepts such a comparison only when
+the response contains every exact requested open after the settlement cutoff;
+a short page advances neither stored values nor the REST-confirmed frontier.
+
+Exact tail work and recent gap repair retain freshness priority. Demanded
+higher-timeframe pages alternate with routine recent reconciliation, while five
+weight-1 turns share capacity with one weight-5 turn from old repair, old
+reconciliation, or deep 1m backfill. This preserves the existing shared
+25-weight/minute envelope, cooldown and deep-history progress while preventing
+a continuously due 239-symbol reconcile sweep or old interior holes from
+blocking requested native history forever. A four-pass virtual production
+fixture with 239 continuously due reconciles, persistent old holes and 225
+native demands advanced all three classes on every pass at 21–25 weight.
+
 ## v0.4.37 — persistent timeframe history for fast Optimized startup
 
 `GET /api/candles/seed` now accepts an optional numeric-minute `interval`.
@@ -1656,6 +1673,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.38 — Move proved-recent WEEX reconciliation to the documented weight-1 current page with exact-range settlement checks. Reserve bounded native-demand progress against continuously due routine reconciliation and old repairs inside the unchanged 25-weight/minute envelope; tail and recent repair remain first.
 - v0.4.37 — Add the optional signed timeframe-seed v2 contract while preserving omitted/explicit `interval=1` as byte-for-byte v1. Persist source-aware higher-timeframe caches, use proved native REST intervals across all six venues, aggregate only complete REST-proven compatible bars, and report exact closed windows/depth/gaps. Share the existing venue weight budget fairly with background 1m depth, retain live/reconcile/repair priority, invalidate reused instrument identities, and keep an extra UTC day of higher-timeframe boundary padding. A warm 700-pair × 24-hour fixture serves in about 0.1 seconds locally; cold WEEX recovery uses documented cheap current pages inside the same conservative weight envelope.
 - v0.4.36 — Apply the store's captured settlement cutoff before REST contiguity, correction, coverage and frontier accounting. A long tick cannot confirm a grace-period row its write rejected, or count a correction it never stored. Preserve rates, fairness, stored data and strict seed-gap checks.
 

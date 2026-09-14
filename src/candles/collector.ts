@@ -206,13 +206,16 @@ interface CandleWorkItem {
   endMs: number;
   /** "reconcile" — v0.4.31: a span the store already holds (usually written by
    *  a websocket) that this collector's OWN REST fetch has not yet looked at.
-   *  Always a plain historical fetch (never `recent`), because the whole point
-   *  is the venue's settled book of record, not its current/forming page. */
+   *  WEEX may use its documented current page only for a range proved inside
+   *  that page, and accepts it only when the exact settled range is complete. */
   kind: "tail" | "backfill" | "repair" | "reconcile";
   /** Use the venue's newest-page endpoint. Existing tails still require the
    *  exact first missing minute before any returned row may be written. */
   recent?: boolean;
   requireStart?: boolean;
+  /** Current-page reconciliation is useful only when every requested settled
+   * minute is present; a prefix must not masquerade as the full comparison. */
+  requireComplete?: boolean;
 }
 
 type ScheduledWork = CandleWorkItem | (TimeframeWork & { kind: "timeframe" });
@@ -264,6 +267,9 @@ export class VenueCollector {
    * five safe pages per minute, preserving insertion order would backfill the
    * first five symbols to retention before any later listing received a page. */
   private weexBackfillCursor = 0;
+  /** Old interior repairs are routine history work. Rotate them by attempts so
+   * one persistent empty/malformed hole cannot monopolise that lane. */
+  private weexRepairCursor = 0;
   /** Last reconciliation actually attempted, anchored in the stable tracked
    *  roster. Rotating the changing due list by a tick counter skips untouched
    *  peers when earlier symbols become due again. Failed attempts yield their
@@ -271,6 +277,8 @@ export class VenueCollector {
   private reconcileAfterSymbol: string | null = null;
   /** Alternates the two equal-priority history lanes when both have work. */
   private higherHistoryFirst = false;
+  /** Alternates demanded native work with routine WEEX REST reconciliation. */
+  private higherReconcileFirst = false;
 
   // ── RATE STATE ────────────────────────────────────────────────────────────
   /** Current adaptive rate. Starts at the configured ceiling and only ever
@@ -669,7 +677,17 @@ export class VenueCollector {
           const floor = cov.lastClosedMs - (RECONCILE_MAX_SPAN_MINUTES - 1) * MINUTE_MS;
           const startMs = Math.max(wanted, floor, cov.firstClosedMs ?? wanted);
           const endMs = cov.lastClosedMs;
-          if (endMs >= startMs) reconcile.push({ symbol: rec.symbol, startMs, endMs, kind: "reconcile" });
+          if (endMs >= startMs) {
+            // WEEX's documented current page holds 1,000 newest rows at weight
+            // 1. Reconciliation spans at most sixty recent minutes, so use that
+            // route only while the exact requested range is provably inside it.
+            // Other venues and any future out-of-range WEEX work retain the
+            // historical route and its existing accounting.
+            const recentOldest = newestClosed - Math.max(0, (adapter.recentPageLimit ?? 0) - 3) * MINUTE_MS;
+            const recent = this.venue === "weex" && !!adapter.fetchRecentKlines && startMs >= recentOldest;
+            reconcile.push({ symbol: rec.symbol, startMs, endMs, kind: "reconcile",
+              recent, requireStart: recent, requireComplete: recent });
+          }
         }
       }
       if (cov.interiorMissing > 0) {
@@ -732,8 +750,9 @@ export class VenueCollector {
   }
 
   /** Add demanded native timeframe pages without bypassing this collector's
-   * pacing, cooldown or priority. Tail/reconcile/repair retain first claim;
-   * ordinary minute depth and timeframe depth alternate fairly after them. */
+   * pacing, cooldown or priority. Exact tail and recent gap repair retain first
+   * claim. Routine reconciliation, old repairs, minute depth and demanded
+   * timeframe depth share the remaining WEEX weight envelope fairly. */
   private scheduledWork(now: number): ScheduledWork[] {
     const minute = this.workQueue(now);
     if (!this.timeframes) return minute;
@@ -743,23 +762,52 @@ export class VenueCollector {
       .map((item) => ({ ...item, kind: "timeframe" as const }));
     const history: ScheduledWork[] = [];
     if (this.venue === "weex") {
+      const newestClosed = settledOpenMs(now);
+      const recentRepairFloor = newestClosed - Math.max(1, this.opts.tailFillMinutes) * MINUTE_MS;
+      const critical = minute.filter((item) => item.kind === "tail"
+        || (item.kind === "repair" && item.endMs >= recentRepairFloor));
+      const oldRepair = minute.filter((item) => item.kind === "repair" && item.endMs < recentRepairFloor);
+      if (oldRepair.length > 0) {
+        const k = this.weexRepairCursor % oldRepair.length;
+        oldRepair.push(...oldRepair.splice(0, k));
+      }
+      // Only a proved current-page reconcile is cheap. A restart candidate
+      // whose held tail is itself old still uses the weight-5 history route.
+      const routine = minute.filter((item) => item.kind === "reconcile" && item.recent);
+      const legacyReconcile = minute.filter((item) => item.kind === "reconcile" && !item.recent);
+      const legacy: ScheduledWork[] = [];
+      for (let i = 0; i < Math.max(oldRepair.length, legacyReconcile.length, backfill.length); i++) {
+        if (oldRepair[i]) legacy.push(oldRepair[i]!);
+        if (legacyReconcile[i]) legacy.push(legacyReconcile[i]!);
+        if (backfill[i]) legacy.push(backfill[i]!);
+      }
+      const cheap: ScheduledWork[] = [];
+      const firstCheap = this.higherReconcileFirst ? higher : routine;
+      const secondCheap = this.higherReconcileFirst ? routine : higher;
+      for (let i = 0; i < Math.max(firstCheap.length, secondCheap.length); i++) {
+        if (firstCheap[i]) cheap.push(firstCheap[i]!);
+        if (secondCheap[i]) cheap.push(secondCheap[i]!);
+      }
       // Fairness is measured in the venue's documented request-weight units:
-      // five weight-1 native-current pages earn one weight-5 legacy 1m page.
-      // That gives both history lanes about half the bounded allowance while
-      // avoiding the 1:1 request alternation that spent five sixths on 1m.
-      let hi = 0, bi = 0;
-      const higherBlock = (): void => {
-        for (let n = 0; n < WEEX_HISTORY_KLINE_WEIGHT && hi < higher.length; n++) history.push(higher[hi++]!);
+      // demanded native pages alternate with routine weight-1 reconciliation;
+      // five of those cheap turns earn one weight-5 legacy 1m backfill page.
+      // Tail and recent gap repair remain critical and precede this bounded share.
+      let ci = 0, li = 0;
+      const cheapBlock = (): void => {
+        for (let n = 0; n < WEEX_HISTORY_KLINE_WEIGHT && ci < cheap.length; n++) history.push(cheap[ci++]!);
       };
-      while (hi < higher.length || bi < backfill.length) {
+      while (ci < cheap.length || li < legacy.length) {
         if (this.higherHistoryFirst) {
-          higherBlock();
-          if (bi < backfill.length) history.push(backfill[bi++]!);
+          cheapBlock();
+          if (li < legacy.length) history.push(legacy[li++]!);
         } else {
-          if (bi < backfill.length) history.push(backfill[bi++]!);
-          higherBlock();
+          if (li < legacy.length) history.push(legacy[li++]!);
+          cheapBlock();
         }
       }
+      if (higher.length && routine.length) this.higherReconcileFirst = !this.higherReconcileFirst;
+      if (cheap.length && legacy.length) this.higherHistoryFirst = !this.higherHistoryFirst;
+      return [...critical, ...history];
     } else {
       const first = this.higherHistoryFirst ? higher : backfill;
       const second = this.higherHistoryFirst ? backfill : higher;
@@ -909,6 +957,7 @@ export class VenueCollector {
     let spentWeight = 0;
     let written = 0;
     let weexBackfillAttempts = 0;
+    let weexOldRepairAttempts = 0;
     // v0.4.31 — how many already-stored candles a reconcile fetch changed the
     // VALUES of this pass. Logged once at the end rather than per item: one
     // line an operator can watch for is more useful than a burst of them.
@@ -940,6 +989,10 @@ export class VenueCollector {
       // ordinary error or rate-limit response. If tail/repair uses the budget
       // first, or a deadline stops the pass, later WEEX symbols retain turn.
       if (this.venue === "weex" && item.kind === "backfill") weexBackfillAttempts++;
+      if (this.venue === "weex" && item.kind === "repair"
+        && item.endMs < newestClosed - Math.max(1, this.opts.tailFillMinutes) * MINUTE_MS) {
+        weexOldRepairAttempts++;
+      }
       try {
         const adapter = ADAPTERS[this.venue];
         if (item.kind === "timeframe") {
@@ -971,7 +1024,7 @@ export class VenueCollector {
           const unique = [...new Map(closed.map((row) => [row.openMs, row])).values()]
             .sort((a, b) => a.openMs - b.openMs);
           if (item.requireStart) {
-            // Existing coverage may advance only from its exact next minute.
+            // Existing coverage or reconciliation may advance only from its exact next minute.
             // Keep the contiguous prefix and discard everything after the first
             // gap; a missing first row forces bounded history on the next pass.
             const contiguous: Candle[] = [];
@@ -983,7 +1036,11 @@ export class VenueCollector {
               expected += MINUTE_MS;
             }
             closed = contiguous;
-            if (closed.length === 0) this.forceHistoricalTail.add(item.symbol);
+            if (item.requireComplete) {
+              const expectedRows = (item.endMs - item.startMs) / MINUTE_MS + 1;
+              if (closed.length !== expectedRows) closed = [];
+            }
+            if (closed.length === 0 && item.kind === "tail") this.forceHistoricalTail.add(item.symbol);
           } else {
             // A cold current page is allowed to be a suffix (the forming bar
             // and settlement grace normally remove its newest rows), but never
@@ -1029,7 +1086,7 @@ export class VenueCollector {
         this.timeframes?.noteMinuteRows(this.venue, item.symbol, closed, this.restConfirmedMs(item.symbol));
         if (item.kind === "tail" && !item.recent && closed.some((row) => row.openMs === item.startMs)) {
           this.forceHistoricalTail.delete(item.symbol);
-        } else if (item.recent && closed.length > 0) {
+        } else if (item.kind === "tail" && item.recent && closed.length > 0) {
           this.forceHistoricalTail.delete(item.symbol);
         }
         // A write may have closed the hole we were chasing; make the next pass
@@ -1085,6 +1142,7 @@ export class VenueCollector {
       }
     }
     this.weexBackfillCursor += weexBackfillAttempts;
+    this.weexRepairCursor += weexOldRepairAttempts;
     if (correctedThisPass > 0) {
       this.log(`${this.venue}: ${correctedThisPass} WS-folded rows corrected from REST this pass`);
     }

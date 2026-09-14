@@ -191,8 +191,12 @@ missing base history and venue outages return 503 or a signed partial response
 with exact gaps; they do not claim the warm-cache startup target. At the
 unchanged conservative WEEX 25-weight/minute share, the deterministic 48-second
 scheduler pass serves 21 cheap current pages when no other work competes: an
-optimistic 34-minute floor for 700 cold hourly pairs. With legacy 1m backfill
-continuously present, cost-weighted fairness produced 11 native pages and two
-weight-5 legacy pages in the same pass, an optimistic 64-minute floor. Urgent
-tails/reconciliation/repairs, retries, empty listings and client verification
-can only increase those times. They are cold recovery bounds, not startup SLAs.
+optimistic 34-minute floor for 700 cold hourly pairs. Demanded native pages
+alternate with routine recent reconciliation; five cheap turns share capacity
+with one weight-5 old repair, old reconciliation, or legacy 1m backfill turn.
+A production-sized virtual run kept 239 reconciles and old holes continuously
+due beside 225 native demands and advanced every class on every pass, with five
+or six native pages at 21–25 total weight. Exact tails and recent repairs may
+reduce that throughput because freshness remains first. Retries, empty listings
+and client verification can increase cold time further; these are recovery
+measurements, not startup SLAs.
