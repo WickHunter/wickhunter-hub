@@ -414,4 +414,131 @@ await test("failed reconciliation yields its turn, cooldown preserves the next t
   assert.equal(f.collector.health(f.state.now).rateLimitHits, 1);
 });
 
+// Real day files and real adapters reproduce the 2026-09-14 Bitunix/Aster
+// startup: a tick captured at 20:57 kept its 20:55 settled cutoff while the
+// yielding coverage scan observed newer WS rows. REST returned 20:56, which
+// the store rejected but the collector nevertheless declared confirmed.
+function settlementFixture(venue, { graceOnDisk = false, advanceDuringScan = true } = {}) {
+  const store = new CandleStore(tmpDir("settlement-store"));
+  const stateDir = tmpDir("settlement-state");
+  const state = { now: NOW, calls: [], rows: [], advanceDuringRequest: 0 };
+  const candle = (openMs, volume = 1) => ({ openMs, open: 10, high: 12, low: 9, close: 11, volume });
+  const collector = new VenueCollector(venue, store, stateDir, {
+    ...DEFAULT_COLLECTOR_OPTIONS, reconcileWsGapMinutes: 4,
+  }, NOW);
+  const putWs = (rows) => {
+    const w = store.write(venue, "BTCUSDT", rows, settledOpenMs(state.now));
+    assert.equal(w.written, rows.length, "fixture WS writes obey their actual wall clock");
+    collector.noteStoredCandles("BTCUSDT", rows, w.written, w.newlyFilled);
+  };
+  if (advanceDuringScan) {
+    putWs([candle(NOW - 2 * MINUTE_MS)]);
+    const coverage = store.coverage.bind(store);
+    let scanned = false;
+    store.coverage = (...args) => {
+      if (!scanned) {
+        scanned = true;
+        state.now += 3 * MINUTE_MS;
+        putWs([
+          ...(graceOnDisk ? [candle(NOW - MINUTE_MS, 0.5)] : []),
+          candle(NOW + MINUTE_MS),
+        ]);
+      }
+      return coverage(...args);
+    };
+  }
+  const fetchLike = async (url) => {
+    const u = new URL(url);
+    if (u.pathname.endsWith("/trading_pairs")) return response({ code: 0, data: [{ symbol: "BTCUSDT", symbolStatus: "OPEN" }] });
+    if (u.pathname.endsWith("/exchangeInfo")) return response({ symbols: [{ symbol: "BTCUSDT", quoteAsset: "USDT", contractType: "PERPETUAL", status: "TRADING" }] });
+    assert.match(u.pathname, /\/(kline|klines)$/);
+    state.calls.push(u);
+    state.now += state.advanceDuringRequest;
+    const start = Number(u.searchParams.get("startTime"));
+    const end = Number(u.searchParams.get("endTime"));
+    const rows = state.rows.filter(c => c.openMs >= start && c.openMs <= end);
+    return response(venue === "bitunix"
+      ? { code: 0, data: rows.map(c => ({ time: c.openMs, open: c.open, high: c.high, low: c.low, close: c.close, quoteVol: c.volume })) }
+      : rows.map(c => [c.openMs, c.open, c.high, c.low, c.close, c.volume]));
+  };
+  return {
+    store, stateDir, collector, state, candle, fetchLike, putWs,
+    tick: (now = NOW) => collector.tick(fetchLike, 1, now, {
+      clock: () => state.now, sleep: async ms => { state.now += ms; },
+    }),
+    seed: () => buildSeed({ venue, symbol: "BTCUSDT", fromMs: NOW - 2 * MINUTE_MS, toMs: NOW + MINUTE_MS }, seedDepsFor({ store, collector })),
+  };
+}
+
+for (const venue of ["bitunix", "aster"]) {
+  for (const graceOnDisk of [false, true]) {
+    await test(`${venue}: a long tick cannot confirm or count corrections for a rejected grace row (WS present=${graceOnDisk})`, async () => {
+      const f = settlementFixture(venue, { graceOnDisk });
+      await f.collector.refreshSymbols(f.fetchLike, NOW);
+      f.state.rows = [-2, -1, 0, 1].map(i => f.candle(NOW + i * MINUTE_MS));
+      f.state.advanceDuringRequest = 3 * MINUTE_MS;
+      const result = await f.tick();
+      assert.equal(result.requests, 1);
+      assert.ok(Number(f.state.calls[0].searchParams.get("endTime")) > settledOpenMs(NOW),
+        "the yielded scan really queued reconciliation beyond the captured tick cutoff");
+      assert.ok(f.state.now >= NOW + 6 * MINUTE_MS, "both scan and pending request crossed minute boundaries");
+      assert.equal(result.written, 1, "only the captured tick's settled row is admitted");
+      assert.equal(result.corrected, 0, "a rejected REST value never counts as a correction of an existing WS row");
+      const grace = f.store.readWindow(venue, "BTCUSDT", NOW - MINUTE_MS, NOW - MINUTE_MS);
+      assert.deepEqual(grace.rows, graceOnDisk ? [[NOW - MINUTE_MS, 10, 12, 9, 11, 0.5]] : [],
+        "REST cannot overwrite the grace slot before its captured cutoff allows it");
+      assert.equal(f.collector.restConfirmedMs("BTCUSDT"), settledOpenMs(NOW),
+        "only a row the store admitted may raise the REST frontier");
+      const persisted = JSON.parse(fs.readFileSync(path.join(f.stateDir, venue, "rest-frontier.json"), "utf8"));
+      assert.equal(persisted.restConfirmed.BTCUSDT, settledOpenMs(NOW));
+      assert.deepEqual(f.collector.coverage("BTCUSDT"), f.store.coverage(venue, "BTCUSDT", true));
+      const first = f.seed();
+      assert.equal(first.ok, true);
+      assert.equal(first.payload.lastClosedMs, settledOpenMs(NOW));
+      assert.deepEqual(first.payload.gaps, [], "the seed cannot declare a missing grace slot as its frontier");
+      assert.equal(first.payload.rows.length, 1, "WS-only grace data stays outside the confirmed seed");
+
+      // Once a later tick's own clock permits those rows, normal reconciliation
+      // writes them and advances evidence; no metadata or gap is rewritten.
+      f.state.advanceDuringRequest = 0;
+      f.putWs([f.candle(NOW + 4 * MINUTE_MS)]);
+      f.state.rows = [-2, -1, 0, 1, 2, 3, 4].map(i => f.candle(NOW + i * MINUTE_MS));
+      const later = await f.tick(f.state.now);
+      assert.equal(later.corrected, graceOnDisk ? 1 : 0, "a correction counts only once its REST value is written");
+      assert.deepEqual(f.store.readWindow(venue, "BTCUSDT", NOW - MINUTE_MS, NOW - MINUTE_MS).rows,
+        [[NOW - MINUTE_MS, 10, 12, 9, 11, 1]]);
+      assert.equal(f.collector.restConfirmedMs("BTCUSDT"), NOW + 4 * MINUTE_MS);
+      assert.deepEqual(f.seed().payload.gaps, []);
+    });
+  }
+
+  await test(`${venue}: short, grace-only and empty REST pages never credit their requested end`, async () => {
+    for (const mode of ["short", "grace-only", "empty"]) {
+      const f = settlementFixture(venue);
+      await f.collector.refreshSymbols(f.fetchLike, NOW);
+      f.state.rows = mode === "empty" ? [] : [f.candle(NOW - (mode === "short" ? 2 : 1) * MINUTE_MS)];
+      const result = await f.tick();
+      const admitted = mode === "short";
+      assert.equal(result.written, admitted ? 1 : 0, mode);
+      assert.equal(result.corrected, 0, mode);
+      assert.equal(f.collector.restConfirmedMs("BTCUSDT"), admitted ? settledOpenMs(NOW) : null, mode);
+      assert.deepEqual(f.collector.coverage("BTCUSDT"), f.store.coverage(venue, "BTCUSDT", true), mode);
+      assert.equal(f.seed().ok, admitted, "no accepted REST rows means no seed evidence");
+    }
+  });
+}
+
+await test("a cold recent page selects its contiguous suffix after applying the store settlement cutoff", async () => {
+  const f = fixture();
+  await f.collector.refreshSymbols(f.fetchLike, NOW);
+  f.setRecent([
+    weexRow(NOW - 3 * MINUTE_MS, 10, 12, 9, 11, 1),
+    weexRow(NOW - MINUTE_MS, 10, 12, 9, 11, 1),
+  ]);
+  const result = await f.collector.tick(f.fetchLike, 1, NOW, { sleep: async () => {} });
+  assert.equal(result.written, 1, "an isolated grace row cannot displace the valid settled suffix");
+  assert.equal(f.collector.restConfirmedMs("NBISUSDT"), NOW - 3 * MINUTE_MS);
+  assert.deepEqual(f.collector.coverage("NBISUSDT"), f.store.coverage("weex", "NBISUSDT", true));
+});
+
 summary("candle-reconcile");

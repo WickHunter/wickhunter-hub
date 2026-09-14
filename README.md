@@ -13,6 +13,16 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.36 — keep REST evidence within the storage cutoff
+
+REST rows now pass the same captured settlement cutoff before contiguity,
+correction counting, coverage and seed-frontier accounting. A long startup scan
+or request could previously return the newest closed minute while storage still
+rejected it for clock-skew grace, producing a signed frontier with a missing
+last candle. Only admitted settled rows now receive credit. Later collection
+repairs existing gaps normally; request limits, signing and app gap checks stay
+unchanged.
+
 ## v0.4.35 — fair REST confirmation of streamed candles
 
 Reconciliation now resumes after the last symbol actually attempted in the
@@ -1602,6 +1612,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.36 — Apply the store's captured settlement cutoff before REST contiguity, correction, coverage and frontier accounting. A long tick cannot confirm a grace-period row its write rejected, or count a correction it never stored. Preserve rates, fairness, stored data and strict seed-gap checks.
 
 - v0.4.35 — Anchor reconciliation to the last attempted symbol in the full tracked roster, so changing due sets cannot starve untouched symbols. Preserve turns through zero-budget, deadline, cooldown and tail-only passes; retain all request limits, backoff and REST provenance gates.
 
