@@ -1,5 +1,41 @@
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.35 follow-up: fair reconciliation under a changing due set
+
+At 20:47–20:49 UTC on 2026-09-14, v0.4.34 kept all 29 native candle sockets
+open and its warmed status returned in 29–33 ms. However, the signed BTC seed
+frontiers were 49–69 minutes behind on Bitget/WEEX while their streamed tails
+continued advancing. Both BTC symbols occupy insertion position zero. Bitget
+had 223 of 783 active symbols without a persisted REST frontier; WEEX had 179
+of 239. Rates and backoff remained bounded; increasing them was not the remedy.
+
+`workQueue()` rotated the filtered reconciliation list by a counter incremented
+once per tick. Symbols left that list after confirmation and returned after
+five minutes, changing what each index meant. Untouched peers could be skipped
+while previously served rows consumed another turn. Actual-collector fixtures
+with continuously advancing WS data first reproduced this: the first 783
+Bitget requests reached only 506 distinct symbols, and the first 239 WEEX
+requests reached only 71. The fixture uses real collector/REST adapter and
+frontier persistence paths with an in-memory candle store to avoid irrelevant
+large disk rewrites.
+
+Reconciliation now anchors to the last attempted symbol in the full tracked
+roster, including retained delisted/untradable records. It resumes with the
+next due symbol after that anchor and wraps. Only an attempted reconciliation
+advances it: failures/429/empty responses yield, but zero budgets, deadlines,
+cooldowns and higher-priority tail-only work do not consume an unseen turn.
+Other work ordering, all request limits/backoff, the 60-minute reconcile span,
+gaps, signing and REST frontier advancement rules are unchanged. Package and
+runtime identity move to v0.4.35; the admin footer reads the served identity.
+At WEEX's unchanged five historical requests per minute, a 239-symbol sweep
+still takes about 48 minutes: fairness removes starvation, not the venue's
+capacity bound. No app seed-depth or entry-staleness check is loosened.
+Build, all 53 suites, and the focused 9-check reconciliation suite passed on
+this Mac with Bash 5 and the real app percentile module. Independent review
+also passed that focused suite and found no blocking issues. The new version
+has not been deployed as part of this local change; root owns rollout and its
+subsequent live frontier verification.
+
 ## v0.4.34 follow-up: do not repeat unaffected coverage scans
 
 The v0.4.33 deployment kept health responsive with all six candle streams

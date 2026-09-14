@@ -254,12 +254,11 @@ export class VenueCollector {
    * five safe pages per minute, preserving insertion order would backfill the
    * first five symbols to retention before any later listing received a page. */
   private weexBackfillCursor = 0;
-  /** Fairness cursor for `reconcile` items, the same shape as `cursor` above
-   *  but kept separate: reconcile-due and tail-due are different populations
-   *  (a symbol can be tail-current and still reconcile-due, or vice versa),
-   *  so rotating them together would let one list's size distort the other's
-   *  round-robin. */
-  private reconcileCursor = 0;
+  /** Last reconciliation actually attempted, anchored in the stable tracked
+   *  roster. Rotating the changing due list by a tick counter skips untouched
+   *  peers when earlier symbols become due again. Failed attempts yield their
+   *  turn too; a budget, deadline or cooldown that issues nothing cannot. */
+  private reconcileAfterSymbol: string | null = null;
 
   // ── RATE STATE ────────────────────────────────────────────────────────────
   /** Current adaptive rate. Starts at the configured ceiling and only ever
@@ -687,12 +686,18 @@ export class VenueCollector {
       tail.push(...tail.splice(0, k));
     }
     this.cursor++;
-    // Same fairness for reconcile, own cursor (see its declaration for why).
-    if (reconcile.length > 0) {
-      const k = this.reconcileCursor % reconcile.length;
-      reconcile.push(...reconcile.splice(0, k));
+    // Resume after the last attempted symbol in the FULL tracked roster, not
+    // after an index in a due list whose members disappear and return. Keep
+    // delisted/untradable records as anchors; refreshSymbols retains them.
+    // Other work classes keep their existing order and priority.
+    if (reconcile.length > 0 && this.reconcileAfterSymbol !== null) {
+      const order = new Map([...this.tracked.keys()].map((symbol, i) => [symbol, i]));
+      const after = order.get(this.reconcileAfterSymbol);
+      if (after !== undefined) {
+        const k = reconcile.findIndex((item) => order.get(item.symbol)! > after);
+        if (k > 0) reconcile.push(...reconcile.splice(0, k));
+      }
     }
-    this.reconcileCursor++;
     // Keep the established ordering for every existing venue. WEEX's very low
     // historical lane needs its own fair cursor: a first 100-row page makes a
     // pair materially more useful, while serial 30-day digging leaves later
@@ -843,6 +848,7 @@ export class VenueCollector {
       if (this.venue === "weex" && item.kind === "backfill") weexBackfillAttempts++;
       try {
         const adapter = ADAPTERS[this.venue];
+        if (item.kind === "reconcile") this.reconcileAfterSymbol = item.symbol;
         const page = item.recent && adapter.fetchRecentKlines
           ? await adapter.fetchRecentKlines(fetchLike, item.symbol, item.startMs, item.endMs)
           : await adapter.fetchKlines(fetchLike, item.symbol, item.startMs, item.endMs);
