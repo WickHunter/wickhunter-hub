@@ -84,6 +84,7 @@ import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { isSnapshotDepth, isSnapshotInterval, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH } from "./candles/snapshot.js";
+import { isTimeframeInterval, TIMEFRAME_INTERVALS } from "./candles/timeframe.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
@@ -1462,7 +1463,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   // ── candle seed ───────────────────────────────────────────────────────────
   //
-  // GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=  — wire contract v1.
+  // GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=[&interval=] — v1/v2.
   //
   // AUTH DECISION: this endpoint is KEYED, like every other download surface
   // on this hub. Three reasons. It is a licensed benefit — the whole point is
@@ -1511,6 +1512,35 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const rawTo = url.searchParams.get("toMs");
     if (rawFrom === null || rawTo === null || !/^\d{1,15}$/.test(rawFrom) || !/^\d{1,15}$/.test(rawTo)) {
       return sendJson(res, 400, { ok: false, error: "fromMs and toMs must be epoch-ms integers" });
+    }
+    const rawInterval = url.searchParams.get("interval");
+    // Omitted and explicit 1 are the pinned minute-v1 contract. No new field,
+    // canonical byte or response header is introduced on that path.
+    if (rawInterval !== null && rawInterval !== "1") {
+      const interval = /^\d{1,4}$/.test(rawInterval) ? Number(rawInterval) : NaN;
+      if (!isTimeframeInterval(interval)) {
+        return sendJson(res, 400, { ok: false,
+          error: `interval must be 1 or one of ${TIMEFRAME_INTERVALS.join(",")} minutes` });
+      }
+      const outcome = candles.timeframeSeed({
+        venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo),
+      });
+      if (!outcome.ok) return sendJson(res, outcome.code, { ok: false, error: outcome.error });
+      const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+      const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
+      const inm = String(req.headers["if-none-match"] ?? "");
+      if (inm && inm.split(",").some((t) => t.trim() === etag)) {
+        res.writeHead(304, { etag, "cache-control": "public, max-age=60" });
+        return void res.end();
+      }
+      const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+      const bytes = wantsGzip ? gzipSync(body) : body;
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8", "content-length": bytes.length,
+        ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+        etag, "cache-control": "public, max-age=60",
+      });
+      return void res.end(bytes);
     }
     const outcome = candles.seed({ venue, symbol, fromMs: Number(rawFrom), toMs: Number(rawTo) });
     if (!outcome.ok) return sendJson(res, outcome.code, { ok: false, error: outcome.error });

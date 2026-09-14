@@ -13,6 +13,49 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.37 — persistent timeframe history for fast Optimized startup
+
+`GET /api/candles/seed` now accepts an optional numeric-minute `interval`.
+Omitted `interval` and explicit `interval=1` remain the byte-for-byte signed v1
+minute contract. Higher intervals return a signed v2 envelope with the exact
+closed request window, available/required depth, aligned gaps and per-range
+native or aggregate provenance. See [the pinned v2 contract](docs/TIMEFRAME-SEED-V2.md).
+
+The Hub stores bounded interval caches per venue-native instrument. It first
+uses complete REST-confirmed history already held, folds unsupported widths
+from the largest compatible native interval, and queues only missing native
+history. Bybit, Bitunix, Bitget, Binance, Aster and WEEX use explicit proved
+interval mappings; a missing mapping is an aggregate decision, never a silent
+one-minute substitution. One shared 1m websocket tail remains unchanged.
+
+Native history runs inside the existing venue collector. Live 1m tails,
+reconciliation and gap repair keep priority, while demanded timeframe depth and
+background minute depth share history request-weight fairly under the same pacing,
+request-weight alarms, Retry-After and adaptive cooldown. Duplicate demand is
+bounded and coalesced. Cache rows persist their source/base interval and REST
+frontier; a re-listed symbol generation invalidates its prior interval files.
+Retention keeps the configured 30 days plus one UTC day for bucket-boundary
+padding without changing v1 minute retention.
+
+The deterministic warm-cache fixture serves 700 pairs × 24 hourly rows in
+about 0.1 seconds on the development Mac and makes no venue history calls. A
+second fixture builds and serves 700 × 720 hourly rows from existing 1m history
+in 16–24 seconds, reading each pair's minute base once. These are Hub cache
+benchmarks; the client still performs matching-venue verification.
+
+Native caches warm only after a v2 request names that venue, symbol and
+timeframe. They then persist for the 30-day horizon plus one boundary day, but
+the in-memory demand/interest state expires after six idle hours. The demand
+queue holds 4,096 series (the oldest inactive request is evicted), while the
+8,192 materialization entries cover all 700 pairs at all 11 offered higher
+intervals. After a restart, cached rows/frontiers remain; an app request
+re-registers any missing work. A wholly cold cache is never instant. WEEX's
+25-weight/minute Hub share has an optimistic no-contention floor of 21 native
+pages/minute (34 minutes for 700 pairs). With continuous legacy 1m backfill, the
+deterministic mixed pass produced 11 native and 2 weight-5 legacy pages/minute,
+an optimistic 64-minute floor before urgent work, retries, empty listings and
+the client's independent venue verification.
+
 ## v0.4.36 — keep REST evidence within the storage cutoff
 
 REST rows now pass the same captured settlement cutoff before contiguity,
@@ -1577,7 +1620,7 @@ anywhere private is enough; everything else is reproducible.
 | `GET /admin/api/billing/events?limit=` | `x-hub-admin` header | recent webhook events with outcomes |
 | `GET /api/latest?key=` | valid token | signed `wickhunter.release.v1` manifest; legacy `{version,file,sha256}` remain top-level |
 | `GET /download/<file\|latest>?key=` | valid token | beta tarballs |
-| `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=` | valid token | signed 1m candle seed (contract v1) |
+| `GET /api/candles/seed?venue=&symbol=&fromMs=&toMs=[&interval=]` | valid token | omitted/`1` signed minute seed (pinned v1); higher numeric-minute history (v2) |
 | `GET /api/candles/snapshot?venue=&interval=&depth=` | valid token (`x-license` / `?key=`) | signed last-N-closed-candles for every tracked symbol on one venue (contract v1); ETag + gzip |
 | `GET /api/market-data/market-caps/v1` | valid token (`x-license` / `?key=`) or `x-hub-key` | signed market-cap snapshot (contract v1); ETag + gzip |
 | `GET /admin` | none (page holds no secrets) | static admin page |
@@ -1613,6 +1656,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.37 — Add the optional signed timeframe-seed v2 contract while preserving omitted/explicit `interval=1` as byte-for-byte v1. Persist source-aware higher-timeframe caches, use proved native REST intervals across all six venues, aggregate only complete REST-proven compatible bars, and report exact closed windows/depth/gaps. Share the existing venue weight budget fairly with background 1m depth, retain live/reconcile/repair priority, invalidate reused instrument identities, and keep an extra UTC day of higher-timeframe boundary padding. A warm 700-pair × 24-hour fixture serves in about 0.1 seconds locally; cold WEEX recovery uses documented cheap current pages inside the same conservative weight envelope.
 - v0.4.36 — Apply the store's captured settlement cutoff before REST contiguity, correction, coverage and frontier accounting. A long tick cannot confirm a grace-period row its write rejected, or count a correction it never stored. Preserve rates, fairness, stored data and strict seed-gap checks.
 
 - v0.4.35 — Anchor reconciliation to the last attempted symbol in the full tracked roster, so changing due sets cannot starve untouched symbols. Preserve turns through zero-budget, deadline, cooldown and tail-only passes; retain all request limits, backoff and REST provenance gates.

@@ -31,7 +31,12 @@ import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import {
   CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, settledOpenMs, type Candle, type SymbolCoverage,
 } from "./store.js";
-import { ADAPTERS, dropUnclosed, isRateLimit, type FetchLike, type VenueId } from "./venues.js";
+import {
+  ADAPTERS, dropUnclosed, fetchNativeTimeframeKlines, isRateLimit, nativeTimeframePageLimit,
+  WEEX_HISTORY_KLINE_WEIGHT, WEEX_RECENT_KLINE_WEIGHT,
+  type FetchLike, type VenueId,
+} from "./venues.js";
+import type { TimeframeHistory, TimeframeWork } from "./timeframe.js";
 
 export interface CollectorOptions {
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
@@ -182,6 +187,9 @@ export interface TrackedSymbol {
   lastListedAt: number;
   delisted: boolean;
   delistedAt?: number;
+  /** Changes only when a disappeared spelling is listed again, fencing
+   * timeframe caches from a venue reusing the same symbol for a new book. */
+  generationAt?: number;
 }
 
 interface SymbolsFile {
@@ -206,6 +214,8 @@ interface CandleWorkItem {
   recent?: boolean;
   requireStart?: boolean;
 }
+
+type ScheduledWork = CandleWorkItem | (TimeframeWork & { kind: "timeframe" });
 
 export type VenueState = "starting" | "running" | "cooling" | "stalled" | "failing";
 
@@ -259,6 +269,8 @@ export class VenueCollector {
    *  peers when earlier symbols become due again. Failed attempts yield their
    *  turn too; a budget, deadline or cooldown that issues nothing cannot. */
   private reconcileAfterSymbol: string | null = null;
+  /** Alternates the two equal-priority history lanes when both have work. */
+  private higherHistoryFirst = false;
 
   // ── RATE STATE ────────────────────────────────────────────────────────────
   /** Current adaptive rate. Starts at the configured ceiling and only ever
@@ -311,6 +323,7 @@ export class VenueCollector {
     private readonly opts: CollectorOptions = DEFAULT_COLLECTOR_OPTIONS,
     now = Date.now(),
     private readonly log: (message: string) => void = (m) => console.log(`[candles] ${m}`),
+    private readonly timeframes?: TimeframeHistory,
   ) {
     this.symbolsFile = path.join(stateDir, venue, "symbols.json");
     this.restFrontierFile = path.join(stateDir, venue, "rest-frontier.json");
@@ -329,6 +342,9 @@ export class VenueCollector {
     for (const sym of this.tracked.keys()) {
       if (!this.restFrontier.has(sym)) this.restartCandidates.add(sym);
     }
+    this.timeframes?.noteInstrumentRoster(this.venue, [...this.tracked.values()].map((rec) => ({
+      symbol: rec.symbol, generation: `${this.venue}:usdt-perpetual:${rec.generationAt ?? rec.firstSeenAt}`,
+    })));
   }
 
   /** For `buildSeed`'s clamp: the newest minute safe to serve for `symbol`, or
@@ -481,6 +497,7 @@ export class VenueCollector {
       if (!prev) {
         this.tracked.set(s.symbol, {
           symbol: s.symbol, tradable: s.tradable, firstSeenAt: now, lastListedAt: now, delisted: false,
+          generationAt: now,
         });
         added.push(s.symbol);
       } else {
@@ -488,7 +505,7 @@ export class VenueCollector {
         // so "new in the last 24h" does not fire again for an old pair.
         prev.tradable = s.tradable;
         prev.lastListedAt = now;
-        if (prev.delisted) { prev.delisted = false; delete prev.delistedAt; }
+        if (prev.delisted) { prev.delisted = false; delete prev.delistedAt; prev.generationAt = now; }
       }
     }
     for (const rec of this.tracked.values()) {
@@ -499,6 +516,9 @@ export class VenueCollector {
     }
     this.lastSymbolRefreshAt = now;
     this.persistSymbols();
+    this.timeframes?.noteInstrumentRoster(this.venue, [...this.tracked.values()].map((rec) => ({
+      symbol: rec.symbol, generation: `${this.venue}:usdt-perpetual:${rec.generationAt ?? rec.firstSeenAt}`,
+    })));
     return { added, delisted };
   }
 
@@ -711,12 +731,67 @@ export class VenueCollector {
     return [...tail, ...reconcile, ...repair, ...backfill];
   }
 
+  /** Add demanded native timeframe pages without bypassing this collector's
+   * pacing, cooldown or priority. Tail/reconcile/repair retain first claim;
+   * ordinary minute depth and timeframe depth alternate fairly after them. */
+  private scheduledWork(now: number): ScheduledWork[] {
+    const minute = this.workQueue(now);
+    if (!this.timeframes) return minute;
+    const urgent = minute.filter((item) => item.kind !== "backfill");
+    const backfill = minute.filter((item) => item.kind === "backfill");
+    const higher = this.timeframes.work(this.venue, now, nativeTimeframePageLimit(this.venue))
+      .map((item) => ({ ...item, kind: "timeframe" as const }));
+    const history: ScheduledWork[] = [];
+    if (this.venue === "weex") {
+      // Fairness is measured in the venue's documented request-weight units:
+      // five weight-1 native-current pages earn one weight-5 legacy 1m page.
+      // That gives both history lanes about half the bounded allowance while
+      // avoiding the 1:1 request alternation that spent five sixths on 1m.
+      let hi = 0, bi = 0;
+      const higherBlock = (): void => {
+        for (let n = 0; n < WEEX_HISTORY_KLINE_WEIGHT && hi < higher.length; n++) history.push(higher[hi++]!);
+      };
+      while (hi < higher.length || bi < backfill.length) {
+        if (this.higherHistoryFirst) {
+          higherBlock();
+          if (bi < backfill.length) history.push(backfill[bi++]!);
+        } else {
+          if (bi < backfill.length) history.push(backfill[bi++]!);
+          higherBlock();
+        }
+      }
+    } else {
+      const first = this.higherHistoryFirst ? higher : backfill;
+      const second = this.higherHistoryFirst ? backfill : higher;
+      for (let i = 0; i < Math.max(first.length, second.length); i++) {
+        if (first[i]) history.push(first[i]!);
+        if (second[i]) history.push(second[i]!);
+      }
+    }
+    if (higher.length && backfill.length) this.higherHistoryFirst = !this.higherHistoryFirst;
+    return [...urgent, ...history];
+  }
+
   /** How many requests this collector may issue in a window of `tickMs`, at the
    *  rate it is CURRENTLY entitled to. The service asks rather than computing it
    *  from the configured ceiling, so a collector that has backed off actually
    *  gets a smaller budget instead of the same budget spread thinner. */
   budgetFor(tickMs: number): number {
     return Math.max(1, Math.round((this.effectiveRps * tickMs) / 1000));
+  }
+
+  /** Cost-aware pass limits. WEEX's configured rate is expressed in expensive
+   * weight-5 history pages. Convert it back to the same conservative weight
+   * envelope so documented weight-1 current pages can use idle capacity without
+   * raising the history route or the venue-wide share. */
+  workBudgetFor(tickMs: number): { maxRequests: number; maxWeight: number; weightPerSecond: number } {
+    if (this.venue !== "weex") {
+      const requests = this.budgetFor(tickMs);
+      return { maxRequests: requests, maxWeight: requests, weightPerSecond: this.effectiveRps };
+    }
+    const weightPerSecond = this.effectiveRps * WEEX_HISTORY_KLINE_WEIGHT;
+    const maxWeight = Math.max(WEEX_HISTORY_KLINE_WEIGHT, Math.round(weightPerSecond * tickMs / 1000));
+    return { maxRequests: maxWeight, maxWeight, weightPerSecond };
   }
 
   /** True while the collector is deliberately silent after a refusal. */
@@ -783,7 +858,10 @@ export class VenueCollector {
     fetchLike: FetchLike,
     budget: number,
     now = Date.now(),
-    deps: { clock?: () => number; sleep?: (ms: number) => Promise<void>; deadlineMs?: number } = {},
+    deps: {
+      clock?: () => number; sleep?: (ms: number) => Promise<void>; deadlineMs?: number;
+      maxRequests?: number; maxWeight?: number; weightPerSecond?: number;
+    } = {},
   ): Promise<{ requests: number; written: number; corrected: number }> {
     const clock = deps.clock ?? Date.now;
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -821,13 +899,14 @@ export class VenueCollector {
     // a responsive startup skip the very first candle requests it prepared.
     await this.prepareWorkQueue(now);
     const startedAt = clock();
-    const queue = this.workQueue(now);
+    const queue = this.scheduledWork(now);
     // NOTHING DUE IS NOT NOTHING WORKING. Recorded before the loop so a venue
     // that has CAUGHT UP is distinguishable from one that has fallen behind —
     // they look identical from `lastSuccessAt` alone. See health().
     this.lastTickHadWork = queue.length > 0;
     const newestClosed = settledOpenMs(now);
     let requests = 0;
+    let spentWeight = 0;
     let written = 0;
     let weexBackfillAttempts = 0;
     // v0.4.31 — how many already-stored candles a reconcile fetch changed the
@@ -837,10 +916,25 @@ export class VenueCollector {
     this.lastPollAt = now;
 
     for (const item of queue) {
-      if (requests >= budget) break;
+      const requestWeight = this.venue === "weex"
+        ? (item.kind === "timeframe" || item.recent ? WEEX_RECENT_KLINE_WEIGHT : WEEX_HISTORY_KLINE_WEIGHT)
+        : 1;
+      if (requests >= (deps.maxRequests ?? budget)) break;
+      // A weight-5 history page may not fit near the end of a pass while a
+      // later weight-1 current page does. Skip the expensive item for this pass
+      // rather than throwing the useful cheap capacity away.
+      if (deps.maxWeight !== undefined && spentWeight + requestWeight > deps.maxWeight) continue;
       if (clock() - startedAt >= deadlineMs) break;
-      await this.pace(clock, sleep);
+      if (deps.weightPerSecond !== undefined) {
+        const gapMs = Math.max(1, Math.round(1000 * requestWeight / Math.max(0.01, deps.weightPerSecond)));
+        const t = clock();
+        if (t < this.nextRequestAt) await sleep(this.nextRequestAt - t);
+        this.nextRequestAt = Math.max(clock(), this.nextRequestAt) + gapMs;
+      } else {
+        await this.pace(clock, sleep);
+      }
       requests++;
+      spentWeight += requestWeight;
       this.requestsMade++;
       // Advance fair scheduling by work actually attempted, including an
       // ordinary error or rate-limit response. If tail/repair uses the budget
@@ -848,6 +942,21 @@ export class VenueCollector {
       if (this.venue === "weex" && item.kind === "backfill") weexBackfillAttempts++;
       try {
         const adapter = ADAPTERS[this.venue];
+        if (item.kind === "timeframe") {
+          this.timeframes!.attempted(item, now);
+          const page = await fetchNativeTimeframeKlines(
+            fetchLike, this.venue, item.symbol, item.interval, item.startMs, item.endMs,
+          );
+          written += this.timeframes!.record(item, page, now);
+          this.lastSuccessAt = now;
+          this.consecutiveFailures = 0;
+          if (page.slowDown) {
+            this.noteRateLimited(page.slowDown, clock(), now, `${item.symbol} ${item.interval}m`);
+            break;
+          }
+          this.noteSuccess();
+          continue;
+        }
         if (item.kind === "reconcile") this.reconcileAfterSymbol = item.symbol;
         const page = item.recent && adapter.fetchRecentKlines
           ? await adapter.fetchRecentKlines(fetchLike, item.symbol, item.startMs, item.endMs)
@@ -914,6 +1023,10 @@ export class VenueCollector {
         written += w.written;
         this.candlesWritten += w.newlyFilled;
         this.noteCoverage(item.symbol, closed, w.newlyFilled);
+        // Aggregate caches listen only to admitted REST rows. This call follows
+        // noteCoverage so the minute REST frontier already covers the rows it
+        // may fold, and it touches only buckets overlapping this page.
+        this.timeframes?.noteMinuteRows(this.venue, item.symbol, closed, this.restConfirmedMs(item.symbol));
         if (item.kind === "tail" && !item.recent && closed.some((row) => row.openMs === item.startMs)) {
           this.forceHistoricalTail.delete(item.symbol);
         } else if (item.recent && closed.length > 0) {
