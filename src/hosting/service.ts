@@ -493,7 +493,7 @@ export class HostingService {
   private enqueueProvisionJob(row: HostingInstanceRow, nowMs: number): void {
     this.store.enqueue({
       hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation,
-      jobType: "provision", dedupeKey: `provision:${row.id}:g${row.generation}`, availableAtMs: nowMs, payload: {},
+      jobType: "provision", dedupeKey: `provision:${row.id}:v${row.lifecycleVersion}:g${row.generation}`, availableAtMs: nowMs, payload: {},
     }, nowMs);
   }
 
@@ -512,8 +512,18 @@ export class HostingService {
       const withId = this.store.updateInstance(instance.id, instance.version, (d) => { d.stripeSubscriptionId = sub.subscriptionId; d.checkoutExpiresAtMs = null; }, nowMs);
       if (withId) {
         instance = withId;
-        if (withId.stage === "ordered") this.enqueueProvisionJob(withId, nowMs);
       }
+    }
+
+    // A bundle invoice can be the first usable paid evidence, because Stripe
+    // does not guarantee checkout.session.completed arrives before
+    // invoice.paid. Conversely checkout can enqueue this job and the invoice
+    // can arrive before the worker drains it. Derive the job from the durable
+    // paid+ordered state on every reconciliation; the lifecycle-scoped dedupe
+    // key makes repeats inert while still allowing a replacement if a real
+    // lifecycle transition obsoletes an older job.
+    if (instance.stage === "ordered" && !instance.providerInstanceId && paidEvidenceExists(sub)) {
+      this.enqueueProvisionJob(instance, nowMs);
     }
 
     // A refund/dispute is recorded for the admin page but is deliberately
@@ -548,12 +558,21 @@ export class HostingService {
       // An ordinary renewal (or the first invoice.paid for a fresh
       // instance): move paid-through forward, clear any stale
       // expiry/cancellation deadlines and their queued notices.
+      const clearsEndSchedule = instance.cancellationReason !== "intentional_cancellation"
+        && (instance.cancellationReason !== null || instance.suspendAtMs !== null || instance.deleteAtMs !== null);
       const fresh = this.store.updateInstance(instance.id, instance.version, (d) => {
         d.paidThroughMs = signal.periodEndMs;
         if (d.cancellationReason !== "intentional_cancellation") { d.suspendAtMs = null; d.deleteAtMs = null; d.cancellationReason = null; }
-        d.lifecycleVersion += 1;
+        // A plain paid-through update is data, not a lifecycle transition.
+        // Keeping the version stable preserves an in-flight provision job,
+        // bootstrap readiness recheck, or unsent ready email. Only clearing
+        // a real end schedule invalidates that schedule's queued work.
+        if (clearsEndSchedule) d.lifecycleVersion += 1;
       }, nowMs);
-      if (fresh) this.store.obsoletePendingJobsOlderThan(instance.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+      if (fresh && clearsEndSchedule) {
+        this.store.obsoletePendingJobsOlderThan(instance.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+        if (fresh.stage === "ordered" && !fresh.providerInstanceId) this.enqueueProvisionJob(fresh, nowMs);
+      }
       return;
     }
     if (scheduledCancel && instance.cancellationReason !== "intentional_cancellation" && !TERMINAL_ISH.has(instance.stage)) {
