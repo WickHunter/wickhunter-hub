@@ -71,7 +71,7 @@ async function call(fetchLike: EmailFetch, secretKey: string, method: "GET" | "P
       authorization: `Bearer ${secretKey}`,
       "content-type": "application/x-www-form-urlencoded",
     },
-    body: method === "POST" ? encode(params) : "",
+    ...(method === "POST" ? { body: encode(params) } : {}),
   });
   const text = await res.text();
   let parsed: unknown = null;
