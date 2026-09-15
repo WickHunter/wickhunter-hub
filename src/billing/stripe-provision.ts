@@ -145,6 +145,17 @@ export async function provisionPlans(input: ProvisionInput, fetchLike: EmailFetc
     const priceId = asStr(price.id);
     if (!priceId) throw new StripeApiError(502, `Stripe returned no price id for ${plan.key}`);
 
+    // Hosted bundles must pass through the Hub's cost reservation before
+    // checkout. A shareable Payment Link would bypass that admission gate.
+    if (plan.checkout === "hosted-bundle") {
+      for (const old of links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key)) {
+        await post(`/payment_links/${asStr(old.id)}`, { active: false });
+        notes.push(`deactivated link ${asStr(old.id)}`);
+      }
+      results.push({ key: plan.key, priceId, priceCreated, paymentLinkUrl: "", linkCreated: false, note: notes.length ? notes.join("; ") : null });
+      continue;
+    }
+
     // ── payment link ─────────────────────────────────────────────────────
     const mine = links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key);
     let link = mine.find((l) => asStr(asObj(l.metadata).price) === priceId) ?? null;

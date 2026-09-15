@@ -213,6 +213,25 @@ await test("a second run reuses everything", async () => {
   assert.deepEqual({ p: creates("/products"), pr: creates("/prices"), l: creates("/payment_links") }, before);
 });
 
+await test("hosted bundle provisioning creates exact prices but no shareable Payment Links", async () => {
+  const plans = [
+    ...DEFAULT_PLANS.map((p) => ({ ...p })),
+    { key: "monthly-hosted", name: "Monthly + VPS", amountCents: 11900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "software", checkout: "hosted-bundle" },
+    { key: "yearly-hosted", name: "Yearly + VPS", amountCents: 93900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "", role: "software", checkout: "hosted-bundle" },
+  ];
+  await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ plans }) });
+  const r = await admin("/admin/api/billing/plans/provision", { method: "POST", body: JSON.stringify({ mode: "test" }) });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const bundles = r.body.plans.filter((p) => p.key.endsWith("-hosted"));
+  assert.ok(bundles.every((p) => p.priceId.startsWith("price_") && p.paymentLinkUrl === "" && p.linkCreated === false));
+  assert.equal(stripe.links.filter((l) => l.active && l.metadata.plan.endsWith("-hosted")).length, 0);
+  const cfg = await admin("/admin/api/billing/config");
+  assert.equal(cfg.body.stripe.test.paymentLinks["monthly-hosted"], undefined);
+  assert.equal(cfg.body.stripe.test.priceIds["monthly-hosted"], bundles.find((p) => p.key === "monthly-hosted").priceId);
+  assert.equal((await fetch(`${h.origin}/buy?plan=monthly-hosted`)).status, 403);
+  await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ plans: DEFAULT_PLANS }) });
+});
+
 await test("a price change rolls a new price and link and retires the old ones", async () => {
   const plans = DEFAULT_PLANS.map((p) => ({ ...p }));
   plans[0].amountCents = 8900;

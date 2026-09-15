@@ -34,11 +34,14 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # the terminal. No terminal at all (cloud-init etc.) -> generate/skip instead.
 ask() { # ask VAR "prompt" [--secret]
   local __var=$1 __prompt=$2 __secret=${3:-} __val=""
-  if [ -r /dev/tty ]; then
+  # The device node can be readable with no controlling terminal (cloud-init).
+  # Probe an actual open in a guarded subshell so errexit cannot abort setup.
+  if ( : < /dev/tty ) 2>/dev/null; then
     if [ "$__secret" = "--secret" ]; then
-      read -r -s -p "$__prompt" __val < /dev/tty; printf '\n' > /dev/tty
+      read -r -s -p "$__prompt" __val < /dev/tty || __val=""
+      printf '\n' > /dev/tty || true
     else
-      read -r -p "$__prompt" __val < /dev/tty
+      read -r -p "$__prompt" __val < /dev/tty || __val=""
     fi
   fi
   printf -v "$__var" '%s' "$__val"
@@ -424,18 +427,35 @@ VERIFY_BOOTSTRAP_CREDENTIAL
   ok "temporary hosted login was seeded and removed from the restarted service environment"
 fi
 
+# Verify the public endpoint with normal CA/hostname checks before claiming
+# that setup is complete. The signed version must be served through HTTPS.
+verify_public_https() {
+  local public_ip=$1 health_file=$2
+  fetch_bounded "https://${public_ip}/api/health" "$health_file" 65536 'application/json' || return 1
+  node - "$health_file" "$REL_VERSION" <<'VERIFY_PUBLIC_HTTPS'
+const fs = require('node:fs');
+const [file, version] = process.argv.slice(2);
+try {
+  const health = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (health.ok !== true || health.version !== version) process.exit(1);
+} catch { process.exit(1); }
+VERIFY_PUBLIC_HTTPS
+}
+
 # ── HTTPS via the bot's own setup (nginx + Let's Encrypt on the public IP) ──
 if [ -x "$APP_DIR/scripts/vps-setup.sh" ] || [ -f "$APP_DIR/scripts/vps-setup.sh" ]; then
   say "Setting up trusted HTTPS (the bot's own vps-setup)"
-  LIQHUNTER_SERVICE_NAME=$SERVICE LIQHUNTER_ENV_FILE=$ENV_FILE bash "$APP_DIR/scripts/vps-setup.sh" \
-    || die "HTTPS setup failed — the bot still works on 127.0.0.1:$PORT; re-run this installer to retry"
+  LIQHUNTER_REQUIRE_HTTPS=1 LIQHUNTER_SERVICE_NAME=$SERVICE LIQHUNTER_ENV_FILE=$ENV_FILE bash "$APP_DIR/scripts/vps-setup.sh" \
+    || die "HTTPS setup failed — re-run this installer to retry"
 else
-  warn "no scripts/vps-setup.sh in this build; skipping HTTPS (bot is on 127.0.0.1:$PORT only)"
+  die "no scripts/vps-setup.sh in this build; trusted HTTPS setup is required"
 fi
 
 PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+[ -n "$PUBLIC_IP" ] || die "could not determine the VPS address for HTTPS verification"
+verify_public_https "$PUBLIC_IP" "$work/public-health.json" || die "trusted public HTTPS did not serve the signed app version — setup is incomplete"
 say "Done — Wick Hunter beta v$REL_VERSION is installed"
-ok "URL:      https://${PUBLIC_IP:-<your-vps-ip>}/"
-ok "Login:    the password you chose (stored in $ENV_FILE)"
+ok "URL:      https://${PUBLIC_IP}/"
+ok "Login:    use your configured dashboard password or hosted access details"
 ok "Upgrade:  re-run this same install command any time"
 ok "Logs:     journalctl -u $SERVICE -f"

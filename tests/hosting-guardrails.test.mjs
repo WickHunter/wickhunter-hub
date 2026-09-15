@@ -4,10 +4,86 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { freshHub, test, summary } from "./helpers.mjs";
 import { exceptionEmail } from "../dist/src/hosting/emails.js";
 import { VultrProvider } from "../dist/src/hosting/provider.js";
-import { HostingService } from "../dist/src/hosting/service.js";
+import { fetchBoundedPublicHealth, HostingService } from "../dist/src/hosting/service.js";
+
+await test("public health transport refuses redirects and streamed bodies over 4096 bytes", async () => {
+  let redirectMode = null;
+  await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", new AbortController().signal, async (_url, init) => {
+    redirectMode = init.redirect;
+    return { redirected: true, url: "https://attacker.example/", headers: new Headers(), body: null, ok: true, status: 200 };
+  }), /redirected/);
+  assert.equal(redirectMode, "error");
+  const oversized = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(3000)); controller.enqueue(new Uint8Array(2000)); controller.close(); } });
+  await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", new AbortController().signal, async () => new Response(oversized, { status: 200 })), /exceeds limit/);
+});
+
+await test("public health deadline aborts both response headers and body reads", async () => {
+  const abortingCall = async (fetcher) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("health deadline")), 20);
+    try { await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", controller.signal, fetcher), /health deadline/); }
+    finally { clearTimeout(timer); }
+  };
+  await abortingCall(async (_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true })));
+  await abortingCall(async (_url, init) => ({
+    redirected: false, url: "https://192.0.2.1/api/health", headers: new Headers(), ok: true, status: 200,
+    body: { getReader: () => ({ read: () => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true })), cancel: async () => {} }) },
+  }));
+});
+
+await test("personalized installer generates credentials without a controlling terminal", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("ask() {");
+  const end = installer.indexOf("\n}\n", start) + 3;
+  assert.ok(start >= 0 && end > start);
+  const script = "set -Eeuo pipefail\n" + installer.slice(start, end) + `
+SECRET=before
+ask SECRET "Secret: " --secret
+[ -z "$SECRET" ]
+[ -n "$SECRET" ] || SECRET=$(openssl rand -hex 32)
+[ "\${#SECRET}" -eq 64 ]
+LOGIN_PW=before
+ask LOGIN_PW "Password: "
+[ -z "$LOGIN_PW" ]
+printf 'unattended-credential-fallback-ok'
+`;
+  // detached starts a new session: /dev/tty can exist and be readable, but
+  // opening it must fail just as it does under real cloud-init.
+  const result = spawnSync("bash", ["-c", script], { encoding: "utf8", detached: true, timeout: 5_000, stdio: ["pipe", "pipe", "pipe"] });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "unattended-credential-fallback-ok");
+  assert.equal(result.stderr, "");
+});
+
+await test("installer refuses completion until trusted HTTPS serves the signed version", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("verify_public_https() {");
+  const end = installer.indexOf("\n}\n", start) + 3;
+  assert.ok(start >= 0 && end > start);
+  assert.match(installer, /LIQHUNTER_REQUIRE_HTTPS=1/);
+  assert.ok(installer.indexOf('verify_public_https "$PUBLIC_IP"') < installer.indexOf('ok "URL:'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-https-"));
+  try {
+    for (const [body, transportOk, accepted] of [
+      [{ ok: true, version: "0.90.93" }, true, true],
+      [{ ok: true, version: "0.90.92" }, true, false],
+      [{ ok: false, version: "0.90.93" }, true, false],
+      ["invalid-json", true, false],
+      [{ ok: true, version: "0.90.93" }, false, false],
+    ]) {
+      const script = 'set -Eeuo pipefail\nREL_VERSION=0.90.93\n'
+        + 'fetch_bounded() { [ "$MOCK_TRANSPORT" = true ] || return 1; printf "%s" "$MOCK_BODY" > "$2"; }\n'
+        + installer.slice(start, end) + '\nverify_public_https 192.0.2.10 "$MOCK_FILE"';
+      const result = spawnSync("bash", ["-c", script], { encoding: "utf8", timeout: 5_000,
+        env: { ...process.env, MOCK_TRANSPORT: String(transportOk), MOCK_BODY: typeof body === "string" ? body : JSON.stringify(body), MOCK_FILE: path.join(dir, "health.json") } });
+      assert.equal(result.status === 0, accepted, result.stderr);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 await test("Vultr plan quotes preserve a real positive monthly cost", async () => {
   const provider = new VultrProvider("test-key", async () => ({

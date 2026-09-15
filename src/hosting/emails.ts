@@ -41,7 +41,7 @@ export interface InstanceEmailFacts {
   accessUrl: string;
   temporaryPassword: string;
   maximumConnectedAccounts: number;
-  monthlyPriceLabel: string;
+  billingSummary: string;
   renewalAt: number | null;
   backupScopeSentence: string;
 }
@@ -69,7 +69,7 @@ export function installationReadyEmail(to: string, firstName: string, f: Instanc
     `Server: ${f.instanceReference}\nLocation: ${f.region}\nCPU / RAM / storage: ${f.cpu} / ${f.ram} / ${f.storage}\nOperating system: ${f.os}\nIP address: ${f.ip}\nApplication username: ${f.appUsername}\nSSH username / port: ${f.sshUsername} / ${f.sshPort}`,
     `View access details: ${f.accessUrl}`,
     `Temporary Unleashed password: ${f.temporaryPassword}\nThe application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${f.monthlyPriceLabel} per month in addition to your software license. Next hosting renewal: ${renewal}. ${f.backupScopeSentence}`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${f.billingSummary} Next renewal: ${renewal}. ${f.backupScopeSentence}`,
   ].join("\n\n");
   const html = [
     `Hi ${name},`,
@@ -77,21 +77,21 @@ export function installationReadyEmail(to: string, firstName: string, f: Instanc
     `Server: ${escapeHtml(f.instanceReference)}<br>Location: ${escapeHtml(f.region)}<br>CPU / RAM / storage: ${escapeHtml(f.cpu)} / ${escapeHtml(f.ram)} / ${escapeHtml(f.storage)}<br>Operating system: ${escapeHtml(f.os)}<br>IP address: ${escapeHtml(f.ip)}<br>Application username: ${escapeHtml(f.appUsername)}<br>SSH username / port: ${escapeHtml(f.sshUsername)} / ${f.sshPort}`,
     `<a href="${escapeHtml(f.accessUrl)}">View access details</a>`,
     `Temporary Unleashed password: <code>${escapeHtml(f.temporaryPassword)}</code><br>The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${escapeHtml(f.monthlyPriceLabel)} per month in addition to your software license. Next hosting renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${escapeHtml(f.billingSummary)} Next renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
   ].join("\n\n");
   return withTo(wrap("Your Unleashed VPS is ready", text, html), to);
 }
 
-export function cancellationScheduledEmail(to: string, instanceReference: string, suspendAt: number, deleteAt: number, manageUrl: string): EmailMessage {
+export function cancellationScheduledEmail(to: string, instanceReference: string, suspendAt: number, deleteAt: number, manageUrl: string, bundled = false): EmailMessage {
   const hostingEndDate = fmtDate(suspendAt).split(",")[0];
   const text = [
     `Your hosting cancellation is scheduled. Your VPS remains available through ${fmtDate(suspendAt)}. It will then be suspended and is scheduled for permanent deletion at ${fmtDate(deleteAt)}.`,
-    `Export any settings you need before suspension. Hosting cancellation does not cancel your separate software license. Stopping the VPS stops bot management; it does not itself close exchange positions or cancel exchange orders.`,
+    bundled ? `This cancels renewal of your combined software and hosting subscription. Your already-paid software access remains valid through its current paid term. Export any settings you need before suspension.` : `Export any settings you need before suspension. Hosting cancellation does not cancel your separate software license. Stopping the VPS stops bot management; it does not itself close exchange positions or cancel exchange orders.`,
     `Manage hosting: ${manageUrl}`,
   ].join("\n\n");
   const html = [
     `Your hosting cancellation is scheduled. Your VPS remains available through <b>${escapeHtml(fmtDate(suspendAt))}</b>. It will then be suspended and is scheduled for permanent deletion at <b>${escapeHtml(fmtDate(deleteAt))}</b>.`,
-    `Export any settings you need before suspension. Hosting cancellation does not cancel your separate software license. Stopping the VPS stops bot management; it does not itself close exchange positions or cancel exchange orders.`,
+    bundled ? `This cancels renewal of your combined software and hosting subscription. Your already-paid software access remains valid through its current paid term. Export any settings you need before suspension.` : `Export any settings you need before suspension. Hosting cancellation does not cancel your separate software license. Stopping the VPS stops bot management; it does not itself close exchange positions or cancel exchange orders.`,
     `<a href="${escapeHtml(manageUrl)}">Manage hosting</a>`,
   ].join("\n\n");
   return withTo(wrap(`Your VPS hosting will end on ${hostingEndDate}`, text, html), to);

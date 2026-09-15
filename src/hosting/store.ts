@@ -370,6 +370,23 @@ export class HostingStore {
     });
   }
 
+  /** Bind an anonymous hosted-bundle reservation to the Stripe customer
+   * proved by its signed webhook. The uniqueness check and owner rewrite are
+   * one file transaction, so no second active VPS can appear for that
+   * customer between the check and write. */
+  adoptBundleReservation(id: string, expectedOwnerId: string, customerId: string, subscriptionId: string, nowMs: number): HostingInstanceRow | null {
+    return this.mutate((db) => {
+      const current = db.instances[id];
+      if (!current || current.ownerId !== expectedOwnerId || current.stage !== "ordered") return null;
+      for (const row of Object.values(db.instances)) {
+        if (row.id !== id && row.ownerId === customerId && row.environment === current.environment && row.stage !== "deleted") return null;
+      }
+      const next = { ...current, ownerId: customerId, stripeCustomerId: customerId, stripeSubscriptionId: subscriptionId || current.stripeSubscriptionId, version: current.version + 1, updatedAtMs: nowMs };
+      db.instances[id] = next;
+      return next;
+    });
+  }
+
   /** Compare-and-swap update. `mutator` receives a DRAFT the caller may
    *  freely mutate; returns the new row, or `null` if `expectedVersion`
    *  did not match the row currently on disk (a concurrent change since the

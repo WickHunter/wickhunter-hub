@@ -29,6 +29,7 @@
 // target state from the same source record is a no-op against a row
 // already in that state).
 import { randomBytes as nodeRandomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import type { BillingService } from "../billing/service.js";
 import type { RoleSubscriptionRecord } from "../billing/store.js";
 import type { EmailConfig } from "../billing/config.js";
@@ -46,11 +47,39 @@ const HOUR = 60 * 60 * 1000;
 const MAX_PROVISION_ATTEMPTS = 3;
 const LEASE_TTL_MS = 2 * 60_000;
 const PROVISION_RETRY_BACKOFF_MS = 30_000;
+const PUBLIC_HEALTH_MAX_BYTES = 4096;
 
 const realFetch: EmailFetch = async (url, init) => {
   const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
   return { ok: res.ok, status: res.status, text: () => res.text() };
 };
+
+export interface PublicHealthResponse { ok: boolean; status: number; body: string }
+export type PublicHealthFetch = (url: string, signal: AbortSignal) => Promise<PublicHealthResponse>;
+
+/** Dedicated transport for the customer-controlled public endpoint. It
+ * never follows redirects and stops reading as soon as the tiny health
+ * response exceeds its cap; the caller's AbortSignal covers both headers
+ * and streamed body reads. */
+export async function fetchBoundedPublicHealth(url: string, signal: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<PublicHealthResponse> {
+  const response = await fetchImpl(url, { method: "GET", redirect: "error", signal });
+  if (response.redirected || (response.url && response.url !== url)) throw new Error("public health redirected");
+  const declared = response.headers.get("content-length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > PUBLIC_HEALTH_MAX_BYTES)) throw new Error("public health body exceeds limit");
+  const reader = response.body?.getReader();
+  if (!reader) return { ok: response.ok, status: response.status, body: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > PUBLIC_HEALTH_MAX_BYTES) { await reader.cancel(); throw new Error("public health body exceeds limit"); }
+    chunks.push(value);
+  }
+  return { ok: response.ok, status: response.status, body: Buffer.concat(chunks.map((x) => Buffer.from(x))).toString("utf8") };
+}
 
 export interface HostingServiceDeps {
   now?: () => number;
@@ -62,6 +91,7 @@ export interface HostingServiceDeps {
    *  a provider that refuses every call until one is. */
   provider?: HostingProvider;
   stripeTimeoutMs?: number;
+  publicHealthFetch?: PublicHealthFetch;
 }
 
 export type HostingActionError =
@@ -94,6 +124,7 @@ export class HostingService {
   private readonly randomBytes: (n: number) => Buffer;
   private readonly injectedProvider: HostingProvider | undefined;
   private readonly stripeTimeoutMs: number;
+  private readonly publicHealthFetch: PublicHealthFetch;
 
   constructor(
     readonly dataDir: string,
@@ -109,6 +140,7 @@ export class HostingService {
     this.randomBytes = deps.randomBytes ?? nodeRandomBytes;
     this.injectedProvider = deps.provider;
     this.stripeTimeoutMs = deps.stripeTimeoutMs ?? 20_000;
+    this.publicHealthFetch = deps.publicHealthFetch ?? fetchBoundedPublicHealth;
   }
 
   policy(): HostingPolicy {
@@ -239,6 +271,111 @@ export class HostingService {
     return this.submitStripeCheckout(held, stripe.secretKey, nowMs);
   }
 
+  bundlePlans(): Array<{ key: string; interval: "month" | "year"; amountCents: number; currency: string }> {
+    return this.billing.config().plans
+      .filter((p) => p.checkout === "hosted-bundle" && (p.interval === "month" || p.interval === "year"))
+      .map((p) => ({ key: p.key, interval: p.interval as "month" | "year", amountCents: p.amountCents, currency: p.currency }));
+  }
+
+  bundleOfferIssue(): string | null {
+    const base = this.hostingOfferIssue();
+    if (base) return base;
+    const cfg = this.billing.config();
+    const plans = this.bundlePlans();
+    if (plans.length !== 2 || plans.filter((p) => p.interval === "month").length !== 1 || plans.filter((p) => p.interval === "year").length !== 1) return "monthly and yearly hosted bundle plans are not configured";
+    if (plans.find((p) => p.interval === "month")?.amountCents !== 11900 || plans.find((p) => p.interval === "year")?.amountCents !== 93900) return "hosted bundle prices do not match the approved offer";
+    if (plans.some((p) => !cfg.stripe[cfg.mode].priceIds[p.key])) return "hosted bundle Stripe prices are not configured";
+    return null;
+  }
+
+  /** Anonymous bundle checkout uses a browser-stable attempt id, never an
+   * email lookup. Stripe supplies the customer id in its signed webhook. */
+  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now()): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
+    const issue = this.bundleOfferIssue();
+    if (issue) return { ok: false, code: "PROVISIONING_DISABLED", error: issue };
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(attemptId)) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkoutAttemptId is malformed" };
+    const cfg = this.billing.config();
+    const policy = this.policy();
+    const plan = cfg.plans.find((p) => p.checkout === "hosted-bundle" && p.interval === interval)!;
+    const priceId = cfg.stripe[cfg.mode].priceIds[plan.key]!;
+    const ownerId = `bundle:${hashBootstrapToken(`${cfg.mode}:${attemptId}`).slice(0, 48)}`;
+    const pricing = { amountCents: plan.amountCents, currency: plan.currency, interval, softwareDays: interval === "month" ? 30 : 365, maximumConnectedAccounts: policy.maximumConnectedAccounts };
+    this.expireCheckoutReservations(nowMs);
+    const existing = this.store.activeInstanceForOwner(ownerId, cfg.mode);
+    if (existing) {
+      if (existing.stage === "ordered" && existing.checkoutExpiresAtMs != null && nowMs < existing.checkoutExpiresAtMs && existing.checkoutRequestBody && existing.checkoutIdempotencyKey) {
+        if (new URLSearchParams(existing.checkoutRequestBody).get("metadata[plan]") !== plan.key) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already reserved for a different plan" };
+        if (existing.checkoutUrl) return { ok: true, value: { url: existing.checkoutUrl, pricing } };
+        const retry = await this.submitStripeCheckout(existing, cfg.stripe[cfg.mode].secretKey, nowMs);
+        return retry.ok ? { ok: true, value: { url: retry.value.url, pricing } } : retry;
+      }
+      return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already in use" };
+    }
+    const pendingAnonymous = this.store.instances().filter((row) => row.ownerId.startsWith("bundle:") && row.stage === "ordered" && row.checkoutExpiresAtMs != null && row.checkoutExpiresAtMs > nowMs).length;
+    if (pendingAnonymous >= 3) return { ok: false, code: "PROVISIONING_DISABLED", error: "too many hosted checkouts are pending; retry shortly" };
+    const provider = this.provider()!;
+    let quote: number;
+    try {
+      const match = (await provider.listPlans()).find((p) => p.id === policy.planId);
+      if (!match) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan is unavailable from the provider" };
+      quote = match.monthlyCostCents;
+    } catch { return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" }; }
+    if (!Number.isSafeInteger(quote) || quote <= 0) return { ok: false, code: "PROVISIONING_DISABLED", error: "the selected provider plan returned an invalid monthly cost" };
+    if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
+    const ceiling = this.costCeilingRefusalWithQuote(quote, policy);
+    if (ceiling) return { ok: false, code: "PROVISIONING_DISABLED", error: ceiling };
+    const verified = await this.verifyStripeRecurringPrice(cfg.stripe[cfg.mode].secretKey, priceId, plan.amountCents, plan.currency, interval);
+    if (!verified.ok) return { ok: false, code: "PROVISIONING_DISABLED", error: verified.error };
+    if (this.costCeilingRefusalWithQuote(quote, policy)) return { ok: false, code: "PROVISIONING_DISABLED", error: "the provider cost ceiling has been reached" };
+    const reservation = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment: cfg.mode, region: policy.regions[0]?.id ?? "nrt", planId: policy.planId, stripeCustomerId: "", nowMs });
+    if (!reservation) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt already exists" };
+    const expiresAtMs = nowMs + 31 * 60_000;
+    const body = new URLSearchParams({
+      mode: "subscription", client_reference_id: reservation.id,
+      "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
+      success_url: `${cfg.siteOrigin || this.origin}/thanks/?hosting=bundle-success`,
+      cancel_url: `${cfg.siteOrigin || this.origin}/pricing/?hosting=bundle-cancelled`,
+      "metadata[plan]": plan.key, "metadata[bundle]": "software-hosting-v1", "metadata[reservation]": reservation.id,
+      "subscription_data[metadata][plan]": plan.key, "subscription_data[metadata][bundle]": "software-hosting-v1", "subscription_data[metadata][reservation]": reservation.id,
+      expires_at: String(Math.floor(expiresAtMs / 1000)),
+    }).toString();
+    const held = this.store.updateInstance(reservation.id, reservation.version, (d) => {
+      d.providerPlanMonthlyCostCents = quote; d.checkoutExpiresAtMs = expiresAtMs;
+      d.checkoutIdempotencyKey = `wh-bundle-${hashBootstrapToken(`${cfg.mode}:${reservation.id}`).slice(0, 40)}`;
+      d.checkoutRequestBody = body;
+    }, nowMs);
+    if (!held) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkout reservation could not be saved" };
+    const submitted = await this.submitStripeCheckout(held, cfg.stripe[cfg.mode].secretKey, nowMs);
+    return submitted.ok ? { ok: true, value: { url: submitted.value.url, pricing } } : submitted;
+  }
+
+  private expireCheckoutReservations(nowMs: number): void {
+    for (const row of this.store.instances()) {
+      if (row.stage === "ordered" && row.checkoutExpiresAtMs != null && nowMs >= row.checkoutExpiresAtMs && !row.stripeSubscriptionId) {
+        this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      }
+    }
+  }
+
+  acceptBundleReservation(reservationId: string, customerId: string, subscriptionId: string, planKey: string, livemode: boolean, terminal: boolean, nowMs = this.now()): boolean {
+    if (!/^host_[A-Za-z0-9_-]+$/.test(reservationId) || !/^cus_[A-Za-z0-9_]+$/.test(customerId)) return false;
+    const row = this.store.getInstance(reservationId);
+    if (!row || row.environment !== (livemode ? "live" : "test") || !row.ownerId.startsWith("bundle:")) {
+      if (row?.ownerId !== customerId || row.stripeSubscriptionId !== subscriptionId) return false;
+      if (terminal && row.stage === "ordered" && !row.providerInstanceId) {
+        return this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; d.failureReason = "bundle_subscription_ended_before_activation"; }, nowMs) !== null;
+      }
+      return true;
+    }
+    if (!row.checkoutRequestBody) return false;
+    const request = new URLSearchParams(row.checkoutRequestBody);
+    if (request.get("metadata[plan]") !== planKey || request.get("subscription_data[metadata][plan]") !== planKey || request.get("metadata[reservation]") !== reservationId) return false;
+    const adopted = this.store.adoptBundleReservation(row.id, row.ownerId, customerId, subscriptionId, nowMs);
+    if (!adopted) return false;
+    if (!terminal) return true;
+    return this.store.updateInstance(adopted.id, adopted.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; d.failureReason = "bundle_subscription_ended_before_activation"; }, nowMs) !== null;
+  }
+
   private async submitStripeCheckout(reservation: HostingInstanceRow, secretKey: string, nowMs: number): Promise<HostingActionResult<{ url: string }>> {
     try {
       const response = await this.stripeFetch("https://api.stripe.com/v1/checkout/sessions", {
@@ -264,14 +401,18 @@ export class HostingService {
   }
 
   private async verifyStripeHostingPrice(secretKey: string, priceId: string, policy: HostingPolicy): Promise<{ ok: true } | { ok: false; error: string }> {
+    return this.verifyStripeRecurringPrice(secretKey, priceId, policy.monthlyPriceCents, policy.currency, "month");
+  }
+
+  private async verifyStripeRecurringPrice(secretKey: string, priceId: string, amountCents: number, currency: string, interval: "month" | "year"): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
       const response = await this.stripeFetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(priceId)}`, { method: "GET", headers: { authorization: `Bearer ${secretKey}` }, body: undefined });
       const p = JSON.parse(await response.text()) as any;
-      if (!response.ok || p.id !== priceId || p.active !== true || p.unit_amount !== policy.monthlyPriceCents || p.currency !== policy.currency || p.type !== "recurring" || p.recurring?.interval !== "month" || p.recurring?.interval_count !== 1) {
-        return { ok: false, error: "the classified Stripe hosting price does not match the advertised monthly price" };
+      if (!response.ok || p.id !== priceId || p.active !== true || p.unit_amount !== amountCents || p.currency !== currency || p.type !== "recurring" || p.recurring?.interval !== interval || p.recurring?.interval_count !== 1) {
+        return { ok: false, error: "the classified Stripe price does not match the advertised recurring price" };
       }
       return { ok: true };
-    } catch { return { ok: false, error: "the classified Stripe hosting price could not be verified" }; }
+    } catch { return { ok: false, error: "the classified Stripe price could not be verified" }; }
   }
 
   // ── the derive-from-billing-record reconciliation (the whole engine) ────
@@ -311,7 +452,7 @@ export class HostingService {
       if (!paidEvidenceExists(sub)) return; // nothing to provision yet (a checkout not yet confirmed)
       const priorTerminated = this.store.instances().find((r) => r.ownerId === ownerId && r.environment === environment && r.stage === "deleted");
       if (priorTerminated?.stripeSubscriptionId && priorTerminated.stripeSubscriptionId === sub.subscriptionId) {
-        if (priorTerminated.failureReason === "unreserved_payment") return;
+        if (priorTerminated.failureReason === "unreserved_payment" || priorTerminated.failureReason === "bundle_subscription_ended_before_activation") return;
         this.notifyLatePayment(priorTerminated, nowMs);
         return;
       }
@@ -503,7 +644,7 @@ export class HostingService {
    *  succeeding; a failure is logged and the LOCAL lifecycle is still
    *  authoritative for suspend/delete timing, matching this Hub's own
    *  Stripe-webhook-is-truth design elsewhere). */
-  async cancel(ownerId: string, instanceId: string, nowMs = this.now()): Promise<HostingActionResult<{ suspendAt: number; deleteAt: number }>> {
+  async cancel(ownerId: string, instanceId: string, nowMs = this.now()): Promise<HostingActionResult<{ suspendAt: number; deleteAt: number; affectsSoftwareRenewal: boolean }>> {
     const row = this.owned(ownerId, instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
     if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this hosting instance cannot be cancelled from its current state" };
@@ -515,7 +656,7 @@ export class HostingService {
     const anchor = row.paidThroughMs ?? nowMs;
     this.scheduleEnd(row, "intentional_cancellation", anchor, policy, nowMs);
     const d = deadlines(anchor, "intentional_cancellation", policy);
-    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt } };
+    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt, affectsSoftwareRenewal: !!this.bundlePlanForOwner(ownerId) } };
   }
 
   /** POST /api/hosting/:id/resume-renewal. Only reversible before the
@@ -580,25 +721,37 @@ export class HostingService {
    *  comparing the presented generation against the row's CURRENT one
    *  (H6: "late callbacks from a failed/replaced instance must not mark
    *  the replacement ready"). */
-  reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): HostingActionResult<{ ready: boolean }> {
-    let row = this.store.getInstance(instanceId);
+  async reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): Promise<HostingActionResult<{ ready: boolean }>> {
+    const row = this.store.getInstance(instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
     if (managementCounter !== undefined) {
       if (row.stage !== "restoring" || row.generation !== generation || !Number.isSafeInteger(managementCounter) || managementCounter <= row.managementCounter || !row.managementTokenHash || hashBootstrapToken(presentedToken) !== row.managementTokenHash) {
         return { ok: false, code: "NOT_FOUND", error: "invalid or replayed management readiness proof" };
       }
-      const counted = this.store.updateInstance(row.id, row.version, (d) => { d.managementCounter = managementCounter; }, nowMs);
-      if (!counted) return { ok: false, code: "NOT_FOUND", error: "changed underneath the management readiness proof" };
-      row = counted;
     } else {
       const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
       if (!authenticated.ok) return authenticated;
     }
     const policy = this.policy();
     const verdict = readinessVerdict(policy.probeVenues, results);
+    let providerIp: string | null = null;
+    if (verdict.ready) {
+      const provider = this.provider();
+      if (!provider || !row.providerInstanceId) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider identity is unavailable; readiness will retry" };
+      try {
+        const providerRow = await provider.getInstance(row.providerInstanceId);
+        providerIp = providerRow?.mainIp?.trim() || null;
+      } catch {
+        return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider address could not be refreshed; readiness will retry" };
+      }
+      if (!providerIp || isIP(providerIp) === 0) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider has not assigned a valid server address yet; readiness will retry" };
+      if (!(await this.publicHealthReady(providerIp))) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the server's public HTTPS health check is not ready; readiness will retry" };
+    }
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      if (managementCounter !== undefined) d.managementCounter = managementCounter;
       d.readiness = { checkedAtMs: nowMs, ready: verdict.ready, refusals: verdict.refusals, regionTried: d.region };
       d.lastProviderCheckAtMs = nowMs;
+      if (providerIp) { d.ip = providerIp; d.appUrl = `https://${providerIp}/`; }
     }, nowMs);
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
     if (verdict.ready) {
@@ -612,6 +765,26 @@ export class HostingService {
       this.handleReadinessRefusal(fresh, verdict, policy, nowMs);
     }
     return { ok: true, value: { ready: verdict.ready } };
+  }
+
+  /** A callback from inside the VPS is not enough to advertise an address
+   * to the customer. Re-read the provider-assigned IP, then prove that the
+   * same public HTTPS endpoint completes a normally verified TLS request
+   * and serves the app's deliberately minimal health document. */
+  private async publicHealthReady(ip: string): Promise<boolean> {
+    const host = ip.includes(":") ? `[${ip}]` : ip;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.stripeTimeoutMs);
+    try {
+      const response = await this.publicHealthFetch(`https://${host}/api/health`, controller.signal);
+      if (!response.ok || response.status !== 200) return false;
+      const parsed = JSON.parse(response.body) as Record<string, unknown>;
+      return parsed.ok === true && typeof parsed.version === "string" && parsed.version.length > 0 && parsed.version.length <= 40;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private markReady(row: HostingInstanceRow, nowMs: number): void {
@@ -1122,11 +1295,19 @@ export class HostingService {
     return ownerId.startsWith("email:") ? ownerId.slice("email:".length) : "";
   }
 
+  private bundlePlanForOwner(ownerId: string) {
+    const customer = this.billing.store.getCustomer(ownerId);
+    const plan = customer?.planKey ? this.billing.plan(customer.planKey) : null;
+    return plan?.checkout === "hosted-bundle" ? plan : null;
+  }
+
   private buildEmail(row: HostingInstanceRow, template: string, cfg: EmailConfig, nowMs: number) {
     const policy = this.policy();
     const ref = row.id;
     const manageUrl = `${this.origin}/customer#hosting`;
     const priceLabel = `$${(policy.monthlyPriceCents / 100).toFixed(2)}`;
+    const bundlePlan = this.bundlePlanForOwner(row.ownerId);
+    const bundlePrice = bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : "";
     const [cpu = policy.planLabel, ram = "see plan", storage = "see plan"] = policy.planLabel.split(/\s*\/\s*/);
     switch (template) {
       case "installation_ready":
@@ -1136,12 +1317,12 @@ export class HostingService {
           appUsername: "admin", sshUsername: "root", sshPort: 22, accessUrl: manageUrl,
           temporaryPassword: row.bootstrapTokenHash ? bootstrapPasswordFromTokenHash(row.bootstrapTokenHash) : "",
           maximumConnectedAccounts: policy.maximumConnectedAccounts,
-          monthlyPriceLabel: priceLabel, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
+          billingSummary: bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
-        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl);
+        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan);
       case "overdue":
-        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, "");
+        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
       case "suspended":
         return tmpl.suspendedEmail("", ref, row.deleteAtMs ?? nowMs, manageUrl);
       case "three_days":
@@ -1374,7 +1555,7 @@ export class HostingService {
     }
     return {
       available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts,
-      instance: instanceView(row, policy, nowMs),
+      instance: instanceView(row, policy, nowMs, this.bundlePlanForOwner(row.ownerId)),
     };
   }
 }
@@ -1401,6 +1582,9 @@ export interface HostingInstanceView {
   monthlyPriceLabel: string;
   managedBackupsIncluded: boolean;
   maximumConnectedAccounts: number;
+  bundleSubscription: boolean;
+  billingPriceLabel: string;
+  billingInterval: "month" | "year";
 }
 export interface HostingCustomerView {
   available: boolean;
@@ -1412,7 +1596,7 @@ export interface HostingCustomerView {
   instance: HostingInstanceView | null;
 }
 
-function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number): HostingInstanceView {
+function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number, bundlePlan: import("../billing/config.js").Plan | null): HostingInstanceView {
   // On hold: no dates ("Scheduled for permanent deletion at …" would be a
   // lie — the pipeline is paused), and the one customer-safe sentence in
   // place of any real failureReason (an operational failure note is not
@@ -1430,6 +1614,9 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     onHold,
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
     maximumConnectedAccounts: policy.maximumConnectedAccounts,
+    bundleSubscription: !!bundlePlan,
+    billingPriceLabel: bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
+    billingInterval: bundlePlan?.interval === "year" ? "year" : "month",
   };
 }
 
