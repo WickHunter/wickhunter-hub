@@ -39,6 +39,13 @@ export function hashBootstrapToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
+/** The one-time dashboard password installed by cloud-init. It is derived
+ * from the already persisted token hash so the asynchronous ready email can
+ * reproduce it without storing another plaintext secret. */
+export function bootstrapPasswordFromTokenHash(tokenHash: string): string {
+  return createHash("sha256").update(`${tokenHash}:password:v1`).digest("hex").slice(0, 24);
+}
+
 export interface ProviderPlan {
   id: string;
   vcpus: number;
@@ -186,9 +193,10 @@ export class FakeProvider implements HostingProvider {
 
 // ── VultrProvider — real HTTP, never called by the test suite ──────────────
 
-export type HttpLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ status: number; ok: boolean; text: () => Promise<string> }>;
+export type HttpLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ status: number; ok: boolean; text: () => Promise<string> }>;
 
 const VULTR_API_BASE = "https://api.vultr.com/v2";
+export const DEFAULT_VULTR_REQUEST_TIMEOUT_MS = 20_000;
 
 /** The real adapter. Constructed only when an operator has supplied a Vultr
  *  API key (src/hosting/service.ts); `createHub`'s test wiring never passes
@@ -200,18 +208,43 @@ const VULTR_API_BASE = "https://api.vultr.com/v2";
  *  handoff §6/§12 and this file's own report note. Recheck the SDK/API
  *  version before the first real provisioning run. */
 export class VultrProvider implements HostingProvider {
-  constructor(private readonly apiKey: string, private readonly http: HttpLike = realFetch) {}
+  constructor(
+    private readonly apiKey: string,
+    private readonly http: HttpLike = realFetch,
+    private readonly requestTimeoutMs = DEFAULT_VULTR_REQUEST_TIMEOUT_MS,
+  ) {
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error("Vultr request timeout must be positive");
+  }
 
   private async call(method: string, path: string, body?: unknown): Promise<{ status: number; json: any }> {
-    const res = await this.http(`${VULTR_API_BASE}${path}`, {
-      method,
-      headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+    const controller = new AbortController();
+    let timeout: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        const error = new Error(`vultr ${method} ${path}: request timed out after ${this.requestTimeoutMs}ms`);
+        reject(error);
+        controller.abort(error);
+      }, this.requestTimeoutMs);
     });
-    const text = await res.text();
-    let json: any = null;
-    try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-    return { status: res.status, json };
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await this.http(`${VULTR_API_BASE}${path}`, {
+            method,
+            headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
+            body: body !== undefined ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+          });
+          const text = await res.text();
+          let json: any = null;
+          try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+          return { status: res.status, json };
+        })(),
+        deadline,
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
 
   async listRegions(): Promise<ProviderRegion[]> {
@@ -222,8 +255,23 @@ export class VultrProvider implements HostingProvider {
 
   async listPlans(): Promise<ProviderPlan[]> {
     const r = await this.call("GET", "/plans");
-    const rows = Array.isArray(r.json?.plans) ? r.json.plans : [];
-    return rows.map((x: any) => ({ id: String(x.id), vcpus: Number(x.vcpu_count) || 0, ramMb: Number(x.ram) || 0, diskGb: Number(x.disk) || 0, monthlyCostCents: Math.round((Number(x.monthly_cost) || 0) * 100) }));
+    if (r.status >= 300 || !Array.isArray(r.json?.plans)) throw new Error(`vultr listPlans: HTTP ${r.status} returned no plan list`);
+    return r.json.plans.map((x: any) => {
+      const monthlyCost = Number(x.monthly_cost);
+      // A missing/malformed provider price must stay unknown upstream. Turning
+      // it into zero would make the spend ceiling approve real paid capacity
+      // as though it were free.
+      if (!Number.isFinite(monthlyCost) || monthlyCost <= 0) {
+        throw new Error(`vultr listPlans: plan ${String(x.id ?? "<unknown>")} has an invalid monthly_cost`);
+      }
+      return {
+        id: String(x.id),
+        vcpus: Number(x.vcpu_count) || 0,
+        ramMb: Number(x.ram) || 0,
+        diskGb: Number(x.disk) || 0,
+        monthlyCostCents: Math.round(monthlyCost * 100),
+      };
+    });
   }
 
   async createInstance(req: CreateInstanceRequest): Promise<ProviderInstance> {

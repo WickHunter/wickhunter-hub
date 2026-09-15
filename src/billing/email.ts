@@ -20,7 +20,8 @@ export interface EmailMessage {
 export interface EmailFetchInit {
   method: string;
   headers: Record<string, string>;
-  body: string;
+  body?: string;
+  signal?: AbortSignal;
 }
 export interface EmailFetchResponse {
   ok: boolean;

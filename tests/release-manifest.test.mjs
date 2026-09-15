@@ -143,7 +143,7 @@ await test("installer fetch is deterministic and binary transport errors are san
 await test("the exact fetch pipeline hard-caps chunked and unknown-length bodies", async () => {
   const template = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
   const from = template.indexOf("curl_hub() {");
-  const to = template.indexOf("\nif fetch_bounded ", from);
+  const to = template.indexOf("\nif [ -n \"$PINNED_MANIFEST_B64U\" ]", from);
   assert.ok(from >= 0 && to > from, "installer fetch helpers are extractable");
   const helpers = template.slice(from, to);
   const dir = tmpDir("installer-bounded-fetch");

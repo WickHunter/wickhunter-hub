@@ -10,34 +10,41 @@ import { FakeProvider } from "../dist/src/hosting/provider.js";
 
 const TEST_WHSEC = "whsec_test_hosting_holds_0123456789";
 const HOUR = 60 * 60 * 1000;
+const TEST_RELEASE_SHA = "a".repeat(64);
 
 function mkEvSeq() { let n = 0; return () => ++n; }
 
 async function newHub(overrides = {}) {
   let clock = Math.floor(Date.now() / 1000) * 1000;
   const provider = overrides.provider ?? new FakeProvider({ now: () => clock });
+  const hostingCalls = [];
   const h = await freshHub({}, {
     billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
     billingNow: () => clock,
     hostingNow: () => clock,
-    hostingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
+    hostingFetch: async (url, init) => {
+      hostingCalls.push({ url, init });
+      if (url.includes("/v1/prices/")) return { ok: true, status: 200, text: async () => JSON.stringify({ id: "price_host1", active: true, unit_amount: 2000, currency: "usd", type: "recurring", recurring: { interval: "month", interval_count: 1 } }) };
+      if (url.endsWith("/v1/checkout/sessions")) return { ok: true, status: 200, text: async () => JSON.stringify({ url: "https://checkout.stripe.com/c/pay_test" }) };
+      return { ok: true, status: 200, text: async () => "{}" };
+    },
     hostingProvider: provider,
   });
   const admin = (p, opts = {}) => jsonReq(`${h.origin}${p}`, { ...opts, headers: { "x-hub-admin": "test-admin-token", "content-type": "application/json", ...(opts.headers ?? {}) } });
   await admin("/admin/api/billing/config", {
     method: "POST",
     body: JSON.stringify({
-      stripe: { test: { webhookSecret: TEST_WHSEC } },
+      stripe: { test: { secretKey: "sk_test_hosting_holds_0123456789", webhookSecret: TEST_WHSEC, paymentLinks: { "hosting-monthly": "https://buy.stripe.com/test_hosting" } } },
       roles: { test: { hosting: { priceIds: ["price_host1"], productIds: [] } } },
       plans: [
         { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "software" },
-        { key: "hosting-monthly", name: "Hosting", amountCents: 1500, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "hosting" },
+        { key: "hosting-monthly", name: "Hosting", amountCents: 2000, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "hosting" },
       ],
     }),
   });
   await admin("/admin/api/hosting/policy", {
     method: "POST",
-    body: JSON.stringify({ policy: { provisioningEnabled: true, osId: "1743", releaseRef: "v-test" } }),
+    body: JSON.stringify({ policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "1743", releaseRef: TEST_RELEASE_SHA } }),
   });
   const nextEv = mkEvSeq();
   const sec = () => Math.floor(clock / 1000);
@@ -52,7 +59,7 @@ async function newHub(overrides = {}) {
     return { status: res.status, body: await res.json() };
   }
   function advance(ms) { clock += ms; }
-  return { h, admin, event, postEvent, advance, provider, getClock: () => clock };
+  return { h, admin, event, postEvent, advance, provider, hostingCalls, getClock: () => clock };
 }
 
 /** A software licence for `customerId`/`email` only — eligible to check out
@@ -71,6 +78,8 @@ async function softwareOnly(ctx, customerId, email) {
  *  its harness). */
 async function boughtHosting(ctx, customerId, email) {
   await softwareOnly(ctx, customerId, email);
+  const checkout = await ctx.h.hub.hosting.checkoutUrl(customerId, email, ctx.getClock());
+  assert.equal(checkout.ok, true);
   const r2 = await ctx.postEvent(ctx.event("checkout.session.completed", {
     id: `cs_host_${customerId}`, mode: "subscription", payment_status: "paid", customer: customerId,
     customer_details: { email }, subscription: `sub_host_${customerId}`, metadata: { plan: "hosting-monthly" },
@@ -231,7 +240,7 @@ await test("release: if the recomputed deadline had already elapsed by the time 
   assert.equal(gone.stage, "deleted", "deletion proceeded on the very next tick");
 
   const jobs = ctx.h.hub.hosting.store.outboxFor(suspended.id);
-  assert.equal(jobs.filter((j) => j.dedupeKey.includes("terminated")).length, 1, "exactly one terminated email");
+  assert.equal(jobs.filter((j) => j.jobType === "email" && j.dedupeKey.includes("terminated")).length, 1, "exactly one terminated email");
   assert.equal(jobs.filter((j) => j.status === "pending" && (j.dedupeKey.includes("three_days") || j.dedupeKey.includes("one_day"))).length, 0, "no stale/fresh reminder jobs for a deadline that had already elapsed");
   await ctx.h.close();
 });
@@ -264,16 +273,28 @@ await test("cost ceiling: exactly at the ceiling passes, one cent over refuses �
   // (reused from the existing instance, since planId is shared — V1 offers
   // one plan) = 2000 exactly -> passes.
   await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 2000 } }) });
-  const atCeiling = ctx.h.hub.hosting.checkoutUrl("cus_cost2", "cost2@example.com");
+  const atCeiling = await ctx.h.hub.hosting.checkoutUrl("cus_cost2", "cost2@example.com");
   assert.equal(atCeiling.ok, true, "projected total exactly equals the ceiling — passes");
-  assert.ok(atCeiling.value.url.includes("/buy?plan="));
+  assert.equal(atCeiling.value.url, "https://checkout.stripe.com/c/pay_test");
+  const sessionCall = ctx.hostingCalls.find((c) => c.url.endsWith("/v1/checkout/sessions") && new URLSearchParams(c.init.body).get("customer") === "cus_cost2");
+  const session = new URLSearchParams(sessionCall.init.body);
+  assert.equal(session.get("customer"), "cus_cost2", "Checkout Session is bound to the existing licensed Stripe customer");
+  assert.equal(session.get("line_items[0][price]"), "price_host1");
+  assert.equal(session.get("subscription_data[metadata][role]"), "hosting");
+  assert.equal(Number(session.get("expires_at")) - Math.floor(ctx.getClock() / 1000), 31 * 60, "Stripe gets margin above its 30-minute minimum");
+  assert.match(sessionCall.init.headers["idempotency-key"], /^wh-hosting-[a-f0-9]{40}$/);
+  const duplicate = await ctx.h.hub.hosting.checkoutUrl("cus_cost2", "cost2@example.com");
+  assert.equal(duplicate.ok, true, "an unpaid reservation returns its one durable Checkout Session");
+  assert.equal(duplicate.value.url, atCeiling.value.url);
+  assert.equal(ctx.hostingCalls.filter((c) => c.url.endsWith("/v1/checkout/sessions") && new URLSearchParams(c.init.body).get("customer") === "cus_cost2").length, 1);
 
   // One cent under what would be needed -> refuses, by name, before any
   // provider call (FakeProvider's createCalls proves nothing new was
   // attempted — the one existing call is cus_cost1's own provisioning).
+  await softwareOnly(ctx, "cus_cost3", "cost3@example.com");
   const callsBefore = ctx.provider.createCalls.length;
   await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 1999 } }) });
-  const overCeiling = ctx.h.hub.hosting.checkoutUrl("cus_cost2", "cost2@example.com");
+  const overCeiling = await ctx.h.hub.hosting.checkoutUrl("cus_cost3", "cost3@example.com");
   assert.equal(overCeiling.ok, false);
   assert.equal(overCeiling.code, "PROVISIONING_DISABLED");
   assert.match(overCeiling.error, /cost ceiling/);
@@ -286,14 +307,15 @@ await test("an instance whose provider quote was never captured makes the WHOLE 
   // Reserved but never ticked — drainProvision (and its quote capture)
   // never ran, so providerPlanMonthlyCostCents stays null.
   const rows = await boughtHosting(ctx, "cus_unk1", "unk1@example.com");
-  assert.equal(rows[0].providerPlanMonthlyCostCents, null);
+  ctx.h.hub.hosting.store.updateInstance(rows[0].id, rows[0].version, (d) => { d.providerPlanMonthlyCostCents = null; }, ctx.getClock());
+  assert.equal(ctx.h.hub.hosting.store.getInstance(rows[0].id).providerPlanMonthlyCostCents, null);
 
   const unset = ctx.h.hub.hosting.projectedMonthlyProviderCostCents();
   assert.equal(unset.known, false, "one unquoted non-deleted instance makes the sum unknown, not silently 0");
 
   await softwareOnly(ctx, "cus_unk2", "unk2@example.com");
   await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 500000 } }) });
-  const r = ctx.h.hub.hosting.checkoutUrl("cus_unk2", "unk2@example.com");
+  const r = await ctx.h.hub.hosting.checkoutUrl("cus_unk2", "unk2@example.com");
   assert.equal(r.ok, false, "an unknown projection refuses even under a ceiling that would obviously not be exceeded — never guessed as 0");
   assert.equal(r.code, "PROVISIONING_DISABLED");
   assert.match(r.error, /cost ceiling/);
@@ -303,13 +325,29 @@ await test("an instance whose provider quote was never captured makes the WHOLE 
 await test("0 = no ceiling — a checkout is never refused for cost, whatever the projection", async () => {
   const ctx = await newHub();
   const rows = await boughtHosting(ctx, "cus_zero1", "zero1@example.com"); // unquoted, unknown projection
-  assert.equal(rows[0].providerPlanMonthlyCostCents, null);
+  ctx.h.hub.hosting.store.updateInstance(rows[0].id, rows[0].version, (d) => { d.providerPlanMonthlyCostCents = null; }, ctx.getClock());
   const policy = ctx.h.hub.hosting.policy();
   assert.equal(policy.maximumProjectedMonthlyProviderCostCents, 0, "the default — existing semantics");
 
   await softwareOnly(ctx, "cus_zero2", "zero2@example.com");
-  const r = ctx.h.hub.hosting.checkoutUrl("cus_zero2", "zero2@example.com");
+  const r = await ctx.h.hub.hosting.checkoutUrl("cus_zero2", "zero2@example.com");
   assert.equal(r.ok, true, "an unknown projection is never even consulted when the ceiling is 0");
+  await ctx.h.close();
+});
+
+await test("an abandoned Checkout reservation expires before a later session is admitted", async () => {
+  const ctx = await newHub();
+  await softwareOnly(ctx, "cus_abandoned", "abandoned@example.com");
+  const first = await ctx.h.hub.hosting.checkoutUrl("cus_abandoned", "abandoned@example.com");
+  assert.equal(first.ok, true);
+  const reserved = ctx.h.hub.hosting.store.activeInstanceForOwner("cus_abandoned", "test");
+  assert.equal(reserved.stage, "ordered");
+  ctx.advance(32 * 60_000);
+  ctx.h.hub.hosting.reconcileAll(ctx.getClock());
+  assert.equal(ctx.h.hub.hosting.store.getInstance(reserved.id).stage, "deleted");
+  const second = await ctx.h.hub.hosting.checkoutUrl("cus_abandoned", "abandoned@example.com", ctx.getClock());
+  assert.equal(second.ok, true);
+  assert.equal(ctx.hostingCalls.filter((c) => c.url.endsWith("/v1/checkout/sessions")).length, 2);
   await ctx.h.close();
 });
 

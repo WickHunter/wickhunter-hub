@@ -102,11 +102,24 @@ export interface HostingInstanceRow {
    *  with a `null` here as making the WHOLE projection unknown, since
    *  silently treating an unread cost as free would understate spend. */
   providerPlanMonthlyCostCents: number | null;
+  checkoutExpiresAtMs: number | null;
+  checkoutIdempotencyKey: string | null;
+  checkoutRequestBody: string | null;
+  checkoutUrl: string | null;
   label: string;
   ip: string | null;
   appUrl: string | null;
   bootstrapTokenHash: string | null;
   bootstrapTokenExpiresAtMs: number | null;
+  /** Readiness-only credential held in a root-owned file on the VPS. It can
+   * prove a later paid power-on, but cannot fetch installers or mutate app
+   * configuration. The counter rejects replayed boot reports. */
+  managementTokenHash: string | null;
+  managementCounter: number;
+  /** Exact signed-manifest identity pinned when this generation's cloud-init
+   *  is built. Policy changes cannot move an in-flight instance to a newer
+   *  customer artifact. */
+  releaseRef: string | null;
   stripeCustomerId: string;
   stripeSubscriptionId: string | null;
   paidThroughMs: number | null;
@@ -317,11 +330,18 @@ export class HostingStore {
         providerAccountRef: "",
         providerInstanceId: null,
         providerPlanMonthlyCostCents: null,
+        checkoutExpiresAtMs: null,
+        checkoutIdempotencyKey: null,
+        checkoutRequestBody: null,
+        checkoutUrl: null,
         label: "",
         ip: null,
         appUrl: null,
         bootstrapTokenHash: null,
         bootstrapTokenExpiresAtMs: null,
+        managementTokenHash: null,
+        managementCounter: 0,
+        releaseRef: null,
         stripeCustomerId: input.stripeCustomerId,
         stripeSubscriptionId: null,
         paidThroughMs: null,

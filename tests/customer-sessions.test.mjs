@@ -235,11 +235,9 @@ await test("GET /api/customer/state: 401 with no session, 200 with one; a lapsed
   assert.equal(body.software[0].customerKey, ada.key);
   assert.equal(body.software[0].revoked, false);
   assert.equal(body.software[0].exitOnly, false, "the licence is still active");
-  // Superseded by H4/H5/H6 (src/hosting/service.ts): `available` now means
-  // "the hosting FEATURE exists on this Hub" (always true once
-  // HostingService is wired), distinct from `hasInstance` — Ada has never
-  // bought hosting, so she has no instance.
-  assert.equal(body.hosting.available, true);
+  // The customer page stays visible, but checkout fails closed while the
+  // managed-hosting master switch and billing prerequisites are incomplete.
+  assert.equal(body.hosting.available, false);
   assert.equal(body.hosting.hasInstance, false);
   assert.ok(!JSON.stringify(body).match(/sk_|whsec_|-----BEGIN/), "no secret material is ever on this page");
 

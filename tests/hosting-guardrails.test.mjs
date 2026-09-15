@@ -1,0 +1,100 @@
+// tests/hosting-guardrails.test.mjs — narrow production guardrails around
+// provider cost accounting and billing failure copy/transport handling.
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { freshHub, test, summary } from "./helpers.mjs";
+import { exceptionEmail } from "../dist/src/hosting/emails.js";
+import { VultrProvider } from "../dist/src/hosting/provider.js";
+import { HostingService } from "../dist/src/hosting/service.js";
+
+await test("Vultr plan quotes preserve a real positive monthly cost", async () => {
+  const provider = new VultrProvider("test-key", async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ plans: [{ id: "vc2-1c-2gb", vcpu_count: 1, ram: 2048, disk: 55, monthly_cost: "10.00" }] }),
+  }));
+  assert.deepEqual(await provider.listPlans(), [{ id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 }]);
+});
+
+await test("Vultr plan quotes reject missing, malformed, and zero costs", async () => {
+  for (const monthly_cost of [undefined, "not-a-price", 0]) {
+    const provider = new VultrProvider("test-key", async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ plans: [{ id: "vc2-1c-2gb", monthly_cost }] }),
+    }));
+    await assert.rejects(() => provider.listPlans(), /invalid monthly_cost/);
+  }
+});
+
+await test("Vultr plan lookup rejects an unsuccessful or malformed response", async () => {
+  for (const response of [
+    { ok: false, status: 503, text: async () => JSON.stringify({ error: "unavailable" }) },
+    { ok: true, status: 200, text: async () => JSON.stringify({ plans: null }) },
+  ]) {
+    const provider = new VultrProvider("test-key", async () => response);
+    await assert.rejects(() => provider.listPlans(), /returned no plan list/);
+  }
+});
+
+await test("Vultr calls time out across both response headers and response body", async () => {
+  for (const http of [
+    async (_url, { signal }) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+    async () => ({ ok: true, status: 200, text: async () => new Promise(() => {}) }),
+  ]) {
+    const provider = new VultrProvider("test-key", http, 20);
+    const started = Date.now();
+    await assert.rejects(() => provider.listPlans(), /request timed out after 20ms/);
+    assert.ok(Date.now() - started < 1_000, "a hung provider call cannot retain the lifecycle worker");
+  }
+});
+
+await test("setup failure email never claims a refund that the lifecycle did not verify", () => {
+  const message = exceptionEmail("customer@example.com", "setup_failure", "host_123", "Setup timed out.", "https://hub.example.com/customer#hosting");
+  assert.doesNotMatch(message.text, /has been refunded/i);
+  assert.doesNotMatch(message.text, /Renewal for this server has been stopped/i);
+  assert.match(message.text, /request to stop renewal/i);
+  assert.match(message.text, /confirm both the renewal status and the status of your initial hosting payment separately/i);
+  assert.doesNotMatch(message.html, /has been refunded/i);
+});
+
+await test("late-payment recovery copy does not promise an unconfirmed refund", () => {
+  const source = fs.readFileSync(new URL("../src/hosting/service.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /The payment will be refunded/i);
+  assert.match(source, /Support must confirm the hosting payment resolution/);
+});
+
+await test("Stripe cancellation and resume log non-2xx responses as failures", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-hosting-guardrails-"));
+  const lines = [];
+  const billing = {
+    config: () => ({ mode: "live", stripe: { live: { secretKey: "sk_live_test" } } }),
+  };
+  const service = new HostingService(dataDir, billing, {}, "https://hub.example.com", {
+    fetchLike: async () => ({ ok: false, status: 401, text: async () => "unauthorized" }),
+    log: (line) => lines.push(line),
+  });
+  await service.bestEffortCancelStripeSubscription("sub_test", 0);
+  await service.bestEffortResumeStripeSubscription("sub_test", 0);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /could not schedule Stripe cancellation.*HTTP 401/);
+  assert.match(lines[1], /could not un-cancel Stripe subscription.*HTTP 401/);
+});
+
+await test("public hosting options are CORS-readable and fail closed while the master switch is off", async () => {
+  const h = await freshHub();
+  try {
+    const response = await fetch(`${h.origin}/api/hosting/options`, { headers: { origin: "https://www.wickhunterunleashed.com" } });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("access-control-allow-origin"), "*");
+    assert.equal(body.purchasable, false);
+    assert.equal(body.priceIsProposed, true);
+  } finally {
+    await h.close();
+  }
+});
+
+summary("hosting-guardrails");

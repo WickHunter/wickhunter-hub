@@ -81,14 +81,13 @@ export const DEFAULT_REGIONS: readonly HostingRegion[] = Object.freeze([
 ]);
 
 export const DEFAULT_PLAN_ID = "vc2-1c-2gb";
-export const DEFAULT_MONTHLY_PRICE_CENTS = 1500; // proposed, per the handoff — not a verified margin
+export const DEFAULT_MONTHLY_PRICE_CENTS = 2000; // 2x the verified $10/month provider plan
 
 export interface HostingPolicy {
   version: number;
   currency: "usd";
-  /** Proposed retail price — see the handoff's §2/§12: $15 pending a real
-   *  Vultr quote and benchmarked resource usage. Labeled "proposed" on every
-   *  customer-facing surface until an operator confirms it. */
+  /** Retail price. Customer-bound checkout verifies this against Stripe and
+   *  requires it to equal twice the provider's current monthly plan quote. */
   monthlyPriceCents: number;
   renewalGraceHours: number;
   retentionHours: number;
@@ -101,6 +100,9 @@ export interface HostingPolicy {
   /** V1: one active hosting instance per owner (H6's explicit recommendation
    *  — "support multiple only through an explicit product expansion"). */
   maxInstancesPerCustomer: number;
+  /** Product limit enforced by the hosted app build only. Self-hosted
+   *  licences do not inherit this machine-size bound. */
+  maximumConnectedAccounts: number;
   managedBackupsIncluded: boolean;
   /** Ordered primary-then-fallback region list. */
   regions: readonly HostingRegion[];
@@ -158,6 +160,7 @@ export function defaultHostingPolicy(): HostingPolicy {
     reminderHoursBeforeDelete: [72, 24],
     temporaryPasswordTtlHours: 24,
     maxInstancesPerCustomer: 1,
+    maximumConnectedAccounts: 5,
     managedBackupsIncluded: false,
     regions: DEFAULT_REGIONS,
     planId: DEFAULT_PLAN_ID,
@@ -166,10 +169,10 @@ export function defaultHostingPolicy(): HostingPolicy {
     readinessRecheckHours: 24,
     provisioningEnabled: false,
     providerAccountRef: "",
-    osId: "",
+    osId: "2284", // Ubuntu 24.04 LTS x64, verified against the live Vultr /v2/os catalogue
     releaseRef: "",
     bootstrapTokenTtlMinutes: 60,
-    maximumConcurrentProvisionJobs: 3,
+    maximumConcurrentProvisionJobs: 1,
     maximumProjectedMonthlyProviderCostCents: 0,
     updatedAtMs: null,
   };
@@ -223,6 +226,9 @@ export function readHostingPolicy(dataDir: string): HostingPolicy {
     reminderHoursBeforeDelete: reminders,
     temporaryPasswordTtlHours: num(raw.temporaryPasswordTtlHours, d.temporaryPasswordTtlHours),
     maxInstancesPerCustomer: num(raw.maxInstancesPerCustomer, d.maxInstancesPerCustomer),
+    maximumConnectedAccounts: Number.isInteger(raw.maximumConnectedAccounts) && (raw.maximumConnectedAccounts as number) >= 1 && (raw.maximumConnectedAccounts as number) <= 5
+      ? raw.maximumConnectedAccounts as number
+      : d.maximumConnectedAccounts,
     managedBackupsIncluded: bool(raw.managedBackupsIncluded, d.managedBackupsIncluded),
     regions: regionsFrom(raw.regions),
     planId: str(raw.planId, d.planId) || d.planId,
@@ -302,6 +308,7 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   }
   if (p.temporaryPasswordTtlHours !== undefined) next.temporaryPasswordTtlHours = intField(p.temporaryPasswordTtlHours, 1, 24 * 30, "temporaryPasswordTtlHours");
   if (p.maxInstancesPerCustomer !== undefined) next.maxInstancesPerCustomer = intField(p.maxInstancesPerCustomer, 1, 10, "maxInstancesPerCustomer");
+  if (p.maximumConnectedAccounts !== undefined) next.maximumConnectedAccounts = intField(p.maximumConnectedAccounts, 1, 5, "maximumConnectedAccounts");
   if (p.managedBackupsIncluded !== undefined) {
     if (typeof p.managedBackupsIncluded !== "boolean") throw new HostingPolicyError("managedBackupsIncluded must be a boolean");
     next.managedBackupsIncluded = p.managedBackupsIncluded;
@@ -327,7 +334,7 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   if (p.provisioningEnabled !== undefined) {
     if (typeof p.provisioningEnabled !== "boolean") throw new HostingPolicyError("provisioningEnabled must be a boolean");
     if (p.provisioningEnabled && (!next.osId && !p.osId)) throw new HostingPolicyError("cannot enable provisioning without an osId configured");
-    if (p.provisioningEnabled && (!next.releaseRef && !p.releaseRef)) throw new HostingPolicyError("cannot enable provisioning without a releaseRef configured");
+    if (p.provisioningEnabled && !/^[0-9a-f]{64}$/.test(String(p.releaseRef ?? next.releaseRef))) throw new HostingPolicyError("cannot enable provisioning without the signed customer artifact SHA-256 as releaseRef");
     next.provisioningEnabled = p.provisioningEnabled;
   }
   if (p.providerAccountRef !== undefined) {
@@ -345,6 +352,10 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   if (p.bootstrapTokenTtlMinutes !== undefined) next.bootstrapTokenTtlMinutes = intField(p.bootstrapTokenTtlMinutes, 5, 24 * 60, "bootstrapTokenTtlMinutes");
   if (p.maximumConcurrentProvisionJobs !== undefined) next.maximumConcurrentProvisionJobs = intField(p.maximumConcurrentProvisionJobs, 1, 50, "maximumConcurrentProvisionJobs");
   if (p.maximumProjectedMonthlyProviderCostCents !== undefined) next.maximumProjectedMonthlyProviderCostCents = intField(p.maximumProjectedMonthlyProviderCostCents, 0, 1_000_000_000, "maximumProjectedMonthlyProviderCostCents");
+  if (next.provisioningEnabled) {
+    if (!next.osId) throw new HostingPolicyError("cannot keep provisioning enabled without an osId configured");
+    if (!/^[0-9a-f]{64}$/.test(next.releaseRef)) throw new HostingPolicyError("cannot keep provisioning enabled without the signed customer artifact SHA-256 as releaseRef");
+  }
   return next;
 }
 

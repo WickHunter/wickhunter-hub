@@ -39,6 +39,8 @@ export interface InstanceEmailFacts {
   sshUsername: string;
   sshPort: number;
   accessUrl: string;
+  temporaryPassword: string;
+  maximumConnectedAccounts: number;
   monthlyPriceLabel: string;
   renewalAt: number | null;
   backupScopeSentence: string;
@@ -66,16 +68,16 @@ export function installationReadyEmail(to: string, firstName: string, f: Instanc
     `Your VPS is ready with Unleashed installed. Open ${f.appUrl} to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
     `Server: ${f.instanceReference}\nLocation: ${f.region}\nCPU / RAM / storage: ${f.cpu} / ${f.ram} / ${f.storage}\nOperating system: ${f.os}\nIP address: ${f.ip}\nApplication username: ${f.appUsername}\nSSH username / port: ${f.sshUsername} / ${f.sshPort}`,
     `View access details: ${f.accessUrl}`,
-    `Use your temporary Unleashed password to sign in. The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `Hosting is ${f.monthlyPriceLabel} per month in addition to your software license. Next hosting renewal: ${renewal}. ${f.backupScopeSentence}`,
+    `Temporary Unleashed password: ${f.temporaryPassword}\nThe application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${f.monthlyPriceLabel} per month in addition to your software license. Next hosting renewal: ${renewal}. ${f.backupScopeSentence}`,
   ].join("\n\n");
   const html = [
     `Hi ${name},`,
     `Your VPS is ready with Unleashed installed. Open <a href="${escapeHtml(f.appUrl)}">${escapeHtml(f.appUrl)}</a> to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
     `Server: ${escapeHtml(f.instanceReference)}<br>Location: ${escapeHtml(f.region)}<br>CPU / RAM / storage: ${escapeHtml(f.cpu)} / ${escapeHtml(f.ram)} / ${escapeHtml(f.storage)}<br>Operating system: ${escapeHtml(f.os)}<br>IP address: ${escapeHtml(f.ip)}<br>Application username: ${escapeHtml(f.appUsername)}<br>SSH username / port: ${escapeHtml(f.sshUsername)} / ${f.sshPort}`,
     `<a href="${escapeHtml(f.accessUrl)}">View access details</a>`,
-    `Use your temporary Unleashed password to sign in. The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `Hosting is ${escapeHtml(f.monthlyPriceLabel)} per month in addition to your software license. Next hosting renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
+    `Temporary Unleashed password: <code>${escapeHtml(f.temporaryPassword)}</code><br>The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${escapeHtml(f.monthlyPriceLabel)} per month in addition to your software license. Next hosting renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
   ].join("\n\n");
   return withTo(wrap("Your Unleashed VPS is ready", text, html), to);
 }
@@ -114,12 +116,12 @@ export function overdueEmail(to: string, instanceReference: string, suspendAt: n
 export function suspendedEmail(to: string, instanceReference: string, deleteAt: number, manageUrl: string): EmailMessage {
   const text = [
     `Hosting for ${instanceReference} has ended and the VPS is now suspended. Bot management on this VPS has stopped. Positions and orders may still exist on your exchange.`,
-    `The server is scheduled for permanent deletion at ${fmtDate(deleteAt)}. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots will need review before they resume.`,
+    `The server is scheduled for permanent deletion at ${fmtDate(deleteAt)}. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots saved as enabled may resume through their normal safety gates after authenticated server readiness; paused bots remain paused.`,
     `Review hosting and payment: ${manageUrl}`,
   ].join("\n\n");
   const html = [
     `Hosting for ${escapeHtml(instanceReference)} has ended and the VPS is now suspended. Bot management on this VPS has stopped. Positions and orders may still exist on your exchange.`,
-    `The server is scheduled for permanent deletion at <b>${escapeHtml(fmtDate(deleteAt))}</b>. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots will need review before they resume.`,
+    `The server is scheduled for permanent deletion at <b>${escapeHtml(fmtDate(deleteAt))}</b>. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots saved as enabled may resume through their normal safety gates after authenticated server readiness; paused bots remain paused.`,
     `<a href="${escapeHtml(manageUrl)}">Review hosting and payment</a>`,
   ].join("\n\n");
   return withTo(wrap("Your Unleashed VPS has been suspended", text, html), to);
@@ -185,11 +187,11 @@ export function terminatedEmail(to: string, instanceReference: string, terminate
  *  wording never claims the wrong cause (§9: "for voluntary cancellation do
  *  not claim a charge failed; for incomplete cleanup do not use the final
  *  template early"). */
-export function exceptionEmail(to: string, kind: "setup_failure_refunded" | "late_payment_after_deletion", instanceReference: string, detail: string, hostingUrl: string): EmailMessage {
-  if (kind === "setup_failure_refunded") {
+export function exceptionEmail(to: string, kind: "setup_failure" | "late_payment_after_deletion", instanceReference: string, detail: string, hostingUrl: string): EmailMessage {
+  if (kind === "setup_failure") {
     const text = [
       `We were not able to finish setting up ${instanceReference}. ${detail}`,
-      `Your hosting payment for this server has been refunded. You can start a new order from your account when you are ready to try again.`,
+      `A request to stop renewal for this server has been sent. We will confirm both the renewal status and the status of your initial hosting payment separately; contact support if you do not receive that confirmation.`,
       `View hosting: ${hostingUrl}`,
     ].join("\n\n");
     const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");

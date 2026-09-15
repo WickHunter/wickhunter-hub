@@ -13,6 +13,7 @@ import { FakeProvider, hashBootstrapToken } from "../dist/src/hosting/provider.j
 
 const TEST_WHSEC = "whsec_test_hosting_0123456789";
 const HOUR = 60 * 60 * 1000;
+const TEST_RELEASE_SHA = "a".repeat(64);
 
 function mkEvSeq() { let n = 0; return () => ++n; }
 
@@ -23,24 +24,28 @@ async function newHub(overrides = {}) {
     billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
     billingNow: () => clock,
     hostingNow: () => clock,
-    hostingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
+    hostingFetch: overrides.hostingFetch ?? (async (url, init) => {
+      if (url.includes("/v1/prices/")) return { ok: true, status: 200, text: async () => JSON.stringify({ id: "price_host1", active: true, unit_amount: 2000, currency: "usd", type: "recurring", recurring: { interval: "month", interval_count: 1 } }) };
+      if (url.endsWith("/v1/checkout/sessions")) return { ok: true, status: 200, text: async () => JSON.stringify({ url: "https://checkout.stripe.com/c/pay_test" }) };
+      return { ok: true, status: 200, text: async () => "{}" };
+    }),
     hostingProvider: provider,
   });
   const admin = (p, opts = {}) => jsonReq(`${h.origin}${p}`, { ...opts, headers: { "x-hub-admin": "test-admin-token", "content-type": "application/json", ...(opts.headers ?? {}) } });
   await admin("/admin/api/billing/config", {
     method: "POST",
     body: JSON.stringify({
-      stripe: { test: { webhookSecret: TEST_WHSEC } },
+      stripe: { test: { secretKey: "sk_test_hosting_0123456789", webhookSecret: TEST_WHSEC, paymentLinks: { "hosting-monthly": "https://buy.stripe.com/test_hosting" } } },
       roles: { test: { hosting: { priceIds: ["price_host1"], productIds: [] } } },
       plans: [
         { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "software" },
-        { key: "hosting-monthly", name: "Hosting", amountCents: 1500, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "hosting" },
+        { key: "hosting-monthly", name: "Hosting", amountCents: 2000, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "hosting" },
       ],
     }),
   });
   await admin("/admin/api/hosting/policy", {
     method: "POST",
-    body: JSON.stringify({ policy: { provisioningEnabled: true, osId: "1743", releaseRef: "v-test" } }),
+    body: JSON.stringify({ policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "1743", releaseRef: TEST_RELEASE_SHA } }),
   });
   const nextEv = mkEvSeq();
   const sec = () => Math.floor(clock / 1000);
@@ -68,6 +73,8 @@ async function boughtHosting(ctx, customerId, email) {
     customer_details: { email }, subscription: `sub_sw_${customerId}`, metadata: { plan: "monthly" },
   }));
   assert.equal(r1.status, 200);
+  const checkout = await ctx.h.hub.hosting.checkoutUrl(customerId, email, ctx.getClock());
+  assert.equal(checkout.ok, true);
   const r2 = await ctx.postEvent(ctx.event("checkout.session.completed", {
     id: `cs_host_${customerId}`, mode: "subscription", payment_status: "paid", customer: customerId,
     customer_details: { email }, subscription: `sub_host_${customerId}`, metadata: { plan: "hosting-monthly" },
@@ -113,6 +120,8 @@ await test("crash between persist and provider create: a create that 'times out'
   await ctx.h.hub.hosting.tick(ctx.getClock());
   let fresh = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(fresh.providerInstanceId, null, "the id was never learned from the timed-out attempt");
+  assert.ok(fresh.bootstrapTokenHash, "the callback verifier is durable before an uncertain provider create returns");
+  assert.equal(fresh.releaseRef, TEST_RELEASE_SHA, "the uncertain instance keeps the exact customer release it booted with");
   assert.equal(provider.createCalls.length, 1);
   assert.equal(instancesFor(ctx, "cus_crash").length, 1, "still exactly one instance row");
   // Second tick, after the backoff: findByLabel must discover the SAME
@@ -130,7 +139,7 @@ await test("crash between persist and provider create: a create that 'times out'
 
 // ── acceptance: readiness refuses by name, and fallback region once ────────
 
-await test("readiness: a refused venue is named; the SAME generation retries exactly once in the fallback region, then refuses for good", async () => {
+await test("readiness: a refused venue is named; the failed VPS is deleted before one fallback generation, then refuses for good", async () => {
   const ctx = await newHub();
   const rows = await boughtHosting(ctx, "cus_ready", "ready@example.com");
   await ctx.h.hub.hosting.tick(ctx.getClock());
@@ -140,6 +149,10 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
   const rawToken = "test-bootstrap-token-1";
   ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
   row = ctx.h.hub.hosting.store.getInstance(row.id);
+  const installer = ctx.h.hub.hosting.bootstrapLicenseToken(row.id, rawToken, row.generation, ctx.getClock());
+  assert.equal(installer.ok, true, "the instance-scoped proof can fetch this customer's installer while bootstrapping");
+  assert.equal(installer.value.releaseRef, TEST_RELEASE_SHA, "the exact release ref was pinned on this generation, independent of later policy edits");
+  assert.match(installer.value.licenseToken, /^LHK1\./);
 
   // Bybit refused (403) in Tokyo -> the instance retries ONCE, in Osaka.
   const r1 = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${row.id}/readiness`, {
@@ -147,17 +160,18 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
   });
   assert.equal(r1.status, 200);
   assert.equal(r1.body.ready, false);
+  const firstGeneration = row.generation;
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // delete the refused Tokyo VPS and advance generation
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // provision its Osaka replacement
   row = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(row.region, "itm", "fell back to Osaka after Tokyo's Bybit refusal");
+  assert.equal(row.generation, firstGeneration + 1, "the replacement has a new callback generation");
   assert.equal(row.regionAttempts.length, 1);
   assert.match(row.failureReason, /Bybit/);
   assert.match(row.failureReason, /403/);
 
-  // Provision again in the fallback region (a new bootstrap token, same
-  // generation), and it ALSO refuses — this must be the LAST fallback: no
+  // The fallback region ALSO refuses — this must be the LAST fallback: no
   // second retry, a permanent refusal naming the venue.
-  await ctx.h.hub.hosting.tick(ctx.getClock());
-  row = ctx.h.hub.hosting.store.getInstance(row.id);
   const rawToken2 = "test-bootstrap-token-2";
   ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken2); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
   row = ctx.h.hub.hosting.store.getInstance(row.id);
@@ -165,6 +179,7 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
     method: "POST", body: JSON.stringify({ token: rawToken2, generation: row.generation, results: [{ venueId: "bybit", status: 403 }, { venueId: "binance", status: 200 }] }),
   });
   assert.equal(r2.body.ready, false);
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // terminal cleanup removes the refused Osaka VPS
   row = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(row.region, "itm", "no THIRD region to try — stays where the single fallback landed");
   assert.equal(row.regionAttempts.length, 1, "the fallback was spent exactly once, not retried again");
@@ -200,14 +215,18 @@ await test("a late readiness callback naming a REPLACED generation is refused �
   await ctx.h.close();
 });
 
-// ── acceptance: restore always boots paused ─────────────────────────────────
+// ── acceptance: restore requires a fresh authenticated readiness proof ──────
 
 await test("restore: a payment while suspended moves the instance to ready (never 'active'), and the customer view never claims bots resumed", async () => {
   const ctx = await newHub();
   const rows = await boughtHosting(ctx, "cus_restore", "restore@example.com");
-  const row = rows[0];
+  let row = rows[0];
+  const managementToken = "restore-management-token";
+  await ctx.h.hub.hosting.tick(ctx.getClock());
+  row = ctx.h.hub.hosting.store.getInstance(row.id);
+  assert.ok(row.providerInstanceId, "the recovery fixture retains a previously provisioned server");
   // Force it straight to `suspended` (as if a nonpayment cycle already ran).
-  ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.stage = "suspended"; d.cancellationReason = "renewal_unpaid"; d.paidThroughMs = ctx.getClock() - 10 * HOUR; }, ctx.getClock());
+  ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.stage = "suspended"; d.cancellationReason = "renewal_unpaid"; d.paidThroughMs = ctx.getClock() - 10 * HOUR; d.managementTokenHash = hashBootstrapToken(managementToken); }, ctx.getClock());
   // A fresh invoice.paid for the hosting subscription arrives.
   const paidThrough = ctx.getClock() + 30 * 24 * HOUR;
   await ctx.postEvent(ctx.event("invoice.paid", {
@@ -221,16 +240,33 @@ await test("restore: a payment while suspended moves the instance to ready (neve
   // instance back (FakeProvider still has it — suspend only powers off).
   await ctx.h.hub.hosting.tick(ctx.getClock());
   fresh = ctx.h.hub.hosting.store.getInstance(row.id);
-  assert.equal(fresh.stage, "bootstrapping", "a restore re-runs the SAME readiness gate as a fresh install — no shortcut to ready");
-  const rawToken = "restore-tok";
-  ctx.h.hub.hosting.store.updateInstance(fresh.id, fresh.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
+  assert.equal(fresh.stage, "restoring", "provider power-on alone is not readiness");
+  const retained = { providerInstanceId: fresh.providerInstanceId, region: fresh.region, generation: fresh.generation };
+  const refusedResults = ["bybit", "binance", "bitget", "bitunix", "blofin", "weex", "aster"].map((venueId) => ({ venueId, status: venueId === "bybit" ? 403 : 200 }));
+  const refused = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken, counter: 1, generation: fresh.generation, results: refusedResults }) });
+  assert.equal(refused.status, 200);
+  assert.equal(refused.body.ready, false);
   fresh = ctx.h.hub.hosting.store.getInstance(fresh.id);
+  assert.equal(fresh.stage, "restoring", "a paid recovery probe refusal retains the recovery state");
+  assert.deepEqual({ providerInstanceId: fresh.providerInstanceId, region: fresh.region, generation: fresh.generation }, retained, "a restore refusal never replaces or deletes the customer's retained server");
+  assert.ok(await ctx.provider.getInstance(retained.providerInstanceId), "the retained provider resource and its data still exist");
+  const replayedRefusal = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken, counter: 1, generation: fresh.generation, results: refusedResults }) });
+  assert.equal(replayedRefusal.status, 404, "an already-consumed management counter is rejected while the instance is still restoring");
+  fresh = ctx.h.hub.hosting.store.getInstance(fresh.id);
+  assert.equal(fresh.managementCounter, 1, "a replay cannot advance or reset the accepted management counter");
+  const wrongGeneration = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken, counter: 2, generation: fresh.generation + 1, results: refusedResults }) });
+  assert.equal(wrongGeneration.status, 404);
+  const wrongToken = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken: "wrong", counter: 2, generation: fresh.generation, results: refusedResults }) });
+  assert.equal(wrongToken.status, 404);
   const results = ["bybit", "binance", "bitget", "bitunix", "blofin", "weex", "aster"].map((venueId) => ({ venueId, status: 200 }));
-  await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ token: rawToken, generation: fresh.generation, results }) });
+  const proof = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken, counter: 2, generation: fresh.generation, results }) });
+  assert.equal(proof.status, 200);
   fresh = ctx.h.hub.hosting.store.getInstance(fresh.id);
   assert.equal(fresh.stage, "ready", "restore lands on 'ready', never 'active' — there is no path in this service that ever sets 'active'");
   const jobs = ctx.h.hub.hosting.store.outboxFor(fresh.id);
   assert.ok(jobs.some((j) => j.jobType === "email" && j.dedupeKey.includes("restored")));
+  const replay = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${fresh.id}/readiness`, { method: "POST", body: JSON.stringify({ managementToken, counter: 2, generation: fresh.generation, results }) });
+  assert.equal(replay.status, 404, "a readiness proof counter cannot be replayed after recovery");
   await ctx.h.close();
 });
 
@@ -388,7 +424,7 @@ await test("customer cancel: schedules suspend AT paid-through (no grace) and de
   assert.equal(fresh.stage, "ready");
 
   // Once past the suspend deadline, reversal is refused.
-  ctx.h.hub.hosting.cancel("cus_cancel", row.id, ctx.getClock());
+  await ctx.h.hub.hosting.cancel("cus_cancel", row.id, ctx.getClock());
   fresh = ctx.h.hub.hosting.store.getInstance(row.id);
   const tooLate = await ctx.h.hub.hosting.resumeRenewal("cus_cancel", row.id, fresh.suspendAtMs + 1);
   assert.equal(tooLate.ok, false);
@@ -396,16 +432,58 @@ await test("customer cancel: schedules suspend AT paid-through (no grace) and de
   await ctx.h.close();
 });
 
+await test("a failed Stripe cancellation leaves the local paid lifecycle unchanged", async () => {
+  const ctx = await newHub({ hostingFetch: async (url) => {
+    if (url.includes("/v1/prices/")) return { ok: true, status: 200, text: async () => JSON.stringify({ id: "price_host1", active: true, unit_amount: 2000, currency: "usd", type: "recurring", recurring: { interval: "month", interval_count: 1 } }) };
+    if (url.endsWith("/v1/checkout/sessions")) return { ok: true, status: 200, text: async () => JSON.stringify({ url: "https://checkout.stripe.com/c/pay_test" }) };
+    return { ok: false, status: 503, text: async () => "unavailable" };
+  } });
+  const [row] = await boughtHosting(ctx, "cus_cancel_fail", "cancel-fail@example.com");
+  ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.stage = "ready"; d.paidThroughMs = ctx.getClock() + 10 * HOUR; }, ctx.getClock());
+  const before = ctx.h.hub.hosting.store.getInstance(row.id);
+  const result = await ctx.h.hub.hosting.cancel("cus_cancel_fail", row.id, ctx.getClock());
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "PROVIDER_STATUS_UNKNOWN");
+  const after = ctx.h.hub.hosting.store.getInstance(row.id);
+  assert.equal(after.stage, before.stage);
+  assert.equal(after.lifecycleVersion, before.lifecycleVersion);
+  assert.equal(after.deleteAtMs, null);
+  await ctx.h.close();
+});
+
+await test("an uncertain Stripe Checkout retry reuses the exact durable request and idempotency key", async () => {
+  const sessionCalls = [];
+  const ctx = await newHub({ hostingFetch: async (url, init) => {
+    if (url.includes("/v1/prices/")) return { ok: true, status: 200, text: async () => JSON.stringify({ id: "price_host1", active: true, unit_amount: 2000, currency: "usd", type: "recurring", recurring: { interval: "month", interval_count: 1 } }) };
+    if (url.endsWith("/v1/checkout/sessions")) {
+      sessionCalls.push(init);
+      if (sessionCalls.length === 1) return { ok: false, status: 503, text: async () => JSON.stringify({ error: "temporarily unavailable" }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ url: "https://checkout.stripe.com/c/recovered" }) };
+    }
+    return { ok: true, status: 200, text: async () => "{}" };
+  } });
+  await ctx.postEvent(ctx.event("checkout.session.completed", { id: "cs_sw_uncertain", mode: "subscription", payment_status: "paid", customer: "cus_uncertain", customer_details: { email: "uncertain@example.com" }, subscription: "sub_sw_uncertain", metadata: { plan: "monthly" } }));
+  const first = await ctx.h.hub.hosting.checkoutUrl("cus_uncertain", "uncertain@example.com", ctx.getClock());
+  assert.equal(first.ok, false);
+  assert.ok(ctx.h.hub.hosting.store.activeInstanceForOwner("cus_uncertain", "test"), "uncertain response retains the cost reservation");
+  const second = await ctx.h.hub.hosting.checkoutUrl("cus_uncertain", "uncertain@example.com", ctx.getClock());
+  assert.equal(second.ok, true);
+  assert.equal(sessionCalls.length, 2);
+  assert.equal(sessionCalls[1].headers["idempotency-key"], sessionCalls[0].headers["idempotency-key"]);
+  assert.equal(sessionCalls[1].body, sessionCalls[0].body);
+  await ctx.h.close();
+});
+
 // ── acceptance / H2 wiring: eligibility gate and the customer dashboard ────
 
 await test("checkout is refused without an eligible software licence, and a second checkout is refused once an instance exists", async () => {
   const ctx = await newHub();
-  const r1 = ctx.h.hub.hosting.checkoutUrl("email:noone@example.com", "noone@example.com");
+  const r1 = await ctx.h.hub.hosting.checkoutUrl("email:noone@example.com", "noone@example.com");
   assert.equal(r1.ok, false);
   assert.equal(r1.code, "SOFTWARE_LICENSE_REQUIRED");
 
   await boughtHosting(ctx, "cus_elig", "elig@example.com");
-  const r2 = ctx.h.hub.hosting.checkoutUrl("cus_elig", "elig@example.com");
+  const r2 = await ctx.h.hub.hosting.checkoutUrl("cus_elig", "elig@example.com");
   assert.equal(r2.ok, false);
   assert.equal(r2.code, "HOSTING_ALREADY_EXISTS");
   await ctx.h.close();

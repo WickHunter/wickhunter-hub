@@ -13,6 +13,39 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.39 — managed VPS provisioning completes a protected install
+
+Managed hosting now fetches the existing personalized installer with a
+short-lived per-instance POST credential. Before provisioning, the Hub stores
+the generation verifier and configured release ref; the returned installer
+pins the complete signed manifest identity and verifies the package version and
+protected native core before it starts the app. Readiness is accepted only
+after the forced-change dashboard credential is durable and every configured
+venue probe succeeds. The temporary password is removed from the server env
+after seeding and sent in the ready email.
+
+Hosted instances receive a plan-specific limit of up to five connected
+exchange accounts without changing self-hosted licences. The customer and
+public hosting views expose that limit, the ready email states that hosting is
+a separate subscription, and the policy defaults to Ubuntu 24.04 x64 with one
+concurrent provisioning job. Provisioning remains disabled until the operator
+pins an authenticated protected release and enables it.
+
+Checkout is a Stripe Checkout Session bound to the existing licensed customer,
+with the classified $20 monthly price verified against the live $10 provider
+quote. A durable unpaid reservation prevents double checkout and cost-ceiling
+oversubscription. Cancellation changes local deadlines only after Stripe
+confirms it; system cancellation retries through the outbox. Paid recovery
+powers on the retained VPS and waits for its generation-bound readiness agent;
+a failed restore probe never deletes customer data.
+
+For managed hosting, `npm run publish-release -- <manifest> <artifact>` verifies
+and publishes the immutable artifact and `manifest-<artifact-sha256>.json`
+before atomically replacing `releases/latest.json`.
+Set the hosting release ref to that 64-character artifact SHA. An instance that
+boots after `latest.json` advances can then retrieve its exact authenticated
+manifest and immutable artifact rather than changing releases mid-generation.
+
 ## v0.4.38 — demanded WEEX timeframe work cannot starve
 
 WEEX reconciliation ranges that fit inside the documented newest 1,000-row
@@ -1673,6 +1706,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.39 — Complete the managed VPS bootstrap through the signed customer installer, pin the full signed release identity per generation, seed and clear the forced-change password safely, require protected-core and venue readiness, and expose the hosted five-account cap without changing self-hosted licences.
 - v0.4.38 — Move proved-recent WEEX reconciliation to the documented weight-1 current page with exact-range settlement checks. Reserve bounded native-demand progress against continuously due routine reconciliation and old repairs inside the unchanged 25-weight/minute envelope; tail and recent repair remain first.
 - v0.4.37 — Add the optional signed timeframe-seed v2 contract while preserving omitted/explicit `interval=1` as byte-for-byte v1. Persist source-aware higher-timeframe caches, use proved native REST intervals across all six venues, aggregate only complete REST-proven compatible bars, and report exact closed windows/depth/gaps. Share the existing venue weight budget fairly with background 1m depth, retain live/reconcile/repair priority, invalidate reused instrument identities, and keep an extra UTC day of higher-timeframe boundary padding. A warm 700-pair × 24-hour fixture serves in about 0.1 seconds locally; cold WEEX recovery uses documented cheap current pages inside the same conservative weight envelope.
 - v0.4.36 — Apply the store's captured settlement cutoff before REST contiguity, correction, coverage and frontier accounting. A long tick cannot confirm a grace-period row its write rejected, or count a correction it never stored. Preserve rates, fairness, stored data and strict seed-gap checks.
