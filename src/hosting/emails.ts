@@ -39,6 +39,8 @@ export interface InstanceEmailFacts {
   sshUsername: string;
   sshPort: number;
   accessUrl: string;
+  temporaryPassword: string;
+  maximumConnectedAccounts: number;
   monthlyPriceLabel: string;
   renewalAt: number | null;
   backupScopeSentence: string;
@@ -66,16 +68,16 @@ export function installationReadyEmail(to: string, firstName: string, f: Instanc
     `Your VPS is ready with Unleashed installed. Open ${f.appUrl} to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
     `Server: ${f.instanceReference}\nLocation: ${f.region}\nCPU / RAM / storage: ${f.cpu} / ${f.ram} / ${f.storage}\nOperating system: ${f.os}\nIP address: ${f.ip}\nApplication username: ${f.appUsername}\nSSH username / port: ${f.sshUsername} / ${f.sshPort}`,
     `View access details: ${f.accessUrl}`,
-    `Use your temporary Unleashed password to sign in. The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `Hosting is ${f.monthlyPriceLabel} per month in addition to your software license. Next hosting renewal: ${renewal}. ${f.backupScopeSentence}`,
+    `Temporary Unleashed password: ${f.temporaryPassword}\nThe application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${f.monthlyPriceLabel} per month in addition to your software license. Next hosting renewal: ${renewal}. ${f.backupScopeSentence}`,
   ].join("\n\n");
   const html = [
     `Hi ${name},`,
     `Your VPS is ready with Unleashed installed. Open <a href="${escapeHtml(f.appUrl)}">${escapeHtml(f.appUrl)}</a> to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
     `Server: ${escapeHtml(f.instanceReference)}<br>Location: ${escapeHtml(f.region)}<br>CPU / RAM / storage: ${escapeHtml(f.cpu)} / ${escapeHtml(f.ram)} / ${escapeHtml(f.storage)}<br>Operating system: ${escapeHtml(f.os)}<br>IP address: ${escapeHtml(f.ip)}<br>Application username: ${escapeHtml(f.appUsername)}<br>SSH username / port: ${escapeHtml(f.sshUsername)} / ${f.sshPort}`,
     `<a href="${escapeHtml(f.accessUrl)}">View access details</a>`,
-    `Use your temporary Unleashed password to sign in. The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `Hosting is ${escapeHtml(f.monthlyPriceLabel)} per month in addition to your software license. Next hosting renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
+    `Temporary Unleashed password: <code>${escapeHtml(f.temporaryPassword)}</code><br>The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
+    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. Hosting is ${escapeHtml(f.monthlyPriceLabel)} per month in addition to your software license. Next hosting renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
   ].join("\n\n");
   return withTo(wrap("Your Unleashed VPS is ready", text, html), to);
 }

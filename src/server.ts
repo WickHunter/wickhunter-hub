@@ -582,7 +582,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // token routes above it).
       if (p === "/api/hosting/checkout") return true;
       if (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal"))) return true;
-      if (p.startsWith("/api/hosting/instances/") && p.endsWith("/readiness")) return true;
+      if (p.startsWith("/api/hosting/instances/") && (p.endsWith("/installer") || p.endsWith("/readiness"))) return true;
       return false;
     }
     return false;
@@ -684,6 +684,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/hosting/checkout") return hostingCheckout(req, res);
     if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/cancel")) return hostingCancel(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/resume-renewal")) return hostingResumeRenewal(req, res, p);
+    if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/installer")) return hostingInstaller(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/readiness")) return hostingReadinessCallback(req, res, p);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
@@ -1112,12 +1113,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   /** The personalised installer, ONE renderer for both doors: `?key=` (the
    *  beta invite) and `/install/<one-time token>` (a purchase). */
-  function sendInstaller(res: ServerResponse, licenseToken: string): void {
+  function sendInstaller(
+    res: ServerResponse,
+    licenseToken: string,
+    pinnedRelease?: Pick<SignedReleaseManifest, "version" | "buildId" | "sha256">,
+  ): void {
     const template = fs.readFileSync(path.join(cfg.templatesDir, "install.sh"), "utf8");
     const script = template
       .replaceAll("__HUB_ORIGIN__", cfg.publicOrigin)
       .replaceAll("__LICENSE_KEY__", licenseToken)
       .replaceAll("__RELEASE_KEYS_B64U__", Buffer.from(JSON.stringify(cfg.releasePublicKeys), "utf8").toString("base64url"))
+      .replaceAll("__PINNED_RELEASE_B64U__", pinnedRelease
+        ? Buffer.from(JSON.stringify(pinnedRelease), "utf8").toString("base64url")
+        : "")
       .replaceAll("__RELEASE_MAX_AGE_MS__", String(cfg.releaseMaxAgeMs));
     res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "no-store" });
     res.end(script);
@@ -1302,13 +1310,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     sendJson(res, 200, {
       ok: true,
       monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
-      priceIsProposed: true,
+      priceIsProposed: !policy.provisioningEnabled,
       regions: policy.regions,
       planId: policy.planId,
       planLabel: policy.planLabel,
+      maximumConnectedAccounts: policy.maximumConnectedAccounts,
       managedBackupsIncluded: policy.managedBackupsIncluded,
       purchasable: policy.provisioningEnabled,
-    }, { "cache-control": "no-store" });
+    }, { "access-control-allow-origin": "*", "cache-control": "no-store" });
   }
 
   function hostingState(req: IncomingMessage, res: ServerResponse): void {
@@ -1369,12 +1378,32 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return customerSessions.hostingOwnerCandidates(identity).includes(row.ownerId) ? row.ownerId : null;
   }
 
-  /** POST /api/hosting/instances/:id/readiness — the ONLY hosting route
-   *  that is neither customer-session nor admin-token authenticated: the
-   *  bootstrap script on the instance itself calls it, carrying the
-   *  short-lived per-generation token minted at provisioning time
-   *  (`HostingService.reportReadiness` verifies it against the STORED
-   *  hash). */
+  /** Serve the same signed-release installer used by manual purchases, after
+   *  authenticating the short-lived instance/generation credential and
+   *  confirming that the currently published signed manifest is the exact
+   *  release the operator pinned in hosting policy. */
+  async function hostingInstaller(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const instanceId = p.slice("/api/hosting/instances/".length, -"/installer".length);
+    const body = await readJsonBody(req);
+    if (body === null || typeof body.token !== "string" || typeof body.generation !== "number") {
+      return sendJson(res, 400, { ok: false, error: "expected {token, generation}" }, { "cache-control": "no-store" });
+    }
+    const release = readLatest();
+    if (!release) return sendText(res, 503, "no verified customer release is published");
+    const authenticated = hosting.bootstrapLicenseToken(instanceId, body.token, body.generation);
+    if (!authenticated.ok) return sendJson(res, 404, { ok: false, error: authenticated.error }, { "cache-control": "no-store" });
+    if (![release.version, release.buildId, release.sha256].includes(authenticated.value.releaseRef)) {
+      return sendText(res, 409, "the published customer release does not match this instance's pinned release ref");
+    }
+    sendInstaller(res, authenticated.value.licenseToken, {
+      version: release.version,
+      buildId: release.buildId,
+      sha256: release.sha256,
+    });
+  }
+
+  /** POST /api/hosting/instances/:id/readiness — the bootstrap script calls
+   *  this only after installation and every venue probe succeed. */
   async function hostingReadinessCallback(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
     const instanceId = p.slice("/api/hosting/instances/".length, -"/readiness".length);
     const body = await readJsonBody(req);

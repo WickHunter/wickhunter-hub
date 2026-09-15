@@ -39,6 +39,13 @@ export function hashBootstrapToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
+/** The one-time dashboard password installed by cloud-init. It is derived
+ * from the already persisted token hash so the asynchronous ready email can
+ * reproduce it without storing another plaintext secret. */
+export function bootstrapPasswordFromTokenHash(tokenHash: string): string {
+  return createHash("sha256").update(`${tokenHash}:password:v1`).digest("hex").slice(0, 24);
+}
+
 export interface ProviderPlan {
   id: string;
   vcpus: number;

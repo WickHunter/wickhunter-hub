@@ -38,7 +38,7 @@ import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type Host
 import { readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
 import { deadlines, type HostingDeadlines, type HostingEndReason } from "./deadlines.js";
 import { readinessVerdict, type ProbeResult, type ReadinessVerdict } from "./readiness.js";
-import { hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
+import { bootstrapPasswordFromTokenHash, hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
 import { buildBootstrapUserData } from "./bootstrap.js";
 import * as tmpl from "./emails.js";
 
@@ -424,6 +424,34 @@ export class HostingService {
 
   // ── readiness callback ───────────────────────────────────────────────────
 
+  /** Authenticate a fresh instance before the Hub gives it the customer's
+   *  signed-release installer. The provider never receives a GitHub token or
+   *  a release-signing secret. */
+  bootstrapLicenseToken(instanceId: string, presentedToken: string, generation: number, nowMs = this.now()): HostingActionResult<{ licenseToken: string; releaseRef: string }> {
+    const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
+    if (!authenticated.ok) return authenticated;
+    if (!this.softwareEligible(authenticated.value.ownerId, nowMs)) {
+      return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: "the software licence is not active" };
+    }
+    const customer = this.billing.store.getCustomer(authenticated.value.ownerId);
+    const licenseToken = customer ? this.licenses.tokenFor(customer.licenseId) : null;
+    if (!licenseToken) return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: "the software licence is not available" };
+    const row = this.store.getInstance(instanceId);
+    if (!row?.releaseRef) return { ok: false, code: "NOT_FOUND", error: "this instance has no pinned customer release" };
+    return { ok: true, value: { licenseToken, releaseRef: row.releaseRef } };
+  }
+
+  private authenticatedBootstrapOwner(instanceId: string, presentedToken: string, generation: number, nowMs: number): HostingActionResult<{ ownerId: string }> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
+    if (row.stage !== "provisioning" && row.stage !== "bootstrapping") return { ok: false, code: "NOT_FOUND", error: "bootstrap is no longer active for this instance" };
+    if (row.generation !== generation) return { ok: false, code: "NOT_FOUND", error: "stale generation — this callback belongs to a replaced instance" };
+    if (!row.bootstrapTokenHash || row.bootstrapTokenExpiresAtMs === null || row.bootstrapTokenExpiresAtMs < nowMs || hashBootstrapToken(presentedToken) !== row.bootstrapTokenHash) {
+      return { ok: false, code: "NOT_FOUND", error: "invalid or expired bootstrap token" };
+    }
+    return { ok: true, value: { ownerId: row.ownerId } };
+  }
+
   /** POST /api/hosting/instances/:id/readiness. Verifies the presented
    *  bootstrap token against the STORED hash (never accepted in plaintext
    *  anywhere else — the token itself never appears in a log line here).
@@ -433,11 +461,9 @@ export class HostingService {
    *  the replacement ready"). */
   reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now()): HostingActionResult<{ ready: boolean }> {
     const row = this.store.getInstance(instanceId);
+    const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
+    if (!authenticated.ok) return authenticated;
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
-    if (row.generation !== generation) return { ok: false, code: "NOT_FOUND", error: "stale generation — this callback belongs to a replaced instance" };
-    if (!row.bootstrapTokenHash || row.bootstrapTokenExpiresAtMs === null || row.bootstrapTokenExpiresAtMs < nowMs || hashBootstrapToken(presentedToken) !== row.bootstrapTokenHash) {
-      return { ok: false, code: "NOT_FOUND", error: "invalid or expired bootstrap token" };
-    }
     const policy = this.policy();
     const verdict = readinessVerdict(policy.probeVenues, results);
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
@@ -597,9 +623,22 @@ export class HostingService {
     }
     if (!created) {
       const rawToken = mintBootstrapToken(this.randomBytes);
+      // Persist the verifier BEFORE the provider call. A create timeout may
+      // mean the instance already exists and cloud-init is already calling
+      // home; writing this afterward creates a race where a legitimate
+      // installer request is refused, and a process crash would lose the one
+      // verifier that can authenticate the orphaned instance.
+      const tokenRow = this.store.getInstance(row.id);
+      if (!tokenRow) return;
+      this.store.updateInstance(row.id, tokenRow.version, (d) => {
+        d.bootstrapTokenHash = hashBootstrapToken(rawToken);
+        d.bootstrapTokenExpiresAtMs = nowMs + policy.bootstrapTokenTtlMinutes * 60_000;
+        d.releaseRef = policy.releaseRef;
+      }, nowMs);
       const userData = buildBootstrapUserData({
         instanceId: row.id, generation: row.generation, bootstrapToken: rawToken,
-        hubOrigin: this.origin, releaseRef: policy.releaseRef,
+        hubOrigin: this.origin,
+        maxAccounts: policy.maximumConnectedAccounts,
         probeVenues: policy.probeVenues,
       });
       try {
@@ -614,11 +653,6 @@ export class HostingService {
         // same instance/generation.
         throw new Error(`createInstance failed/uncertain: ${(err as Error).message} — will re-check findByLabel next attempt`);
       }
-      const current = this.store.getInstance(row.id);
-      if (current) this.store.updateInstance(row.id, current.version, (d) => {
-        d.bootstrapTokenHash = hashBootstrapToken(rawToken);
-        d.bootstrapTokenExpiresAtMs = nowMs + policy.bootstrapTokenTtlMinutes * 60_000;
-      }, nowMs);
     }
     if (!this.store.resourcesFor(row.id).some((r) => r.providerResourceId === created!.providerInstanceId)) {
       // Recorded whether `created` came from a fresh `createInstance` or
@@ -843,6 +877,13 @@ export class HostingService {
     if (!msg) return;
     const r = await sendEmail(cfg, { ...msg, to: email }, this.fetchLike);
     if (!r.ok) throw new Error(`send failed: ${r.error}`);
+    if (template === "installation_ready") {
+      const current = this.store.getInstance(row.id);
+      if (current) this.store.updateInstance(current.id, current.version, (d) => {
+        d.bootstrapTokenHash = null;
+        d.bootstrapTokenExpiresAtMs = null;
+      }, nowMs);
+    }
   }
 
   private emailFor(ownerId: string): string {
@@ -856,12 +897,15 @@ export class HostingService {
     const ref = row.id;
     const manageUrl = `${this.origin}/customer#hosting`;
     const priceLabel = `$${(policy.monthlyPriceCents / 100).toFixed(2)}`;
+    const [cpu = policy.planLabel, ram = "see plan", storage = "see plan"] = policy.planLabel.split(/\s*\/\s*/);
     switch (template) {
       case "installation_ready":
         return tmpl.installationReadyEmail("", "", {
           instanceReference: ref, appUrl: row.appUrl ?? "", region: policy.regions.find((r) => r.id === row.region)?.label ?? row.region,
-          cpu: "1 vCPU", ram: "2 GB", storage: "55 GB SSD", os: "Ubuntu (pinned)", ip: row.ip ?? "",
+          cpu, ram, storage, os: "Ubuntu 24.04 LTS x64", ip: row.ip ?? "",
           appUsername: "admin", sshUsername: "root", sshPort: 22, accessUrl: manageUrl,
+          temporaryPassword: row.bootstrapTokenHash ? bootstrapPasswordFromTokenHash(row.bootstrapTokenHash) : "",
+          maximumConnectedAccounts: policy.maximumConnectedAccounts,
           monthlyPriceLabel: priceLabel, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
@@ -1062,10 +1106,10 @@ export class HostingService {
     const row = this.store.activeInstanceForOwner(ownerId, environment) ?? this.store.activeInstanceForOwner(ownerId, environment === "live" ? "test" : "live");
     const policy = this.policy();
     if (!row) {
-      return { available: true, hasInstance: false, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, instance: null };
+      return { available: true, hasInstance: false, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts, instance: null };
     }
     return {
-      available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
+      available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts,
       instance: instanceView(row, policy, nowMs),
     };
   }
@@ -1092,6 +1136,7 @@ export interface HostingInstanceView {
   onHold: boolean;
   monthlyPriceLabel: string;
   managedBackupsIncluded: boolean;
+  maximumConnectedAccounts: number;
 }
 export interface HostingCustomerView {
   available: boolean;
@@ -1099,6 +1144,7 @@ export interface HostingCustomerView {
   note: string | null;
   plans: string[];
   monthlyPriceLabel: string;
+  maximumConnectedAccounts: number;
   instance: HostingInstanceView | null;
 }
 
@@ -1119,6 +1165,7 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     failureReason: onHold ? "This server is on hold by support." : row.failureReason,
     onHold,
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
+    maximumConnectedAccounts: policy.maximumConnectedAccounts,
   };
 }
 

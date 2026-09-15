@@ -128,7 +128,7 @@
       <span class="eyebrow">Hosting</span>
       <span class="pill dim">No hosting yet</span>
     </div>
-    <p class="fine" style="margin:8px 0 12px">Unleashed VPS Hosting — <span class="v-price"></span>/month in addition to your software license. Your own virtual server with Unleashed preinstalled, so you can run your bots without keeping your computer on. This is a separate hosting subscription, billed on its own schedule — it never replaces or restarts your software license above.</p>
+    <p class="fine" style="margin:8px 0 12px">Unleashed VPS Hosting — <span class="v-price"></span>/month in addition to your software license. Your own virtual server with Unleashed preinstalled, supporting up to <span class="v-account-limit"></span> connected exchange accounts. This is a separate hosting subscription, billed on its own schedule — it never replaces or restarts your software license above.</p>
     <div class="row"><button class="btn v-add" type="button">Add VPS Hosting</button></div>
     <p class="err v-add-err" hidden style="margin:10px 0 0"></p>
     <p class="fine" style="margin-top:12px">Requires an eligible Unleashed software license. After payment you will choose <b>Start fresh</b> or <b>Move my existing setup</b> — both start with your bots paused until you finish setup and confirm your old installation (if any) has stopped, so the two never trade the same positions at once.</p>
@@ -147,6 +147,7 @@
       <span class="k">IP address</span><span class="v-ip"></span>
       <span class="k">App URL</span><span class="v-url"></span>
       <span class="k">Price</span><span class="v-price-line"></span>
+      <span class="k">Connected accounts</span><span class="v-account-limit"></span>
       <span class="k">Next renewal</span><span class="v-renewal"></span>
     </div>
     <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
@@ -315,6 +316,7 @@
     if (!hosting.hasInstance) {
       var node = document.getElementById("hostingAddTpl").content.firstElementChild.cloneNode(true);
       node.querySelector(".v-price").textContent = hosting.monthlyPriceLabel || "$15.00";
+      node.querySelector(".v-account-limit").textContent = hosting.maximumConnectedAccounts || 5;
       var addBtn = node.querySelector(".v-add");
       var addErr = node.querySelector(".v-add-err");
       addBtn.addEventListener("click", async function () {
@@ -341,6 +343,7 @@
     node.querySelector(".v-ip").textContent = inst.ip || "—";
     node.querySelector(".v-url").textContent = inst.appUrl || "—";
     node.querySelector(".v-price-line").textContent = inst.monthlyPriceLabel + "/month";
+    node.querySelector(".v-account-limit").textContent = "Up to " + inst.maximumConnectedAccounts;
     node.querySelector(".v-renewal").textContent = fmtDateTime(inst.paidThroughMs);
     node.querySelector(".v-backup").textContent = inst.managedBackupsIncluded ? "Backups are included." : "No managed backups are included — export your settings while the server is active.";
 

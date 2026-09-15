@@ -101,6 +101,9 @@ export interface HostingPolicy {
   /** V1: one active hosting instance per owner (H6's explicit recommendation
    *  — "support multiple only through an explicit product expansion"). */
   maxInstancesPerCustomer: number;
+  /** Product limit enforced by the hosted app build only. Self-hosted
+   *  licences do not inherit this machine-size bound. */
+  maximumConnectedAccounts: number;
   managedBackupsIncluded: boolean;
   /** Ordered primary-then-fallback region list. */
   regions: readonly HostingRegion[];
@@ -158,6 +161,7 @@ export function defaultHostingPolicy(): HostingPolicy {
     reminderHoursBeforeDelete: [72, 24],
     temporaryPasswordTtlHours: 24,
     maxInstancesPerCustomer: 1,
+    maximumConnectedAccounts: 5,
     managedBackupsIncluded: false,
     regions: DEFAULT_REGIONS,
     planId: DEFAULT_PLAN_ID,
@@ -166,10 +170,10 @@ export function defaultHostingPolicy(): HostingPolicy {
     readinessRecheckHours: 24,
     provisioningEnabled: false,
     providerAccountRef: "",
-    osId: "",
+    osId: "2284", // Ubuntu 24.04 LTS x64, verified against the live Vultr /v2/os catalogue
     releaseRef: "",
     bootstrapTokenTtlMinutes: 60,
-    maximumConcurrentProvisionJobs: 3,
+    maximumConcurrentProvisionJobs: 1,
     maximumProjectedMonthlyProviderCostCents: 0,
     updatedAtMs: null,
   };
@@ -223,6 +227,9 @@ export function readHostingPolicy(dataDir: string): HostingPolicy {
     reminderHoursBeforeDelete: reminders,
     temporaryPasswordTtlHours: num(raw.temporaryPasswordTtlHours, d.temporaryPasswordTtlHours),
     maxInstancesPerCustomer: num(raw.maxInstancesPerCustomer, d.maxInstancesPerCustomer),
+    maximumConnectedAccounts: Number.isInteger(raw.maximumConnectedAccounts) && (raw.maximumConnectedAccounts as number) >= 1 && (raw.maximumConnectedAccounts as number) <= 5
+      ? raw.maximumConnectedAccounts as number
+      : d.maximumConnectedAccounts,
     managedBackupsIncluded: bool(raw.managedBackupsIncluded, d.managedBackupsIncluded),
     regions: regionsFrom(raw.regions),
     planId: str(raw.planId, d.planId) || d.planId,
@@ -302,6 +309,7 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   }
   if (p.temporaryPasswordTtlHours !== undefined) next.temporaryPasswordTtlHours = intField(p.temporaryPasswordTtlHours, 1, 24 * 30, "temporaryPasswordTtlHours");
   if (p.maxInstancesPerCustomer !== undefined) next.maxInstancesPerCustomer = intField(p.maxInstancesPerCustomer, 1, 10, "maxInstancesPerCustomer");
+  if (p.maximumConnectedAccounts !== undefined) next.maximumConnectedAccounts = intField(p.maximumConnectedAccounts, 1, 5, "maximumConnectedAccounts");
   if (p.managedBackupsIncluded !== undefined) {
     if (typeof p.managedBackupsIncluded !== "boolean") throw new HostingPolicyError("managedBackupsIncluded must be a boolean");
     next.managedBackupsIncluded = p.managedBackupsIncluded;

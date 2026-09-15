@@ -15,6 +15,7 @@ HUB="__HUB_ORIGIN__"
 KEY="__LICENSE_KEY__"
 RELEASE_KEYS_B64U="__RELEASE_KEYS_B64U__"
 RELEASE_MAX_AGE_MS="__RELEASE_MAX_AGE_MS__"
+PINNED_RELEASE_B64U="__PINNED_RELEASE_B64U__"
 
 APP_DIR=/opt/wickhunter
 ENV_FILE=/etc/wickhunter/env
@@ -189,6 +190,36 @@ then
   die "release manifest authentication failed — continuing to run the current version"
 fi
 
+# Managed instances pin the complete signed release identity chosen for this
+# provisioning generation. The structured value is base64url JSON, so no
+# operator-controlled release field is interpolated into shell syntax. Manual
+# installs leave the value empty and continue following the latest signed beta.
+if [ -n "$PINNED_RELEASE_B64U" ]; then
+  if ! node - "$work/verified.json" "$PINNED_RELEASE_B64U" <<'VERIFY_PINNED_RELEASE'
+const fs = require("node:fs");
+const [manifestPath, pinnedB64u] = process.argv.slice(2);
+const fail = (message) => { throw new Error(message); };
+if (!/^[A-Za-z0-9_-]+$/.test(pinnedB64u)) fail("pinned release identity is not base64url");
+const bytes = Buffer.from(pinnedB64u, "base64url");
+if (bytes.toString("base64url") !== pinnedB64u) fail("pinned release identity is not canonical base64url");
+let manifest, pinned;
+try { manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")); }
+catch { fail("verified release manifest is unreadable"); }
+try { pinned = JSON.parse(bytes.toString("utf8")); }
+catch { fail("pinned release identity is invalid JSON"); }
+const keys = Object.keys(pinned ?? {}).sort();
+if (keys.join(",") !== "buildId,sha256,version") fail("pinned release identity has unexpected fields");
+for (const field of keys) {
+  if (typeof pinned[field] !== "string" || !pinned[field] || manifest[field] !== pinned[field]) {
+    fail(`signed release does not match pinned ${field}`);
+  }
+}
+VERIFY_PINNED_RELEASE
+  then
+    die "signed release does not match this managed instance's pinned release"
+  fi
+fi
+
 REL_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' "$work/verified.json")
 REL_FILE=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).file' "$work/verified.json")
 REL_SHA=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).sha256' "$work/verified.json")
@@ -213,6 +244,14 @@ src="$work/unpack"
 if [ ! -f "$src/package.json" ]; then
   src=$(find "$work/unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)
   [ -n "$src" ] && [ -f "$src/package.json" ] || die "unexpected tarball layout (no package.json)"
+fi
+
+PACKAGE_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' "$src/package.json")
+[ "$PACKAGE_VERSION" = "$REL_VERSION" ] || die "signed release version $REL_VERSION does not match package version $PACKAGE_VERSION"
+if [ -n "${LIQHUNTER_BOOTSTRAP_PASSWORD:-}" ]; then
+  [ -x "$src/bin/wh-core-linux-amd64" ] || die "hosted release is missing the protected native core"
+  CORE_VERSION=$("$src/bin/wh-core-linux-amd64" -version 2>/dev/null || true)
+  case "$CORE_VERSION" in "wh-core "*) ;; *) die "hosted release native core did not identify as wh-core" ;; esac
 fi
 rsync -a --checksum --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
@@ -240,6 +279,11 @@ set_env() { # set_env NAME VALUE — replace-or-append, keep the file mode 600
   printf '%s=%s\n' "$1" "$2" >> "$tmp"
   install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"
 }
+unset_env() { # unset_env NAME
+  local tmp; tmp=$(mktemp)
+  grep -v "^$1=" "$ENV_FILE" > "$tmp" || true
+  install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"
+}
 
 SECRET=$(get_env LIQHUNTER_SECRET)
 if [ -z "$SECRET" ]; then
@@ -254,12 +298,22 @@ fi
 # The bot refuses to boot on a plaintext password under 8 characters (v0.74.26+) — so the
 # installer must never store one. The old auto-generate (base64 12 bytes minus
 # stripped symbols) landed at ~15 chars and crash-looped a real tester box.
+BOOTSTRAP_PW=${LIQHUNTER_BOOTSTRAP_PASSWORD:-$(get_env LIQHUNTER_BOOTSTRAP_PASSWORD)}
 LOGIN_PW=$(get_env LIQHUNTER_LOGIN_PASSWORD)
-if [ -n "$LOGIN_PW" ] && [ "${#LOGIN_PW}" -lt 8 ]; then
+DURABLE_CREDENTIAL=""
+[ -s "$APP_DIR/data/app-credential.json" ] && DURABLE_CREDENTIAL=1
+if [ -n "$BOOTSTRAP_PW" ]; then
+  [ "${#BOOTSTRAP_PW}" -ge 8 ] || die "LIQHUNTER_BOOTSTRAP_PASSWORD must be at least 8 characters"
+  unset_env LIQHUNTER_LOGIN_PASSWORD
+  unset_env LIQHUNTER_LOGIN_PASSWORD_HASH
+  set_env LIQHUNTER_BOOTSTRAP_PASSWORD "$BOOTSTRAP_PW"
+  ok "temporary hosted login configured; the application will require a password change"
+fi
+if [ -z "$BOOTSTRAP_PW" ] && [ -n "$LOGIN_PW" ] && [ "${#LOGIN_PW}" -lt 8 ]; then
   warn "existing login password is under the bot's 8-character minimum — replacing it"
   LOGIN_PW=""
 fi
-if [ -z "$LOGIN_PW" ]; then
+if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -z "$LOGIN_PW" ]; then
   while :; do
     ask LOGIN_PW "Choose a dashboard login password (8+ characters; Enter to auto-generate): " --secret
     if [ -z "$LOGIN_PW" ] || [ "${#LOGIN_PW}" -ge 8 ]; then break; fi
@@ -274,11 +328,18 @@ if [ -z "$LOGIN_PW" ]; then
   else
     ok "login password configured"
   fi
-else
+elif [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ]; then
   ok "keeping existing login password"
+elif [ -z "$BOOTSTRAP_PW" ]; then
+  ok "keeping the application's durable login credential"
 fi
 
 set_env LIQHUNTER_HUB_ORIGIN "$HUB"
+if [ -n "${LIQHUNTER_HOSTED_MAX_ACCOUNTS:-}" ]; then
+  case "$LIQHUNTER_HOSTED_MAX_ACCOUNTS" in *[!0-9]*|'') die "LIQHUNTER_HOSTED_MAX_ACCOUNTS must be a positive integer" ;; esac
+  [ "$LIQHUNTER_HOSTED_MAX_ACCOUNTS" -ge 1 ] || die "LIQHUNTER_HOSTED_MAX_ACCOUNTS must be a positive integer"
+  set_env LIQHUNTER_HOSTED_MAX_ACCOUNTS "$LIQHUNTER_HOSTED_MAX_ACCOUNTS"
+fi
 
 # License key: what the bot presents at check-in. Mode 600 — it is a secret.
 printf '%s\n' "$KEY" > "$APP_DIR/data/license.key"
@@ -325,6 +386,21 @@ for _try in 1 2 3 4 5 6 7 8 9; do
 done
 [ -n "$health" ] || die "the bot did not answer on 127.0.0.1:$PORT after 45s; inspect: journalctl -u $SERVICE -n 50"
 ok "bot is healthy: $health"
+
+# A hosted install is ready only after the app has durably consumed the
+# temporary password into its forced-change credential record. Remove the
+# plaintext environment copy once that proof exists; the record remains
+# authoritative across restart and update.
+if [ -n "$BOOTSTRAP_PW" ]; then
+  node - "$APP_DIR/data/app-credential.json" <<'VERIFY_BOOTSTRAP_CREDENTIAL'
+const fs = require("node:fs");
+const record = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (record.createdFrom !== "bootstrap" || record.mustChange !== true || typeof record.hash !== "string" || !record.hash) process.exit(1);
+VERIFY_BOOTSTRAP_CREDENTIAL
+  unset_env LIQHUNTER_BOOTSTRAP_PASSWORD
+  unset BOOTSTRAP_PW
+  ok "temporary hosted login was seeded into the forced-change credential store"
+fi
 
 # ── HTTPS via the bot's own setup (nginx + Let's Encrypt on the public IP) ──
 if [ -x "$APP_DIR/scripts/vps-setup.sh" ] || [ -f "$APP_DIR/scripts/vps-setup.sh" ]; then

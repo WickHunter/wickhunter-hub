@@ -107,6 +107,10 @@ export interface HostingInstanceRow {
   appUrl: string | null;
   bootstrapTokenHash: string | null;
   bootstrapTokenExpiresAtMs: number | null;
+  /** Exact signed-manifest identity pinned when this generation's cloud-init
+   *  is built. Policy changes cannot move an in-flight instance to a newer
+   *  customer artifact. */
+  releaseRef: string | null;
   stripeCustomerId: string;
   stripeSubscriptionId: string | null;
   paidThroughMs: number | null;
@@ -322,6 +326,7 @@ export class HostingStore {
         appUrl: null,
         bootstrapTokenHash: null,
         bootstrapTokenExpiresAtMs: null,
+        releaseRef: null,
         stripeCustomerId: input.stripeCustomerId,
         stripeSubscriptionId: null,
         paidThroughMs: null,

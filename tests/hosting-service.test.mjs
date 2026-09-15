@@ -113,6 +113,8 @@ await test("crash between persist and provider create: a create that 'times out'
   await ctx.h.hub.hosting.tick(ctx.getClock());
   let fresh = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(fresh.providerInstanceId, null, "the id was never learned from the timed-out attempt");
+  assert.ok(fresh.bootstrapTokenHash, "the callback verifier is durable before an uncertain provider create returns");
+  assert.equal(fresh.releaseRef, "v-test", "the uncertain instance keeps the exact customer release it booted with");
   assert.equal(provider.createCalls.length, 1);
   assert.equal(instancesFor(ctx, "cus_crash").length, 1, "still exactly one instance row");
   // Second tick, after the backoff: findByLabel must discover the SAME
@@ -140,6 +142,10 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
   const rawToken = "test-bootstrap-token-1";
   ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
   row = ctx.h.hub.hosting.store.getInstance(row.id);
+  const installer = ctx.h.hub.hosting.bootstrapLicenseToken(row.id, rawToken, row.generation, ctx.getClock());
+  assert.equal(installer.ok, true, "the instance-scoped proof can fetch this customer's installer while bootstrapping");
+  assert.equal(installer.value.releaseRef, "v-test", "the exact release ref was pinned on this generation, independent of later policy edits");
+  assert.match(installer.value.licenseToken, /^LHK1\./);
 
   // Bybit refused (403) in Tokyo -> the instance retries ONCE, in Osaka.
   const r1 = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${row.id}/readiness`, {

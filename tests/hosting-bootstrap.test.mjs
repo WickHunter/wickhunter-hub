@@ -6,6 +6,7 @@
 // image, and never leak the bootstrap token into a trace or an argv other
 // processes on the box can read via /proc.
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { test, summary } from "./helpers.mjs";
 import { buildBootstrapUserData } from "../dist/src/hosting/bootstrap.js";
 import { DEFAULT_PROBE_VENUES } from "../dist/src/hosting/policy.js";
@@ -15,7 +16,7 @@ const input = {
   generation: 2,
   bootstrapToken: "super-secret-token-value",
   hubOrigin: "https://hub.example.com",
-  releaseRef: "v1.2.3",
+  maxAccounts: 5,
   probeVenues: DEFAULT_PROBE_VENUES,
 };
 
@@ -55,10 +56,47 @@ await test("no company-wide provider/Stripe/email credential and no exchange sec
   assert.doesNotMatch(script, /vultr/i);
 });
 
-await test("the release ref is pinned, never 'latest'", () => {
+await test("the bootstrap requests its server-pinned installer, never an unpinned latest release", () => {
   const script = buildBootstrapUserData(input);
-  assert.match(script, /WH_RELEASE_REF='\\''v1\.2\.3'\\''/);
+  assert.doesNotMatch(script, /WH_RELEASE_REF/);
   assert.doesNotMatch(script, /latest/);
+  assert.match(script, /\/api\/hosting\/instances\/\$WH_INSTANCE_ID\/installer/);
+});
+
+await test("the signed installer completes before any readiness probe runs", () => {
+  const script = buildBootstrapUserData(input);
+  const installerRoute = script.indexOf("/installer");
+  const installRun = script.indexOf('bash "$INSTALLER"');
+  const firstProbe = script.indexOf("https://api.bybit.com/v5/market/time");
+  assert.ok(installerRoute > 0 && installRun > installerRoute, "fetches and runs the instance-scoped installer");
+  assert.ok(firstProbe > installRun, "venue probes cannot mark an uninstalled box ready");
+  assert.match(script, /--data-binary @-/);
+  assert.doesNotMatch(script, /installer\?token=/);
+});
+
+await test("hosted login is derived with domain separation and never echoes the bootstrap token", () => {
+  const script = buildBootstrapUserData(input);
+  assert.match(script, /TOKEN_HASH=.*sha256sum/);
+  assert.match(script, /TOKEN_HASH:password:v1/);
+  assert.match(script, /export LIQHUNTER_BOOTSTRAP_PASSWORD/);
+  assert.match(script, /unset LIQHUNTER_BOOTSTRAP_PASSWORD/);
+  assert.match(script, /WH_HOSTED_MAX_ACCOUNTS=5/);
+  assert.match(script, /export LIQHUNTER_HOSTED_MAX_ACCOUNTS/);
+});
+
+await test("the shared installer seeds only the forced-change credential for hosted installs, then removes its env copy", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const hosted = installer.indexOf('BOOTSTRAP_PW=${LIQHUNTER_BOOTSTRAP_PASSWORD');
+  const removeLogin = installer.indexOf("unset_env LIQHUNTER_LOGIN_PASSWORD", hosted);
+  const setBootstrap = installer.indexOf('set_env LIQHUNTER_BOOTSTRAP_PASSWORD "$BOOTSTRAP_PW"', removeLogin);
+  const verifyRecord = installer.indexOf("VERIFY_BOOTSTRAP_CREDENTIAL", setBootstrap);
+  const clearBootstrap = installer.indexOf("unset_env LIQHUNTER_BOOTSTRAP_PASSWORD", verifyRecord);
+  assert.ok(hosted > 0 && removeLogin > hosted && setBootstrap > removeLogin);
+  assert.ok(verifyRecord > setBootstrap && clearBootstrap > verifyRecord, "plaintext env copy is removed only after the durable must-change record is proved");
+  assert.match(installer, /record\.createdFrom !== "bootstrap" \|\| record\.mustChange !== true/);
+  assert.match(installer, /LIQHUNTER_HOSTED_MAX_ACCOUNTS/);
+  assert.match(installer, /PINNED_RELEASE_B64U="__PINNED_RELEASE_B64U__"/);
+  assert.match(installer, /manifest\[field\] !== pinned\[field\]/);
 });
 
 await test("posts back to THIS hub origin (via its own shell variable), naming the exact instance id and generation", () => {

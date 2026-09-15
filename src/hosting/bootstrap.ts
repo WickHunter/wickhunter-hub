@@ -10,19 +10,16 @@
 //     Vultr/Stripe/email credential, never an exchange secret)
 //   - the Hub's own public origin, so the script can call back to
 //     POST /api/hosting/instances/:id/readiness
-//   - the pinned release reference to install (never "latest")
+//   - an instance-scoped installer request; the Hub responds with the complete
+//     signed release identity pinned for this generation (never bare "latest")
 //   - the per-venue probe list, so the script and the Hub verdict
 //     (src/hosting/readiness.ts) agree on exactly which checks run
 // The token is written into the script BODY, never into a URL a shell
 // history or a proxy log would capture verbatim on its own, and every
 // command that touches it redirects its own stdout/stderr so a copy never
-// reaches the instance's boot log. Real end-to-end installation on the
-// bootstrapped release artifact — the app's forced-password-change wiring
-// (LIQHUNTER_BOOTSTRAP_PASSWORD, liqhunter-private CLAUDE.md's v0.90.65
-// contract) — is application-repo work outside this file's boundary; this
-// script's only job is to fetch and run THAT repo's own installer with the
-// right environment, exactly the way an operator's `curl | sudo bash`
-// install command already works on a self-hosted box (README).
+// reaches the instance's boot log. It fetches and runs the same signed
+// customer installer used by self-hosted boxes, with the hosted app's
+// forced-password-change and connected-account-limit environment contracts.
 import type { ProbeVenue } from "./policy.js";
 
 export interface BootstrapInput {
@@ -30,8 +27,7 @@ export interface BootstrapInput {
   generation: number;
   bootstrapToken: string;
   hubOrigin: string;
-  /** A pinned release ref/digest; refuses to install "latest" silently. */
-  releaseRef: string;
+  maxAccounts: number;
   probeVenues: readonly ProbeVenue[];
 }
 
@@ -75,15 +71,32 @@ export WH_BOOTSTRAP_TOKEN=${shellSingleQuote(input.bootstrapToken)}
 WH_HUB_ORIGIN=${shellSingleQuote(input.hubOrigin)}
 WH_INSTANCE_ID=${shellSingleQuote(input.instanceId)}
 WH_GENERATION=${input.generation}
-WH_RELEASE_REF=${shellSingleQuote(input.releaseRef)}
+WH_HOSTED_MAX_ACCOUNTS=${input.maxAccounts}
 
-# Install the pinned Unleashed release through the existing supported
-# deployment path (the operator's own self-update/install scripts) — not
-# reproduced here; this script's job ends at "readiness", the app's own
-# forced-password-change flow (LIQHUNTER_BOOTSTRAP_PASSWORD) is what makes
-# the installed app itself refuse to trade until the customer sets a
-# permanent password.
-# install_unleashed "$WH_RELEASE_REF"   # left to the operator's real installer
+# Fetch the existing personalized installer through the instance-scoped
+# bootstrap credential. The credential stays in the POST body (not the URL or
+# curl argv), and that installer verifies the Hub's signed release manifest
+# and artifact before it installs anything.
+INSTALLER=$(mktemp)
+trap 'rm -f "$INSTALLER"' EXIT
+printf '{"token":"%s","generation":%s}' "$WH_BOOTSTRAP_TOKEN" "$WH_GENERATION" \
+  | curl -q -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \
+      -H 'content-type: application/json' --data-binary @- \
+      "$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/installer" \
+      -o "$INSTALLER"
+chmod 700 "$INSTALLER"
+
+# The app treats this as a temporary credential and refuses dashboard and
+# exposure-increasing access until the customer replaces it. Both ends can
+# derive it from the bootstrap proof without persisting that proof itself.
+export LIQHUNTER_BOOTSTRAP_PASSWORD
+export LIQHUNTER_HOSTED_MAX_ACCOUNTS="$WH_HOSTED_MAX_ACCOUNTS"
+TOKEN_HASH=$(printf '%s' "$WH_BOOTSTRAP_TOKEN" | sha256sum | cut -d' ' -f1)
+LIQHUNTER_BOOTSTRAP_PASSWORD=$(printf '%s' "$TOKEN_HASH:password:v1" | sha256sum | cut -c1-24)
+unset TOKEN_HASH
+bash "$INSTALLER"
+unset LIQHUNTER_BOOTSTRAP_PASSWORD
+unset LIQHUNTER_HOSTED_MAX_ACCOUNTS
 
 RESULTS=""
 probe() {
