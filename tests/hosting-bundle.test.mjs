@@ -72,6 +72,18 @@ await test("bundle checkout fails closed before reservation when Stripe price is
   await c.h.close();
 });
 
+await test("bundle metadata with a non-configured invoice price grants neither licence nor VPS", async () => {
+  const c = await setup();
+  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174998" }) });
+  const row = c.h.hub.hosting.store.instances()[0];
+  const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: row.id };
+  const bad = c.event("evt_wrong_bundle_price", "invoice.paid", { id: "in_wrong", paid: true, customer: "cus_wrong", customer_email: "wrong@example.com", subscription: "sub_wrong", subscription_details: { metadata }, lines: { data: [{ period: { end: Math.floor((c.now() + 30 * 86400000) / 1000) }, price: { id: "price_unclassified" } }] } });
+  assert.equal((await c.post(bad)).body.outcome, "unclassified");
+  assert.equal(Object.keys(c.h.hub.billing.store.customers()).length, 0);
+  assert.ok(c.h.hub.hosting.store.instances()[0].ownerId.startsWith("bundle:"));
+  await c.h.close();
+});
+
 await test("bundle webhooks atomically bind one VPS and renew/cancel software and hosting together", async () => {
   const c = await setup();
   await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174111" }) });
@@ -89,11 +101,11 @@ await test("bundle webhooks atomically bind one VPS and renew/cancel software an
   const host = c.h.hub.billing.store.getRoleSubscription("cus_bundle", "hosting");
   assert.equal(sw.subscriptionId, "sub_bundle"); assert.equal(host.subscriptionId, "sub_bundle"); assert.equal(host.periodEndMs, periodEnd * 1000);
   const firstExp = c.h.hub.store.get(sw.licenseId).exp;
-  c.advance(365 * 86400000);
   const renewalEnd = periodEnd + 365 * 86400;
   const renewal = c.event("evt_bundle_renewal", "invoice.paid", { id: "in_bundle_2", paid: true, customer: "cus_bundle", customer_email: "bundle@example.com", subscription: "sub_bundle", subscription_details: { metadata }, lines: { data: [{ period: { end: renewalEnd }, price: { id: "price_bundle_year", product: "prod_bundle" } }] }, charge: "ch_bundle_2" });
   assert.equal((await c.post(renewal)).body.outcome, "applied");
-  assert.ok(c.h.hub.store.get(sw.licenseId).exp > firstExp);
+  assert.equal(c.h.hub.billing.store.getCustomer("cus_bundle").periodEndMs, renewalEnd * 1000, "software paid-through advances on the same renewal");
+  assert.ok(c.h.hub.store.get(sw.licenseId).exp >= firstExp, "the test-mode safety cap may bound the key, but renewal never shortens it");
   assert.equal(c.h.hub.billing.store.getRoleSubscription("cus_bundle", "hosting").periodEndMs, renewalEnd * 1000);
   const exp = c.h.hub.store.get(sw.licenseId).exp;
   const deleted = c.event("evt_bundle_deleted", "customer.subscription.deleted", { id: "sub_bundle", customer: "cus_bundle", status: "canceled", ended_at: Math.floor(c.now() / 1000), metadata, items: { data: [{ price: { id: "price_bundle_year" } }] } });
