@@ -30,6 +30,68 @@ ok()   { printf '   + %s\n' "$*"; }
 warn() { printf '   ! %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Fresh Ubuntu images can start unattended-upgrades at the same time as
+# cloud-init.  Let dpkg finish normally: never kill it and never remove its
+# lock files.  Each apt attempt waits up to 30 seconds for dpkg's lock, and
+# failed attempts retry for up to ten minutes. Once apt has acquired the lock,
+# let that package transaction finish normally even if the retry window passes.
+APT_RETRY_DEADLINE_SECONDS=600
+APT_LOCK_TIMEOUT_SECONDS=30
+APT_RETRY_SLEEP_SECONDS=5
+apt_retry() { # apt_retry update -qq | apt_retry install ...
+  local started now remaining attempt delay status lock_wait
+  started=$(date +%s)
+  attempt=1
+  while :; do
+    now=$(date +%s)
+    remaining=$((APT_RETRY_DEADLINE_SECONDS - (now - started)))
+    # The first attempt always runs. Later failed attempts stop at the shared
+    # deadline; a short final attempt waits only the remaining seconds for the
+    # lock rather than starting another full 30-second lock wait.
+    [ "$attempt" -eq 1 ] || [ "$remaining" -gt 0 ] || return "$status"
+    lock_wait=$APT_LOCK_TIMEOUT_SECONDS
+    [ "$remaining" -ge "$lock_wait" ] || lock_wait=$remaining
+    [ "$lock_wait" -ge 1 ] || lock_wait=1
+    set +e
+    apt-get -o "DPkg::Lock::Timeout=$lock_wait" "$@"
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] && return 0
+    now=$(date +%s)
+    remaining=$((APT_RETRY_DEADLINE_SECONDS - (now - started)))
+    [ "$remaining" -gt 0 ] || return "$status"
+    delay=$APT_RETRY_SLEEP_SECONDS
+    [ "$delay" -le "$remaining" ] || delay=$remaining
+    warn "apt command failed on attempt $attempt (status $status); waiting ${delay}s before retry"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
+
+# NodeSource's setup script performs its own apt operations. A temporary
+# APT_CONFIG gives those calls the same native lock wait, while this wrapper
+# retries the idempotent setup script within the shared ten-minute window.
+retry_command() { # retry_command command args...
+  local started now remaining attempt delay status
+  started=$(date +%s)
+  attempt=1
+  while :; do
+    set +e
+    "$@"
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] && return 0
+    now=$(date +%s)
+    remaining=$((APT_RETRY_DEADLINE_SECONDS - (now - started)))
+    [ "$remaining" -gt 0 ] || return "$status"
+    delay=$APT_RETRY_SLEEP_SECONDS
+    [ "$delay" -le "$remaining" ] || delay=$remaining
+    warn "package repository setup failed on attempt $attempt (status $status); waiting ${delay}s before retry"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
+
 # When run as `curl | sudo bash`, stdin is the pipe — prompts must come from
 # the terminal. No terminal at all (cloud-init etc.) -> generate/skip instead.
 ask() { # ask VAR "prompt" [--secret]
@@ -53,15 +115,24 @@ case "$HUB" in https://*) ;; *) die "the WickHunter Hub must use HTTPS" ;; esac
 
 say "Installing prerequisites"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq curl ca-certificates rsync tar openssl
+apt_retry update -qq || die "apt update did not complete after bounded retries; unattended upgrades may still be running"
+apt_retry install -y -qq curl ca-certificates rsync tar openssl \
+  || die "prerequisite packages did not install after bounded retries"
 
 # ── Node 22 (nodesource) ────────────────────────────────────────────────────
 node_major() { node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/'; }
 if ! command -v node >/dev/null || [ "$(node_major)" -lt "$NODE_MAJOR_WANTED" ]; then
   say "Installing Node ${NODE_MAJOR_WANTED} (nodesource)"
-  curl -q -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_WANTED}.x" | bash - >/dev/null
-  apt-get install -y -qq nodejs
+  nodesource_setup=$(mktemp)
+  nodesource_apt_config=$(mktemp)
+  curl -q -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_WANTED}.x" > "$nodesource_setup"
+  printf 'DPkg::Lock::Timeout "%s";\n' "$APT_LOCK_TIMEOUT_SECONDS" > "$nodesource_apt_config"
+  if ! retry_command env APT_CONFIG="$nodesource_apt_config" bash "$nodesource_setup" >/dev/null; then
+    rm -f "$nodesource_setup" "$nodesource_apt_config"
+    die "NodeSource repository setup did not complete after bounded retries"
+  fi
+  rm -f "$nodesource_setup" "$nodesource_apt_config"
+  apt_retry install -y -qq nodejs || die "Node.js did not install after bounded apt retries"
 fi
 [ "$(node_major)" -ge "$NODE_MAJOR_WANTED" ] || die "Node ${NODE_MAJOR_WANTED}+ required, found $(node -v)"
 ok "node $(node -v)"

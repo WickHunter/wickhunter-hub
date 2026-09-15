@@ -59,6 +59,103 @@ printf 'unattended-credential-fallback-ok'
   assert.equal(result.stderr, "");
 });
 
+await test("installer waits for apt locks with bounded retries and never removes or kills them", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
+  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  assert.ok(start >= 0 && end > start, "apt retry helper was not found");
+  const helper = installer.slice(start, end)
+    .replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=10")
+    .replace("APT_RETRY_SLEEP_SECONDS=5", "APT_RETRY_SLEEP_SECONDS=0");
+  assert.match(helper, /DPkg::Lock::Timeout=\$lock_wait/);
+  assert.doesNotMatch(helper, /(?:rm|unlink)[^\n]*(?:lock|dpkg)|(?:kill|pkill|killall|timeout)[^\n]*(?:apt|dpkg)/i);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-apt-retry-"));
+  try {
+    const fakeApt = path.join(dir, "apt-get");
+    fs.writeFileSync(fakeApt, `#!/usr/bin/env bash
+set -eu
+count=0; [ ! -f "$COUNT_FILE" ] || count=$(cat "$COUNT_FILE")
+count=$((count + 1)); printf '%s' "$count" > "$COUNT_FILE"
+[ "$1" = -o ] && [[ "$2" = DPkg::Lock::Timeout=* ]]
+[ "$count" -ge 3 ]
+`, { mode: 0o755 });
+    const countFile = path.join(dir, "count");
+    const script = `set -Eeuo pipefail
+warn() { :; }
+${helper}
+apt_retry update -qq
+`;
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8", timeout: 5_000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, COUNT_FILE: countFile },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(countFile, "utf8"), "3", "two lock-like failures were retried before success");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test("installer apt retry stops only completed failures at its deadline", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
+  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  const helper = installer.slice(start, end)
+    .replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=1")
+    .replace("APT_RETRY_SLEEP_SECONDS=5", "APT_RETRY_SLEEP_SECONDS=1");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-apt-deadline-"));
+  try {
+    const fakeApt = path.join(dir, "apt-get");
+    fs.writeFileSync(fakeApt, `#!/usr/bin/env bash
+set -eu
+count=0; [ ! -f "$COUNT_FILE" ] || count=$(cat "$COUNT_FILE")
+count=$((count + 1)); printf '%s' "$count" > "$COUNT_FILE"
+exit 100
+`, { mode: 0o755 });
+    const countFile = path.join(dir, "count");
+    const script = `set -Eeuo pipefail
+warn() { :; }
+${helper}
+apt_retry update -qq
+`;
+    const started = Date.now();
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8", timeout: 4_000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, COUNT_FILE: countFile },
+    });
+    assert.equal(result.status, 100, result.stderr);
+    assert.ok(Date.now() - started >= 900 && Date.now() - started < 3_000, "completed failures observe the shared retry deadline");
+    assert.equal(fs.readFileSync(countFile, "utf8"), "1", "deadline prevents another lock attempt after the bounded wait");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test("installer never kills an apt transaction that succeeds after the retry deadline", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
+  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  const helper = installer.slice(start, end).replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=1");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-apt-finish-"));
+  try {
+    const fakeApt = path.join(dir, "apt-get");
+    fs.writeFileSync(fakeApt, "#!/usr/bin/env bash\nsleep 2\nexit 0\n", { mode: 0o755 });
+    const script = `set -Eeuo pipefail
+warn() { :; }
+${helper}
+apt_retry install nodejs
+`;
+    const started = Date.now();
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8", timeout: 5_000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(Date.now() - started >= 1_900, "an acquired package transaction was allowed to finish normally");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test("NodeSource internal apt calls inherit native lock waiting and bounded setup retries", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  assert.match(installer, /APT_CONFIG="\$nodesource_apt_config"/);
+  assert.match(installer, /DPkg::Lock::Timeout/);
+  assert.match(installer, /retry_command env APT_CONFIG=/);
+});
+
 await test("installer refuses completion until trusted HTTPS serves the signed version", () => {
   const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
   const start = installer.indexOf("verify_public_https() {");
