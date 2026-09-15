@@ -2431,7 +2431,7 @@ function renderHostingPolicyCard(policy, secrets) {
   wrap.appendChild(billingConfigField("Plan id", billingTextField("planId", policy.planId, "vc2-1c-2gb")));
   wrap.appendChild(billingConfigField("Plan label", billingTextField("planLabel", policy.planLabel, "1 vCPU / 2 GB RAM / 55 GB SSD")));
   wrap.appendChild(billingConfigField("OS id", billingTextField("osId", policy.osId, "required before provisioning can be enabled")));
-  wrap.appendChild(billingConfigField("Release ref", billingTextField("releaseRef", policy.releaseRef, "a pinned git ref/tag/digest — never “latest”")));
+  wrap.appendChild(billingConfigField("Release ref", billingTextField("releaseRef", policy.releaseRef, "the signed customer artifact SHA-256 — never “latest”")));
   wrap.appendChild(billingConfigField("Provider account ref", billingTextField("providerAccountRef", policy.providerAccountRef, "")));
   const vultrInput = document.createElement("input");
   vultrInput.type = "password"; vultrInput.autocomplete = "off"; vultrInput.dataset.field = "vultrApiKey";

@@ -273,7 +273,9 @@ mkdir -p "$APP_DIR/data"
 # no lockfile — so `npm ci` is wrong here (it dies without one, which took a
 # live tester install down). Best-effort `npm install`, never fatal.
 say "Installing optional runtime accelerators"
-if ( cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 ); then
+if [ -n "${LIQHUNTER_BOOTSTRAP_PASSWORD:-}" ]; then
+  ok "hosted install uses only the signed artifact; optional registry packages skipped"
+elif ( cd "$APP_DIR" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 ); then
   ok "accelerators installed"
 else
   warn "optional accelerators skipped — the bot runs fine without them"
@@ -390,14 +392,19 @@ systemctl restart "$SERVICE"
 
 # Retry the health check — `systemctl restart` returns before Node has bound
 # its port; a single immediate curl races the boot and cries wolf.
+wait_for_signed_version() {
+  health=""
+  for _try in 1 2 3 4 5 6 7 8 9; do
+    health=$(curl -q -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null) && break
+    sleep 5
+  done
+  [ -n "$health" ] || die "the bot did not answer on 127.0.0.1:$PORT after 45s; inspect: journalctl -u $SERVICE -n 50"
+  node -e 'const [raw,want]=process.argv.slice(1); let x; try{x=JSON.parse(raw)}catch{process.exit(1)}; if(x.ok!==true||x.version!==want)process.exit(1)' "$health" "$REL_VERSION" \
+    || die "the health responder is not the signed release v$REL_VERSION"
+  ok "bot v$REL_VERSION is healthy"
+}
 say "Waiting for the bot to come up"
-health=""
-for _try in 1 2 3 4 5 6 7 8 9; do
-  health=$(curl -q -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null) && break
-  sleep 5
-done
-[ -n "$health" ] || die "the bot did not answer on 127.0.0.1:$PORT after 45s; inspect: journalctl -u $SERVICE -n 50"
-ok "bot is healthy: $health"
+wait_for_signed_version
 
 # A hosted install is ready only after the app has durably consumed the
 # temporary password into its forced-change credential record. Remove the
@@ -411,7 +418,10 @@ if (record.createdFrom !== "bootstrap" || record.mustChange !== true || typeof r
 VERIFY_BOOTSTRAP_CREDENTIAL
   unset_env LIQHUNTER_BOOTSTRAP_PASSWORD
   unset BOOTSTRAP_PW
-  ok "temporary hosted login was seeded into the forced-change credential store"
+  unset LIQHUNTER_BOOTSTRAP_PASSWORD
+  systemctl restart "$SERVICE"
+  wait_for_signed_version
+  ok "temporary hosted login was seeded and removed from the restarted service environment"
 fi
 
 # ── HTTPS via the bot's own setup (nginx + Let's Encrypt on the public IP) ──

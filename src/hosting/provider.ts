@@ -193,9 +193,10 @@ export class FakeProvider implements HostingProvider {
 
 // ── VultrProvider — real HTTP, never called by the test suite ──────────────
 
-export type HttpLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ status: number; ok: boolean; text: () => Promise<string> }>;
+export type HttpLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ status: number; ok: boolean; text: () => Promise<string> }>;
 
 const VULTR_API_BASE = "https://api.vultr.com/v2";
+export const DEFAULT_VULTR_REQUEST_TIMEOUT_MS = 20_000;
 
 /** The real adapter. Constructed only when an operator has supplied a Vultr
  *  API key (src/hosting/service.ts); `createHub`'s test wiring never passes
@@ -207,18 +208,43 @@ const VULTR_API_BASE = "https://api.vultr.com/v2";
  *  handoff §6/§12 and this file's own report note. Recheck the SDK/API
  *  version before the first real provisioning run. */
 export class VultrProvider implements HostingProvider {
-  constructor(private readonly apiKey: string, private readonly http: HttpLike = realFetch) {}
+  constructor(
+    private readonly apiKey: string,
+    private readonly http: HttpLike = realFetch,
+    private readonly requestTimeoutMs = DEFAULT_VULTR_REQUEST_TIMEOUT_MS,
+  ) {
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error("Vultr request timeout must be positive");
+  }
 
   private async call(method: string, path: string, body?: unknown): Promise<{ status: number; json: any }> {
-    const res = await this.http(`${VULTR_API_BASE}${path}`, {
-      method,
-      headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+    const controller = new AbortController();
+    let timeout: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        const error = new Error(`vultr ${method} ${path}: request timed out after ${this.requestTimeoutMs}ms`);
+        reject(error);
+        controller.abort(error);
+      }, this.requestTimeoutMs);
     });
-    const text = await res.text();
-    let json: any = null;
-    try { json = text ? JSON.parse(text) : null; } catch { json = null; }
-    return { status: res.status, json };
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await this.http(`${VULTR_API_BASE}${path}`, {
+            method,
+            headers: { authorization: `Bearer ${this.apiKey}`, "content-type": "application/json" },
+            body: body !== undefined ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+          });
+          const text = await res.text();
+          let json: any = null;
+          try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+          return { status: res.status, json };
+        })(),
+        deadline,
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
 
   async listRegions(): Promise<ProviderRegion[]> {

@@ -81,14 +81,13 @@ export const DEFAULT_REGIONS: readonly HostingRegion[] = Object.freeze([
 ]);
 
 export const DEFAULT_PLAN_ID = "vc2-1c-2gb";
-export const DEFAULT_MONTHLY_PRICE_CENTS = 1500; // proposed, per the handoff — not a verified margin
+export const DEFAULT_MONTHLY_PRICE_CENTS = 2000; // 2x the verified $10/month provider plan
 
 export interface HostingPolicy {
   version: number;
   currency: "usd";
-  /** Proposed retail price — see the handoff's §2/§12: $15 pending a real
-   *  Vultr quote and benchmarked resource usage. Labeled "proposed" on every
-   *  customer-facing surface until an operator confirms it. */
+  /** Retail price. Customer-bound checkout verifies this against Stripe and
+   *  requires it to equal twice the provider's current monthly plan quote. */
   monthlyPriceCents: number;
   renewalGraceHours: number;
   retentionHours: number;
@@ -335,7 +334,7 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   if (p.provisioningEnabled !== undefined) {
     if (typeof p.provisioningEnabled !== "boolean") throw new HostingPolicyError("provisioningEnabled must be a boolean");
     if (p.provisioningEnabled && (!next.osId && !p.osId)) throw new HostingPolicyError("cannot enable provisioning without an osId configured");
-    if (p.provisioningEnabled && (!next.releaseRef && !p.releaseRef)) throw new HostingPolicyError("cannot enable provisioning without a releaseRef configured");
+    if (p.provisioningEnabled && !/^[0-9a-f]{64}$/.test(String(p.releaseRef ?? next.releaseRef))) throw new HostingPolicyError("cannot enable provisioning without the signed customer artifact SHA-256 as releaseRef");
     next.provisioningEnabled = p.provisioningEnabled;
   }
   if (p.providerAccountRef !== undefined) {
@@ -353,6 +352,10 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   if (p.bootstrapTokenTtlMinutes !== undefined) next.bootstrapTokenTtlMinutes = intField(p.bootstrapTokenTtlMinutes, 5, 24 * 60, "bootstrapTokenTtlMinutes");
   if (p.maximumConcurrentProvisionJobs !== undefined) next.maximumConcurrentProvisionJobs = intField(p.maximumConcurrentProvisionJobs, 1, 50, "maximumConcurrentProvisionJobs");
   if (p.maximumProjectedMonthlyProviderCostCents !== undefined) next.maximumProjectedMonthlyProviderCostCents = intField(p.maximumProjectedMonthlyProviderCostCents, 0, 1_000_000_000, "maximumProjectedMonthlyProviderCostCents");
+  if (next.provisioningEnabled) {
+    if (!next.osId) throw new HostingPolicyError("cannot keep provisioning enabled without an osId configured");
+    if (!/^[0-9a-f]{64}$/.test(next.releaseRef)) throw new HostingPolicyError("cannot keep provisioning enabled without the signed customer artifact SHA-256 as releaseRef");
+  }
   return next;
 }
 

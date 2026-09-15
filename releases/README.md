@@ -36,11 +36,22 @@ unsigned `ok:true` compatibility envelope that new clients exclude from the
 signed bytes.
 
 Build and sign in the bot repo with the offline environment documented in
-`docs/SIGNED-RELEASES.md`, then publish:
+`docs/SIGNED-RELEASES.md`. Copy the signed manifest and its artifact to a
+staging directory on the Hub, then publish with the Hub's public verifier:
 
 ```
-scripts/publish-beta.sh /opt/wickhunter-hub/releases
+cd /opt/wickhunter-hub
+HUB_RELEASE_PUBLIC_KEYS_JSON='{"release-kid":"public-key-base64url"}' \
+  npm run publish-release -- \
+  --manifest /root/release-staging/signed-manifest.json \
+  --artifact /root/release-staging/wickhunter-beta-0.89.92.tar.gz \
+  --releases-dir /opt/wickhunter-hub/releases
 ```
+
+The publisher accepts public keys only. It verifies the signature, target,
+freshness and artifact hash, atomically installs the immutable artifact and
+`manifest-<artifact-sha256>.json`, then atomically replaces `latest.json` last.
+It refuses to overwrite a SHA-addressed file with different bytes.
 
 Rollout is Hub-first but the signed manifest comes before the Hub restart:
 sign the currently published artifact, configure only its public key on the

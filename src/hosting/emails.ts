@@ -116,12 +116,12 @@ export function overdueEmail(to: string, instanceReference: string, suspendAt: n
 export function suspendedEmail(to: string, instanceReference: string, deleteAt: number, manageUrl: string): EmailMessage {
   const text = [
     `Hosting for ${instanceReference} has ended and the VPS is now suspended. Bot management on this VPS has stopped. Positions and orders may still exist on your exchange.`,
-    `The server is scheduled for permanent deletion at ${fmtDate(deleteAt)}. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots will need review before they resume.`,
+    `The server is scheduled for permanent deletion at ${fmtDate(deleteAt)}. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots saved as enabled may resume through their normal safety gates after authenticated server readiness; paused bots remain paused.`,
     `Review hosting and payment: ${manageUrl}`,
   ].join("\n\n");
   const html = [
     `Hosting for ${escapeHtml(instanceReference)} has ended and the VPS is now suspended. Bot management on this VPS has stopped. Positions and orders may still exist on your exchange.`,
-    `The server is scheduled for permanent deletion at <b>${escapeHtml(fmtDate(deleteAt))}</b>. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots will need review before they resume.`,
+    `The server is scheduled for permanent deletion at <b>${escapeHtml(fmtDate(deleteAt))}</b>. Complete the required hosting payment before deletion begins to request recovery of this server. Any required software renewal is shown in your account. Bots saved as enabled may resume through their normal safety gates after authenticated server readiness; paused bots remain paused.`,
     `<a href="${escapeHtml(manageUrl)}">Review hosting and payment</a>`,
   ].join("\n\n");
   return withTo(wrap("Your Unleashed VPS has been suspended", text, html), to);
@@ -191,7 +191,7 @@ export function exceptionEmail(to: string, kind: "setup_failure" | "late_payment
   if (kind === "setup_failure") {
     const text = [
       `We were not able to finish setting up ${instanceReference}. ${detail}`,
-      `Renewal for this server has been stopped. We will confirm the status of your initial hosting payment separately; contact support if you do not receive that confirmation.`,
+      `A request to stop renewal for this server has been sent. We will confirm both the renewal status and the status of your initial hosting payment separately; contact support if you do not receive that confirmation.`,
       `View hosting: ${hostingUrl}`,
     ].join("\n\n");
     const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");

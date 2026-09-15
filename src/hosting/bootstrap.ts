@@ -26,6 +26,7 @@ export interface BootstrapInput {
   instanceId: string;
   generation: number;
   bootstrapToken: string;
+  managementToken: string;
   hubOrigin: string;
   maxAccounts: number;
   probeVenues: readonly ProbeVenue[];
@@ -94,7 +95,52 @@ export LIQHUNTER_HOSTED_MAX_ACCOUNTS="$WH_HOSTED_MAX_ACCOUNTS"
 TOKEN_HASH=$(printf '%s' "$WH_BOOTSTRAP_TOKEN" | sha256sum | cut -d' ' -f1)
 LIQHUNTER_BOOTSTRAP_PASSWORD=$(printf '%s' "$TOKEN_HASH:password:v1" | sha256sum | cut -c1-24)
 unset TOKEN_HASH
-bash "$INSTALLER"
+installed=0
+for attempt in 1 2 3; do
+  if bash "$INSTALLER"; then installed=1; break; fi
+  [ "$attempt" -eq 3 ] || sleep $((attempt * 15))
+done
+[ "$installed" -eq 1 ] || { echo "managed installation failed after 3 attempts" >&2; exit 1; }
+
+# Install a readiness-only boot agent for paid power-on recovery. Its bearer
+# lives in a root-owned file and can only submit a higher one-shot boot counter
+# for this instance/generation; it cannot fetch an installer or configure the
+# application.
+install -d -m 700 /etc/wickhunter-hosting
+printf '%s' ${shellSingleQuote(input.managementToken)} > /etc/wickhunter-hosting/token
+chmod 600 /etc/wickhunter-hosting/token
+printf '0\n' > /etc/wickhunter-hosting/counter
+printf '%s' ${shellSingleQuote(managementAgentScript(input, probeLines))} > /usr/local/sbin/wickhunter-hosting-readiness
+chmod 700 /usr/local/sbin/wickhunter-hosting-readiness
+cat > /etc/systemd/system/wickhunter-hosting-readiness.service <<'WH_HOSTING_UNIT'
+[Unit]
+Description=Wick Hunter managed-hosting boot readiness proof
+After=network-online.target wickhunter.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wickhunter-hosting-readiness
+
+[Install]
+WantedBy=multi-user.target
+WH_HOSTING_UNIT
+cat > /etc/systemd/system/wickhunter-hosting-readiness.timer <<'WH_HOSTING_TIMER'
+[Unit]
+Description=Retry Wick Hunter managed-hosting readiness proof
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+WH_HOSTING_TIMER
+systemctl daemon-reload
+systemctl enable --now wickhunter-hosting-readiness.timer >/dev/null
+
 unset LIQHUNTER_BOOTSTRAP_PASSWORD
 unset LIQHUNTER_HOSTED_MAX_ACCOUNTS
 
@@ -118,5 +164,46 @@ printf '{"token":"%s","generation":%s,"results":[%s]}' "$WH_BOOTSTRAP_TOKEN" "$W
       "$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness" -o /dev/null
 
 unset WH_BOOTSTRAP_TOKEN
+`;
+}
+
+function managementAgentScript(input: BootstrapInput, probeLines: string): string {
+  return `#!/usr/bin/env bash
+set -euo pipefail
+HUB=${shellSingleQuote(input.hubOrigin)}
+INSTANCE=${shellSingleQuote(input.instanceId)}
+GENERATION=${input.generation}
+TOKEN=$(cat /etc/wickhunter-hosting/token)
+COUNTER=$(cat /etc/wickhunter-hosting/counter 2>/dev/null || echo 0)
+case "$COUNTER" in *[!0-9]*|'') COUNTER=0 ;; esac
+COUNTER=$((COUNTER + 1))
+counter_tmp=$(mktemp /etc/wickhunter-hosting/counter.XXXXXX)
+printf '%s\n' "$COUNTER" > "$counter_tmp"
+chmod 600 "$counter_tmp"
+mv "$counter_tmp" /etc/wickhunter-hosting/counter
+
+APP_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' /opt/wickhunter/package.json)
+node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const originOk=x.createdFrom==="bootstrap"?x.mustChange===true:x.createdFrom==="user"?x.mustChange===false:false;if(!originOk||typeof x.hash!=="string"||!x.hash)process.exit(1)' /opt/wickhunter/data/app-credential.json
+healthy=0
+for _try in $(seq 1 60); do
+  body=$(curl -q -fsS --max-time 5 http://127.0.0.1:8090/api/health 2>/dev/null || true)
+  if node -e 'const [r,v]=process.argv.slice(1);try{const x=JSON.parse(r);process.exit(x.ok===true&&x.version===v?0:1)}catch{process.exit(1)}' "$body" "$APP_VERSION"; then healthy=1; break; fi
+  sleep 5
+done
+[ "$healthy" -eq 1 ] || exit 1
+
+RESULTS=""
+probe() {
+  local id="$1" url="$2" status=0 observed
+  if observed=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --retry 1 "$url" 2>/dev/null); then
+    case "$observed" in [0-9][0-9][0-9]) status="$observed" ;; esac
+  fi
+  RESULTS="\${RESULTS}\${RESULTS:+,}{\\"venueId\\":\\"\${id}\\",\\"status\\":\${status}}"
+}
+${probeLines}
+printf '{"managementToken":"%s","counter":%s,"generation":%s,"results":[%s]}' "$TOKEN" "$COUNTER" "$GENERATION" "$RESULTS" \\
+  | curl -q -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 1 \\
+      -H 'content-type: application/json' --data-binary @- "$HUB/api/hosting/instances/$INSTANCE/readiness" -o /dev/null
+unset TOKEN
 `;
 }

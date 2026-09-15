@@ -48,7 +48,7 @@ const LEASE_TTL_MS = 2 * 60_000;
 const PROVISION_RETRY_BACKOFF_MS = 30_000;
 
 const realFetch: EmailFetch = async (url, init) => {
-  const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+  const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
   return { ok: res.ok, status: res.status, text: () => res.text() };
 };
 
@@ -61,6 +61,7 @@ export interface HostingServiceDeps {
    *  passes undefined and gets `VultrProvider` once a key is configured, or
    *  a provider that refuses every call until one is. */
   provider?: HostingProvider;
+  stripeTimeoutMs?: number;
 }
 
 export type HostingActionError =
@@ -92,6 +93,7 @@ export class HostingService {
   private readonly log: (line: string) => void;
   private readonly randomBytes: (n: number) => Buffer;
   private readonly injectedProvider: HostingProvider | undefined;
+  private readonly stripeTimeoutMs: number;
 
   constructor(
     readonly dataDir: string,
@@ -106,6 +108,7 @@ export class HostingService {
     this.log = deps.log ?? ((line) => console.log(line));
     this.randomBytes = deps.randomBytes ?? nodeRandomBytes;
     this.injectedProvider = deps.provider;
+    this.stripeTimeoutMs = deps.stripeTimeoutMs ?? 20_000;
   }
 
   policy(): HostingPolicy {
@@ -148,7 +151,8 @@ export class HostingService {
 
   /** One source of truth for whether the advertised hosting checkout is safe
    * to expose. Price/currency/interval must match the actual Stripe plan, the
-   * master switch must be on, and both provider and Payment Link must exist. */
+   * master switch must be on, and provider plus customer-bound Stripe
+   * Checkout prerequisites must exist. */
   hostingOfferIssue(): string | null {
     const policy = this.policy();
     if (!policy.provisioningEnabled) return "managed hosting is not available for purchase yet";
@@ -159,33 +163,114 @@ export class HostingService {
     if (plan.amountCents !== policy.monthlyPriceCents || plan.currency !== policy.currency || plan.interval !== "month" || plan.lifetime) {
       return "managed hosting price configuration does not match checkout";
     }
-    if (!this.billing.buyUrl(plan.key)) return "managed hosting checkout is not configured";
+    const billing = this.billing.config();
+    const stripe = billing.stripe[billing.mode];
+    const role = billing.roles[billing.mode].hosting;
+    if (!stripe.secretKey) return "managed hosting customer-bound checkout is not configured";
+    if (!stripe.webhookSecret) return "managed hosting billing intake is not configured";
+    if (role.priceIds.length !== 1) return "managed hosting requires exactly one classified Stripe price";
     return null;
   }
 
-  /** POST /api/hosting/checkout — returns the URL to redirect to (the
-   *  EXISTING `/buy?plan=` rail, §3/H4 acceptance case: "through the
-   *  existing rail"). Stripe Payment Links have no server-side
-   *  "attach to this exact customer" parameter, so the email is passed as
-   *  `prefilled_email` — Stripe matches an existing customer by email on
-   *  its own when one exists for that email in this mode; this is a real
-   *  gap against "the SAME Stripe customer ID" and is called out in the
-   *  delivery report. */
-  checkoutUrl(ownerId: string, email: string, nowMs = this.now()): HostingActionResult<{ url: string }> {
+  /** Creates a customer-bound Stripe Checkout Session after independently
+   * validating the configured Stripe price and the live provider quote. */
+  async checkoutUrl(ownerId: string, email: string, nowMs = this.now()): Promise<HostingActionResult<{ url: string }>> {
     const cfg = this.billing.config();
     const mode = cfg.mode;
-    const environment = mode; // "test"|"live" lines up 1:1 with billing's own mode
+    const environment = mode;
     const offerIssue = this.hostingOfferIssue();
     if (offerIssue) return { ok: false, code: "PROVISIONING_DISABLED", error: offerIssue };
     if (!this.softwareEligible(ownerId, nowMs)) return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: "an eligible Unleashed software license is required before adding hosting" };
-    if (this.store.activeInstanceForOwner(ownerId, environment)) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "you already have a hosting instance — manage it from this page" };
+    if (!/^cus_[A-Za-z0-9_]+$/.test(ownerId)) return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: "hosting checkout requires the Stripe customer already bound to your software licence" };
+    const stripe = cfg.stripe[mode];
+    const existing = this.store.activeInstanceForOwner(ownerId, environment);
+    if (existing) {
+      if (existing.stage === "ordered" && existing.checkoutExpiresAtMs != null && nowMs < existing.checkoutExpiresAtMs && existing.checkoutIdempotencyKey && existing.checkoutRequestBody) {
+        if (existing.checkoutUrl) return { ok: true, value: { url: existing.checkoutUrl } };
+        return this.submitStripeCheckout(existing, stripe.secretKey, nowMs);
+      }
+      return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "you already have a hosting checkout or instance — manage it from this page" };
+    }
     const planKey = this.hostingPlanKeys()[0];
     if (!planKey) return { ok: false, code: "PROVISIONING_DISABLED", error: "hosting is not yet configured for purchase on this Hub" };
     const policy = this.policy();
-    const ceilingRefusal = this.costCeilingRefusal(policy.planId, policy);
+    const provider = this.provider();
+    if (!provider) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting provisioning is not configured" };
+    let quote: number;
+    try {
+      const match = (await provider.listPlans()).find((p) => p.id === policy.planId);
+      if (!match) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan is unavailable from the provider" };
+      quote = match.monthlyCostCents;
+    } catch {
+      return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" };
+    }
+    if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
+    const ceilingRefusal = this.costCeilingRefusalWithQuote(quote, policy);
     if (ceilingRefusal) return { ok: false, code: "PROVISIONING_DISABLED", error: ceilingRefusal };
-    const url = `${this.origin}/buy?plan=${encodeURIComponent(planKey)}${email ? `&prefilled_email=${encodeURIComponent(email)}` : ""}`;
-    return { ok: true, value: { url } };
+    const priceId = cfg.roles[mode].hosting.priceIds[0]!;
+    const checked = await this.verifyStripeHostingPrice(stripe.secretKey, priceId, policy);
+    if (!checked.ok) return { ok: false, code: "PROVISIONING_DISABLED", error: checked.error };
+    const finalCeilingRefusal = this.costCeilingRefusalWithQuote(quote, policy);
+    if (finalCeilingRefusal) return { ok: false, code: "PROVISIONING_DISABLED", error: finalCeilingRefusal };
+    const reservation = this.store.reserveInstance({
+      id: this.store.newId("host"), ownerId, environment, region: policy.regions[0]?.id ?? "nrt",
+      planId: policy.planId, stripeCustomerId: ownerId, nowMs,
+    });
+    if (!reservation) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "you already have a hosting checkout or instance" };
+    const expiresAtMs = nowMs + 31 * 60_000;
+    const idempotencyKey = `wh-hosting-${hashBootstrapToken(`${mode}:${reservation.id}`).slice(0, 40)}`;
+    const body = new URLSearchParams({
+      mode: "subscription", customer: ownerId, client_reference_id: ownerId,
+      "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
+      success_url: `${this.origin}/customer?hosting=checkout-success#hosting`,
+      cancel_url: `${this.origin}/customer?hosting=checkout-cancelled#hosting`,
+      "metadata[plan]": planKey, "metadata[role]": "hosting", "metadata[owner]": ownerId,
+      "subscription_data[metadata][plan]": planKey, "subscription_data[metadata][role]": "hosting",
+      expires_at: String(Math.floor(expiresAtMs / 1000)),
+    }).toString();
+    const held = this.store.updateInstance(reservation.id, reservation.version, (d) => {
+      d.providerPlanMonthlyCostCents = quote;
+      d.checkoutExpiresAtMs = expiresAtMs;
+      d.checkoutIdempotencyKey = idempotencyKey;
+      d.checkoutRequestBody = body;
+    }, nowMs);
+    if (!held) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkout reservation could not be saved" };
+    return this.submitStripeCheckout(held, stripe.secretKey, nowMs);
+  }
+
+  private async submitStripeCheckout(reservation: HostingInstanceRow, secretKey: string, nowMs: number): Promise<HostingActionResult<{ url: string }>> {
+    try {
+      const response = await this.stripeFetch("https://api.stripe.com/v1/checkout/sessions", {
+        method: "POST", headers: { authorization: `Bearer ${secretKey}`, "content-type": "application/x-www-form-urlencoded", "idempotency-key": reservation.checkoutIdempotencyKey! }, body: reservation.checkoutRequestBody!,
+      });
+      const parsed = JSON.parse(await response.text()) as Record<string, unknown>;
+      if (!response.ok) {
+        if ([400, 401, 403, 404].includes(response.status)) {
+          const current = this.store.getInstance(reservation.id);
+          if (current?.stage === "ordered" && !current.stripeSubscriptionId) this.store.updateInstance(current.id, current.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+          return { ok: false, code: "PROVISIONING_DISABLED", error: `Stripe refused the hosting checkout (HTTP ${response.status})` };
+        }
+        throw new Error(`Stripe returned uncertain HTTP ${response.status}`);
+      }
+      if (typeof parsed.url !== "string" || !parsed.url.startsWith("https://checkout.stripe.com/")) throw new Error("Stripe returned no checkout URL");
+      const current = this.store.getInstance(reservation.id);
+      if (current?.stage === "ordered") this.store.updateInstance(current.id, current.version, (d) => { d.checkoutUrl = parsed.url as string; }, nowMs);
+      return { ok: true, value: { url: parsed.url } };
+    } catch (err) {
+      this.log(`[hosting] customer-bound checkout uncertain for ${reservation.ownerId}: ${(err as Error).message}; reservation retained for idempotent retry`);
+      return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "managed hosting checkout is still being confirmed; retry from this dashboard" };
+    }
+  }
+
+  private async verifyStripeHostingPrice(secretKey: string, priceId: string, policy: HostingPolicy): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      const response = await this.stripeFetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(priceId)}`, { method: "GET", headers: { authorization: `Bearer ${secretKey}` }, body: undefined });
+      const p = JSON.parse(await response.text()) as any;
+      if (!response.ok || p.id !== priceId || p.active !== true || p.unit_amount !== policy.monthlyPriceCents || p.currency !== policy.currency || p.type !== "recurring" || p.recurring?.interval !== "month" || p.recurring?.interval_count !== 1) {
+        return { ok: false, error: "the classified Stripe hosting price does not match the advertised monthly price" };
+      }
+      return { ok: true };
+    } catch { return { ok: false, error: "the classified Stripe hosting price could not be verified" }; }
   }
 
   // ── the derive-from-billing-record reconciliation (the whole engine) ────
@@ -196,6 +281,11 @@ export class HostingService {
    *  instance's own time-driven jobs drained). Safe to call as often as
    *  wanted; every step is idempotent. */
   reconcileAll(nowMs = this.now()): void {
+    for (const row of this.store.instances()) {
+      if (row.stage === "ordered" && row.checkoutExpiresAtMs != null && nowMs >= row.checkoutExpiresAtMs && !row.stripeSubscriptionId) {
+        this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      }
+    }
     const owners = new Set<string>();
     for (const rec of Object.values(this.billing.store.roleSubscriptions())) if (rec.role === "hosting") owners.add(rec.customerKey);
     for (const row of this.store.instances()) owners.add(row.ownerId);
@@ -218,27 +308,27 @@ export class HostingService {
     let instance = this.store.activeInstanceForOwner(ownerId, environment);
     if (!instance) {
       if (!paidEvidenceExists(sub)) return; // nothing to provision yet (a checkout not yet confirmed)
-      if (!this.softwareEligible(ownerId, nowMs)) {
-        this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer`);
-        if (sub.subscriptionId) this.bestEffortCancelStripeSubscription(sub.subscriptionId, nowMs);
-        return;
-      }
-      // A DELETED instance frees the owner's reservation slot (H6 §17: "a
-      // returning customer receives a new instance only through an
-      // EXPLICIT new purchase") — but recurring billing evidence for the
-      // SAME subscription that instance was terminated for is exactly the
-      // late-payment case (§8/§11 case 15), not a new purchase. Only a
-      // DIFFERENT subscription id (a genuinely new Stripe Checkout) may
-      // provision here; the same id routes to `notifyLatePayment` instead
-      // via the terminated instance it names — never silently reused, and
-      // never silently ignored.
       const priorTerminated = this.store.instances().find((r) => r.ownerId === ownerId && r.environment === environment && r.stage === "deleted");
-      if (priorTerminated && priorTerminated.stripeSubscriptionId && priorTerminated.stripeSubscriptionId === sub.subscriptionId) {
+      if (priorTerminated?.stripeSubscriptionId && priorTerminated.stripeSubscriptionId === sub.subscriptionId) {
+        if (priorTerminated.failureReason === "unreserved_payment") return;
         this.notifyLatePayment(priorTerminated, nowMs);
         return;
       }
-      instance = this.provisionNewInstance(ownerId, sub, nowMs);
-      if (!instance) return; // lost the reservation race to a concurrent call — the winner already reconciled
+      this.log(`[hosting] refusing unreserved hosting payment for ${ownerId}: no customer-bound Checkout reservation exists`);
+      if (sub.subscriptionId) {
+        const rejected = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment, region: this.policy().regions[0]?.id ?? "nrt", planId: this.policy().planId, stripeCustomerId: ownerId, nowMs });
+        if (rejected) {
+          const stopped = this.store.updateInstance(rejected.id, rejected.version, (d) => { d.stage = "deleted"; d.stripeSubscriptionId = sub.subscriptionId; d.failureReason = "unreserved_payment"; }, nowMs);
+          if (stopped) this.enqueueStripeCancellation(stopped, sub.subscriptionId, "unreserved-payment", nowMs);
+        }
+      }
+      return;
+    }
+    if (!this.softwareEligible(ownerId, nowMs)) {
+      this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer`);
+      if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
+      if (instance.stage === "ordered" && !instance.providerInstanceId) this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      return;
     }
     this.applyBillingSignal(instance, sub, nowMs);
   }
@@ -277,8 +367,11 @@ export class HostingService {
     // tell a genuinely new purchase from a late payment on the same dead
     // subscription (see that method's own comment).
     if (sub.subscriptionId && sub.subscriptionId !== instance.stripeSubscriptionId) {
-      const withId = this.store.updateInstance(instance.id, instance.version, (d) => { d.stripeSubscriptionId = sub.subscriptionId; }, nowMs);
-      if (withId) instance = withId;
+      const withId = this.store.updateInstance(instance.id, instance.version, (d) => { d.stripeSubscriptionId = sub.subscriptionId; d.checkoutExpiresAtMs = null; }, nowMs);
+      if (withId) {
+        instance = withId;
+        if (withId.stage === "ordered") this.enqueueProvisionJob(withId, nowMs);
+      }
     }
 
     // A refund/dispute is recorded for the admin page but is deliberately
@@ -376,10 +469,9 @@ export class HostingService {
 
   /** A payment observed while the instance is past_due/cancel_scheduled/
    *  suspended/restoring: invalidate the expiry pipeline and move toward
-   *  `restoring`. NEVER jumps straight to `ready`/`active` — "restore
-   *  always boots paused" is enforced by `drainRestore` requiring a fresh
-   *  provider health read before advancing past this stage (H6/§11 case
-   *  11). Irreversible deletion is a hard wall: once `stage === "deleting"`
+   *  `restoring`. NEVER jumps straight to `ready`/`active`; the retained
+   *  instance must submit a fresh authenticated app/credential/venue proof.
+   *  Irreversible deletion is a hard wall: once `stage === "deleting"`
    *  or `"deleted"`, this method refuses and reports late-payment instead
    *  (handled by the caller checking stage first — see `applyBillingSignal`,
    *  which routes here only from `RECOVERABLE_STAGES`, and `drainDelete`,
@@ -414,11 +506,13 @@ export class HostingService {
     const row = this.owned(ownerId, instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
     if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this hosting instance cannot be cancelled from its current state" };
+    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
+    if (!sub?.subscriptionId || !(await this.setStripeCancellation(sub.subscriptionId, true))) {
+      return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "Stripe did not confirm the cancellation; no local hosting deadline was changed" };
+    }
     const policy = this.policy();
     const anchor = row.paidThroughMs ?? nowMs;
     this.scheduleEnd(row, "intentional_cancellation", anchor, policy, nowMs);
-    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
-    if (sub?.subscriptionId) this.bestEffortCancelStripeSubscription(sub.subscriptionId, nowMs);
     const d = deadlines(anchor, "intentional_cancellation", policy);
     return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt } };
   }
@@ -431,13 +525,15 @@ export class HostingService {
     if (row.stage !== "cancel_scheduled" || (row.suspendAtMs !== null && nowMs >= row.suspendAtMs)) {
       return { ok: false, code: "RESTORATION_UNAVAILABLE", error: "this cancellation can no longer be reversed from here — the hosting window has passed" };
     }
+    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
+    if (!sub?.subscriptionId || !(await this.setStripeCancellation(sub.subscriptionId, false))) {
+      return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "Stripe did not confirm renewal; the existing cancellation schedule remains unchanged" };
+    }
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
       d.cancellationReason = null; d.suspendAtMs = null; d.deleteAtMs = null; d.stage = "ready"; d.lifecycleVersion += 1;
     }, nowMs);
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "this hosting instance changed underneath the request — reload and try again" };
     this.store.obsoletePendingJobsOlderThan(fresh.id, fresh.lifecycleVersion, fresh.generation, nowMs);
-    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
-    if (sub?.subscriptionId) this.bestEffortResumeStripeSubscription(sub.subscriptionId, nowMs);
     return { ok: true, value: { stage: fresh.stage } };
   }
 
@@ -483,11 +579,20 @@ export class HostingService {
    *  comparing the presented generation against the row's CURRENT one
    *  (H6: "late callbacks from a failed/replaced instance must not mark
    *  the replacement ready"). */
-  reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now()): HostingActionResult<{ ready: boolean }> {
-    const row = this.store.getInstance(instanceId);
-    const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
-    if (!authenticated.ok) return authenticated;
+  reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): HostingActionResult<{ ready: boolean }> {
+    let row = this.store.getInstance(instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
+    if (managementCounter !== undefined) {
+      if (row.stage !== "restoring" || row.generation !== generation || !Number.isSafeInteger(managementCounter) || managementCounter <= row.managementCounter || !row.managementTokenHash || hashBootstrapToken(presentedToken) !== row.managementTokenHash) {
+        return { ok: false, code: "NOT_FOUND", error: "invalid or replayed management readiness proof" };
+      }
+      const counted = this.store.updateInstance(row.id, row.version, (d) => { d.managementCounter = managementCounter; }, nowMs);
+      if (!counted) return { ok: false, code: "NOT_FOUND", error: "changed underneath the management readiness proof" };
+      row = counted;
+    } else {
+      const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
+      if (!authenticated.ok) return authenticated;
+    }
     const policy = this.policy();
     const verdict = readinessVerdict(policy.probeVenues, results);
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
@@ -497,6 +602,11 @@ export class HostingService {
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
     if (verdict.ready) {
       this.markReady(fresh, nowMs);
+    } else if (managementCounter !== undefined) {
+      this.store.updateInstance(fresh.id, fresh.version, (d) => {
+        d.operationalHealth = "unhealthy";
+        d.failureReason = `Paid recovery is waiting for server readiness — ${verdict.refusals.join("; ")}`;
+      }, nowMs);
     } else {
       this.handleReadinessRefusal(fresh, verdict, policy, nowMs);
     }
@@ -504,10 +614,6 @@ export class HostingService {
   }
 
   private markReady(row: HostingInstanceRow, nowMs: number): void {
-    // Both entrances (fresh provisioning and a restore) land here, and both
-    // land on the SAME stage — "ready", never "active" — because neither a
-    // fresh install nor a restore is evidence bots are safe to resume; see
-    // the docstring on `restore()` ("restore always boots paused").
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
       d.stage = "ready";
       d.operationalHealth = "healthy";
@@ -515,12 +621,8 @@ export class HostingService {
       d.pendingRestore = false;
     }, nowMs);
     if (!fresh) return;
-    // `row.stage` (the STAGE at the moment readiness confirmed) is
-    // "bootstrapping" whether this was a fresh install or a restore —
-    // `drainProvision` runs the identical stage sequence for both, on
-    // purpose (a restore re-earns readiness through the same gate a fresh
-    // install does). `pendingRestore` is what survives across that job to
-    // tell the two apart here.
+    // `pendingRestore` distinguishes a retained paid recovery from the
+    // initial empty-server bootstrap for customer messaging.
     if (row.pendingRestore) {
       this.store.enqueue({ hostingInstanceId: fresh.id, lifecycleVersion: fresh.lifecycleVersion, generation: fresh.generation, jobType: "email", dedupeKey: `email:restored:${fresh.id}:g${fresh.generation}`, availableAtMs: nowMs, payload: { template: "restored" } }, nowMs);
     } else {
@@ -610,6 +712,11 @@ export class HostingService {
       case "readiness_recheck": return this.drainReadinessRecheck(row, job, nowMs);
       case "suspend": return this.drainSuspend(row, nowMs);
       case "delete": return this.drainDelete(row, nowMs);
+      case "billing_reconcile": {
+        const subscriptionId = String(job.payload.subscriptionId ?? "");
+        if (!subscriptionId || !(await this.setStripeCancellation(subscriptionId, true))) throw new Error("Stripe did not confirm the durable cancellation request");
+        return;
+      }
       case "email": {
         const template = String((job.payload as any).template ?? "");
         // "Reminders about deletion are suppressed while held" (the
@@ -633,14 +740,36 @@ export class HostingService {
 
   private async drainProvision(row: HostingInstanceRow, nowMs: number): Promise<void> {
     const policy = this.policy();
-    if (!policy.provisioningEnabled) { this.log(`[hosting] ${row.id}: provisioning is disabled on this Hub (policy.provisioningEnabled=false) — leaving ${row.stage}`); return; }
+    if (!policy.provisioningEnabled) throw new Error("provisioning master switch is off — the durable job will retry without creating a server");
     const provider = this.provider();
     if (!provider) throw new Error("no provider API key is configured — provisioning will retry without creating a server");
+    if (row.stage === "restoring") {
+      if (!row.providerInstanceId) throw new Error("cannot restore a server whose provider instance id is missing");
+      const existing = await provider.getInstance(row.providerInstanceId);
+      if (!existing) throw new Error("cannot restore because the provider no longer has this server");
+      if (existing.status !== "active") await provider.power(row.providerInstanceId, "on");
+      const current = this.store.getInstance(row.id);
+      if (current?.stage === "restoring") this.store.updateInstance(current.id, current.version, (d) => {
+        d.lastProviderCheckAtMs = nowMs;
+        d.failureReason = "Server power-on requested; waiting for its authenticated boot readiness proof.";
+      }, nowMs);
+      return;
+    }
     if (row.provisionAttempts >= MAX_PROVISION_ATTEMPTS) { this.failProvisioning(row, `setup failed after ${row.provisionAttempts} attempts`, nowMs); return; }
     await this.captureProviderPlanQuote(row, provider, nowMs);
     // Quote capture updates this same row. Refresh before the stage/attempt
     // CAS or the stale version would make that mutation a silent no-op.
     row = this.store.getInstance(row.id) ?? row;
+    if (row.providerPlanMonthlyCostCents === null) throw new Error("provider price could not be verified — provisioning remains blocked");
+    if (policy.monthlyPriceCents !== row.providerPlanMonthlyCostCents * 2) {
+      this.failProvisioning(row, "advertised hosting price no longer equals twice the verified provider cost", nowMs);
+      return;
+    }
+    const projected = this.projectedMonthlyProviderCostCents();
+    if (policy.maximumProjectedMonthlyProviderCostCents > 0 && (!projected.known || projected.cents > policy.maximumProjectedMonthlyProviderCostCents)) {
+      this.failProvisioning(row, "the provider cost ceiling changed or was reached before server creation", nowMs);
+      return;
+    }
 
     const label = hostingInstanceLabel(row.id, row.generation);
     this.store.updateInstance(row.id, row.version, (d) => { d.stage = "provisioning"; d.label = label; d.provisionAttempts += 1; }, nowMs);
@@ -653,6 +782,7 @@ export class HostingService {
     }
     if (!created) {
       const rawToken = mintBootstrapToken(this.randomBytes);
+      const rawManagementToken = mintBootstrapToken(this.randomBytes);
       // Persist the verifier BEFORE the provider call. A create timeout may
       // mean the instance already exists and cloud-init is already calling
       // home; writing this afterward creates a race where a legitimate
@@ -663,10 +793,13 @@ export class HostingService {
       this.store.updateInstance(row.id, tokenRow.version, (d) => {
         d.bootstrapTokenHash = hashBootstrapToken(rawToken);
         d.bootstrapTokenExpiresAtMs = nowMs + policy.bootstrapTokenTtlMinutes * 60_000;
+        d.managementTokenHash = hashBootstrapToken(rawManagementToken);
+        d.managementCounter = 0;
         d.releaseRef = policy.releaseRef;
       }, nowMs);
       const userData = buildBootstrapUserData({
         instanceId: row.id, generation: row.generation, bootstrapToken: rawToken,
+        managementToken: rawManagementToken,
         hubOrigin: this.origin,
         maxAccounts: policy.maximumConnectedAccounts,
         probeVenues: policy.probeVenues,
@@ -733,7 +866,12 @@ export class HostingService {
     const refusals = Array.isArray(job.payload.refusals) ? job.payload.refusals.map(String) : ["bootstrap did not report readiness"];
     const provider = this.provider();
     if (!provider) throw new Error("provider API key is unavailable during failed-instance cleanup");
-    if (row.providerInstanceId) await provider.deleteInstance(row.providerInstanceId);
+    if (row.providerInstanceId) {
+      await provider.deleteInstance(row.providerInstanceId);
+      if (await provider.getInstance(row.providerInstanceId)) {
+        throw new Error("provider deletion is still in progress — replacement remains blocked");
+      }
+    }
     for (const resource of this.store.resourcesFor(row.id)) {
       if (resource.generation === row.generation && resource.cleanupState === "present") this.store.markResourceRemoved(resource.id, nowMs);
     }
@@ -755,6 +893,7 @@ export class HostingService {
       d.provisionAttempts = 0;
       d.providerInstanceId = null; d.ip = null; d.appUrl = null; d.label = "";
       d.bootstrapTokenHash = null; d.bootstrapTokenExpiresAtMs = null; d.releaseRef = null;
+      d.managementTokenHash = null; d.managementCounter = 0;
       d.stage = "provisioning";
     }, nowMs);
     if (fresh) this.enqueueProvisionJob(fresh, nowMs);
@@ -835,11 +974,19 @@ export class HostingService {
     return null;
   }
 
+  private costCeilingRefusalWithQuote(quote: number, policy: HostingPolicy): string | null {
+    if (policy.maximumProjectedMonthlyProviderCostCents <= 0) return null;
+    const current = this.projectedMonthlyProviderCostCents();
+    if (!current.known) return "hosting is at its provider cost ceiling — the current projected provider spend could not be verified";
+    if (current.cents + quote > policy.maximumProjectedMonthlyProviderCostCents) return "hosting is at its provider cost ceiling";
+    return null;
+  }
+
   private failProvisioning(row: HostingInstanceRow, reason: string, nowMs: number): void {
     this.store.updateInstance(row.id, row.version, (d) => { d.operationalHealth = "unhealthy"; d.failureReason = reason; }, nowMs);
     this.store.enqueue({ hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation, jobType: "email", dedupeKey: `email:setup_failure:${row.id}:g${row.generation}`, availableAtMs: nowMs, payload: { template: "setup_failure" } }, nowMs);
     const sub = this.billing.store.getRoleSubscription(row.ownerId, "hosting");
-    if (sub?.subscriptionId) this.bestEffortCancelStripeSubscription(sub.subscriptionId, nowMs);
+    if (sub?.subscriptionId) this.enqueueStripeCancellation(row, sub.subscriptionId, "setup-failure", nowMs);
     this.log(`[hosting] ${row.id}: provisioning permanently failed — ${reason}. Recommended policy: refund the initial hosting payment (idempotent, operator-verified — see report).`);
   }
 
@@ -903,11 +1050,15 @@ export class HostingService {
       }
       if (absent) {
         for (const res of this.store.resourcesFor(committed.id)) if (res.cleanupState === "present") this.store.markResourceRemoved(res.id, nowMs);
-        const done = this.store.updateInstance(committed.id, committed.version, (d) => { d.stage = "deleted"; d.providerDeletedAtMs = nowMs; d.terminatedAtMs = nowMs; }, nowMs);
+        const done = this.store.updateInstance(committed.id, committed.version, (d) => {
+          d.stage = "deleted"; d.providerDeletedAtMs = nowMs; d.terminatedAtMs = nowMs;
+          d.bootstrapTokenHash = null; d.bootstrapTokenExpiresAtMs = null;
+          d.managementTokenHash = null; d.managementCounter = 0;
+        }, nowMs);
         if (done) {
           this.store.enqueue({ hostingInstanceId: done.id, lifecycleVersion: done.lifecycleVersion, generation: done.generation, jobType: "email", dedupeKey: `email:terminated:${done.id}:g${done.generation}`, availableAtMs: nowMs, payload: { template: "terminated" } }, nowMs);
           const sub = this.billing.store.getRoleSubscription(done.ownerId, "hosting");
-          if (sub?.subscriptionId) this.bestEffortCancelStripeSubscription(sub.subscriptionId, nowMs);
+          if (sub?.subscriptionId) this.enqueueStripeCancellation(done, sub.subscriptionId, "terminated", nowMs);
         }
       } else {
         // Deletion requested but not yet confirmed absent — reschedule a
@@ -929,9 +1080,8 @@ export class HostingService {
    *  excludes those stages on purpose, so `restore()` is never reached for
    *  them; this is the alternate branch that IS reached. Never restores,
    *  never re-creates; records the fact and emails the exception template.
-   *  The actual refund is a REAL Stripe call, best-effort, logged on
-   *  failure for operator follow-up — this repo makes no live call in
-   *  tests (see the provider/Stripe fetch seam). */
+   *  Refund resolution remains explicitly pending operator confirmation;
+   *  neither state nor customer copy claims money moved before it did. */
   private notifyLatePayment(row: HostingInstanceRow, nowMs: number): void {
     const marker = "late_payment_resolution_required";
     // Deduped on the marker itself, not on `nowMs` — `paidThroughMs` is
@@ -942,7 +1092,7 @@ export class HostingService {
     if (row.failureReason === marker) return;
     this.store.updateInstance(row.id, row.version, (d) => { d.failureReason = marker; }, nowMs);
     this.store.enqueue({ hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation, jobType: "email", dedupeKey: `email:late_payment:${row.id}:g${row.generation}`, availableAtMs: nowMs, payload: { template: "late_payment" } }, nowMs);
-    this.log(`[hosting] ${row.id}: LATE PAYMENT after deletion — refund the hosting payment (idempotent) and tell the customer to buy a fresh VPS. Never mark this instance ready.`);
+    this.log(`[hosting] ${row.id}: LATE PAYMENT after deletion — operator payment resolution is required; tell the customer to buy a fresh VPS only after it is confirmed. Never mark this instance ready.`);
   }
 
   // ── emails ────────────────────────────────────────────────────────────────
@@ -997,13 +1147,13 @@ export class HostingService {
       case "one_day":
         return tmpl.oneDayReminderEmail("", ref, row.deleteAtMs ?? nowMs, manageUrl);
       case "restored":
-        return tmpl.restoredEmail("", ref, row.appUrl ?? "", row.paidThroughMs, "Your bots are paused and were not automatically resumed.");
+        return tmpl.restoredEmail("", ref, row.appUrl ?? "", row.paidThroughMs, "Bots saved as enabled may resume through their normal readiness, admission, and protection gates; bots saved as paused remain paused.");
       case "terminated":
         return tmpl.terminatedEmail("", ref, row.terminatedAtMs ?? nowMs, "Hosting billing has been stopped for this server.", manageUrl);
       case "setup_failure":
         return tmpl.exceptionEmail("", "setup_failure", ref, row.failureReason ?? "Setup did not complete.", manageUrl);
       case "late_payment":
-        return tmpl.exceptionEmail("", "late_payment_after_deletion", ref, "This server was already permanently deleted and its data cannot be recovered. The payment will be refunded.", manageUrl);
+        return tmpl.exceptionEmail("", "late_payment_after_deletion", ref, "This server was already permanently deleted and its data cannot be recovered. Support must confirm the hosting payment resolution before any refund is considered complete.", manageUrl);
       default:
         return null;
     }
@@ -1017,7 +1167,7 @@ export class HostingService {
     const key = cfg.stripe[mode].secretKey;
     if (!key) return;
     try {
-      const response = await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.stripeFetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: "cancel_at_period_end=true",
       });
       if (!response.ok) throw new Error(`Stripe returned HTTP ${response.status}`);
@@ -1030,12 +1180,43 @@ export class HostingService {
     const key = cfg.stripe[mode].secretKey;
     if (!key) return;
     try {
-      const response = await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.stripeFetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: "cancel_at_period_end=false",
       });
       if (!response.ok) throw new Error(`Stripe returned HTTP ${response.status}`);
     } catch (err) { this.log(`[hosting] could not un-cancel Stripe subscription ${subscriptionId}: ${(err as Error).message}`); }
     void nowMs;
+  }
+
+  private async setStripeCancellation(subscriptionId: string, cancelAtPeriodEnd: boolean): Promise<boolean> {
+    const cfg = this.billing.config();
+    const key = cfg.stripe[cfg.mode].secretKey;
+    if (!key) return false;
+    try {
+      const response = await this.stripeFetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+        method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: `cancel_at_period_end=${cancelAtPeriodEnd ? "true" : "false"}`,
+      });
+      return response.ok;
+    } catch { return false; }
+  }
+
+  private enqueueStripeCancellation(row: HostingInstanceRow, subscriptionId: string, reason: string, nowMs: number): void {
+    this.store.enqueue({
+      hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation,
+      jobType: "billing_reconcile", dedupeKey: `stripe-cancel:${row.id}:${subscriptionId}:${reason}`,
+      availableAtMs: nowMs, payload: { subscriptionId, action: "cancel", reason },
+    }, nowMs);
+  }
+
+  private async stripeFetch(url: string, init: Parameters<EmailFetch>[1]): Promise<Awaited<ReturnType<EmailFetch>>> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.stripeTimeoutMs);
+    try {
+      return await this.fetchLike(url, { ...init, signal: controller.signal });
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error(`Stripe request timed out after ${this.stripeTimeoutMs}ms`);
+      throw err;
+    } finally { clearTimeout(timer); }
   }
 
   // ── admin actions ────────────────────────────────────────────────────────

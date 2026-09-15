@@ -654,7 +654,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // ── billing (public) ────────────────────────────────────────────────
     if (m === "GET" && p === "/buy") {
       const planKey = url.searchParams.get("plan");
-      if (planKey && !billing.plan(planKey)) return sendText(res, 404, "unknown plan");
+      const plan = planKey ? billing.plan(planKey) : null;
+      if (planKey && !plan) return sendText(res, 404, "unknown plan");
+      if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
     // The website reads prices from here, so a price change on the Hub shows
@@ -1347,7 +1349,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const candidates = customerSessions.hostingOwnerCandidates(identity);
     let ownerId = candidates[0] ?? `email:${identity.email}`;
     for (const key of candidates) if (hosting.store.activeInstanceForOwner(key, "live") || hosting.store.activeInstanceForOwner(key, "test")) { ownerId = key; break; }
-    const r = hosting.checkoutUrl(ownerId, identity.email);
+    const r = await hosting.checkoutUrl(ownerId, identity.email);
     if (!r.ok) return sendJson(res, r.code === "SOFTWARE_LICENSE_REQUIRED" ? 403 : r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, url: r.value.url }, { "cache-control": "no-store" });
   }
@@ -1404,8 +1406,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   async function hostingReadinessCallback(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
     const instanceId = p.slice("/api/hosting/instances/".length, -"/readiness".length);
     const body = await readJsonBody(req);
-    if (body === null || typeof body.token !== "string" || typeof body.generation !== "number" || !Array.isArray(body.results)) {
-      return sendJson(res, 400, { ok: false, error: "expected {token, generation, results: [{venueId, status|outcome}]}" }, { "cache-control": "no-store" });
+    const bootstrapToken = body !== null && typeof body.token === "string" ? body.token : null;
+    const managementToken = body !== null && typeof body.managementToken === "string" ? body.managementToken : null;
+    const managementCounter = body !== null && typeof body.counter === "number" ? body.counter : undefined;
+    if (body === null || (bootstrapToken === null) === (managementToken === null) || (managementToken !== null && managementCounter === undefined) || typeof body.generation !== "number" || !Array.isArray(body.results)) {
+      return sendJson(res, 400, { ok: false, error: "expected exactly one readiness token plus generation and results" }, { "cache-control": "no-store" });
     }
     const results: ProbeResult[] = [];
     for (const r of body.results) {
@@ -1414,7 +1419,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (status === null) continue;
       results.push({ venueId: (r as any).venueId, outcome: classifyProbeStatus(status) });
     }
-    const r = hosting.reportReadiness(instanceId, body.token, body.generation, results);
+    const r = hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter);
     if (!r.ok) return sendJson(res, 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, ready: r.value.ready }, { "cache-control": "no-store" });
   }

@@ -15,6 +15,7 @@
     "leasekey": "node dist/bin/leasekey.js",
     "candlekey": "node dist/bin/candlekey.js",
     "marketcapkey": "node dist/bin/marketcapkey.js",
+    "publish-release": "node dist/bin/publish-release.js",
     "issue": "node dist/bin/issue.js",
     "revoke": "node dist/bin/revoke.js",
     "list": "node dist/bin/list.js",

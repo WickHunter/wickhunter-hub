@@ -15,6 +15,7 @@ const input = {
   instanceId: "host_abc123",
   generation: 2,
   bootstrapToken: "super-secret-token-value",
+  managementToken: "management-token-value",
   hubOrigin: "https://hub.example.com",
   maxAccounts: 5,
   probeVenues: DEFAULT_PROBE_VENUES,
@@ -44,7 +45,7 @@ await test("every probe uses a 5s timeout and exactly one retry", () => {
   const script = commandOf(buildBootstrapUserData(input));
   assert.match(script, /--max-time 5 --retry 1/);
   assert.match(script, /case "\$observed" in \[0-9\]\[0-9\]\[0-9\]\)/);
-  assert.doesNotMatch(script, /\|\| echo 0/);
+  assert.doesNotMatch(script, /http_code[^\n]+\|\| echo 0/);
 });
 
 await test("the token is exported into the environment, never interpolated into a curl argv, and is unset at the end", () => {
@@ -80,6 +81,10 @@ await test("the signed installer completes before any readiness probe runs", () 
   const firstProbe = script.indexOf("https://api.bybit.com/v5/market/time");
   assert.ok(installerRoute > 0 && installRun > installerRoute, "fetches and runs the instance-scoped installer");
   assert.ok(firstProbe > installRun, "venue probes cannot mark an uninstalled box ready");
+  assert.match(script, /for attempt in 1 2 3/);
+  assert.match(script, /systemctl enable --now wickhunter-hosting-readiness\.timer/);
+  assert.match(script, /x\.createdFrom==="bootstrap"\?x\.mustChange===true/);
+  assert.match(script, /x\.createdFrom==="user"\?x\.mustChange===false/);
   assert.match(script, /--data-binary @-/);
   assert.doesNotMatch(script, /installer\?token=/);
 });

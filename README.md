@@ -31,6 +31,21 @@ a separate subscription, and the policy defaults to Ubuntu 24.04 x64 with one
 concurrent provisioning job. Provisioning remains disabled until the operator
 pins an authenticated protected release and enables it.
 
+Checkout is a Stripe Checkout Session bound to the existing licensed customer,
+with the classified $20 monthly price verified against the live $10 provider
+quote. A durable unpaid reservation prevents double checkout and cost-ceiling
+oversubscription. Cancellation changes local deadlines only after Stripe
+confirms it; system cancellation retries through the outbox. Paid recovery
+powers on the retained VPS and waits for its generation-bound readiness agent;
+a failed restore probe never deletes customer data.
+
+For managed hosting, `npm run publish-release -- <manifest> <artifact>` verifies
+and publishes the immutable artifact and `manifest-<artifact-sha256>.json`
+before atomically replacing `releases/latest.json`.
+Set the hosting release ref to that 64-character artifact SHA. An instance that
+boots after `latest.json` advances can then retrieve its exact authenticated
+manifest and immutable artifact rather than changing releases mid-generation.
+
 ## v0.4.38 — demanded WEEX timeframe work cannot starve
 
 WEEX reconciliation ranges that fit inside the documented newest 1,000-row
