@@ -181,6 +181,7 @@ await test("Create in Stripe makes the product, three prices and three links, an
   await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { test: { secretKey: "sk_test_fake" } } }) });
   const r = await admin("/admin/api/billing/plans/provision", { method: "POST", body: JSON.stringify({ mode: "test" }) });
   assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.ok(stripe.calls.filter((c) => c.method === "GET").every((c) => c.body === undefined), "Stripe GET requests omit a request body for Node fetch compatibility");
   assert.equal(r.body.product.created, true);
   assert.equal(r.body.plans.length, 3);
   assert.ok(r.body.plans.every((p) => p.priceCreated && p.linkCreated));
