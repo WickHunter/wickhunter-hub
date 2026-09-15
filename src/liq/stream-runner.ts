@@ -282,7 +282,7 @@ export class LiqStreamRunner {
       load: () => fetchBybitSymbols(fetchLike, this.cfg.bybitRestBase, category, quote),
       onLoaded: (list) => {
         this.bybitRoster.set(id, list);
-        this.notes.set(id, `${list.length} perp(s) subscribed`);
+        this.notes.set(id, `${list.length} perp(s) requested · awaiting subscribe acknowledgement`);
         pool.resync();
       },
       log: this.deps.log,

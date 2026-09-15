@@ -105,7 +105,7 @@ await test("v0.4.21 — a bybit subscribe ack or refusal rides the source note, 
   await settle();
   made[0].h.onOpen();
   const noteOf = () => r.status().find((s) => s.id === "bybit-usdc").note;
-  assert.equal(noteOf(), "1 perp(s) subscribed");
+  assert.equal(noteOf(), "1 perp(s) requested · awaiting subscribe acknowledgement");
   made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: false, ret_msg: "Invalid topic allLiquidation.BTCPERP", conn_id: "x" }));
   assert.equal(noteOf(), "1 perp(s) requested · subscribe REFUSED: Invalid topic allLiquidation.BTCPERP");
   assert.ok(logs.some((l) => l.includes("bybit-usdc: subscribe refused")), "the refusal is logged");

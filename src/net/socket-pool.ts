@@ -108,16 +108,22 @@ export interface SocketPoolDeps<C> {
   /** First reconnect delay; doubles per consecutive failure to the ceiling. */
   reconnectMs?: number;
   reconnectMaxMs?: number;
+  /** A handshake that produces neither open, error nor close cannot occupy a
+   *  connection slot forever. */
+  connectTimeoutMs?: number;
 }
 
 interface InternalConn<C> extends PoolConn<C> {
   attempts: number;
   timer: ReturnType<typeof setTimeout> | null;
+  connectTimer: ReturnType<typeof setTimeout> | null;
   ping: ReturnType<typeof setInterval> | null;
+  generation: number;
 }
 
 const DEFAULT_RECONNECT_MS = 2_000;
 const DEFAULT_RECONNECT_MAX_MS = 60_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 
 export class SocketPool<C> {
   private conns: InternalConn<C>[] = [];
@@ -157,7 +163,8 @@ export class SocketPool<C> {
     for (let i = 0; i < want.length; i += cap) {
       const c: InternalConn<C> = {
         index: this.conns.length, symbols: want.slice(i, i + cap), sock: null,
-        extra: this.deps.makeExtra(), attempts: 0, timer: null, ping: null, opened: false,
+        extra: this.deps.makeExtra(), attempts: 0, timer: null, connectTimer: null,
+        ping: null, opened: false, generation: 0,
       };
       this.conns.push(c);
       this.open(c);
@@ -172,9 +179,12 @@ export class SocketPool<C> {
     const a = this.deps.adapter;
     const factory = this.deps.socket ?? nodeSocketFactory;
     c.opened = false;
+    const generation = ++c.generation;
     try {
-      c.sock = factory(a.url, {
+      const sock = factory(a.url, {
         onOpen: () => {
+          if (!this.current(c, generation)) return;
+          if (c.connectTimer) { clearTimeout(c.connectTimer); c.connectTimer = null; }
           c.opened = true;
           c.attempts = 0;
           for (const f of a.subscribeFrames(c.symbols)) c.sock?.send(JSON.stringify(f));
@@ -182,32 +192,56 @@ export class SocketPool<C> {
             c.ping = setInterval(() => c.sock?.send(a.pingFrame!), a.pingIntervalMs);
           }
         },
-        onMessage: (data) => this.handleMessage(c, data),
-        onClose: () => this.reopen(c),
-        // An error is not itself a close on every implementation, so the
-        // reconnect hangs off `onClose` alone and this only records the reason.
-        onError: (e) => this.deps.log?.(`${a.id}[${c.index}]: socket error — ${(e as Error)?.message ?? "unknown"}`),
+        onMessage: (data) => this.handleMessage(c, generation, data),
+        onClose: () => this.reopen(c, generation),
+        onError: (e) => {
+          if (!this.current(c, generation)) return;
+          this.deps.log?.(`${a.id}[${c.index}]: socket error — ${(e as Error)?.message ?? "unknown"}`);
+          // Node's WebSocket may emit only `error` when the HTTP upgrade is
+          // rejected. Retire this attempt here; a later close callback is
+          // generation-stale and cannot schedule a second reconnect.
+          this.reopen(c, generation);
+        },
       });
+      if (!this.current(c, generation)) { try { sock.close(); } catch {} return; }
+      c.sock = sock;
+      if (!c.opened) {
+        const timeout = Math.max(1, this.deps.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+        c.connectTimer = setTimeout(() => {
+          if (!this.current(c, generation) || c.opened) return;
+          this.deps.log?.(`${a.id}[${c.index}]: connection timed out before open`);
+          this.reopen(c, generation);
+        }, timeout);
+        c.connectTimer.unref?.();
+      }
     } catch (e) {
       this.deps.log?.(`${a.id}[${c.index}]: could not open — ${(e as Error)?.message ?? "unknown"}`);
-      this.reopen(c);
+      this.reopen(c, generation);
     }
   }
 
-  private handleMessage(c: InternalConn<C>, data: string): void {
+  private current(c: InternalConn<C>, generation: number): boolean {
+    return this.runningFlag && this.conns.includes(c) && c.generation === generation;
+  }
+
+  private handleMessage(c: InternalConn<C>, generation: number, data: string): void {
     // A retired connection's socket can deliver one last callback after a
     // roster rebuild or stop. Reject it before it can act on stale state.
-    if (!this.runningFlag || !this.conns.includes(c)) return;
+    if (!this.current(c, generation)) return;
     try {
       for (const reply of this.deps.adapter.replyFrames?.(data) ?? []) c.sock?.send(JSON.stringify(reply));
     } catch { /* a malformed heartbeat must not stop the tail */ }
     this.deps.onMessage(c, data);
   }
 
-  private reopen(c: InternalConn<C>): void {
-    if (!this.runningFlag || !this.conns.includes(c)) return;
+  private reopen(c: InternalConn<C>, generation: number): void {
+    if (!this.current(c, generation)) return;
+    ++c.generation; // invalidate error/close/message callbacks from this socket
     this.clearTimers(c);
+    const old = c.sock;
     c.sock = null;
+    c.opened = false;
+    try { old?.close(); } catch { /* already gone */ }
     c.attempts++;
     const base = this.deps.reconnectMs ?? DEFAULT_RECONNECT_MS;
     const ceiling = this.deps.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS;
@@ -217,15 +251,19 @@ export class SocketPool<C> {
     const wait = Math.round(backoff * (0.5 + Math.random() * 0.5));
     this.deps.onDiscard?.(c);
     c.timer = setTimeout(() => this.open(c), wait);
+    c.timer.unref?.();
   }
 
   private clearTimers(c: InternalConn<C>): void {
     if (c.timer) { clearTimeout(c.timer); c.timer = null; }
+    if (c.connectTimer) { clearTimeout(c.connectTimer); c.connectTimer = null; }
     if (c.ping) { clearInterval(c.ping); c.ping = null; }
   }
 
   private teardown(c: InternalConn<C>): void {
+    ++c.generation;
     this.clearTimers(c);
+    c.opened = false;
     this.deps.onDiscard?.(c);
     try { c.sock?.close(); } catch { /* already gone */ }
     c.sock = null;

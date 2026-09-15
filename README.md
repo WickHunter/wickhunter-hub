@@ -13,6 +13,14 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.40 — WebSocket handshake failures recover
+
+The shared candle and liquidation socket pool now retires and reconnects a
+socket when Node reports an error without a close event, and times out a
+handshake that never opens. Attempt generations prevent late callbacks from
+starting duplicate reconnects or reviving retired sockets. Bybit liquidation
+status says a roster was requested until the venue acknowledges it.
+
 ## v0.4.39 — managed VPS provisioning completes a protected install
 
 Managed hosting now fetches the existing personalized installer with a
@@ -1706,6 +1714,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.40 — Recover shared candle and liquidation streams from error-only or hanging WebSocket handshakes with generation-fenced reconnects; report Bybit subscriptions as requested until acknowledged.
 - v0.4.39 — Complete the managed VPS bootstrap through the signed customer installer, pin the full signed release identity per generation, seed and clear the forced-change password safely, require protected-core and venue readiness, and expose the hosted five-account cap without changing self-hosted licences.
 - v0.4.38 — Move proved-recent WEEX reconciliation to the documented weight-1 current page with exact-range settlement checks. Reserve bounded native-demand progress against continuously due routine reconciliation and old repairs inside the unchanged 25-weight/minute envelope; tail and recent repair remain first.
 - v0.4.37 — Add the optional signed timeframe-seed v2 contract while preserving omitted/explicit `interval=1` as byte-for-byte v1. Persist source-aware higher-timeframe caches, use proved native REST intervals across all six venues, aggregate only complete REST-proven compatible bars, and report exact closed windows/depth/gaps. Share the existing venue weight budget fairly with background 1m depth, retain live/reconcile/repair priority, invalidate reused instrument identities, and keep an extra UTC day of higher-timeframe boundary padding. A warm 700-pair × 24-hour fixture serves in about 0.1 seconds locally; cold WEEX recovery uses documented cheap current pages inside the same conservative weight envelope.
