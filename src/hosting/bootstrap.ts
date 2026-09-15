@@ -42,10 +42,10 @@ export function buildBootstrapUserData(input: BootstrapInput): string {
   const probeLines = input.probeVenues
     .map((v) => `probe ${shellSingleQuote(v.id)} ${shellSingleQuote(v.url)}`)
     .join("\n");
-  return `#cloud-config
-runcmd:
-  - [ bash, -c, ${shellSingleQuote(bootstrapScript(input, probeLines))} ]
-`;
+  // JSON is a strict YAML subset. Encoding the command as JSON avoids a
+  // second, subtly different YAML quoting language around an already quoted
+  // Bash program; cloud-init receives exactly one `bash -c` argv triple.
+  return `#cloud-config\n${JSON.stringify({ runcmd: [["bash", "-c", bootstrapScript(input, probeLines)]] })}\n`;
 }
 
 function bootstrapScript(input: BootstrapInput, probeLines: string): string {
@@ -104,15 +104,18 @@ probe() {
   # 5s timeout, one retry — a venue's edge is a "server time" GET, never a
   # long-poll; a hard-blocked venue answers fast (403/451) and a dead one
   # should not hold the whole callback up for minutes.
-  status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --retry 1 "$url" 2>/dev/null || echo 0)
+  status=0
+  if observed=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --retry 1 "$url" 2>/dev/null); then
+    case "$observed" in [0-9][0-9][0-9]) status="$observed" ;; esac
+  fi
   RESULTS="\${RESULTS}\${RESULTS:+,}{\\"venueId\\":\\"\${id}\\",\\"status\\":\${status}}"
 }
 ${probeLines}
 
-curl -s -X POST "$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness" \\
-  -H "content-type: application/json" \\
-  -d "{\\"token\\":\\"$WH_BOOTSTRAP_TOKEN\\",\\"generation\\":$WH_GENERATION,\\"results\\":[$RESULTS]}" \\
-  >/dev/null 2>&1
+printf '{"token":"%s","generation":%s,"results":[%s]}' "$WH_BOOTSTRAP_TOKEN" "$WH_GENERATION" "$RESULTS" \\
+  | curl -q -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \\
+      --retry 2 --retry-delay 1 -H 'content-type: application/json' --data-binary @- \\
+      "$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness" -o /dev/null
 
 unset WH_BOOTSTRAP_TOKEN
 `;

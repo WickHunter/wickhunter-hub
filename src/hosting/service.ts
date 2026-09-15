@@ -146,6 +146,23 @@ export class HostingService {
     return this.billing.config().plans.filter((p) => p.role === "hosting").map((p) => p.key);
   }
 
+  /** One source of truth for whether the advertised hosting checkout is safe
+   * to expose. Price/currency/interval must match the actual Stripe plan, the
+   * master switch must be on, and both provider and Payment Link must exist. */
+  hostingOfferIssue(): string | null {
+    const policy = this.policy();
+    if (!policy.provisioningEnabled) return "managed hosting is not available for purchase yet";
+    if (!this.provider()) return "managed hosting provisioning is not configured";
+    const plans = this.billing.config().plans.filter((p) => p.role === "hosting");
+    if (plans.length !== 1) return "managed hosting requires exactly one configured monthly plan";
+    const plan = plans[0]!;
+    if (plan.amountCents !== policy.monthlyPriceCents || plan.currency !== policy.currency || plan.interval !== "month" || plan.lifetime) {
+      return "managed hosting price configuration does not match checkout";
+    }
+    if (!this.billing.buyUrl(plan.key)) return "managed hosting checkout is not configured";
+    return null;
+  }
+
   /** POST /api/hosting/checkout — returns the URL to redirect to (the
    *  EXISTING `/buy?plan=` rail, §3/H4 acceptance case: "through the
    *  existing rail"). Stripe Payment Links have no server-side
@@ -158,6 +175,8 @@ export class HostingService {
     const cfg = this.billing.config();
     const mode = cfg.mode;
     const environment = mode; // "test"|"live" lines up 1:1 with billing's own mode
+    const offerIssue = this.hostingOfferIssue();
+    if (offerIssue) return { ok: false, code: "PROVISIONING_DISABLED", error: offerIssue };
     if (!this.softwareEligible(ownerId, nowMs)) return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: "an eligible Unleashed software license is required before adding hosting" };
     if (this.store.activeInstanceForOwner(ownerId, environment)) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "you already have a hosting instance — manage it from this page" };
     const planKey = this.hostingPlanKeys()[0];
@@ -199,6 +218,11 @@ export class HostingService {
     let instance = this.store.activeInstanceForOwner(ownerId, environment);
     if (!instance) {
       if (!paidEvidenceExists(sub)) return; // nothing to provision yet (a checkout not yet confirmed)
+      if (!this.softwareEligible(ownerId, nowMs)) {
+        this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer`);
+        if (sub.subscriptionId) this.bestEffortCancelStripeSubscription(sub.subscriptionId, nowMs);
+        return;
+      }
       // A DELETED instance frees the owner's reservation slot (H6 §17: "a
       // returning customer receives a new instance only through an
       // EXPLICIT new purchase") — but recurring billing evidence for the
@@ -516,21 +540,23 @@ export class HostingService {
     const nextRegion = policy.regions.find((r) => !triedSet.has(r.id));
     if (nextRegion) {
       const fresh = this.store.updateInstance(row.id, row.version, (d) => {
-        d.region = nextRegion.id;
-        d.regionAttempts = [...d.regionAttempts, row.region];
-        d.stage = "provisioning";
         d.operationalHealth = "unhealthy";
-        d.failureReason = `readiness refused in ${row.region}: ${verdict.refusals.join("; ")} — retrying once in ${nextRegion.label}`;
+        d.failureReason = `readiness refused in ${row.region}: ${verdict.refusals.join("; ")} — replacing it once in ${nextRegion.label}`;
       }, nowMs);
       if (fresh) {
         this.log(`[hosting] ${row.id}: readiness refused in ${row.region}, retrying once in ${nextRegion.id}`);
-        this.enqueueProvisionJob(fresh, nowMs);
+        this.store.enqueue({
+          hostingInstanceId: fresh.id, lifecycleVersion: fresh.lifecycleVersion, generation: fresh.generation,
+          jobType: "readiness_recheck", dedupeKey: `region-replace:${fresh.id}:g${fresh.generation}:${nextRegion.id}`,
+          availableAtMs: nowMs, payload: { kind: "replace-region", nextRegionId: nextRegion.id, refusals: [...verdict.refusals] },
+        }, nowMs);
       }
       return;
     }
-    this.store.updateInstance(row.id, row.version, (d) => {
-      d.operationalHealth = "unhealthy";
-      d.failureReason = `Hosting is not available in an exchange-approved region right now — ${verdict.refusals.join("; ")}`;
+    this.store.enqueue({
+      hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation,
+      jobType: "readiness_recheck", dedupeKey: `region-terminal:${row.id}:g${row.generation}`,
+      availableAtMs: nowMs, payload: { kind: "replace-region", nextRegionId: null, refusals: [...verdict.refusals] },
     }, nowMs);
     this.log(`[hosting] ${row.id}: readiness refused in every configured region — ${verdict.refusals.join("; ")}`);
   }
@@ -581,6 +607,7 @@ export class HostingService {
     if (!row || row.lifecycleVersion !== job.lifecycleVersion || row.generation !== job.generation) return; // superseded — nothing to do, "sent" (obsolete-in-effect)
     switch (job.jobType) {
       case "provision": return this.drainProvision(row, nowMs);
+      case "readiness_recheck": return this.drainReadinessRecheck(row, job, nowMs);
       case "suspend": return this.drainSuspend(row, nowMs);
       case "delete": return this.drainDelete(row, nowMs);
       case "email": {
@@ -608,9 +635,12 @@ export class HostingService {
     const policy = this.policy();
     if (!policy.provisioningEnabled) { this.log(`[hosting] ${row.id}: provisioning is disabled on this Hub (policy.provisioningEnabled=false) — leaving ${row.stage}`); return; }
     const provider = this.provider();
-    if (!provider) { this.log(`[hosting] ${row.id}: no provider configured — cannot provision`); return; }
+    if (!provider) throw new Error("no provider API key is configured — provisioning will retry without creating a server");
     if (row.provisionAttempts >= MAX_PROVISION_ATTEMPTS) { this.failProvisioning(row, `setup failed after ${row.provisionAttempts} attempts`, nowMs); return; }
     await this.captureProviderPlanQuote(row, provider, nowMs);
+    // Quote capture updates this same row. Refresh before the stage/attempt
+    // CAS or the stale version would make that mutation a silent no-op.
+    row = this.store.getInstance(row.id) ?? row;
 
     const label = hostingInstanceLabel(row.id, row.generation);
     this.store.updateInstance(row.id, row.version, (d) => { d.stage = "provisioning"; d.label = label; d.provisionAttempts += 1; }, nowMs);
@@ -678,8 +708,56 @@ export class HostingService {
     if (after) this.store.enqueue({
       hostingInstanceId: after.id, lifecycleVersion: after.lifecycleVersion, generation: after.generation,
       jobType: "readiness_recheck", dedupeKey: `bootstrap-timeout:${after.id}:g${after.generation}:a${after.provisionAttempts}`,
-      availableAtMs: nowMs + 15 * 60_000, payload: { kind: "bootstrap-timeout" },
+      availableAtMs: after.bootstrapTokenExpiresAtMs ?? nowMs + policy.bootstrapTokenTtlMinutes * 60_000,
+      payload: { kind: "bootstrap-timeout" },
     }, nowMs);
+  }
+
+  /** Finish a timed-out or venue-refused generation without leaking its VPS.
+   * The old resource is deleted first; only then is a new generation queued
+   * in the one remaining configured region. An uncertain delete keeps this
+   * durable job pending and can never create the replacement concurrently. */
+  private async drainReadinessRecheck(row: HostingInstanceRow, job: HostingOutboxRow, nowMs: number): Promise<void> {
+    if (row.stage !== "bootstrapping") return;
+    const kind = String(job.payload.kind ?? "");
+    if (kind === "bootstrap-timeout") {
+      if (row.bootstrapTokenExpiresAtMs !== null && nowMs < row.bootstrapTokenExpiresAtMs) {
+        throw new Error("bootstrap timeout check ran before the credential expiry");
+      }
+      const verdict = readinessVerdict(this.policy().probeVenues, []);
+      this.handleReadinessRefusal(row, verdict, this.policy(), nowMs);
+      return;
+    }
+    if (kind !== "replace-region") return;
+    const nextRegionId = typeof job.payload.nextRegionId === "string" ? job.payload.nextRegionId : null;
+    const refusals = Array.isArray(job.payload.refusals) ? job.payload.refusals.map(String) : ["bootstrap did not report readiness"];
+    const provider = this.provider();
+    if (!provider) throw new Error("provider API key is unavailable during failed-instance cleanup");
+    if (row.providerInstanceId) await provider.deleteInstance(row.providerInstanceId);
+    for (const resource of this.store.resourcesFor(row.id)) {
+      if (resource.generation === row.generation && resource.cleanupState === "present") this.store.markResourceRemoved(resource.id, nowMs);
+    }
+    const current = this.store.getInstance(row.id);
+    if (!current) return;
+    if (!nextRegionId) {
+      this.store.updateInstance(current.id, current.version, (d) => {
+        d.providerInstanceId = null; d.ip = null; d.appUrl = null;
+        d.bootstrapTokenHash = null; d.bootstrapTokenExpiresAtMs = null;
+      }, nowMs);
+      const cleaned = this.store.getInstance(current.id);
+      if (cleaned) this.failProvisioning(cleaned, `Hosting is not available in an exchange-approved region right now — ${refusals.join("; ")}`, nowMs);
+      return;
+    }
+    const fresh = this.store.updateInstance(current.id, current.version, (d) => {
+      d.regionAttempts = [...d.regionAttempts, d.region];
+      d.region = nextRegionId;
+      d.generation += 1;
+      d.provisionAttempts = 0;
+      d.providerInstanceId = null; d.ip = null; d.appUrl = null; d.label = "";
+      d.bootstrapTokenHash = null; d.bootstrapTokenExpiresAtMs = null; d.releaseRef = null;
+      d.stage = "provisioning";
+    }, nowMs);
+    if (fresh) this.enqueueProvisionJob(fresh, nowMs);
   }
 
   /** Records `providerPlanMonthlyCostCents` on the row from
@@ -1106,7 +1184,8 @@ export class HostingService {
     const row = this.store.activeInstanceForOwner(ownerId, environment) ?? this.store.activeInstanceForOwner(ownerId, environment === "live" ? "test" : "live");
     const policy = this.policy();
     if (!row) {
-      return { available: true, hasInstance: false, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts, instance: null };
+      const issue = this.hostingOfferIssue();
+      return { available: issue === null, hasInstance: false, note: issue, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts, instance: null };
     }
     return {
       available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts,

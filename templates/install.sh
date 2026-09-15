@@ -16,6 +16,7 @@ KEY="__LICENSE_KEY__"
 RELEASE_KEYS_B64U="__RELEASE_KEYS_B64U__"
 RELEASE_MAX_AGE_MS="__RELEASE_MAX_AGE_MS__"
 PINNED_RELEASE_B64U="__PINNED_RELEASE_B64U__"
+PINNED_MANIFEST_B64U="__PINNED_MANIFEST_B64U__"
 
 APP_DIR=/opt/wickhunter
 ENV_FILE=/etc/wickhunter/env
@@ -91,14 +92,25 @@ fetch_bounded() {
   if [ "$fetch_bytes" -gt "$fetch_max" ]; then return 65; fi
   [ "${fetch_status[0]:-1}" -eq 0 ] && [ "${fetch_status[1]:-1}" -eq 0 ]
 }
-if fetch_bounded "$HUB/api/latest?key=$KEY" "$work/latest.json" 1048576 'application/json'; then
-  :
+if [ -n "$PINNED_MANIFEST_B64U" ]; then
+  node - "$PINNED_MANIFEST_B64U" "$work/latest.json" <<'DECODE_PINNED_MANIFEST' || die "embedded pinned release manifest is malformed"
+const fs = require("node:fs");
+const [encoded, out] = process.argv.slice(2);
+if (!/^[A-Za-z0-9_-]+$/.test(encoded)) process.exit(1);
+const bytes = Buffer.from(encoded, "base64url");
+if (!bytes.length || bytes.length > 1024 * 1024 || bytes.toString("base64url") !== encoded) process.exit(1);
+fs.writeFileSync(out, bytes, { mode: 0o600 });
+DECODE_PINNED_MANIFEST
 else
-  fetch_code=$?
-  if [ "$fetch_code" -eq 65 ]; then
-    die "release manifest response exceeded 1 MiB — proxy or network corruption"
+  if fetch_bounded "$HUB/api/latest?key=$KEY" "$work/latest.json" 1048576 'application/json'; then
+    :
+  else
+    fetch_code=$?
+    if [ "$fetch_code" -eq 65 ]; then
+      die "release manifest response exceeded 1 MiB — proxy or network corruption"
+    fi
+    die "could not reach the hub (or your key is expired/revoked) — contact the operator"
   fi
-  die "could not reach the hub (or your key is expired/revoked) — contact the operator"
 fi
 
 # Verify the offline Ed25519 release authority before trusting even the file

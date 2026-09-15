@@ -1116,7 +1116,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   function sendInstaller(
     res: ServerResponse,
     licenseToken: string,
-    pinnedRelease?: Pick<SignedReleaseManifest, "version" | "buildId" | "sha256">,
+    pinnedRelease?: SignedReleaseManifest,
   ): void {
     const template = fs.readFileSync(path.join(cfg.templatesDir, "install.sh"), "utf8");
     const script = template
@@ -1124,6 +1124,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       .replaceAll("__LICENSE_KEY__", licenseToken)
       .replaceAll("__RELEASE_KEYS_B64U__", Buffer.from(JSON.stringify(cfg.releasePublicKeys), "utf8").toString("base64url"))
       .replaceAll("__PINNED_RELEASE_B64U__", pinnedRelease
+        ? Buffer.from(JSON.stringify({ version: pinnedRelease.version, buildId: pinnedRelease.buildId, sha256: pinnedRelease.sha256 }), "utf8").toString("base64url")
+        : "")
+      .replaceAll("__PINNED_MANIFEST_B64U__", pinnedRelease
         ? Buffer.from(JSON.stringify(pinnedRelease), "utf8").toString("base64url")
         : "")
       .replaceAll("__RELEASE_MAX_AGE_MS__", String(cfg.releaseMaxAgeMs));
@@ -1307,6 +1310,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   function hostingOptions(res: ServerResponse): void {
     const policy = hosting.policy();
+    const offerIssue = hosting.hostingOfferIssue();
     sendJson(res, 200, {
       ok: true,
       monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
@@ -1316,7 +1320,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       planLabel: policy.planLabel,
       maximumConnectedAccounts: policy.maximumConnectedAccounts,
       managedBackupsIncluded: policy.managedBackupsIncluded,
-      purchasable: policy.provisioningEnabled,
+      purchasable: offerIssue === null,
     }, { "access-control-allow-origin": "*", "cache-control": "no-store" });
   }
 
@@ -1388,18 +1392,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (body === null || typeof body.token !== "string" || typeof body.generation !== "number") {
       return sendJson(res, 400, { ok: false, error: "expected {token, generation}" }, { "cache-control": "no-store" });
     }
-    const release = readLatest();
-    if (!release) return sendText(res, 503, "no verified customer release is published");
     const authenticated = hosting.bootstrapLicenseToken(instanceId, body.token, body.generation);
     if (!authenticated.ok) return sendJson(res, 404, { ok: false, error: authenticated.error }, { "cache-control": "no-store" });
-    if (![release.version, release.buildId, release.sha256].includes(authenticated.value.releaseRef)) {
-      return sendText(res, 409, "the published customer release does not match this instance's pinned release ref");
-    }
-    sendInstaller(res, authenticated.value.licenseToken, {
-      version: release.version,
-      buildId: release.buildId,
-      sha256: release.sha256,
-    });
+    const release = readPinnedRelease(authenticated.value.releaseRef);
+    if (!release) return sendText(res, 503, "no verified customer release is published");
+    sendInstaller(res, authenticated.value.licenseToken, release);
   }
 
   /** POST /api/hosting/instances/:id/readiness — the bootstrap script calls
@@ -1423,8 +1420,24 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   function readLatest(): SignedReleaseManifest | null {
+    return readReleaseFile("latest.json");
+  }
+
+  /** Resolve an in-flight hosting generation after `latest.json` advances.
+   * Publishing retains the exact signed manifest as
+   * `manifest-<artifact-sha256>.json`; the immutable artifact file named by
+   * that manifest remains beside it. */
+  function readPinnedRelease(ref: string): SignedReleaseManifest | null {
+    const latest = readLatest();
+    if (latest && [latest.version, latest.buildId, latest.sha256].includes(ref)) return latest;
+    if (!/^[0-9a-f]{64}$/.test(ref)) return null;
+    const archived = readReleaseFile(`manifest-${ref}.json`);
+    return archived?.sha256 === ref ? archived : null;
+  }
+
+  function readReleaseFile(name: string): SignedReleaseManifest | null {
     try {
-      const raw = JSON.parse(fs.readFileSync(path.join(cfg.releasesDir, "latest.json"), "utf8"));
+      const raw = JSON.parse(fs.readFileSync(path.join(cfg.releasesDir, name), "utf8"));
       const manifest = verifyReleaseManifest(raw, {
         publicKeys: cfg.releasePublicKeys,
         now: Date.now(),

@@ -27,7 +27,7 @@ async function newHub(overrides = {}) {
   await admin("/admin/api/billing/config", {
     method: "POST",
     body: JSON.stringify({
-      stripe: { test: { webhookSecret: TEST_WHSEC } },
+      stripe: { test: { webhookSecret: TEST_WHSEC, paymentLinks: { "hosting-monthly": "https://buy.stripe.com/test_hosting" } } },
       roles: { test: { hosting: { priceIds: ["price_host1"], productIds: [] } } },
       plans: [
         { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "software" },

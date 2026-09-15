@@ -30,7 +30,7 @@ async function newHub(overrides = {}) {
   await admin("/admin/api/billing/config", {
     method: "POST",
     body: JSON.stringify({
-      stripe: { test: { webhookSecret: TEST_WHSEC } },
+      stripe: { test: { webhookSecret: TEST_WHSEC, paymentLinks: { "hosting-monthly": "https://buy.stripe.com/test_hosting" } } },
       roles: { test: { hosting: { priceIds: ["price_host1"], productIds: [] } } },
       plans: [
         { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "", role: "software" },
@@ -132,7 +132,7 @@ await test("crash between persist and provider create: a create that 'times out'
 
 // ── acceptance: readiness refuses by name, and fallback region once ────────
 
-await test("readiness: a refused venue is named; the SAME generation retries exactly once in the fallback region, then refuses for good", async () => {
+await test("readiness: a refused venue is named; the failed VPS is deleted before one fallback generation, then refuses for good", async () => {
   const ctx = await newHub();
   const rows = await boughtHosting(ctx, "cus_ready", "ready@example.com");
   await ctx.h.hub.hosting.tick(ctx.getClock());
@@ -153,17 +153,18 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
   });
   assert.equal(r1.status, 200);
   assert.equal(r1.body.ready, false);
+  const firstGeneration = row.generation;
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // delete the refused Tokyo VPS and advance generation
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // provision its Osaka replacement
   row = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(row.region, "itm", "fell back to Osaka after Tokyo's Bybit refusal");
+  assert.equal(row.generation, firstGeneration + 1, "the replacement has a new callback generation");
   assert.equal(row.regionAttempts.length, 1);
   assert.match(row.failureReason, /Bybit/);
   assert.match(row.failureReason, /403/);
 
-  // Provision again in the fallback region (a new bootstrap token, same
-  // generation), and it ALSO refuses — this must be the LAST fallback: no
+  // The fallback region ALSO refuses — this must be the LAST fallback: no
   // second retry, a permanent refusal naming the venue.
-  await ctx.h.hub.hosting.tick(ctx.getClock());
-  row = ctx.h.hub.hosting.store.getInstance(row.id);
   const rawToken2 = "test-bootstrap-token-2";
   ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken2); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
   row = ctx.h.hub.hosting.store.getInstance(row.id);
@@ -171,6 +172,7 @@ await test("readiness: a refused venue is named; the SAME generation retries exa
     method: "POST", body: JSON.stringify({ token: rawToken2, generation: row.generation, results: [{ venueId: "bybit", status: 403 }, { venueId: "binance", status: 200 }] }),
   });
   assert.equal(r2.body.ready, false);
+  await ctx.h.hub.hosting.tick(ctx.getClock()); // terminal cleanup removes the refused Osaka VPS
   row = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(row.region, "itm", "no THIRD region to try — stays where the single fallback landed");
   assert.equal(row.regionAttempts.length, 1, "the fallback was spent exactly once, not retried again");
