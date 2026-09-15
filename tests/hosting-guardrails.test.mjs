@@ -34,6 +34,32 @@ printf 'unattended-credential-fallback-ok'
   assert.equal(result.stderr, "");
 });
 
+await test("installer refuses completion until trusted HTTPS serves the signed version", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("verify_public_https() {");
+  const end = installer.indexOf("\n}\n", start) + 3;
+  assert.ok(start >= 0 && end > start);
+  assert.match(installer, /LIQHUNTER_REQUIRE_HTTPS=1/);
+  assert.ok(installer.indexOf('verify_public_https "$PUBLIC_IP"') < installer.indexOf('ok "URL:'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-https-"));
+  try {
+    for (const [body, transportOk, accepted] of [
+      [{ ok: true, version: "0.90.93" }, true, true],
+      [{ ok: true, version: "0.90.92" }, true, false],
+      [{ ok: false, version: "0.90.93" }, true, false],
+      ["invalid-json", true, false],
+      [{ ok: true, version: "0.90.93" }, false, false],
+    ]) {
+      const script = 'set -Eeuo pipefail\nREL_VERSION=0.90.93\n'
+        + 'fetch_bounded() { [ "$MOCK_TRANSPORT" = true ] || return 1; printf "%s" "$MOCK_BODY" > "$2"; }\n'
+        + installer.slice(start, end) + '\nverify_public_https 192.0.2.10 "$MOCK_FILE"';
+      const result = spawnSync("bash", ["-c", script], { encoding: "utf8", timeout: 5_000,
+        env: { ...process.env, MOCK_TRANSPORT: String(transportOk), MOCK_BODY: typeof body === "string" ? body : JSON.stringify(body), MOCK_FILE: path.join(dir, "health.json") } });
+      assert.equal(result.status === 0, accepted, result.stderr);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 await test("Vultr plan quotes preserve a real positive monthly cost", async () => {
   const provider = new VultrProvider("test-key", async () => ({
     ok: true,
