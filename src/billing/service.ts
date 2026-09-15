@@ -127,7 +127,7 @@ interface CustomerFacts {
 }
 
 const realFetch: EmailFetch = async (url, init) => {
-  const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+  const res = await fetch(url, { method: init.method, headers: init.headers, ...(init.body !== undefined ? { body: init.body } : {}) });
   return { ok: res.ok, status: res.status, text: () => res.text() };
 };
 
