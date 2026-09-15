@@ -105,12 +105,47 @@ await test("v0.4.21 — a bybit subscribe ack or refusal rides the source note, 
   await settle();
   made[0].h.onOpen();
   const noteOf = () => r.status().find((s) => s.id === "bybit-usdc").note;
-  assert.equal(noteOf(), "1 perp(s) requested · awaiting subscribe acknowledgement");
+  assert.equal(noteOf(), "0/1 perp(s) acknowledged · 1 awaiting connection/acknowledgement");
   made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: false, ret_msg: "Invalid topic allLiquidation.BTCPERP", conn_id: "x" }));
-  assert.equal(noteOf(), "1 perp(s) requested · subscribe REFUSED: Invalid topic allLiquidation.BTCPERP");
+  assert.equal(noteOf(), "0/1 perp(s) acknowledged · 1 refused: Invalid topic allLiquidation.BTCPERP");
   assert.ok(logs.some((l) => l.includes("bybit-usdc: subscribe refused")), "the refusal is logged");
   made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: true, ret_msg: "", conn_id: "x" }));
-  assert.equal(noteOf(), "1 perp(s) subscribed · acknowledged");
+  assert.equal(noteOf(), "1/1 perp(s) acknowledged");
+  r.stop();
+});
+
+await test("a multi-socket Bybit roster separates ack/refusal/pending, clears a discarded chunk, and preserves proofs on unchanged refresh", async () => {
+  const { factory, made } = fakeSockets();
+  const rows = Array.from({ length: 1_001 }, (_, i) => bybitRow(`S${i}USDT`, "USDT"));
+  const fetchLike = fakeFetch([{ test: (u) => u.includes("instruments-info"), body: bybitInstruments(rows) }]);
+  const r = new LiqStreamRunner(baseCfg({ sources: ["bybit-usdt"], rosterRefreshMs: 8 }), {
+    emit: () => {}, fetchLike, socket: factory, reconnectMs: 4, reconnectMaxMs: 4,
+  });
+  r.start(); await settle();
+  const noteOf = () => r.status().find((s) => s.id === "bybit-usdt").note;
+  assert.equal(made.length, 3);
+  made[0].h.onOpen(); made[1].h.onOpen(); made[2].h.onOpen();
+  made[0].h.onMessage(JSON.stringify({ op: "subscribe", success: true }));
+  assert.equal(noteOf(), "500/1001 perp(s) acknowledged · 501 awaiting connection/acknowledgement");
+  made[1].h.onMessage(JSON.stringify({ op: "subscribe", success: false, ret_msg: "second chunk refused" }));
+  assert.equal(noteOf(), "500/1001 perp(s) acknowledged · 500 refused: second chunk refused · 1 awaiting connection/acknowledgement");
+  made[2].h.onMessage(JSON.stringify({ op: "subscribe", success: true }));
+  assert.equal(noteOf(), "501/1001 perp(s) acknowledged · 500 refused: second chunk refused");
+  made[1].h.onMessage(JSON.stringify({ op: "subscribe", success: true }));
+  assert.equal(noteOf(), "1001/1001 perp(s) acknowledged");
+
+  // The periodic roster read returns the identical set. resync is a no-op and
+  // must not erase acknowledgements or rebuild sockets.
+  await new Promise((resolve) => setTimeout(resolve, 12));
+  assert.equal(made.length, 3, "an unchanged roster preserves every connection");
+  assert.equal(noteOf(), "1001/1001 perp(s) acknowledged", "unchanged refresh preserves per-connection proof");
+
+  made[2].h.onError(new Error("chunk dropped"));
+  assert.equal(noteOf(), "1000/1001 perp(s) acknowledged · 1 awaiting connection/acknowledgement");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(made.length, 4, "only the discarded chunk reconnects");
+  made[3].h.onOpen(); made[3].h.onMessage(JSON.stringify({ op: "subscribe", success: true }));
+  assert.equal(noteOf(), "1001/1001 perp(s) acknowledged");
   r.stop();
 });
 

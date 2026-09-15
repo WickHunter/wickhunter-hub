@@ -13,6 +13,17 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.41 — Bybit subscription status reports partial coverage
+
+Bybit liquidation status counts acknowledged topics across each physical
+socket instead of calling the whole roster subscribed after the first chunk's
+reply. A discarded chunk immediately loses its proof; refusals and still
+pending topics are counted separately, and an unchanged roster refresh keeps
+the acknowledgements it already earned.
+
+Large seed/snapshot responses now compress asynchronously with bounded worker
+and memory capacity, keeping HTTP and WebSocket work responsive during downloads.
+
 ## v0.4.40 — WebSocket handshake failures recover
 
 The shared candle and liquidation socket pool now retires and reconnects a
@@ -1714,6 +1725,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.41 — Report Bybit liquidation subscription acknowledgements per physical socket, including separate refused and pending topic counts across partial reconnects.
 - v0.4.40 — Recover shared candle and liquidation streams from error-only or hanging WebSocket handshakes with generation-fenced reconnects; report Bybit subscriptions as requested until acknowledged.
 - v0.4.39 — Complete the managed VPS bootstrap through the signed customer installer, pin the full signed release identity per generation, seed and clear the forced-change password safely, require protected-core and venue readiness, and expose the hosted five-account cap without changing self-hosted licences.
 - v0.4.38 — Move proved-recent WEEX reconciliation to the documented weight-1 current page with exact-range settlement checks. Reserve bounded native-demand progress against continuously due routine reconciliation and old repairs inside the unchanged 25-weight/minute envelope; tail and recent repair remain first.

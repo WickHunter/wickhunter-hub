@@ -98,6 +98,14 @@ export interface LiqSourceStatus {
   note: string;
 }
 
+/** Per-socket Bybit subscription proof. Other firehose connections leave the
+ * fields unset; keeping one pool-extra shape lets status inspect every pool
+ * without weakening the common connection contract. */
+interface LiqConnExtra {
+  bybitAcknowledged?: boolean;
+  bybitRefusal?: string | null;
+}
+
 /** The connection LABEL each source's prints arrive on — several sources can
  *  share one physical socket (OKX's one channel serves three; a currently-
  *  unconfigured Binance side is simply absent). Read only by `status()`. */
@@ -205,7 +213,7 @@ async function fetchBinanceContractSizes(fetchLike: LiqFetchLike, dapiBase: stri
 
 export class LiqStreamRunner {
   private stopped = true;
-  private readonly pools = new Map<string, SocketPool<Record<string, never>>>();
+  private readonly pools = new Map<string, SocketPool<LiqConnExtra>>();
   private readonly loaders: Array<{ stop(): void }> = [];
   private readonly wanted: Set<LiqSourceId>;
   private readonly counts = new Map<LiqSourceId, { events: number; lastAt: number | null }>();
@@ -259,7 +267,20 @@ export class LiqStreamRunner {
     category: "linear" | "inverse", quote: "USDT" | "USDC" | null, fetchLike: LiqFetchLike,
   ): void {
     this.bybitRoster.set(id, []);
-    const pool = new SocketPool<Record<string, never>>({
+    let pool: SocketPool<LiqConnExtra>;
+    const refreshNote = (): void => {
+      const desired = (this.bybitRoster.get(id) ?? []).length;
+      const conns = pool.connections;
+      const acknowledged = conns.reduce((n, c) => n + (c.extra.bybitAcknowledged ? c.symbols.length : 0), 0);
+      const refusedConns = conns.filter((c) => !!c.extra.bybitRefusal);
+      const refused = refusedConns.reduce((n, c) => n + c.symbols.length, 0);
+      const firstRefusal = refusedConns[0]?.extra.bybitRefusal;
+      const pending = Math.max(0, desired - acknowledged - refused);
+      this.notes.set(id, `${acknowledged}/${desired} perp(s) acknowledged${refused
+        ? ` · ${refused} refused${firstRefusal ? `: ${firstRefusal}` : ""}` : ""}${pending
+        ? ` · ${pending} awaiting connection/acknowledgement` : ""}`);
+    };
+    pool = new SocketPool<LiqConnExtra>({
       adapter: {
         id, url, maxTopicsPerConnection: 500, // matches the candle bybit kline stream's documented cap
         pingIntervalMs: 20_000, pingFrame: JSON.stringify({ op: "ping" }),
@@ -268,8 +289,13 @@ export class LiqStreamRunner {
           : [],
       },
       symbols: () => this.bybitRoster.get(id) ?? [],
-      makeExtra: () => ({}),
-      onMessage: (_c, data) => this.handleBybitMessage(id, data),
+      makeExtra: () => ({ bybitAcknowledged: false, bybitRefusal: null }),
+      onMessage: (c, data) => this.handleBybitMessage(id, c, data, refreshNote),
+      onDiscard: (c) => {
+        c.extra.bybitAcknowledged = false;
+        c.extra.bybitRefusal = null;
+        refreshNote();
+      },
       log: this.deps.log, socket: this.deps.socket,
       reconnectMs: this.deps.reconnectMs, reconnectMaxMs: this.deps.reconnectMaxMs,
     });
@@ -282,14 +308,17 @@ export class LiqStreamRunner {
       load: () => fetchBybitSymbols(fetchLike, this.cfg.bybitRestBase, category, quote),
       onLoaded: (list) => {
         this.bybitRoster.set(id, list);
-        this.notes.set(id, `${list.length} perp(s) requested · awaiting subscribe acknowledgement`);
         pool.resync();
+        refreshNote();
       },
       log: this.deps.log,
     }));
   }
 
-  private handleBybitMessage(id: "bybit-usdt" | "bybit-usdc" | "bybit-inverse", data: string): void {
+  private handleBybitMessage(
+    id: "bybit-usdt" | "bybit-usdc" | "bybit-inverse",
+    conn: { extra: LiqConnExtra }, data: string, refreshNote: () => void,
+  ): void {
     let m: { topic?: unknown; data?: unknown; op?: unknown; success?: unknown; ret_msg?: unknown };
     try { m = JSON.parse(data); } catch { return; }
     // v0.4.21 — THE VENUE'S OWN ANSWER TO THE SUBSCRIBE IS RECORDED. A
@@ -298,13 +327,16 @@ export class LiqStreamRunner {
     // and look exactly like a quiet market. The ack (or the refusal, in the
     // venue's own words) rides the source's note on the admin card.
     if (m?.op === "subscribe") {
-      const roster = this.bybitRoster.get(id) ?? [];
       if (m.success === false) {
         const why = String(m.ret_msg ?? "no reason given");
-        this.notes.set(id, `${roster.length} perp(s) requested · subscribe REFUSED: ${why}`);
+        conn.extra.bybitAcknowledged = false;
+        conn.extra.bybitRefusal = why;
+        refreshNote();
         this.deps.log?.(`[liq] ${id}: subscribe refused — ${why}`);
       } else if (m.success === true) {
-        this.notes.set(id, `${roster.length} perp(s) subscribed · acknowledged`);
+        conn.extra.bybitAcknowledged = true;
+        conn.extra.bybitRefusal = null;
+        refreshNote();
       }
       return;
     }
@@ -342,7 +374,7 @@ export class LiqStreamRunner {
 
   // ── OKX: one channel, three sources split by the print's own quote ───────
   private startOkx(fetchLike: LiqFetchLike): void {
-    const pool = new SocketPool<Record<string, never>>({
+    const pool = new SocketPool<LiqConnExtra>({
       adapter: {
         id: "okx", url: this.cfg.okxWsUrl, maxTopicsPerConnection: 1,
         // OKX requires a client-sent text ping to keep the socket open; it
@@ -380,8 +412,8 @@ export class LiqStreamRunner {
   // ── shared single-always-on-stream connection builder ─────────────────────
   private buildSingleStreamPool(
     id: string, url: string, pingFrame: string | undefined, onMessage: (data: string) => void,
-  ): SocketPool<Record<string, never>> {
-    return new SocketPool<Record<string, never>>({
+  ): SocketPool<LiqConnExtra> {
+    return new SocketPool<LiqConnExtra>({
       adapter: {
         id, url, maxTopicsPerConnection: 1,
         // No JSON ping: Binance uses protocol ping/pong and Node's own
