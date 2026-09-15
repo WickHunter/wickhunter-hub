@@ -229,8 +229,23 @@ export class VultrProvider implements HostingProvider {
 
   async listPlans(): Promise<ProviderPlan[]> {
     const r = await this.call("GET", "/plans");
-    const rows = Array.isArray(r.json?.plans) ? r.json.plans : [];
-    return rows.map((x: any) => ({ id: String(x.id), vcpus: Number(x.vcpu_count) || 0, ramMb: Number(x.ram) || 0, diskGb: Number(x.disk) || 0, monthlyCostCents: Math.round((Number(x.monthly_cost) || 0) * 100) }));
+    if (r.status >= 300 || !Array.isArray(r.json?.plans)) throw new Error(`vultr listPlans: HTTP ${r.status} returned no plan list`);
+    return r.json.plans.map((x: any) => {
+      const monthlyCost = Number(x.monthly_cost);
+      // A missing/malformed provider price must stay unknown upstream. Turning
+      // it into zero would make the spend ceiling approve real paid capacity
+      // as though it were free.
+      if (!Number.isFinite(monthlyCost) || monthlyCost <= 0) {
+        throw new Error(`vultr listPlans: plan ${String(x.id ?? "<unknown>")} has an invalid monthly_cost`);
+      }
+      return {
+        id: String(x.id),
+        vcpus: Number(x.vcpu_count) || 0,
+        ramMb: Number(x.ram) || 0,
+        diskGb: Number(x.disk) || 0,
+        monthlyCostCents: Math.round(monthlyCost * 100),
+      };
+    });
   }
 
   async createInstance(req: CreateInstanceRequest): Promise<ProviderInstance> {

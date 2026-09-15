@@ -1001,7 +1001,7 @@ export class HostingService {
       case "terminated":
         return tmpl.terminatedEmail("", ref, row.terminatedAtMs ?? nowMs, "Hosting billing has been stopped for this server.", manageUrl);
       case "setup_failure":
-        return tmpl.exceptionEmail("", "setup_failure_refunded", ref, row.failureReason ?? "Setup did not complete.", manageUrl);
+        return tmpl.exceptionEmail("", "setup_failure", ref, row.failureReason ?? "Setup did not complete.", manageUrl);
       case "late_payment":
         return tmpl.exceptionEmail("", "late_payment_after_deletion", ref, "This server was already permanently deleted and its data cannot be recovered. The payment will be refunded.", manageUrl);
       default:
@@ -1017,9 +1017,10 @@ export class HostingService {
     const key = cfg.stripe[mode].secretKey;
     if (!key) return;
     try {
-      await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: "cancel_at_period_end=true",
       });
+      if (!response.ok) throw new Error(`Stripe returned HTTP ${response.status}`);
     } catch (err) { this.log(`[hosting] could not schedule Stripe cancellation for ${subscriptionId}: ${(err as Error).message}`); }
     void nowMs;
   }
@@ -1029,9 +1030,10 @@ export class HostingService {
     const key = cfg.stripe[mode].secretKey;
     if (!key) return;
     try {
-      await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.fetchLike(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: "cancel_at_period_end=false",
       });
+      if (!response.ok) throw new Error(`Stripe returned HTTP ${response.status}`);
     } catch (err) { this.log(`[hosting] could not un-cancel Stripe subscription ${subscriptionId}: ${(err as Error).message}`); }
     void nowMs;
   }

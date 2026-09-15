@@ -187,11 +187,11 @@ export function terminatedEmail(to: string, instanceReference: string, terminate
  *  wording never claims the wrong cause (§9: "for voluntary cancellation do
  *  not claim a charge failed; for incomplete cleanup do not use the final
  *  template early"). */
-export function exceptionEmail(to: string, kind: "setup_failure_refunded" | "late_payment_after_deletion", instanceReference: string, detail: string, hostingUrl: string): EmailMessage {
-  if (kind === "setup_failure_refunded") {
+export function exceptionEmail(to: string, kind: "setup_failure" | "late_payment_after_deletion", instanceReference: string, detail: string, hostingUrl: string): EmailMessage {
+  if (kind === "setup_failure") {
     const text = [
       `We were not able to finish setting up ${instanceReference}. ${detail}`,
-      `Your hosting payment for this server has been refunded. You can start a new order from your account when you are ready to try again.`,
+      `Renewal for this server has been stopped. We will confirm the status of your initial hosting payment separately; contact support if you do not receive that confirmation.`,
       `View hosting: ${hostingUrl}`,
     ].join("\n\n");
     const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");
