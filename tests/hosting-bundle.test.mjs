@@ -9,10 +9,11 @@ const RELEASE = "b".repeat(64);
 async function setup(overrides = {}) {
   let clock = Math.floor(Date.now() / 1000) * 1000;
   const calls = [];
+  const provider = new FakeProvider({ now: () => clock });
   const h = await freshHub({}, {
     billingNow: () => clock, hostingNow: () => clock,
     billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
-    hostingProvider: new FakeProvider({ now: () => clock }),
+    hostingProvider: provider,
     hostingFetch: async (url, init) => {
       calls.push({ url, init });
       if (url.includes("/v1/prices/")) {
@@ -44,7 +45,7 @@ async function setup(overrides = {}) {
     const res = await fetch(`${h.origin}/api/billing/stripe/test`, { method: "POST", headers: { "content-type": "application/json", "stripe-signature": signStripePayload(body, WHSEC, Math.floor(clock / 1000)) }, body });
     return { status: res.status, body: await res.json() };
   }
-  return { h, calls, event, post, advance: (ms) => { clock += ms; }, now: () => clock };
+  return { h, calls, provider, event, post, advance: (ms) => { clock += ms; }, now: () => clock };
 }
 
 await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable through /buy", async () => {
@@ -128,6 +129,120 @@ await test("bundle webhooks atomically bind one VPS and renew/cancel software an
   assert.equal(c.h.hub.billing.store.getCustomer("cus_bundle").subscriptionStatus, "canceled");
   assert.equal(c.h.hub.billing.store.getRoleSubscription("cus_bundle", "hosting").subscriptionStatus, "canceled");
   assert.equal(c.h.hub.store.get(sw.licenseId).exp, exp, "cancel never shortens the already-paid software term");
+  await c.h.close();
+});
+
+await test("checkout then initial paid invoice before the worker preserves one current provision job and one create", async () => {
+  const c = await setup();
+  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174112" }) });
+  const reserved = c.h.hub.hosting.store.instances()[0];
+  const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
+  const checkout = c.event("evt_order_checkout", "checkout.session.completed", { id: "cs_order", mode: "subscription", payment_status: "paid", customer: "cus_order", customer_details: { email: "order@example.com" }, subscription: "sub_order", metadata });
+  assert.equal((await c.post(checkout)).body.outcome, "applied");
+  let row = c.h.hub.hosting.store.getInstance(reserved.id);
+  let provision = c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "provision" && job.status === "pending");
+  assert.equal(provision.length, 1);
+  assert.equal(provision[0].lifecycleVersion, row.lifecycleVersion);
+
+  const periodEnd = Math.floor((c.now() + 30 * 86400000) / 1000);
+  const invoice = c.event("evt_order_invoice", "invoice.paid", { id: "in_order", paid: true, status: "paid", customer: "cus_order", customer_email: "order@example.com", subscription: "sub_order", subscription_details: { metadata }, lines: { data: [{ period: { end: periodEnd }, price: { id: "price_bundle_month" } }] }, charge: "ch_order" });
+  assert.equal((await c.post(invoice)).body.outcome, "applied");
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.stage, "ordered");
+  assert.equal(row.paidThroughMs, periodEnd * 1000);
+  assert.equal(row.suspendAtMs, null); assert.equal(row.deleteAtMs, null);
+  provision = c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "provision" && job.status === "pending");
+  assert.equal(provision.length, 1, "invoice reconciliation neither obsoletes nor duplicates the current provision job");
+  assert.equal(provision[0].lifecycleVersion, row.lifecycleVersion);
+  assert.equal((await c.post(checkout)).body.outcome, "duplicate");
+  assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+
+  await c.h.hub.hosting.tick(c.now());
+  assert.equal(c.provider.createCalls.length, 1);
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.stage, "bootstrapping");
+  const readiness = c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "readiness_recheck" && job.status === "pending");
+  assert.equal(readiness.length, 1);
+  const lifecycleAtBootstrap = row.lifecycleVersion;
+
+  c.advance(1000);
+  const renewalEnd = periodEnd + 30 * 86400;
+  const renewal = c.event("evt_order_renewal", "invoice.paid", { id: "in_order_renewal", paid: true, status: "paid", customer: "cus_order", customer_email: "order@example.com", subscription: "sub_order", subscription_details: { metadata }, lines: { data: [{ period: { end: renewalEnd }, price: { id: "price_bundle_month" } }] }, charge: "ch_order_renewal" });
+  assert.equal((await c.post(renewal)).body.outcome, "applied");
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.lifecycleVersion, lifecycleAtBootstrap, "paid-through alone does not invalidate bootstrap operations");
+  assert.equal(c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "readiness_recheck" && job.status === "pending").length, 1);
+  await c.h.hub.hosting.tick(c.now());
+  assert.equal(c.provider.createCalls.length, 1, "repeat reconciliation never creates a second VPS");
+  await c.h.close();
+});
+
+await test("an initial paid invoice during the provider create does not obsolete the in-flight job or create twice", async () => {
+  const c = await setup();
+  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174114" }) });
+  const reserved = c.h.hub.hosting.store.instances()[0];
+  const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
+  const checkout = c.event("evt_inflight_checkout", "checkout.session.completed", { id: "cs_inflight", mode: "subscription", payment_status: "paid", customer: "cus_inflight", customer_details: { email: "inflight@example.com" }, subscription: "sub_inflight", metadata });
+  assert.equal((await c.post(checkout)).body.outcome, "applied");
+
+  const realCreate = c.provider.createInstance.bind(c.provider);
+  let releaseCreate;
+  const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+  let enteredCreate;
+  const entered = new Promise((resolve) => { enteredCreate = resolve; });
+  c.provider.createInstance = async (request) => { enteredCreate(); await createGate; return realCreate(request); };
+  const tick = c.h.hub.hosting.tick(c.now());
+  await entered;
+  let row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.stage, "provisioning");
+  const lifecycleDuringCreate = row.lifecycleVersion;
+
+  const periodEnd = Math.floor((c.now() + 30 * 86400000) / 1000);
+  const invoice = c.event("evt_inflight_invoice", "invoice.paid", { id: "in_inflight", paid: true, status: "paid", customer: "cus_inflight", customer_email: "inflight@example.com", subscription: "sub_inflight", subscription_details: { metadata }, lines: { data: [{ period: { end: periodEnd }, price: { id: "price_bundle_month" } }] }, charge: "ch_inflight" });
+  assert.equal((await c.post(invoice)).body.outcome, "applied");
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.lifecycleVersion, lifecycleDuringCreate);
+  assert.equal(row.paidThroughMs, periodEnd * 1000);
+
+  releaseCreate();
+  await tick;
+  assert.equal(c.provider.createCalls.length, 1);
+  assert.equal(c.h.hub.hosting.store.getInstance(reserved.id).stage, "bootstrapping");
+  await c.h.hub.hosting.tick(c.now());
+  assert.equal(c.provider.createCalls.length, 1, "a later reconcile finds the durable provider id and never creates again");
+  await c.h.close();
+});
+
+await test("initial paid invoice before checkout completion converges to one create and later paid-through preserves a ready email", async () => {
+  const c = await setup();
+  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174113" }) });
+  const reserved = c.h.hub.hosting.store.instances()[0];
+  const metadata = { plan: "yearly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
+  const periodEnd = Math.floor((c.now() + 365 * 86400000) / 1000);
+  const invoice = c.event("evt_reverse_invoice", "invoice.paid", { id: "in_reverse", paid: true, status: "paid", customer: "cus_reverse", customer_email: "reverse@example.com", subscription: "sub_reverse", subscription_details: { metadata }, lines: { data: [{ period: { end: periodEnd }, price: { id: "price_bundle_year" } }] }, charge: "ch_reverse" });
+  assert.equal((await c.post(invoice)).body.outcome, "applied");
+  const checkout = c.event("evt_reverse_checkout", "checkout.session.completed", { id: "cs_reverse", mode: "subscription", payment_status: "paid", customer: "cus_reverse", customer_details: { email: "reverse@example.com" }, subscription: "sub_reverse", metadata });
+  assert.equal((await c.post(checkout)).body.outcome, "applied");
+  let row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.paidThroughMs, periodEnd * 1000);
+  assert.equal(c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "provision" && job.status === "pending" && job.lifecycleVersion === row.lifecycleVersion).length, 1);
+  await c.h.hub.hosting.tick(c.now());
+  assert.equal(c.provider.createCalls.length, 1);
+
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  row = c.h.hub.hosting.store.updateInstance(row.id, row.version, (draft) => { draft.stage = "ready"; }, c.now());
+  c.h.hub.hosting.store.enqueue({ hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation, jobType: "email", dedupeKey: `email:installation_ready:test:${row.id}`, availableAtMs: c.now() + 60_000, payload: { template: "installation_ready" } }, c.now());
+  const readyLifecycle = row.lifecycleVersion;
+  c.advance(1000);
+  const renewalEnd = periodEnd + 365 * 86400;
+  const renewal = c.event("evt_reverse_renewal", "invoice.paid", { id: "in_reverse_renewal", paid: true, status: "paid", customer: "cus_reverse", customer_email: "reverse@example.com", subscription: "sub_reverse", subscription_details: { metadata }, lines: { data: [{ period: { end: renewalEnd }, price: { id: "price_bundle_year" } }] }, charge: "ch_reverse_renewal" });
+  assert.equal((await c.post(renewal)).body.outcome, "applied");
+  row = c.h.hub.hosting.store.getInstance(reserved.id);
+  assert.equal(row.lifecycleVersion, readyLifecycle);
+  assert.equal(c.h.hub.hosting.store.outboxFor(row.id).filter((job) => job.jobType === "email" && job.status === "pending" && job.payload.template === "installation_ready").length, 1, "paid-through alone does not obsolete a ready email");
+  assert.equal(c.provider.createCalls.length, 1);
+  assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+  assert.equal((await c.post(checkout)).body.outcome, "duplicate");
   await c.h.close();
 });
 
