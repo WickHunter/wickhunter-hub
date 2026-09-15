@@ -18,8 +18,8 @@ await test("Vultr plan quotes preserve a real positive monthly cost", async () =
   assert.deepEqual(await provider.listPlans(), [{ id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 }]);
 });
 
-await test("Vultr plan quotes reject missing, malformed, and zero costs", async () => {
-  for (const monthly_cost of [undefined, "not-a-price", 0]) {
+await test("Vultr plan quotes reject missing, malformed, negative, and unsafe costs", async () => {
+  for (const monthly_cost of [undefined, null, "", " ", false, [], {}, -1, "-1", "not-a-price", 1e20]) {
     const provider = new VultrProvider("test-key", async () => ({
       ok: true,
       status: 200,
@@ -27,6 +27,19 @@ await test("Vultr plan quotes reject missing, malformed, and zero costs", async 
     }));
     await assert.rejects(() => provider.listPlans(), /invalid monthly_cost/);
   }
+});
+
+await test("Vultr free plan inventory does not block a paid plan quote", async () => {
+  const provider = new VultrProvider("test-key", async () => ({
+    ok: true, status: 200,
+    text: async () => JSON.stringify({ plans: [
+      { id: "vc2-1c-0.5gb-free", monthly_cost: 0 },
+      { id: "vc2-1c-2gb", monthly_cost: "10.00" },
+    ] }),
+  }));
+  const plans = await provider.listPlans();
+  assert.equal(plans[0].monthlyCostCents, 0);
+  assert.equal(plans.find(p => p.id === "vc2-1c-2gb").monthlyCostCents, 1000);
 });
 
 await test("Vultr plan lookup rejects an unsuccessful or malformed response", async () => {

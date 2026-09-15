@@ -1,3 +1,18 @@
+# Vultr inventory hotfix (2026-09-14)
+
+The first authorized isolated real-provider workflow stopped before any VPS
+creation: Vultr lists `vc2-1c-0.5gb-free` at a legitimate zero monthly cost, and
+our inventory parser rejected the entire list. The parser now accepts an
+explicit finite nonnegative numeric price (or decimal string), including zero,
+while rejecting missing/null/empty/boolean/negative/unsafe prices. Checkout,
+quote capture, and provisioning independently require a positive selected-plan
+quote; the paid plan and 100% markup rule are unchanged.
+
+Regression coverage includes mixed free/paid inventory and selected-free-plan
+checkout rejection before any instance reservation or Stripe request. No
+customer purchase or provider resource is created by these tests. Deployment
+and the isolated real-provider workflow must still be verified separately.
+
 # Claude handoff: account/candle/marketplace audit
 
 ## v0.4.38: WEEX native demand fairness under continuous reconciliation
