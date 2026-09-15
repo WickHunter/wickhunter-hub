@@ -1,3 +1,24 @@
+## v0.4.41 response compression follow-up (September 15)
+
+A ten-second production CPU profile during deep-history seeding identified
+synchronous gzip in candleSeed as the largest sampled function (1,684 samples).
+Health requests could exceed five seconds. All four gzip response paths now use
+async zlib with two active jobs, eight total reservations and a 64 MiB retained
+input limit. Admission happens before expensive seed construction. Overflow
+returns 503 with Retry-After: 1, including conditional requests under saturation;
+normal successful signatures, payloads, ETags and 304 responses are unchanged.
+Pre-submit throws and early returns release reservations through finally.
+
+A local four-request / 43,200-row benchmark (4.51 MB per response) measured
+451 ms maximum heartbeat delay with sync gzip versus 6 ms with bounded async;
+elapsed time was 461 ms versus 236 ms. These are local synthetic measurements,
+not a guarantee about venue or VPS network latency.
+
+Operational note: the read-only CPU profile succeeded, but the operator's
+inspector-cleanup expression used unsupported dynamic import and triggered one
+Hub restart at 14:02:56 UTC. Systemd recovered it at 14:03:01. No trading service
+was restarted; the diagnostic port is closed. Do not reuse that cleanup script.
+
 ## Automatic install terminal correction
 
 The authorized real Vultr2GB VPS reached active, then cloud-init failed because
@@ -25,6 +46,22 @@ customer purchase or provider resource is created by these tests. Deployment
 and the isolated real-provider workflow must still be verified separately.
 
 # Claude handoff: account/candle/marketplace audit
+
+## v0.4.41: partial Bybit subscription status is counted per socket
+
+The v0.4.40 reconnect worked live, but Bybit linear uses two physical sockets
+for its 762-topic roster. The first 500-topic acknowledgement changed the
+source note to `762 subscribed` while the second socket was still failing and
+retrying. The source state was therefore live but its detail claimed coverage
+the venue had not acknowledged.
+
+Each Bybit pool connection now owns its acknowledgement or refusal proof. The
+note sums acknowledged topic counts against the current desired roster and
+counts refused and still-pending topics separately. Discarding one connection
+clears only that chunk's proof; its re-ack restores it. An unchanged roster
+refresh remains a pool no-op and preserves every valid proof. A 501-symbol
+two-socket regression covers partial acknowledgement, refusal, re-ack,
+unchanged refresh, discard, reconnect, and the replacement acknowledgement.
 
 ## v0.4.40: error-only WebSocket handshakes recover
 

@@ -69,7 +69,6 @@
 // log for /hub/ either; if the operator turns one on, that is on them.
 import fs from "node:fs";
 import { createHash, timingSafeEqual, createPublicKey } from "node:crypto";
-import { gzipSync } from "node:zlib";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { isIP, type AddressInfo } from "node:net";
@@ -85,6 +84,10 @@ import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
 import { isVenueId } from "./candles/venues.js";
 import { isSnapshotDepth, isSnapshotInterval, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH } from "./candles/snapshot.js";
 import { isTimeframeInterval, TIMEFRAME_INTERVALS } from "./candles/timeframe.js";
+import {
+  AsyncGzipQueue, GzipCapacityError,
+  type AsyncGzipLimits, type GzipFunction, type GzipReservation,
+} from "./async-gzip.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
 import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
 import {
@@ -243,6 +246,9 @@ export interface HubDeps {
   candleNow?: CandleServiceDeps["now"];
   /** Where a snapshot rebuild reports its cost; production prints it. */
   candleLog?: CandleServiceDeps["log"];
+  /** Injectable async response compressor and limits for deterministic tests. */
+  responseGzip?: GzipFunction;
+  responseGzipLimits?: Partial<AsyncGzipLimits>;
   /** Injectable so market-cap tests never reach a paid provider. */
   marketCapHttp?: HttpLike;
   /** The venues' own public endpoints, for the instrument catalogues. */
@@ -298,6 +304,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     ...DEFAULT_FEEDBACK_STORAGE_LIMITS,
     ...deps.feedbackStorageLimits,
   };
+  const responseGzip = new AsyncGzipQueue({ ...deps.responseGzipLimits, gzip: deps.responseGzip });
   // ── public-route rate limiting (src/ratelimit.ts) ────────────────────────
   // `HubConfig` is built by hand in tests and tools as well as by
   // `configFromEnv`, so an absent policy falls back to the shipped default —
@@ -1568,6 +1575,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // that silently stopped seeding those installs would look like the venue
   // warm-up simply coming back. Accepting both is one line and costs nothing.
   // Header first, so an install sending both is judged on the safer one.
+  function compressionBusy(res: ServerResponse): void {
+    sendJson(res, 503, { ok: false, error: "response compression is busy; retry shortly" }, {
+      "retry-after": "1",
+      "cache-control": "no-store",
+    });
+  }
+
+  async function compressedBytes(body: Buffer, reservation: GzipReservation, res: ServerResponse): Promise<Buffer | null> {
+    try {
+      return await reservation.compress(body);
+    } catch (error) {
+      if (error instanceof GzipCapacityError) {
+        compressionBusy(res);
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async function candleSeed(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     if (cfg.candleRequireLicense) {
       const v = store.verify(licenseTokenOf(req, url));
@@ -1590,6 +1616,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 400, { ok: false, error: "fromMs and toMs must be epoch-ms integers" });
     }
     const rawInterval = url.searchParams.get("interval");
+    const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
     // Omitted and explicit 1 are the pinned minute-v1 contract. No new field,
     // canonical byte or response header is introduced on that path.
     if (rawInterval !== null && rawInterval !== "1") {
@@ -1598,46 +1625,62 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         return sendJson(res, 400, { ok: false,
           error: `interval must be 1 or one of ${TIMEFRAME_INTERVALS.join(",")} minutes` });
       }
-      const outcome = candles.timeframeSeed({
-        venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo),
-      });
-      if (!outcome.ok) return sendJson(res, outcome.code, { ok: false, error: outcome.error });
-      const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
-      const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
-      const inm = String(req.headers["if-none-match"] ?? "");
-      if (inm && inm.split(",").some((t) => t.trim() === etag)) {
-        res.writeHead(304, { etag, "cache-control": "public, max-age=60" });
-        return void res.end();
+      const reservation = wantsGzip ? responseGzip.reserve() : null;
+      if (wantsGzip && !reservation) return compressionBusy(res);
+      try {
+        const outcome = candles.timeframeSeed({
+          venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo),
+        });
+        if (!outcome.ok) {
+          return sendJson(res, outcome.code, { ok: false, error: outcome.error });
+        }
+        const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+        const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
+        const inm = String(req.headers["if-none-match"] ?? "");
+        if (inm && inm.split(",").some((t) => t.trim() === etag)) {
+          res.writeHead(304, { etag, "cache-control": "public, max-age=60" });
+          return void res.end();
+        }
+        const bytes = reservation ? await compressedBytes(body, reservation, res) : body;
+        if (!bytes) return;
+        res.writeHead(200, {
+          "content-type": "application/json; charset=utf-8", "content-length": bytes.length,
+          ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+          etag, "cache-control": "public, max-age=60",
+        });
+        return void res.end(bytes);
+      } finally {
+        reservation?.release();
       }
-      const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
-      const bytes = wantsGzip ? gzipSync(body) : body;
-      res.writeHead(200, {
-        "content-type": "application/json; charset=utf-8", "content-length": bytes.length,
-        ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
-        etag, "cache-control": "public, max-age=60",
-      });
-      return void res.end(bytes);
     }
-    const outcome = candles.seed({ venue, symbol, fromMs: Number(rawFrom), toMs: Number(rawTo) });
-    if (!outcome.ok) return sendJson(res, outcome.code, { ok: false, error: outcome.error });
+    const reservation = wantsGzip ? responseGzip.reserve() : null;
+    if (wantsGzip && !reservation) return compressionBusy(res);
+    try {
+      const outcome = candles.seed({ venue, symbol, fromMs: Number(rawFrom), toMs: Number(rawTo) });
+      if (!outcome.ok) {
+        return sendJson(res, outcome.code, { ok: false, error: outcome.error });
+      }
 
-    // The payload's own key order IS the signed canonical order plus `sig`
-    // last, so serialising it directly cannot disagree with what was signed.
-    const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
-    const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
-    // A 30-day seed is ~43k rows of mostly-decimal JSON; gzip takes roughly an
-    // order of magnitude off it, which is the difference between this being a
-    // download and being a problem.
-    const bytes = wantsGzip ? gzipSync(body) : body;
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "content-length": bytes.length,
-      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
-      // Candles are immutable once closed, but `lastClosedMs` advances every
-      // minute, so the response is only good for about that long.
-      "cache-control": "public, max-age=60",
-    });
-    res.end(bytes);
+      // The payload's own key order IS the signed canonical order plus `sig`
+      // last, so serialising it directly cannot disagree with what was signed.
+      const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+      // A 30-day seed is ~43k rows of mostly-decimal JSON; gzip takes roughly an
+      // order of magnitude off it, which is the difference between this being a
+      // download and being a problem.
+      const bytes = reservation ? await compressedBytes(body, reservation, res) : body;
+      if (!bytes) return;
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": bytes.length,
+        ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+        // Candles are immutable once closed, but `lastClosedMs` advances every
+        // minute, so the response is only good for about that long.
+        "cache-control": "public, max-age=60",
+      });
+      res.end(bytes);
+    } finally {
+      reservation?.release();
+    }
   }
 
   // ── the whole-venue candle snapshot ───────────────────────────────────────
@@ -1686,32 +1729,41 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!isSnapshotDepth(depth)) {
       return sendJson(res, 400, { ok: false, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` });
     }
-    const current = candles.snapshot(venue, interval, depth);
-    // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
-    // means "ask me again", which is a different sentence from "this venue has
-    // nothing on it".
-    if (!current.ok) return sendJson(res, current.code, { ok: false, error: current.error });
-
-    const inm = String(req.headers["if-none-match"] ?? "");
-    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
-      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
-      return void res.end();
-    }
     const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
-    // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
-    // roughly an order of magnitude off it, exactly as it does for a seed.
-    const bytes = wantsGzip ? gzipSync(current.body) : current.body;
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "content-length": bytes.length,
-      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
-      etag: current.etag,
-      // The window only moves on a bucket boundary, but `generatedAtMs` and the
-      // roster do not, so a minute of caching is the same bargain the seed and
-      // the market-cap snapshot already make.
-      "cache-control": "public, max-age=60",
-    });
-    res.end(bytes);
+    const reservation = wantsGzip ? responseGzip.reserve() : null;
+    if (wantsGzip && !reservation) return compressionBusy(res);
+    try {
+      const current = candles.snapshot(venue, interval, depth);
+      // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
+      // means "ask me again", which is a different sentence from "this venue has
+      // nothing on it".
+      if (!current.ok) {
+        return sendJson(res, current.code, { ok: false, error: current.error });
+      }
+
+      const inm = String(req.headers["if-none-match"] ?? "");
+      if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+        res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+        return void res.end();
+      }
+      // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
+      // roughly an order of magnitude off it, exactly as it does for a seed.
+      const bytes = reservation ? await compressedBytes(current.body, reservation, res) : current.body;
+      if (!bytes) return;
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": bytes.length,
+        ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+        etag: current.etag,
+        // The window only moves on a bucket boundary, but `generatedAtMs` and the
+        // roster do not, so a minute of caching is the same bargain the seed and
+        // the market-cap snapshot already make.
+        "cache-control": "public, max-age=60",
+      });
+      res.end(bytes);
+    } finally {
+      reservation?.release();
+    }
   }
 
   // ── the signed market-cap snapshot ────────────────────────────────────────
@@ -1745,23 +1797,30 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!current) {
       return sendJson(res, 503, { ok: false, error: "no market-cap snapshot has been produced yet" });
     }
-    const inm = String(req.headers["if-none-match"] ?? "");
-    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
-      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
-      return void res.end();
-    }
     const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
-    const bytes = wantsGzip ? gzipSync(current.body) : current.body;
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "content-length": bytes.length,
-      ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
-      etag: current.etag,
-      // Caps refresh hourly and the payload carries its own `expiresAt`; a
-      // minute of caching costs nothing and takes the repeat-poll load off.
-      "cache-control": "public, max-age=60",
-    });
-    res.end(bytes);
+    const reservation = wantsGzip ? responseGzip.reserve() : null;
+    if (wantsGzip && !reservation) return compressionBusy(res);
+    try {
+      const inm = String(req.headers["if-none-match"] ?? "");
+      if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+        res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+        return void res.end();
+      }
+      const bytes = reservation ? await compressedBytes(current.body, reservation, res) : current.body;
+      if (!bytes) return;
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": bytes.length,
+        ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+        etag: current.etag,
+        // Caps refresh hourly and the payload carries its own `expiresAt`; a
+        // minute of caching costs nothing and takes the repeat-poll load off.
+        "cache-control": "public, max-age=60",
+      });
+      res.end(bytes);
+    } finally {
+      reservation?.release();
+    }
   }
 
   // ── admin surface ─────────────────────────────────────────────────────────
