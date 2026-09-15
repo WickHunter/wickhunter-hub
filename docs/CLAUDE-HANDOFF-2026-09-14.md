@@ -26,6 +26,28 @@ and the isolated real-provider workflow must still be verified separately.
 
 # Claude handoff: account/candle/marketplace audit
 
+## v0.4.40: error-only WebSocket handshakes recover
+
+After the Hub booted, Bybit's linear liquidation upgrade returned a network or
+non-101 error without a close callback. `SocketPool.onError` only logged, while
+the sole reconnect path lived in `onClose`, so both linear source pools stayed
+`connecting` with zero events for ten hours. Other sources remained live.
+
+Each socket attempt now has a generation. Error, close, and a 15-second connect
+timeout converge on one retirement path: it marks the connection closed,
+actively closes the old socket, discards per-attempt state once, and schedules
+the existing bounded jittered backoff. The generation changes before close, so
+a subsequent close or any late open/message callback is inert. Stop and resync
+also invalidate generations and clear all timers. Connection records and topic
+chunking remain bounded.
+
+The Bybit liquidation note now says `requested · awaiting subscribe
+acknowledgement` after roster load and changes to `subscribed · acknowledged`
+only on the venue's success reply. Regression tests reproduce an error with no
+close followed by a late close, a handshake with no callbacks, stale callbacks,
+and one bounded connection record. The shared candle stream and liquidation
+stream suites pass unchanged alongside the new pool suite.
+
 ## v0.4.38: WEEX native demand fairness under continuous reconciliation
 
 Live v0.4.37 verification registered 225 hourly WEEX demands but wrote no
