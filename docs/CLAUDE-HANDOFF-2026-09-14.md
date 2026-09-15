@@ -1,3 +1,14 @@
+## Automatic install terminal correction
+
+The authorized real Vultr2GB VPS reached active, then cloud-init failed because
+`/dev/tty` was readable as a device node without a controlling terminal. The
+installer's password prompt aborted under `set -e`. Prompting now probes an
+actual guarded terminal open; missing terminal or EOF leaves the response empty
+so the existing secure auto-generation path runs. A detached-process regression
+runs the real extracted prompt helper and verifies both secret/nonsecret paths
+without exposing generated credentials. No manually preseeded secret is needed.
+This correction still needs the real unattended rerun before hosting launch.
+
 # Vultr inventory hotfix (2026-09-14)
 
 The first authorized isolated real-provider workflow stopped before any VPS

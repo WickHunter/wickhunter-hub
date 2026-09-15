@@ -34,11 +34,14 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # the terminal. No terminal at all (cloud-init etc.) -> generate/skip instead.
 ask() { # ask VAR "prompt" [--secret]
   local __var=$1 __prompt=$2 __secret=${3:-} __val=""
-  if [ -r /dev/tty ]; then
+  # The device node can be readable with no controlling terminal (cloud-init).
+  # Probe an actual open in a guarded subshell so errexit cannot abort setup.
+  if ( : < /dev/tty ) 2>/dev/null; then
     if [ "$__secret" = "--secret" ]; then
-      read -r -s -p "$__prompt" __val < /dev/tty; printf '\n' > /dev/tty
+      read -r -s -p "$__prompt" __val < /dev/tty || __val=""
+      printf '\n' > /dev/tty || true
     else
-      read -r -p "$__prompt" __val < /dev/tty
+      read -r -p "$__prompt" __val < /dev/tty || __val=""
     fi
   fi
   printf -v "$__var" '%s' "$__val"

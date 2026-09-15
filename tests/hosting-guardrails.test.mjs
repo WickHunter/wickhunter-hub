@@ -4,10 +4,35 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { freshHub, test, summary } from "./helpers.mjs";
 import { exceptionEmail } from "../dist/src/hosting/emails.js";
 import { VultrProvider } from "../dist/src/hosting/provider.js";
 import { HostingService } from "../dist/src/hosting/service.js";
+
+await test("personalized installer generates credentials without a controlling terminal", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  const start = installer.indexOf("ask() {");
+  const end = installer.indexOf("\n}\n", start) + 3;
+  assert.ok(start >= 0 && end > start);
+  const script = "set -Eeuo pipefail\n" + installer.slice(start, end) + `
+SECRET=before
+ask SECRET "Secret: " --secret
+[ -z "$SECRET" ]
+[ -n "$SECRET" ] || SECRET=$(openssl rand -hex 32)
+[ "\${#SECRET}" -eq 64 ]
+LOGIN_PW=before
+ask LOGIN_PW "Password: "
+[ -z "$LOGIN_PW" ]
+printf 'unattended-credential-fallback-ok'
+`;
+  // detached starts a new session: /dev/tty can exist and be readable, but
+  // opening it must fail just as it does under real cloud-init.
+  const result = spawnSync("bash", ["-c", script], { encoding: "utf8", detached: true, timeout: 5_000, stdio: ["pipe", "pipe", "pipe"] });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "unattended-credential-fallback-ok");
+  assert.equal(result.stderr, "");
+});
 
 await test("Vultr plan quotes preserve a real positive monthly cost", async () => {
   const provider = new VultrProvider("test-key", async () => ({
