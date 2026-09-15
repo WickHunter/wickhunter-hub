@@ -128,7 +128,7 @@
       <span class="eyebrow">Hosting</span>
       <span class="pill dim">No hosting yet</span>
     </div>
-    <p class="fine" style="margin:8px 0 12px">Unleashed VPS Hosting — <span class="v-price"></span>/month in addition to your software license. Your own virtual server with Unleashed preinstalled, supporting up to <span class="v-account-limit"></span> connected exchange accounts. This is a separate hosting subscription, billed on its own schedule — it never replaces or restarts your software license above.</p>
+    <p class="fine hosting-billing-explainer" style="margin:8px 0 12px">Unleashed VPS Hosting — <span class="v-price"></span>/month in addition to your software license. Your own virtual server with Unleashed preinstalled, supporting up to <span class="v-account-limit"></span> connected exchange accounts. This is a separate hosting subscription, billed on its own schedule — it never replaces or restarts your software license above.</p>
     <div class="row"><button class="btn v-add" type="button">Add VPS Hosting</button></div>
     <p class="err v-add-err" hidden style="margin:10px 0 0"></p>
     <p class="fine" style="margin-top:12px">Requires an eligible Unleashed software license. After payment you will choose <b>Start fresh</b> or <b>Move my existing setup</b> — both start with your bots paused until you finish setup and confirm your old installation (if any) has stopped, so the two never trade the same positions at once.</p>
@@ -153,6 +153,7 @@
     <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
     <p class="err v-delete-note" hidden style="margin:6px 0 0"></p>
     <p class="err v-fail-note" hidden style="margin:10px 0 0"></p>
+    <p class="fine v-bundle-note" hidden style="margin:10px 0 0"></p>
     <div class="row" style="margin-top:14px">
       <a class="btn v-open" href="#" target="_blank" rel="noopener" hidden>Open server</a>
       <button class="btn quiet v-cancel" type="button" hidden>Cancel renewal</button>
@@ -335,6 +336,11 @@
     }
     var inst = hosting.instance;
     var node = document.getElementById("hostingInstanceTpl").content.firstElementChild.cloneNode(true);
+    if (inst.bundleSubscription) {
+      var bundleNote = node.querySelector(".v-bundle-note");
+      bundleNote.textContent = "Your Wick Hunter software and managed VPS share one " + inst.billingInterval + "ly subscription. Canceling or resuming renewal affects both; already-paid software access remains valid through the current paid term.";
+      bundleNote.hidden = false;
+    }
     var pillEl = node.querySelector(".v-stage-pill");
     pillEl.className = "pill " + (HOSTING_STAGE_PILL[inst.stage] || "dim");
     pillEl.textContent = HOSTING_STAGE_LABEL[inst.stage] || inst.stage;
@@ -342,7 +348,9 @@
     node.querySelector(".v-region").textContent = inst.regionLabel || inst.region;
     node.querySelector(".v-ip").textContent = inst.ip || "—";
     node.querySelector(".v-url").textContent = inst.appUrl || "—";
-    node.querySelector(".v-price-line").textContent = inst.monthlyPriceLabel + "/month";
+    node.querySelector(".v-price-line").textContent = inst.bundleSubscription
+      ? inst.billingPriceLabel + "/" + inst.billingInterval + " combined software + hosting"
+      : inst.monthlyPriceLabel + "/month hosting";
     node.querySelector(".v-account-limit").textContent = "Up to " + inst.maximumConnectedAccounts;
     node.querySelector(".v-renewal").textContent = fmtDateTime(inst.paidThroughMs);
     node.querySelector(".v-backup").textContent = inst.managedBackupsIncluded ? "Backups are included." : "No managed backups are included — export your settings while the server is active.";
@@ -374,25 +382,27 @@
     var resumeBtn = node.querySelector(".v-resume");
     if (inst.stage !== "cancel_scheduled" && inst.stage !== "suspended" && inst.stage !== "deleting" && inst.stage !== "deleted") {
       cancelBtn.hidden = false;
+      if (inst.bundleSubscription) cancelBtn.textContent = "Cancel software + hosting renewal";
       cancelBtn.addEventListener("click", async function () {
+        if (inst.bundleSubscription && !window.confirm("Cancel renewal of both your Wick Hunter software and managed VPS at the end of the paid term?")) return;
         cancelBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
         var r = await api("/api/hosting/" + inst.id + "/cancel", { method: "POST", body: "{}" });
         cancelBtn.disabled = false;
         if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not schedule cancellation"; errEl.hidden = false; return; }
-        okEl.textContent = "Cancellation scheduled. Suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + ".";
+        okEl.textContent = (r.body.affectsSoftwareRenewal ? "Combined software + hosting renewal canceled. " : "Hosting cancellation scheduled. ") + "VPS suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + ".";
         okEl.hidden = false;
         setTimeout(function () { boot(); }, 1200);
       });
     }
     if (inst.stage === "cancel_scheduled") {
       resumeBtn.hidden = false;
-      resumeBtn.textContent = "Resume renewal";
+      resumeBtn.textContent = inst.bundleSubscription ? "Resume software + hosting renewal" : "Resume renewal";
       resumeBtn.addEventListener("click", async function () {
         resumeBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
         var r = await api("/api/hosting/" + inst.id + "/resume-renewal", { method: "POST", body: "{}" });
         resumeBtn.disabled = false;
         if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not reverse the cancellation"; errEl.hidden = false; return; }
-        okEl.textContent = "Renewal resumed."; okEl.hidden = false;
+        okEl.textContent = inst.bundleSubscription ? "Combined software + hosting renewal resumed." : "Hosting renewal resumed."; okEl.hidden = false;
         setTimeout(function () { boot(); }, 1200);
       });
     }

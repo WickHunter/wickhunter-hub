@@ -372,7 +372,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
-    onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode) ?? false,
+    onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode, input.terminal) ?? false,
   });
   // ── Unleashed VPS Hosting (H4/H5/H6) ──────────────────────────────────────
   const hosting = new HostingService(cfg.dataDir, billing, store, cfg.publicOrigin, {
@@ -398,6 +398,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // generous against an honest retry (the token itself lasts 15 minutes)
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
@@ -622,7 +623,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // burst of Stripe's own retries of one event is never refused; every
     // other unauthenticated-or-bearer public route shares the general "rest
     // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
-    if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
+    if (m === "POST" && p === "/api/hosting/bundle-checkout") {
+      const rate = hostingBundleIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "hosted bundle checkout"); }
+    } else if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
       const rate = webhookIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "the billing webhook"); }
     } else if (isGeneralRateLimitedRoute(m, p)) {
@@ -1385,7 +1389,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!owner) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" }, { "cache-control": "no-store" });
     const r = await hosting.cancel(owner, instanceId);
     if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
-    sendJson(res, 200, { ok: true, suspendAt: r.value.suspendAt, deleteAt: r.value.deleteAt }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, suspendAt: r.value.suspendAt, deleteAt: r.value.deleteAt, affectsSoftwareRenewal: r.value.affectsSoftwareRenewal }, { "cache-control": "no-store" });
   }
 
   async function hostingResumeRenewal(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {

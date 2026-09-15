@@ -10,6 +10,7 @@
 //                                            re-deciding anything or calling Stripe
 //   data/billing-role-migration.v1.json     one-shot marker: has the pre-dispatcher customer file
 //                                            been folded into the role index yet
+//   data/billing-bundle-subscriptions.v1.json per-subscription event watermark and terminal tombstone
 //   data/billing-tokens.v1.json      install-page and one-time install tokens (HASHED)
 //   data/billing-events.v1.jsonl     every webhook event received, with its outcome
 //   data/billing-events-seen.v1.json bounded set of event ids, for idempotent replay
@@ -29,6 +30,7 @@ export const EVENTS_SEEN_FILE = "billing-events-seen.v1.json";
 export const ROLE_SUBSCRIPTIONS_FILE = "billing-role-subscriptions.v1.json";
 export const ROLE_INDEX_FILE = "billing-role-index.v1.json";
 export const ROLE_MIGRATION_MARKER_FILE = "billing-role-migration.v1.json";
+export const BUNDLE_SUBSCRIPTIONS_FILE = "billing-bundle-subscriptions.v1.json";
 
 /** How many event ids we remember. Stripe retries for up to three days; this
  *  is years of a small shop's events, and the ledger keeps the full history. */
@@ -122,6 +124,18 @@ export interface RoleSubscriptionRecord {
   lastEventAtMs: number | null;
 }
 
+export interface BundleSubscriptionRecord {
+  subscriptionId: string;
+  reservationId: string;
+  customerId: string;
+  planKey: string;
+  priceId: string;
+  latestEventCreatedMs: number;
+  pendingStatus: "past_due" | null;
+  terminal: boolean;
+  updatedAtMs: number;
+}
+
 export const roleSubscriptionKey = (customerKey: string, role: BillingRole): string => `${customerKey}::${role}`;
 
 const hashToken = (raw: string): string => createHash("sha256").update(raw).digest("hex");
@@ -140,6 +154,7 @@ export class BillingStore {
   private readonly roleSubscriptionsFile: string;
   private readonly roleIndexFile: string;
   private readonly roleMigrationFile: string;
+  private readonly bundleSubscriptionsFile: string;
 
   constructor(readonly dataDir: string, private readonly randomBytes: (n: number) => Buffer = nodeRandomBytes) {
     this.customersFile = path.join(dataDir, CUSTOMERS_FILE);
@@ -149,7 +164,19 @@ export class BillingStore {
     this.roleSubscriptionsFile = path.join(dataDir, ROLE_SUBSCRIPTIONS_FILE);
     this.roleIndexFile = path.join(dataDir, ROLE_INDEX_FILE);
     this.roleMigrationFile = path.join(dataDir, ROLE_MIGRATION_MARKER_FILE);
+    this.bundleSubscriptionsFile = path.join(dataDir, BUNDLE_SUBSCRIPTIONS_FILE);
     this.migrateLegacySoftwareRoles();
+  }
+
+  getBundleSubscription(subscriptionId: string): BundleSubscriptionRecord | null {
+    if (!subscriptionId) return null;
+    return readJson<Record<string, BundleSubscriptionRecord>>(this.bundleSubscriptionsFile, {})[subscriptionId] ?? null;
+  }
+
+  putBundleSubscription(rec: BundleSubscriptionRecord): void {
+    const all = bare(readJson<Record<string, BundleSubscriptionRecord>>(this.bundleSubscriptionsFile, {}));
+    all[rec.subscriptionId] = rec;
+    writeJsonAtomic(this.bundleSubscriptionsFile, all);
   }
 
   // ── customers ─────────────────────────────────────────────────────────────

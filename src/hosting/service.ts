@@ -267,16 +267,20 @@ export class HostingService {
     const plan = cfg.plans.find((p) => p.checkout === "hosted-bundle" && p.interval === interval)!;
     const priceId = cfg.stripe[cfg.mode].priceIds[plan.key]!;
     const ownerId = `bundle:${hashBootstrapToken(`${cfg.mode}:${attemptId}`).slice(0, 48)}`;
-    const existing = this.store.activeInstanceForOwner(ownerId, cfg.mode);
     const pricing = { amountCents: plan.amountCents, currency: plan.currency, interval, softwareDays: interval === "month" ? 30 : 365, maximumConnectedAccounts: policy.maximumConnectedAccounts };
+    this.expireCheckoutReservations(nowMs);
+    const existing = this.store.activeInstanceForOwner(ownerId, cfg.mode);
     if (existing) {
       if (existing.stage === "ordered" && existing.checkoutExpiresAtMs != null && nowMs < existing.checkoutExpiresAtMs && existing.checkoutRequestBody && existing.checkoutIdempotencyKey) {
+        if (new URLSearchParams(existing.checkoutRequestBody).get("metadata[plan]") !== plan.key) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already reserved for a different plan" };
         if (existing.checkoutUrl) return { ok: true, value: { url: existing.checkoutUrl, pricing } };
         const retry = await this.submitStripeCheckout(existing, cfg.stripe[cfg.mode].secretKey, nowMs);
         return retry.ok ? { ok: true, value: { url: retry.value.url, pricing } } : retry;
       }
       return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already in use" };
     }
+    const pendingAnonymous = this.store.instances().filter((row) => row.ownerId.startsWith("bundle:") && row.stage === "ordered" && row.checkoutExpiresAtMs != null && row.checkoutExpiresAtMs > nowMs).length;
+    if (pendingAnonymous >= 3) return { ok: false, code: "PROVISIONING_DISABLED", error: "too many hosted checkouts are pending; retry shortly" };
     const provider = this.provider()!;
     let quote: number;
     try {
@@ -284,6 +288,7 @@ export class HostingService {
       if (!match) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan is unavailable from the provider" };
       quote = match.monthlyCostCents;
     } catch { return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" }; }
+    if (!Number.isSafeInteger(quote) || quote <= 0) return { ok: false, code: "PROVISIONING_DISABLED", error: "the selected provider plan returned an invalid monthly cost" };
     if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
     const ceiling = this.costCeilingRefusalWithQuote(quote, policy);
     if (ceiling) return { ok: false, code: "PROVISIONING_DISABLED", error: ceiling };
@@ -312,14 +317,31 @@ export class HostingService {
     return submitted.ok ? { ok: true, value: { url: submitted.value.url, pricing } } : submitted;
   }
 
-  acceptBundleReservation(reservationId: string, customerId: string, subscriptionId: string, planKey: string, livemode: boolean, nowMs = this.now()): boolean {
+  private expireCheckoutReservations(nowMs: number): void {
+    for (const row of this.store.instances()) {
+      if (row.stage === "ordered" && row.checkoutExpiresAtMs != null && nowMs >= row.checkoutExpiresAtMs && !row.stripeSubscriptionId) {
+        this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      }
+    }
+  }
+
+  acceptBundleReservation(reservationId: string, customerId: string, subscriptionId: string, planKey: string, livemode: boolean, terminal: boolean, nowMs = this.now()): boolean {
     if (!/^host_[A-Za-z0-9_-]+$/.test(reservationId) || !/^cus_[A-Za-z0-9_]+$/.test(customerId)) return false;
     const row = this.store.getInstance(reservationId);
-    if (!row || row.environment !== (livemode ? "live" : "test") || !row.ownerId.startsWith("bundle:")) return row?.ownerId === customerId && row.stripeSubscriptionId === subscriptionId;
+    if (!row || row.environment !== (livemode ? "live" : "test") || !row.ownerId.startsWith("bundle:")) {
+      if (row?.ownerId !== customerId || row.stripeSubscriptionId !== subscriptionId) return false;
+      if (terminal && row.stage === "ordered" && !row.providerInstanceId) {
+        return this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; d.failureReason = "bundle_subscription_ended_before_activation"; }, nowMs) !== null;
+      }
+      return true;
+    }
     if (!row.checkoutRequestBody) return false;
     const request = new URLSearchParams(row.checkoutRequestBody);
     if (request.get("metadata[plan]") !== planKey || request.get("subscription_data[metadata][plan]") !== planKey || request.get("metadata[reservation]") !== reservationId) return false;
-    return this.store.adoptBundleReservation(row.id, row.ownerId, customerId, subscriptionId, nowMs) !== null;
+    const adopted = this.store.adoptBundleReservation(row.id, row.ownerId, customerId, subscriptionId, nowMs);
+    if (!adopted) return false;
+    if (!terminal) return true;
+    return this.store.updateInstance(adopted.id, adopted.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; d.failureReason = "bundle_subscription_ended_before_activation"; }, nowMs) !== null;
   }
 
   private async submitStripeCheckout(reservation: HostingInstanceRow, secretKey: string, nowMs: number): Promise<HostingActionResult<{ url: string }>> {
@@ -398,7 +420,7 @@ export class HostingService {
       if (!paidEvidenceExists(sub)) return; // nothing to provision yet (a checkout not yet confirmed)
       const priorTerminated = this.store.instances().find((r) => r.ownerId === ownerId && r.environment === environment && r.stage === "deleted");
       if (priorTerminated?.stripeSubscriptionId && priorTerminated.stripeSubscriptionId === sub.subscriptionId) {
-        if (priorTerminated.failureReason === "unreserved_payment") return;
+        if (priorTerminated.failureReason === "unreserved_payment" || priorTerminated.failureReason === "bundle_subscription_ended_before_activation") return;
         this.notifyLatePayment(priorTerminated, nowMs);
         return;
       }
@@ -590,7 +612,7 @@ export class HostingService {
    *  succeeding; a failure is logged and the LOCAL lifecycle is still
    *  authoritative for suspend/delete timing, matching this Hub's own
    *  Stripe-webhook-is-truth design elsewhere). */
-  async cancel(ownerId: string, instanceId: string, nowMs = this.now()): Promise<HostingActionResult<{ suspendAt: number; deleteAt: number }>> {
+  async cancel(ownerId: string, instanceId: string, nowMs = this.now()): Promise<HostingActionResult<{ suspendAt: number; deleteAt: number; affectsSoftwareRenewal: boolean }>> {
     const row = this.owned(ownerId, instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
     if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this hosting instance cannot be cancelled from its current state" };
@@ -602,7 +624,7 @@ export class HostingService {
     const anchor = row.paidThroughMs ?? nowMs;
     this.scheduleEnd(row, "intentional_cancellation", anchor, policy, nowMs);
     const d = deadlines(anchor, "intentional_cancellation", policy);
-    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt } };
+    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt, affectsSoftwareRenewal: !!this.bundlePlanForOwner(ownerId) } };
   }
 
   /** POST /api/hosting/:id/resume-renewal. Only reversible before the
@@ -1209,11 +1231,19 @@ export class HostingService {
     return ownerId.startsWith("email:") ? ownerId.slice("email:".length) : "";
   }
 
+  private bundlePlanForOwner(ownerId: string) {
+    const customer = this.billing.store.getCustomer(ownerId);
+    const plan = customer?.planKey ? this.billing.plan(customer.planKey) : null;
+    return plan?.checkout === "hosted-bundle" ? plan : null;
+  }
+
   private buildEmail(row: HostingInstanceRow, template: string, cfg: EmailConfig, nowMs: number) {
     const policy = this.policy();
     const ref = row.id;
     const manageUrl = `${this.origin}/customer#hosting`;
     const priceLabel = `$${(policy.monthlyPriceCents / 100).toFixed(2)}`;
+    const bundlePlan = this.bundlePlanForOwner(row.ownerId);
+    const bundlePrice = bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : "";
     const [cpu = policy.planLabel, ram = "see plan", storage = "see plan"] = policy.planLabel.split(/\s*\/\s*/);
     switch (template) {
       case "installation_ready":
@@ -1223,12 +1253,12 @@ export class HostingService {
           appUsername: "admin", sshUsername: "root", sshPort: 22, accessUrl: manageUrl,
           temporaryPassword: row.bootstrapTokenHash ? bootstrapPasswordFromTokenHash(row.bootstrapTokenHash) : "",
           maximumConnectedAccounts: policy.maximumConnectedAccounts,
-          monthlyPriceLabel: priceLabel, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
+          billingSummary: bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
-        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl);
+        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan);
       case "overdue":
-        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, "");
+        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
       case "suspended":
         return tmpl.suspendedEmail("", ref, row.deleteAtMs ?? nowMs, manageUrl);
       case "three_days":
@@ -1461,7 +1491,7 @@ export class HostingService {
     }
     return {
       available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts,
-      instance: instanceView(row, policy, nowMs),
+      instance: instanceView(row, policy, nowMs, this.bundlePlanForOwner(row.ownerId)),
     };
   }
 }
@@ -1488,6 +1518,9 @@ export interface HostingInstanceView {
   monthlyPriceLabel: string;
   managedBackupsIncluded: boolean;
   maximumConnectedAccounts: number;
+  bundleSubscription: boolean;
+  billingPriceLabel: string;
+  billingInterval: "month" | "year";
 }
 export interface HostingCustomerView {
   available: boolean;
@@ -1499,7 +1532,7 @@ export interface HostingCustomerView {
   instance: HostingInstanceView | null;
 }
 
-function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number): HostingInstanceView {
+function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number, bundlePlan: import("../billing/config.js").Plan | null): HostingInstanceView {
   // On hold: no dates ("Scheduled for permanent deletion at …" would be a
   // lie — the pipeline is paused), and the one customer-safe sentence in
   // place of any real failureReason (an operational failure note is not
@@ -1517,6 +1550,9 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     onHold,
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
     maximumConnectedAccounts: policy.maximumConnectedAccounts,
+    bundleSubscription: !!bundlePlan,
+    billingPriceLabel: bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
+    billingInterval: bundlePlan?.interval === "year" ? "year" : "month",
   };
 }
 

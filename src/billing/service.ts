@@ -103,7 +103,7 @@ export interface BillingServiceDeps {
   onHostingEvent?: (customerKey: string, livemode: boolean) => void;
   /** Atomically adopts the anonymous VPS reservation to the Stripe customer
    * proved by a bundle webhook. Returning false makes Stripe retry. */
-  onBundleEvent?: (input: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; livemode: boolean }) => boolean;
+  onBundleEvent?: (input: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; livemode: boolean; terminal: boolean }) => boolean;
 }
 
 export interface WebhookReply {
@@ -382,7 +382,7 @@ export class BillingService {
     }
   }
 
-  private bundleIdentity(ev: StripeEvent, cfg: BillingConfig): { reservationId: string; customerId: string; subscriptionId: string; planKey: string } | null {
+  private bundleIdentity(ev: StripeEvent, cfg: BillingConfig): { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string } | null {
     let metadata: Record<string, string> = {};
     let customerId = "";
     let subscriptionId = "";
@@ -399,31 +399,94 @@ export class BillingService {
     } else if (ev.type.startsWith("charge.")) {
       const f = chargeFacts(ev.object); customerId = f.customerId; chargeId = f.chargeId || f.paymentIntentId;
     }
+    if (subscriptionId) {
+      const bound = this.store.getBundleSubscription(subscriptionId);
+      if (bound) {
+        if (
+          (customerId && customerId !== bound.customerId)
+          || (observedPriceIds.length > 0 && !observedPriceIds.includes(bound.priceId))
+          || (metadata.plan && metadata.plan !== bound.planKey)
+          || (metadata.reservation && metadata.reservation !== bound.reservationId)
+          || (metadata.bundle && metadata.bundle !== "software-hosting-v1")
+        ) return null;
+        return { reservationId: bound.reservationId, customerId: customerId || bound.customerId, subscriptionId, planKey: bound.planKey, priceId: bound.priceId };
+      }
+    }
     const plan = planByKey(cfg, metadata.plan);
     if (metadata.bundle === "software-hosting-v1" && plan?.checkout === "hosted-bundle") {
       const expectedPriceId = cfg.stripe[ev.livemode ? "live" : "test"].priceIds[plan.key];
       if (!expectedPriceId || (observedPriceIds.length > 0 && !observedPriceIds.includes(expectedPriceId))) return null;
-      return { reservationId: metadata.reservation ?? "", customerId, subscriptionId, planKey: plan.key };
+      return { reservationId: metadata.reservation ?? "", customerId, subscriptionId, planKey: plan.key, priceId: expectedPriceId };
     }
     if (subscriptionId) {
       const sw = this.store.findBySubscription(subscriptionId);
       const host = this.store.findRoleSubscriptionBySubscription("hosting", subscriptionId);
-      if (sw && host && sw.key === host.customerKey) return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId, planKey: sw.planKey ?? "" };
+      if (sw && host && sw.key === host.customerKey) {
+        const expectedPriceId = sw.planKey ? cfg.stripe[ev.livemode ? "live" : "test"].priceIds[sw.planKey] : "";
+        if (!expectedPriceId || (observedPriceIds.length > 0 && !observedPriceIds.includes(expectedPriceId))) return null;
+        return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId, planKey: sw.planKey ?? "", priceId: expectedPriceId };
+      }
     }
     if (chargeId) {
       const sw = this.store.findByCharge(chargeId);
       const host = this.store.findRoleSubscriptionByCharge("hosting", chargeId);
-      if (sw && host && sw.key === host.customerKey) return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId: sw.subscriptionId ?? host.subscriptionId ?? "", planKey: sw.planKey ?? "" };
+      if (sw && host && sw.key === host.customerKey) {
+        const boundSubscriptionId = sw.subscriptionId ?? host.subscriptionId ?? "";
+        const bound = this.store.getBundleSubscription(boundSubscriptionId);
+        if (bound) return { reservationId: bound.reservationId, customerId: customerId || bound.customerId, subscriptionId: boundSubscriptionId, planKey: bound.planKey, priceId: bound.priceId };
+        return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId: boundSubscriptionId, planKey: sw.planKey ?? "", priceId: sw.planKey ? cfg.stripe[ev.livemode ? "live" : "test"].priceIds[sw.planKey] ?? "" : "" };
+      }
     }
     return null;
   }
 
-  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string }): Promise<ApplyResult> {
+  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string }): Promise<ApplyResult> {
+    if (!bundle.subscriptionId || !bundle.customerId || !bundle.planKey || !bundle.priceId) return { outcome: "unclassified", note: "bundle event did not carry a complete subscription identity" };
+    const prior = this.store.getBundleSubscription(bundle.subscriptionId);
+    if (prior && (
+      prior.customerId !== bundle.customerId
+      || prior.planKey !== bundle.planKey
+      || prior.priceId !== bundle.priceId
+      || (bundle.reservationId && prior.reservationId && prior.reservationId !== bundle.reservationId)
+    )) return { outcome: "unclassified", note: "bundle event conflicts with the subscription's durable identity" };
+    const terminal = ev.type === "customer.subscription.deleted";
+    if (prior?.terminal && !terminal) return { outcome: "ignored", note: "bundle subscription already ended; later events cannot reactivate it" };
     const confirmed = ev.type === "checkout.session.async_payment_succeeded"
       || (ev.type === "checkout.session.completed" && checkoutFacts(ev.object).paymentStatus !== "unpaid")
       || ((ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded") && invoiceFacts(ev.object).paid);
-    if (bundle.reservationId && confirmed) {
-      if (!bundle.customerId || !bundle.subscriptionId || !this.onBundleEvent?.({ ...bundle, livemode: ev.livemode })) throw new Error("hosted bundle reservation could not be bound to the confirmed Stripe customer");
+    const knownSoftware = this.store.findBySubscription(bundle.subscriptionId);
+    const knownHosting = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
+    const hasEntitlements = !!knownSoftware || !!knownHosting;
+    const failed = ev.type === "invoice.payment_failed";
+    const statusUpdate = ev.type === "customer.subscription.updated";
+    const orderingRelevant = terminal || confirmed || failed || (statusUpdate && hasEntitlements);
+    const stale = !terminal && orderingRelevant && prior && ev.createdMs < prior.latestEventCreatedMs;
+    // A failed renewal can arrive before the older paid invoice that proves
+    // the initial term. Allow that one activation, then restore the newer
+    // past-due state; once records exist, stale paid events are inert.
+    const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
+    if (stale && !activatingBehindFailure) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+
+    const ledger = {
+      subscriptionId: bundle.subscriptionId,
+      reservationId: prior?.reservationId || bundle.reservationId,
+      customerId: bundle.customerId,
+      planKey: bundle.planKey,
+      priceId: bundle.priceId,
+      latestEventCreatedMs: orderingRelevant ? Math.max(prior?.latestEventCreatedMs ?? 0, ev.createdMs) : (prior?.latestEventCreatedMs ?? 0),
+      pendingStatus: failed ? "past_due" as const : (confirmed && !activatingBehindFailure ? null : prior?.pendingStatus ?? null),
+      terminal: terminal || prior?.terminal === true,
+      updatedAtMs: this.now(),
+    };
+    // A terminal record is written first and replayed idempotently. This
+    // prevents a paid event delivered after deletion (even with a later
+    // event id or timestamp) from creating either entitlement.
+    if (terminal) this.store.putBundleSubscription(ledger);
+    if (ledger.reservationId && (confirmed || terminal)) {
+      if (!this.onBundleEvent?.({ reservationId: ledger.reservationId, customerId: ledger.customerId, subscriptionId: ledger.subscriptionId, planKey: ledger.planKey, livemode: ev.livemode, terminal })) throw new Error("hosted bundle reservation could not be bound to the confirmed Stripe customer");
+    }
+    if (terminal && !this.store.findBySubscription(bundle.subscriptionId) && !this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId)) {
+      return { outcome: "applied", note: "bundle ended before activation; reservation closed and no entitlement issued" };
     }
     let software: ApplyResult;
     switch (ev.type) {
@@ -440,6 +503,13 @@ export class BillingService {
       default: return { outcome: "ignored", note: "bundle event type not handled" };
     }
     const hosting = this.applyHostingEvent(ev);
+    if (activatingBehindFailure) {
+      const softwareRec = this.store.findBySubscription(bundle.subscriptionId);
+      if (softwareRec) { softwareRec.subscriptionStatus = "past_due"; softwareRec.updatedAtMs = this.now(); this.store.putCustomer(softwareRec); }
+      const hostingRec = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
+      if (hostingRec) { hostingRec.subscriptionStatus = "past_due"; hostingRec.updatedAtMs = this.now(); this.saveHostingRecord(hostingRec); }
+    }
+    if (!terminal) this.store.putBundleSubscription(ledger);
     return {
       outcome: software.outcome === "applied" || hosting.outcome === "applied" ? "applied" : software.outcome,
       note: `bundle software: ${software.note ?? software.outcome}; hosting: ${hosting.note ?? hosting.outcome}`,
