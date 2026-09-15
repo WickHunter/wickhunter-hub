@@ -257,11 +257,14 @@ export class VultrProvider implements HostingProvider {
     const r = await this.call("GET", "/plans");
     if (r.status >= 300 || !Array.isArray(r.json?.plans)) throw new Error(`vultr listPlans: HTTP ${r.status} returned no plan list`);
     return r.json.plans.map((x: any) => {
-      const monthlyCost = Number(x.monthly_cost);
-      // A missing/malformed provider price must stay unknown upstream. Turning
-      // it into zero would make the spend ceiling approve real paid capacity
-      // as though it were free.
-      if (!Number.isFinite(monthlyCost) || monthlyCost <= 0) {
+      const rawCost = x.monthly_cost;
+      const validType = typeof rawCost === "number" ||
+        (typeof rawCost === "string" && /^\d+(?:\.\d+)?$/.test(rawCost.trim()));
+      const monthlyCost = validType ? Number(rawCost) : NaN;
+      const monthlyCostCents = Math.round(monthlyCost * 100);
+      // Vultr also lists free plans. A genuine zero is valid inventory, while
+      // absent or malformed prices must never become zero through coercion.
+      if (!Number.isFinite(monthlyCost) || monthlyCost < 0 || !Number.isSafeInteger(monthlyCostCents)) {
         throw new Error(`vultr listPlans: plan ${String(x.id ?? "<unknown>")} has an invalid monthly_cost`);
       }
       return {
@@ -269,7 +272,7 @@ export class VultrProvider implements HostingProvider {
         vcpus: Number(x.vcpu_count) || 0,
         ramMb: Number(x.ram) || 0,
         diskGb: Number(x.disk) || 0,
-        monthlyCostCents: Math.round(monthlyCost * 100),
+        monthlyCostCents,
       };
     });
   }

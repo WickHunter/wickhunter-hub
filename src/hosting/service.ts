@@ -201,6 +201,7 @@ export class HostingService {
       const match = (await provider.listPlans()).find((p) => p.id === policy.planId);
       if (!match) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan is unavailable from the provider" };
       quote = match.monthlyCostCents;
+      if (!Number.isSafeInteger(quote) || quote <= 0) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan must have a verified positive provider cost" };
     } catch {
       return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" };
     }
@@ -760,7 +761,7 @@ export class HostingService {
     // Quote capture updates this same row. Refresh before the stage/attempt
     // CAS or the stale version would make that mutation a silent no-op.
     row = this.store.getInstance(row.id) ?? row;
-    if (row.providerPlanMonthlyCostCents === null) throw new Error("provider price could not be verified — provisioning remains blocked");
+    if (row.providerPlanMonthlyCostCents === null || !Number.isSafeInteger(row.providerPlanMonthlyCostCents) || row.providerPlanMonthlyCostCents <= 0) throw new Error("provider price could not be verified — provisioning remains blocked");
     if (policy.monthlyPriceCents !== row.providerPlanMonthlyCostCents * 2) {
       this.failProvisioning(row, "advertised hosting price no longer equals twice the verified provider cost", nowMs);
       return;
@@ -912,6 +913,7 @@ export class HostingService {
       const plans = await provider.listPlans();
       const match = plans.find((p) => p.id === row.planId);
       if (!match) { this.log(`[hosting] ${row.id}: provider does not list plan "${row.planId}" — cost ceiling projection stays unknown for this instance`); return; }
+      if (!Number.isSafeInteger(match.monthlyCostCents) || match.monthlyCostCents <= 0) { this.log(`[hosting] ${row.id}: selected provider plan has no verified positive cost`); return; }
       const current = this.store.getInstance(row.id);
       if (current && current.providerPlanMonthlyCostCents === null) {
         this.store.updateInstance(current.id, current.version, (d) => { d.providerPlanMonthlyCostCents = match.monthlyCostCents; }, nowMs);
