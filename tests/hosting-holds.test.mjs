@@ -392,4 +392,19 @@ await test("POST …/hold and …/release-hold over HTTP, admin-token gated, wir
   await ctx.h.close();
 });
 
+await test("selected zero-cost plan refuses checkout before reservation or Stripe", async () => {
+  const provider = new FakeProvider();
+  provider.plans[0].monthlyCostCents = 0;
+  const ctx = await newHub({ provider });
+  try {
+    await softwareOnly(ctx, "cus_free", "free@example.com");
+    const result = await ctx.h.hub.hosting.checkoutUrl("cus_free", "free@example.com", ctx.getClock());
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "PROVISIONING_DISABLED");
+    assert.match(result.error, /positive provider cost/);
+    assert.equal(instancesFor(ctx, "cus_free").length, 0);
+    assert.equal(ctx.hostingCalls.length, 0);
+  } finally { await ctx.h.close(); }
+});
+
 summary("hosting-holds");
