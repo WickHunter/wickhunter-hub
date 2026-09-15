@@ -101,6 +101,9 @@ export interface BillingServiceDeps {
    *  for what that retry does (src/hosting/store.ts's `reserveInstance`),
    *  so retrying this hook is always safe. */
   onHostingEvent?: (customerKey: string, livemode: boolean) => void;
+  /** Atomically adopts the anonymous VPS reservation to the Stripe customer
+   * proved by a bundle webhook. Returning false makes Stripe retry. */
+  onBundleEvent?: (input: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; livemode: boolean }) => boolean;
 }
 
 export interface WebhookReply {
@@ -138,6 +141,7 @@ export class BillingService {
   private readonly log: (line: string) => void;
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
+  private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
 
   constructor(
     readonly dataDir: string,
@@ -152,6 +156,7 @@ export class BillingService {
     this.log = deps.log ?? ((line) => console.log(line));
     this.onRevoke = deps.onRevoke ?? (() => {});
     this.onHostingEvent = deps.onHostingEvent ?? (() => {});
+    this.onBundleEvent = deps.onBundleEvent;
   }
 
   /** The one write path for a hosting-role record: persists it exactly as
@@ -218,8 +223,9 @@ export class BillingService {
         licenseDays: p.licenseDays,
         lifetime: p.lifetime,
         description: p.description,
-        buyUrl: `${this.origin}/buy?plan=${encodeURIComponent(p.key)}`,
-        available: !!paymentLinkFor(cfg, cfg.mode, p.key),
+        checkout: p.checkout,
+        buyUrl: p.checkout === "payment-link" ? `${this.origin}/buy?plan=${encodeURIComponent(p.key)}` : null,
+        available: p.checkout === "payment-link" && !!paymentLinkFor(cfg, cfg.mode, p.key),
       })),
     };
   }
@@ -243,10 +249,14 @@ export class BillingService {
       }
       return { ok: false, status: 502, error: `Stripe request failed: ${(err as Error).message}` };
     }
-    const links: Record<string, string> = {};
-    for (const p of result.plans) links[p.key] = p.paymentLinkUrl;
+    const links: Record<string, string | null> = {};
+    const priceIds: Record<string, string> = {};
+    for (const p of result.plans) {
+      priceIds[p.key] = p.priceId;
+      links[p.key] = p.paymentLinkUrl || null;
+    }
     const first = cfg.plans[0]?.key;
-    this.updateConfig({ stripe: { [mode]: { paymentLinks: links, ...(!m.paymentLinkUrl && first && links[first] ? { paymentLinkUrl: links[first] } : {}) } } });
+    this.updateConfig({ stripe: { [mode]: { paymentLinks: links, priceIds, ...(!m.paymentLinkUrl && first && links[first] ? { paymentLinkUrl: links[first] } : {}) } } });
     this.log(`[billing] provisioned ${result.plans.length} plan(s) in Stripe ${mode}: ${result.plans.map((p) => `${p.key} ${p.linkCreated ? "created" : "reused"}`).join(", ")}`);
     return { ok: true, result };
   }
@@ -317,6 +327,9 @@ export class BillingService {
     const foreignFamilyNote = this.foreignProductFamilyNote(ev);
     if (foreignFamilyNote) return { outcome: "ignored", note: foreignFamilyNote };
 
+    const bundle = this.bundleIdentity(ev, cfg);
+    if (bundle) return this.applyBundleEvent(ev, cfg, bundle);
+
     // ── the billing-role dispatcher (H1) ────────────────────────────────────
     // Classify BEFORE touching any state. This is the fix: every handler
     // below this point used to run for EVERY event on EVERY customer,
@@ -367,6 +380,70 @@ export class BillingService {
       default:
         return { outcome: "ignored", note: "event type not handled" };
     }
+  }
+
+  private bundleIdentity(ev: StripeEvent, cfg: BillingConfig): { reservationId: string; customerId: string; subscriptionId: string; planKey: string } | null {
+    let metadata: Record<string, string> = {};
+    let customerId = "";
+    let subscriptionId = "";
+    let chargeId = "";
+    let observedPriceIds: string[] = [];
+    if (ev.type.startsWith("checkout.session.")) {
+      const f = checkoutFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId;
+    } else if (ev.type.startsWith("invoice.")) {
+      const f = invoiceFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; chargeId = f.chargeId || f.paymentIntentId; observedPriceIds = f.priceIds;
+    } else if (ev.type.startsWith("customer.subscription.")) {
+      const f = subscriptionFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; observedPriceIds = f.priceIds;
+    } else if (ev.type === "charge.dispute.created") {
+      const f = disputeFacts(ev.object); chargeId = f.chargeId || f.paymentIntentId;
+    } else if (ev.type.startsWith("charge.")) {
+      const f = chargeFacts(ev.object); customerId = f.customerId; chargeId = f.chargeId || f.paymentIntentId;
+    }
+    const plan = planByKey(cfg, metadata.plan);
+    if (metadata.bundle === "software-hosting-v1" && plan?.checkout === "hosted-bundle") {
+      const expectedPriceId = cfg.stripe[ev.livemode ? "live" : "test"].priceIds[plan.key];
+      if (!expectedPriceId || (observedPriceIds.length > 0 && !observedPriceIds.includes(expectedPriceId))) return null;
+      return { reservationId: metadata.reservation ?? "", customerId, subscriptionId, planKey: plan.key };
+    }
+    if (subscriptionId) {
+      const sw = this.store.findBySubscription(subscriptionId);
+      const host = this.store.findRoleSubscriptionBySubscription("hosting", subscriptionId);
+      if (sw && host && sw.key === host.customerKey) return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId, planKey: sw.planKey ?? "" };
+    }
+    if (chargeId) {
+      const sw = this.store.findByCharge(chargeId);
+      const host = this.store.findRoleSubscriptionByCharge("hosting", chargeId);
+      if (sw && host && sw.key === host.customerKey) return { reservationId: "", customerId: customerId || sw.stripeCustomerId, subscriptionId: sw.subscriptionId ?? host.subscriptionId ?? "", planKey: sw.planKey ?? "" };
+    }
+    return null;
+  }
+
+  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string }): Promise<ApplyResult> {
+    const confirmed = ev.type === "checkout.session.async_payment_succeeded"
+      || (ev.type === "checkout.session.completed" && checkoutFacts(ev.object).paymentStatus !== "unpaid")
+      || ((ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded") && invoiceFacts(ev.object).paid);
+    if (bundle.reservationId && confirmed) {
+      if (!bundle.customerId || !bundle.subscriptionId || !this.onBundleEvent?.({ ...bundle, livemode: ev.livemode })) throw new Error("hosted bundle reservation could not be bound to the confirmed Stripe customer");
+    }
+    let software: ApplyResult;
+    switch (ev.type) {
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded": software = await this.onCheckout(ev, cfg); break;
+      case "invoice.paid":
+      case "invoice.payment_succeeded": software = await this.onInvoicePaid(ev, cfg); break;
+      case "invoice.payment_failed": software = this.onInvoiceFailed(ev); break;
+      case "customer.subscription.updated": software = this.onSubscriptionUpdated(ev, cfg); break;
+      case "customer.subscription.deleted": software = this.onSubscriptionDeleted(ev); break;
+      case "charge.succeeded": software = this.onChargeSucceeded(ev); break;
+      case "charge.refunded": software = this.onRefund(ev, cfg); break;
+      case "charge.dispute.created": software = this.onDispute(ev, cfg); break;
+      default: return { outcome: "ignored", note: "bundle event type not handled" };
+    }
+    const hosting = this.applyHostingEvent(ev);
+    return {
+      outcome: software.outcome === "applied" || hosting.outcome === "applied" ? "applied" : software.outcome,
+      note: `bundle software: ${software.note ?? software.outcome}; hosting: ${hosting.note ?? hosting.outcome}`,
+    };
   }
 
   /** Every id the given ids array names, minus blanks — object ids arrive as
@@ -658,7 +735,8 @@ export class BillingService {
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "invoice carried neither a customer nor an email" };
     const now = this.now();
     const paidThrough = f.periodEndMs !== null ? f.periodEndMs + cfg.policy.graceDays * DAY_MS : null;
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey: null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
+    const planKey = this.planKeyOf(f.metadata, cfg);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
     if (paidThrough !== null) {
       if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;

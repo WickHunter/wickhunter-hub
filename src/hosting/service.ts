@@ -238,6 +238,89 @@ export class HostingService {
     return this.submitStripeCheckout(held, stripe.secretKey, nowMs);
   }
 
+  bundlePlans(): Array<{ key: string; interval: "month" | "year"; amountCents: number; currency: string }> {
+    return this.billing.config().plans
+      .filter((p) => p.checkout === "hosted-bundle" && (p.interval === "month" || p.interval === "year"))
+      .map((p) => ({ key: p.key, interval: p.interval as "month" | "year", amountCents: p.amountCents, currency: p.currency }));
+  }
+
+  bundleOfferIssue(): string | null {
+    const base = this.hostingOfferIssue();
+    if (base) return base;
+    const cfg = this.billing.config();
+    const plans = this.bundlePlans();
+    if (plans.length !== 2 || plans.filter((p) => p.interval === "month").length !== 1 || plans.filter((p) => p.interval === "year").length !== 1) return "monthly and yearly hosted bundle plans are not configured";
+    if (plans.find((p) => p.interval === "month")?.amountCents !== 11900 || plans.find((p) => p.interval === "year")?.amountCents !== 93900) return "hosted bundle prices do not match the approved offer";
+    if (plans.some((p) => !cfg.stripe[cfg.mode].priceIds[p.key])) return "hosted bundle Stripe prices are not configured";
+    return null;
+  }
+
+  /** Anonymous bundle checkout uses a browser-stable attempt id, never an
+   * email lookup. Stripe supplies the customer id in its signed webhook. */
+  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now()): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
+    const issue = this.bundleOfferIssue();
+    if (issue) return { ok: false, code: "PROVISIONING_DISABLED", error: issue };
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(attemptId)) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkoutAttemptId is malformed" };
+    const cfg = this.billing.config();
+    const policy = this.policy();
+    const plan = cfg.plans.find((p) => p.checkout === "hosted-bundle" && p.interval === interval)!;
+    const priceId = cfg.stripe[cfg.mode].priceIds[plan.key]!;
+    const ownerId = `bundle:${hashBootstrapToken(`${cfg.mode}:${attemptId}`).slice(0, 48)}`;
+    const existing = this.store.activeInstanceForOwner(ownerId, cfg.mode);
+    const pricing = { amountCents: plan.amountCents, currency: plan.currency, interval, softwareDays: interval === "month" ? 30 : 365, maximumConnectedAccounts: policy.maximumConnectedAccounts };
+    if (existing) {
+      if (existing.stage === "ordered" && existing.checkoutExpiresAtMs != null && nowMs < existing.checkoutExpiresAtMs && existing.checkoutRequestBody && existing.checkoutIdempotencyKey) {
+        if (existing.checkoutUrl) return { ok: true, value: { url: existing.checkoutUrl, pricing } };
+        const retry = await this.submitStripeCheckout(existing, cfg.stripe[cfg.mode].secretKey, nowMs);
+        return retry.ok ? { ok: true, value: { url: retry.value.url, pricing } } : retry;
+      }
+      return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already in use" };
+    }
+    const provider = this.provider()!;
+    let quote: number;
+    try {
+      const match = (await provider.listPlans()).find((p) => p.id === policy.planId);
+      if (!match) return { ok: false, code: "PROVISIONING_DISABLED", error: "the configured hosting plan is unavailable from the provider" };
+      quote = match.monthlyCostCents;
+    } catch { return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" }; }
+    if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
+    const ceiling = this.costCeilingRefusalWithQuote(quote, policy);
+    if (ceiling) return { ok: false, code: "PROVISIONING_DISABLED", error: ceiling };
+    const verified = await this.verifyStripeRecurringPrice(cfg.stripe[cfg.mode].secretKey, priceId, plan.amountCents, plan.currency, interval);
+    if (!verified.ok) return { ok: false, code: "PROVISIONING_DISABLED", error: verified.error };
+    if (this.costCeilingRefusalWithQuote(quote, policy)) return { ok: false, code: "PROVISIONING_DISABLED", error: "the provider cost ceiling has been reached" };
+    const reservation = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment: cfg.mode, region: policy.regions[0]?.id ?? "nrt", planId: policy.planId, stripeCustomerId: "", nowMs });
+    if (!reservation) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt already exists" };
+    const expiresAtMs = nowMs + 31 * 60_000;
+    const body = new URLSearchParams({
+      mode: "subscription", client_reference_id: reservation.id,
+      "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
+      success_url: `${cfg.siteOrigin || this.origin}/thanks/?hosting=bundle-success`,
+      cancel_url: `${cfg.siteOrigin || this.origin}/pricing/?hosting=bundle-cancelled`,
+      "metadata[plan]": plan.key, "metadata[bundle]": "software-hosting-v1", "metadata[reservation]": reservation.id,
+      "subscription_data[metadata][plan]": plan.key, "subscription_data[metadata][bundle]": "software-hosting-v1", "subscription_data[metadata][reservation]": reservation.id,
+      expires_at: String(Math.floor(expiresAtMs / 1000)),
+    }).toString();
+    const held = this.store.updateInstance(reservation.id, reservation.version, (d) => {
+      d.providerPlanMonthlyCostCents = quote; d.checkoutExpiresAtMs = expiresAtMs;
+      d.checkoutIdempotencyKey = `wh-bundle-${hashBootstrapToken(`${cfg.mode}:${reservation.id}`).slice(0, 40)}`;
+      d.checkoutRequestBody = body;
+    }, nowMs);
+    if (!held) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkout reservation could not be saved" };
+    const submitted = await this.submitStripeCheckout(held, cfg.stripe[cfg.mode].secretKey, nowMs);
+    return submitted.ok ? { ok: true, value: { url: submitted.value.url, pricing } } : submitted;
+  }
+
+  acceptBundleReservation(reservationId: string, customerId: string, subscriptionId: string, planKey: string, livemode: boolean, nowMs = this.now()): boolean {
+    if (!/^host_[A-Za-z0-9_-]+$/.test(reservationId) || !/^cus_[A-Za-z0-9_]+$/.test(customerId)) return false;
+    const row = this.store.getInstance(reservationId);
+    if (!row || row.environment !== (livemode ? "live" : "test") || !row.ownerId.startsWith("bundle:")) return row?.ownerId === customerId && row.stripeSubscriptionId === subscriptionId;
+    if (!row.checkoutRequestBody) return false;
+    const request = new URLSearchParams(row.checkoutRequestBody);
+    if (request.get("metadata[plan]") !== planKey || request.get("subscription_data[metadata][plan]") !== planKey || request.get("metadata[reservation]") !== reservationId) return false;
+    return this.store.adoptBundleReservation(row.id, row.ownerId, customerId, subscriptionId, nowMs) !== null;
+  }
+
   private async submitStripeCheckout(reservation: HostingInstanceRow, secretKey: string, nowMs: number): Promise<HostingActionResult<{ url: string }>> {
     try {
       const response = await this.stripeFetch("https://api.stripe.com/v1/checkout/sessions", {
@@ -263,14 +346,18 @@ export class HostingService {
   }
 
   private async verifyStripeHostingPrice(secretKey: string, priceId: string, policy: HostingPolicy): Promise<{ ok: true } | { ok: false; error: string }> {
+    return this.verifyStripeRecurringPrice(secretKey, priceId, policy.monthlyPriceCents, policy.currency, "month");
+  }
+
+  private async verifyStripeRecurringPrice(secretKey: string, priceId: string, amountCents: number, currency: string, interval: "month" | "year"): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
       const response = await this.stripeFetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(priceId)}`, { method: "GET", headers: { authorization: `Bearer ${secretKey}` }, body: undefined });
       const p = JSON.parse(await response.text()) as any;
-      if (!response.ok || p.id !== priceId || p.active !== true || p.unit_amount !== policy.monthlyPriceCents || p.currency !== policy.currency || p.type !== "recurring" || p.recurring?.interval !== "month" || p.recurring?.interval_count !== 1) {
-        return { ok: false, error: "the classified Stripe hosting price does not match the advertised monthly price" };
+      if (!response.ok || p.id !== priceId || p.active !== true || p.unit_amount !== amountCents || p.currency !== currency || p.type !== "recurring" || p.recurring?.interval !== interval || p.recurring?.interval_count !== 1) {
+        return { ok: false, error: "the classified Stripe price does not match the advertised recurring price" };
       }
       return { ok: true };
-    } catch { return { ok: false, error: "the classified Stripe hosting price could not be verified" }; }
+    } catch { return { ok: false, error: "the classified Stripe price could not be verified" }; }
   }
 
   // ── the derive-from-billing-record reconciliation (the whole engine) ────

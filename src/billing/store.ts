@@ -179,6 +179,12 @@ export class BillingStore {
     return null;
   }
 
+  findBySubscription(id: string): CustomerRecord | null {
+    if (!id) return null;
+    for (const rec of Object.values(this.customers())) if (rec.subscriptionId === id) return rec;
+    return null;
+  }
+
   findByEmail(email: string): CustomerRecord | null {
     const e = email.trim().toLowerCase();
     if (!e) return null;
@@ -208,6 +214,12 @@ export class BillingStore {
   findRoleSubscriptionByCharge(role: BillingRole, id: string): RoleSubscriptionRecord | null {
     if (!id) return null;
     for (const rec of Object.values(this.roleSubscriptions())) if (rec.role === role && rec.chargeIds.includes(id)) return rec;
+    return null;
+  }
+
+  findRoleSubscriptionBySubscription(role: BillingRole, id: string): RoleSubscriptionRecord | null {
+    if (!id) return null;
+    for (const rec of Object.values(this.roleSubscriptions())) if (rec.role === role && rec.subscriptionId === id) return rec;
     return null;
   }
 

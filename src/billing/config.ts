@@ -65,15 +65,18 @@ export interface Plan {
    *  type is classified from real price/product ids instead and never
    *  consults this field. */
   role: BillingRole;
+  /** Reserved Checkout Session that also allocates one managed VPS. These
+   * plans never receive a shareable Payment Link and `/buy` refuses them. */
+  checkout: "payment-link" | "hosted-bundle";
 }
 
 export const MAX_LICENSE_DAYS = 3650;
 export const PLAN_KEY_RE = /^[a-z][a-z0-9-]{0,23}$/;
 
 const DEFAULT_PLAN_LIST: Plan[] = [
-  { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time.", role: "software" },
-  { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free.", role: "software" },
-  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment.", role: "software" },
+  { key: "monthly", name: "Monthly", amountCents: 9900, currency: "usd", interval: "month", licenseDays: null, lifetime: false, description: "Billed monthly. Cancel any time.", role: "software", checkout: "payment-link" },
+  { key: "yearly", name: "Yearly", amountCents: 69900, currency: "usd", interval: "year", licenseDays: null, lifetime: false, description: "Billed yearly. Two months free.", role: "software", checkout: "payment-link" },
+  { key: "lifetime", name: "Lifetime", amountCents: 99900, currency: "usd", interval: null, licenseDays: MAX_LICENSE_DAYS, lifetime: true, description: "One payment.", role: "software", checkout: "payment-link" },
 ];
 export const DEFAULT_PLANS: readonly Plan[] = Object.freeze(DEFAULT_PLAN_LIST.map((p) => Object.freeze({ ...p })));
 
@@ -92,6 +95,9 @@ export interface StripeModeConfig {
   /** Payment Link per plan key (`/buy?plan=<key>`). `paymentLinkFor` reads
    *  this first and falls back to `paymentLinkUrl` for the first plan. */
   paymentLinks: Record<string, string>;
+  /** Exact Stripe price id created for each plan. Public identifiers, used
+   * to build non-shareable hosted-bundle Checkout Sessions. */
+  priceIds: Record<string, string>;
   /** Stripe's no-code Customer Portal login link, the `/billing` fallback. */
   portalUrl: string;
 }
@@ -140,7 +146,7 @@ export interface BillingConfig {
   updatedAtMs: number | null;
 }
 
-const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhookSecret: "", paymentLinkUrl: "", paymentLinks: {}, portalUrl: "" };
+const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhookSecret: "", paymentLinkUrl: "", paymentLinks: {}, priceIds: {}, portalUrl: "" };
 const EMPTY_ROLES: ModeRoleConfig = { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } };
 
 export const DEFAULT_BILLING_POLICY: BillingPolicy = {
@@ -158,7 +164,7 @@ export function defaultBillingConfig(): BillingConfig {
     v: 1,
     mode: "test",
     plans: clonePlans(DEFAULT_PLANS),
-    stripe: { test: { ...EMPTY_MODE, paymentLinks: {} }, live: { ...EMPTY_MODE, paymentLinks: {} } },
+    stripe: { test: { ...EMPTY_MODE, paymentLinks: {}, priceIds: {} }, live: { ...EMPTY_MODE, paymentLinks: {}, priceIds: {} } },
     email: { provider: "none", apiKey: "", from: "", replyTo: "" },
     policy: { ...DEFAULT_BILLING_POLICY },
     roles: { test: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } }, live: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } } },
@@ -185,12 +191,16 @@ function modeFrom(raw: unknown): StripeModeConfig {
   const links: Record<string, string> = {};
   const rawLinks = (o.paymentLinks && typeof o.paymentLinks === "object" ? o.paymentLinks : {}) as Record<string, unknown>;
   for (const [k, v] of Object.entries(rawLinks)) if (PLAN_KEY_RE.test(k) && typeof v === "string" && v) links[k] = v;
+  const priceIds: Record<string, string> = {};
+  const rawPriceIds = (o.priceIds && typeof o.priceIds === "object" ? o.priceIds : {}) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(rawPriceIds)) if (PLAN_KEY_RE.test(k) && isStripePriceId(v)) priceIds[k] = v;
   return {
     publishableKey: str(o.publishableKey),
     secretKey: str(o.secretKey),
     webhookSecret: str(o.webhookSecret),
     paymentLinkUrl: str(o.paymentLinkUrl),
     paymentLinks: links,
+    priceIds,
     portalUrl: str(o.portalUrl),
   };
 }
@@ -341,7 +351,10 @@ export function validatePlans(raw: unknown): Plan[] {
     // a mistake should be reported, not guessed past.
     const role = o.role === undefined ? "software" : o.role === "software" || o.role === "hosting" ? o.role : "bad";
     if (role === "bad") throw new BillingConfigError(`plan ${key}: role must be "software" or "hosting"`);
-    out.push({ key, name, amountCents: amount as number, currency, interval, licenseDays, lifetime, description, role });
+    const checkout = o.checkout === undefined || o.checkout === "payment-link" ? "payment-link" : o.checkout === "hosted-bundle" ? "hosted-bundle" : "bad";
+    if (checkout === "bad") throw new BillingConfigError(`plan ${key}: checkout must be "payment-link" or "hosted-bundle"`);
+    if (checkout === "hosted-bundle" && (role !== "software" || !interval || lifetime)) throw new BillingConfigError(`plan ${key}: a hosted bundle must be a recurring software plan`);
+    out.push({ key, name, amountCents: amount as number, currency, interval, licenseDays, lifetime, description, role, checkout });
   }
   return out;
 }
@@ -351,7 +364,8 @@ export function validatePlans(raw: unknown): Plan[] {
 export function paymentLinkFor(cfg: BillingConfig, mode: BillingMode, planKey: string | null | undefined): string {
   const m = cfg.stripe[mode];
   const key = planKey && PLAN_KEY_RE.test(planKey) ? planKey : cfg.plans[0]?.key ?? "monthly";
-  if (!cfg.plans.some((p) => p.key === key)) return "";
+  const plan = cfg.plans.find((p) => p.key === key);
+  if (!plan || plan.checkout === "hosted-bundle") return "";
   return m.paymentLinks[key] || (key === cfg.plans[0]?.key ? m.paymentLinkUrl : "");
 }
 
@@ -364,7 +378,7 @@ function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unk
   if (!patch || typeof patch !== "object") throw new BillingConfigError(`stripe.${mode} must be an object`);
   const p = patch as Record<string, unknown>;
   const label = mode === "test" ? "Test" : "Live";
-  const next: StripeModeConfig = { ...current };
+  const next: StripeModeConfig = { ...current, paymentLinks: { ...current.paymentLinks }, priceIds: { ...current.priceIds } };
   if (p.publishableKey !== undefined) {
     if (typeof p.publishableKey !== "string") throw new BillingConfigError(`${label} publishable key must be a string`);
     next.publishableKey = keyWithPrefix(p.publishableKey, [`pk_${mode}_`], `${label} publishable key`);
@@ -389,6 +403,17 @@ function applyModePatch(mode: BillingMode, current: StripeModeConfig, patch: unk
       links[k] = httpsUrl(v, `${label} Payment Link for ${k}`);
     }
     next.paymentLinks = links;
+  }
+  if (p.priceIds !== undefined) {
+    if (!p.priceIds || typeof p.priceIds !== "object" || Array.isArray(p.priceIds)) throw new BillingConfigError(`${label} priceIds must be an object of plan key to Stripe price id`);
+    const ids = { ...current.priceIds };
+    for (const [k, v] of Object.entries(p.priceIds as Record<string, unknown>)) {
+      if (!PLAN_KEY_RE.test(k)) throw new BillingConfigError(`${label} priceIds: ${JSON.stringify(k)} is not a plan key`);
+      if (v === null || v === "") { delete ids[k]; continue; }
+      if (!isStripePriceId(v)) throw new BillingConfigError(`${label} priceIds.${k} must be a Stripe price id or null`);
+      ids[k] = v;
+    }
+    next.priceIds = ids;
   }
   return next;
 }
@@ -442,8 +467,8 @@ export function applyBillingPatch(current: BillingConfig, patch: Record<string, 
     ...current,
     plans: clonePlans(current.plans),
     stripe: {
-      test: { ...current.stripe.test, paymentLinks: { ...current.stripe.test.paymentLinks } },
-      live: { ...current.stripe.live, paymentLinks: { ...current.stripe.live.paymentLinks } },
+      test: { ...current.stripe.test, paymentLinks: { ...current.stripe.test.paymentLinks }, priceIds: { ...current.stripe.test.priceIds } },
+      live: { ...current.stripe.live, paymentLinks: { ...current.stripe.live.paymentLinks }, priceIds: { ...current.stripe.live.priceIds } },
     },
     roles: {
       test: { software: { ...current.roles.test.software }, hosting: { ...current.roles.test.hosting } },
@@ -537,10 +562,11 @@ export function maskedBillingConfig(cfg: BillingConfig, publicOrigin: string, re
     webhookSecret: maskSecret(m.webhookSecret),
     paymentLinkUrl: m.paymentLinkUrl,
     paymentLinks: { ...m.paymentLinks },
+    priceIds: { ...m.priceIds },
     portalUrl: m.portalUrl,
   });
   const buyPlans: Record<string, string> = {};
-  for (const p of cfg.plans) buyPlans[p.key] = `${origin}/buy?plan=${encodeURIComponent(p.key)}`;
+  for (const p of cfg.plans) if (p.checkout === "payment-link") buyPlans[p.key] = `${origin}/buy?plan=${encodeURIComponent(p.key)}`;
   const ready: BillingReadiness = {
     stripeTest: stripeModeReady(cfg.stripe.test),
     stripeLive: stripeModeReady(cfg.stripe.live),

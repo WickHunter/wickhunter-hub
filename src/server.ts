@@ -372,6 +372,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
+    onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode) ?? false,
   });
   // ── Unleashed VPS Hosting (H4/H5/H6) ──────────────────────────────────────
   const hosting = new HostingService(cfg.dataDir, billing, store, cfg.publicOrigin, {
@@ -581,6 +582,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // callback (an instance-scoped credential, like the welcome/install
       // token routes above it).
       if (p === "/api/hosting/checkout") return true;
+      if (p === "/api/hosting/bundle-checkout") return true;
       if (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal"))) return true;
       if (p.startsWith("/api/hosting/instances/") && (p.endsWith("/installer") || p.endsWith("/readiness"))) return true;
       return false;
@@ -604,6 +606,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const url = new URL(req.url ?? "/", "http://hub.invalid");
     const p = url.pathname;
     const m = req.method ?? "GET";
+
+    if (m === "OPTIONS" && p === "/api/hosting/bundle-checkout") {
+      res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "access-control-max-age": "600" });
+      res.end();
+      return;
+    }
 
     // ── pre-dispatch rate limiting ──────────────────────────────────────
     // Checked before ANY route-specific work — a refusal here never reads a
@@ -657,6 +665,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const plan = planKey ? billing.plan(planKey) : null;
       if (planKey && !plan) return sendText(res, 404, "unknown plan");
       if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
+      if (plan?.checkout === "hosted-bundle") return sendText(res, 403, "hosted bundles require a reserved Checkout Session");
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
     // The website reads prices from here, so a price change on the Hub shows
@@ -684,6 +693,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p === "/api/hosting/options") return hostingOptions(res);
     if (m === "GET" && p === "/api/hosting") return hostingState(req, res);
     if (m === "POST" && p === "/api/hosting/checkout") return hostingCheckout(req, res);
+    if (m === "POST" && p === "/api/hosting/bundle-checkout") return hostingBundleCheckout(req, res);
     if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/cancel")) return hostingCancel(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/resume-renewal")) return hostingResumeRenewal(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/installer")) return hostingInstaller(req, res, p);
@@ -1323,6 +1333,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       maximumConnectedAccounts: policy.maximumConnectedAccounts,
       managedBackupsIncluded: policy.managedBackupsIncluded,
       purchasable: offerIssue === null,
+      bundleEnabled: hosting.bundleOfferIssue() === null,
+      bundles: hosting.bundlePlans(),
     }, { "access-control-allow-origin": "*", "cache-control": "no-store" });
   }
 
@@ -1352,6 +1364,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const r = await hosting.checkoutUrl(ownerId, identity.email);
     if (!r.ok) return sendJson(res, r.code === "SOFTWARE_LICENSE_REQUIRED" ? 403 : r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, url: r.value.url }, { "cache-control": "no-store" });
+  }
+
+  async function hostingBundleCheckout(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const headers = { "cache-control": "no-store", "access-control-allow-origin": "*" };
+    const body = await readJsonBody(req);
+    const plan = body?.plan;
+    const checkoutAttemptId = body?.checkoutAttemptId;
+    if ((plan !== "monthly" && plan !== "yearly") || typeof checkoutAttemptId !== "string") return sendJson(res, 400, { ok: false, error: "expected {plan: monthly|yearly, checkoutAttemptId}" }, headers);
+    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId);
+    if (!r.ok) return sendJson(res, r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, headers);
+    sendJson(res, 200, { ok: true, url: r.value.url, pricing: r.value.pricing }, headers);
   }
 
   async function hostingCancel(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
