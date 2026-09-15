@@ -8,7 +8,32 @@ import { spawnSync } from "node:child_process";
 import { freshHub, test, summary } from "./helpers.mjs";
 import { exceptionEmail } from "../dist/src/hosting/emails.js";
 import { VultrProvider } from "../dist/src/hosting/provider.js";
-import { HostingService } from "../dist/src/hosting/service.js";
+import { fetchBoundedPublicHealth, HostingService } from "../dist/src/hosting/service.js";
+
+await test("public health transport refuses redirects and streamed bodies over 4096 bytes", async () => {
+  let redirectMode = null;
+  await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", new AbortController().signal, async (_url, init) => {
+    redirectMode = init.redirect;
+    return { redirected: true, url: "https://attacker.example/", headers: new Headers(), body: null, ok: true, status: 200 };
+  }), /redirected/);
+  assert.equal(redirectMode, "error");
+  const oversized = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(3000)); controller.enqueue(new Uint8Array(2000)); controller.close(); } });
+  await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", new AbortController().signal, async () => new Response(oversized, { status: 200 })), /exceeds limit/);
+});
+
+await test("public health deadline aborts both response headers and body reads", async () => {
+  const abortingCall = async (fetcher) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("health deadline")), 20);
+    try { await assert.rejects(() => fetchBoundedPublicHealth("https://192.0.2.1/api/health", controller.signal, fetcher), /health deadline/); }
+    finally { clearTimeout(timer); }
+  };
+  await abortingCall(async (_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true })));
+  await abortingCall(async (_url, init) => ({
+    redirected: false, url: "https://192.0.2.1/api/health", headers: new Headers(), ok: true, status: 200,
+    body: { getReader: () => ({ read: () => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true })), cancel: async () => {} }) },
+  }));
+});
 
 await test("personalized installer generates credentials without a controlling terminal", () => {
   const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");

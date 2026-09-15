@@ -29,6 +29,7 @@ async function newHub(overrides = {}) {
       if (url.endsWith("/v1/checkout/sessions")) return { ok: true, status: 200, text: async () => JSON.stringify({ url: "https://checkout.stripe.com/c/pay_test" }) };
       return { ok: true, status: 200, text: async () => "{}" };
     }),
+    hostingPublicHealthFetch: overrides.publicHealthFetch ?? (async () => ({ ok: true, status: 200, body: JSON.stringify({ ok: true, version: "0.90.93" }) })),
     hostingProvider: provider,
   });
   const admin = (p, opts = {}) => jsonReq(`${h.origin}${p}`, { ...opts, headers: { "x-hub-admin": "test-admin-token", "content-type": "application/json", ...(opts.headers ?? {}) } });
@@ -196,13 +197,38 @@ await test("readiness: all venues ok -> stage becomes ready, and the installatio
   const rawToken = "tok-ok";
   ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; }, ctx.getClock());
   row = ctx.h.hub.hosting.store.getInstance(row.id);
+  // Vultr commonly returns the create response before main_ip is assigned.
+  // Model the exact real workflow: the durable row still has no address,
+  // while a later provider read does.
+  ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.ip = null; d.appUrl = null; }, ctx.getClock());
+  row = ctx.h.hub.hosting.store.getInstance(row.id);
   const results = ["bybit", "binance", "bitget", "bitunix", "blofin", "weex", "aster"].map((venueId) => ({ venueId, status: 200 }));
   const r = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${row.id}/readiness`, { method: "POST", body: JSON.stringify({ token: rawToken, generation: row.generation, results }) });
   assert.equal(r.body.ready, true);
   row = ctx.h.hub.hosting.store.getInstance(row.id);
   assert.equal(row.stage, "ready");
+  assert.equal(row.ip, "203.0.113.1", "readiness refreshes the provider-assigned address instead of preserving create-time null");
+  assert.equal(row.appUrl, "https://203.0.113.1/");
   const jobs = ctx.h.hub.hosting.store.outboxFor(row.id);
   assert.ok(jobs.some((j) => j.jobType === "email" && j.dedupeKey.includes("ready") && j.status === "pending"));
+  await ctx.h.close();
+});
+
+await test("readiness refuses to advertise or email an address whose public HTTPS health is not verified", async () => {
+  const ctx = await newHub({ publicHealthFetch: async () => ({ ok: false, status: 503, body: "TLS unavailable" }) });
+  const [ordered] = await boughtHosting(ctx, "cus_no_https", "no-https@example.com");
+  await ctx.h.hub.hosting.tick(ctx.getClock());
+  let row = ctx.h.hub.hosting.store.getInstance(ordered.id);
+  const rawToken = "tok-no-public-https";
+  ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.bootstrapTokenHash = hashBootstrapToken(rawToken); d.bootstrapTokenExpiresAtMs = ctx.getClock() + HOUR; d.ip = null; d.appUrl = null; }, ctx.getClock());
+  row = ctx.h.hub.hosting.store.getInstance(row.id);
+  const results = ["bybit", "binance", "bitget", "bitunix", "blofin", "weex", "aster"].map((venueId) => ({ venueId, status: 200 }));
+  const response = await jsonReq(`${ctx.h.origin}/api/hosting/instances/${row.id}/readiness`, { method: "POST", body: JSON.stringify({ token: rawToken, generation: row.generation, results }) });
+  assert.equal(response.status, 503);
+  row = ctx.h.hub.hosting.store.getInstance(row.id);
+  assert.equal(row.stage, "bootstrapping");
+  assert.equal(row.ip, null); assert.equal(row.appUrl, null);
+  assert.equal(ctx.h.hub.hosting.store.outboxFor(row.id).filter((j) => j.dedupeKey.includes("email:ready")).length, 0);
   await ctx.h.close();
 });
 

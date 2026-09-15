@@ -29,6 +29,7 @@
 // target state from the same source record is a no-op against a row
 // already in that state).
 import { randomBytes as nodeRandomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import type { BillingService } from "../billing/service.js";
 import type { RoleSubscriptionRecord } from "../billing/store.js";
 import type { EmailConfig } from "../billing/config.js";
@@ -46,11 +47,39 @@ const HOUR = 60 * 60 * 1000;
 const MAX_PROVISION_ATTEMPTS = 3;
 const LEASE_TTL_MS = 2 * 60_000;
 const PROVISION_RETRY_BACKOFF_MS = 30_000;
+const PUBLIC_HEALTH_MAX_BYTES = 4096;
 
 const realFetch: EmailFetch = async (url, init) => {
   const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
   return { ok: res.ok, status: res.status, text: () => res.text() };
 };
+
+export interface PublicHealthResponse { ok: boolean; status: number; body: string }
+export type PublicHealthFetch = (url: string, signal: AbortSignal) => Promise<PublicHealthResponse>;
+
+/** Dedicated transport for the customer-controlled public endpoint. It
+ * never follows redirects and stops reading as soon as the tiny health
+ * response exceeds its cap; the caller's AbortSignal covers both headers
+ * and streamed body reads. */
+export async function fetchBoundedPublicHealth(url: string, signal: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<PublicHealthResponse> {
+  const response = await fetchImpl(url, { method: "GET", redirect: "error", signal });
+  if (response.redirected || (response.url && response.url !== url)) throw new Error("public health redirected");
+  const declared = response.headers.get("content-length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > PUBLIC_HEALTH_MAX_BYTES)) throw new Error("public health body exceeds limit");
+  const reader = response.body?.getReader();
+  if (!reader) return { ok: response.ok, status: response.status, body: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > PUBLIC_HEALTH_MAX_BYTES) { await reader.cancel(); throw new Error("public health body exceeds limit"); }
+    chunks.push(value);
+  }
+  return { ok: response.ok, status: response.status, body: Buffer.concat(chunks.map((x) => Buffer.from(x))).toString("utf8") };
+}
 
 export interface HostingServiceDeps {
   now?: () => number;
@@ -62,6 +91,7 @@ export interface HostingServiceDeps {
    *  a provider that refuses every call until one is. */
   provider?: HostingProvider;
   stripeTimeoutMs?: number;
+  publicHealthFetch?: PublicHealthFetch;
 }
 
 export type HostingActionError =
@@ -94,6 +124,7 @@ export class HostingService {
   private readonly randomBytes: (n: number) => Buffer;
   private readonly injectedProvider: HostingProvider | undefined;
   private readonly stripeTimeoutMs: number;
+  private readonly publicHealthFetch: PublicHealthFetch;
 
   constructor(
     readonly dataDir: string,
@@ -109,6 +140,7 @@ export class HostingService {
     this.randomBytes = deps.randomBytes ?? nodeRandomBytes;
     this.injectedProvider = deps.provider;
     this.stripeTimeoutMs = deps.stripeTimeoutMs ?? 20_000;
+    this.publicHealthFetch = deps.publicHealthFetch ?? fetchBoundedPublicHealth;
   }
 
   policy(): HostingPolicy {
@@ -689,25 +721,37 @@ export class HostingService {
    *  comparing the presented generation against the row's CURRENT one
    *  (H6: "late callbacks from a failed/replaced instance must not mark
    *  the replacement ready"). */
-  reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): HostingActionResult<{ ready: boolean }> {
-    let row = this.store.getInstance(instanceId);
+  async reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): Promise<HostingActionResult<{ ready: boolean }>> {
+    const row = this.store.getInstance(instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
     if (managementCounter !== undefined) {
       if (row.stage !== "restoring" || row.generation !== generation || !Number.isSafeInteger(managementCounter) || managementCounter <= row.managementCounter || !row.managementTokenHash || hashBootstrapToken(presentedToken) !== row.managementTokenHash) {
         return { ok: false, code: "NOT_FOUND", error: "invalid or replayed management readiness proof" };
       }
-      const counted = this.store.updateInstance(row.id, row.version, (d) => { d.managementCounter = managementCounter; }, nowMs);
-      if (!counted) return { ok: false, code: "NOT_FOUND", error: "changed underneath the management readiness proof" };
-      row = counted;
     } else {
       const authenticated = this.authenticatedBootstrapOwner(instanceId, presentedToken, generation, nowMs);
       if (!authenticated.ok) return authenticated;
     }
     const policy = this.policy();
     const verdict = readinessVerdict(policy.probeVenues, results);
+    let providerIp: string | null = null;
+    if (verdict.ready) {
+      const provider = this.provider();
+      if (!provider || !row.providerInstanceId) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider identity is unavailable; readiness will retry" };
+      try {
+        const providerRow = await provider.getInstance(row.providerInstanceId);
+        providerIp = providerRow?.mainIp?.trim() || null;
+      } catch {
+        return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider address could not be refreshed; readiness will retry" };
+      }
+      if (!providerIp || isIP(providerIp) === 0) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "provider has not assigned a valid server address yet; readiness will retry" };
+      if (!(await this.publicHealthReady(providerIp))) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the server's public HTTPS health check is not ready; readiness will retry" };
+    }
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      if (managementCounter !== undefined) d.managementCounter = managementCounter;
       d.readiness = { checkedAtMs: nowMs, ready: verdict.ready, refusals: verdict.refusals, regionTried: d.region };
       d.lastProviderCheckAtMs = nowMs;
+      if (providerIp) { d.ip = providerIp; d.appUrl = `https://${providerIp}/`; }
     }, nowMs);
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
     if (verdict.ready) {
@@ -721,6 +765,26 @@ export class HostingService {
       this.handleReadinessRefusal(fresh, verdict, policy, nowMs);
     }
     return { ok: true, value: { ready: verdict.ready } };
+  }
+
+  /** A callback from inside the VPS is not enough to advertise an address
+   * to the customer. Re-read the provider-assigned IP, then prove that the
+   * same public HTTPS endpoint completes a normally verified TLS request
+   * and serves the app's deliberately minimal health document. */
+  private async publicHealthReady(ip: string): Promise<boolean> {
+    const host = ip.includes(":") ? `[${ip}]` : ip;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.stripeTimeoutMs);
+    try {
+      const response = await this.publicHealthFetch(`https://${host}/api/health`, controller.signal);
+      if (!response.ok || response.status !== 200) return false;
+      const parsed = JSON.parse(response.body) as Record<string, unknown>;
+      return parsed.ok === true && typeof parsed.version === "string" && parsed.version.length > 0 && parsed.version.length <= 40;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private markReady(row: HostingInstanceRow, nowMs: number): void {

@@ -287,6 +287,7 @@ export interface HubDeps {
   hostingFetch?: HostingServiceDeps["fetchLike"];
   hostingRandomBytes?: HostingServiceDeps["randomBytes"];
   hostingProvider?: HostingServiceDeps["provider"];
+  hostingPublicHealthFetch?: HostingServiceDeps["publicHealthFetch"];
 }
 
 export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
@@ -380,6 +381,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     fetchLike: deps.hostingFetch,
     randomBytes: deps.hostingRandomBytes,
     provider: deps.hostingProvider,
+    publicHealthFetch: deps.hostingPublicHealthFetch,
   });
   hostingRef = hosting;
   // ── customer sessions: one central sign-in, downstream of a real billing
@@ -1446,8 +1448,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (status === null) continue;
       results.push({ venueId: (r as any).venueId, outcome: classifyProbeStatus(status) });
     }
-    const r = hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter);
-    if (!r.ok) return sendJson(res, 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    const r = await hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter);
+    if (!r.ok) return sendJson(res, r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, ready: r.value.ready }, { "cache-control": "no-store" });
   }
 
