@@ -7,6 +7,9 @@
 // processes on the box can read via /proc.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { test, summary } from "./helpers.mjs";
 import { buildBootstrapUserData } from "../dist/src/hosting/bootstrap.js";
 import { DEFAULT_PROBE_VENUES } from "../dist/src/hosting/policy.js";
@@ -82,11 +85,70 @@ await test("the signed installer completes before any readiness probe runs", () 
   assert.ok(installerRoute > 0 && installRun > installerRoute, "fetches and runs the instance-scoped installer");
   assert.ok(firstProbe > installRun, "venue probes cannot mark an uninstalled box ready");
   assert.match(script, /for attempt in 1 2 3/);
-  assert.match(script, /systemctl enable --now wickhunter-hosting-readiness\.timer/);
+  assert.match(script, /systemctl_retry enable --now wickhunter-hosting-readiness\.timer/);
   assert.match(script, /x\.createdFrom==="bootstrap"\?x\.mustChange===true/);
   assert.match(script, /x\.createdFrom==="user"\?x\.mustChange===false/);
   assert.match(script, /--data-binary @-/);
   assert.doesNotMatch(script, /installer\?token=/);
+});
+
+await test("transient systemd disconnects retry daemon-reload and timer enable before readiness continues", () => {
+  const script = commandOf(buildBootstrapUserData(input));
+  const begin = script.indexOf("# BEGIN HOSTING SYSTEMCTL RETRY HELPER");
+  const end = script.indexOf("# END HOSTING SYSTEMCTL RETRY HELPER");
+  assert.ok(begin >= 0 && end > begin, "bounded systemctl retry helper is reviewable in cloud-init");
+  const helper = script.slice(begin, end);
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "wh-systemctl-retry-"));
+  const count = path.join(sandbox, "count");
+  const calls = path.join(sandbox, "calls");
+  const sleeps = path.join(sandbox, "sleeps");
+  const executable = (name, body) => {
+    const target = path.join(sandbox, name);
+    fs.writeFileSync(target, `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`, { mode: 0o700 });
+  };
+  executable("systemctl", `
+printf '%s\\n' "$*" >> "$WH_FAKE_CALLS"
+key=$(printf '%s' "$*" | tr ' /' '__')
+counter="$WH_FAKE_COUNT.$key"
+n=0; [ ! -f "$counter" ] || n=$(cat "$counter")
+n=$((n + 1)); printf '%s' "$n" > "$counter"
+case "$1" in daemon-reload|enable) [ "$n" -ge 3 ] ;; *) exit 0 ;; esac
+`);
+  executable("timeout", `
+[ "$1" = --foreground ]; shift
+case "$1" in *s) ;; *) exit 90 ;; esac; shift
+[ "\${WH_FAKE_TIMEOUT_MODE:-pass}" != expire ] || { /bin/sleep 1; exit 124; }
+exec "$@"
+`);
+  executable("sleep", `printf '%s\\n' "$1" >> "$WH_FAKE_SLEEPS"`);
+  const cleanEnv = { PATH: `${sandbox}:/usr/bin:/bin`, WH_FAKE_COUNT: count, WH_FAKE_CALLS: calls, WH_FAKE_SLEEPS: sleeps };
+  try {
+    execFileSync("bash", ["-c", `${helper}
+systemctl_retry daemon-reload
+systemctl_retry enable --now wickhunter-hosting-readiness.timer
+systemctl_retry is-enabled wickhunter-hosting-readiness.timer
+systemctl_retry is-active wickhunter-hosting-readiness.timer`], {
+      env: cleanEnv,
+      stdio: "ignore",
+    });
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "daemon-reload", "daemon-reload", "daemon-reload",
+      "enable --now wickhunter-hosting-readiness.timer", "enable --now wickhunter-hosting-readiness.timer", "enable --now wickhunter-hosting-readiness.timer",
+      "is-enabled wickhunter-hosting-readiness.timer", "is-active wickhunter-hosting-readiness.timer",
+    ]);
+    assert.equal(fs.readFileSync(sleeps, "utf8").trim().split("\n").length, 4, "only failed attempts sleep");
+
+    fs.rmSync(calls, { force: true });
+    assert.throws(() => execFileSync("bash", ["-c", `${helper}
+HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 1))
+systemctl_retry daemon-reload`], {
+      env: { ...cleanEnv, WH_FAKE_TIMEOUT_MODE: "expire" },
+      stdio: "ignore",
+    }), "a failed final attempt exhausts the one shared deadline");
+    assert.equal(fs.existsSync(calls), false, "timed-out systemctl emits no successful status path");
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
 });
 
 await test("hosted login is derived with domain separation and never echoes the bootstrap token", () => {

@@ -138,8 +138,33 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 WH_HOSTING_TIMER
-systemctl daemon-reload
-systemctl enable --now wickhunter-hosting-readiness.timer >/dev/null
+
+# BEGIN HOSTING SYSTEMCTL RETRY HELPER
+# Fresh Ubuntu may briefly disconnect systemctl's D-Bus client while package
+# activity reloads systemd. Retrying these idempotent operations is safe. Each
+# client attempt is bounded without killing systemd or the unit it controls,
+# and the whole retry window is bounded as well.
+HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 300))
+systemctl_retry() {
+  local remaining this_attempt this_delay
+  while true; do
+    remaining=$((HOSTING_SYSTEMCTL_DEADLINE - SECONDS))
+    [ "$remaining" -gt 0 ] || return 1
+    this_attempt=30
+    [ "$this_attempt" -le "$remaining" ] || this_attempt=$remaining
+    if timeout --foreground "\${this_attempt}s" systemctl "$@"; then return 0; fi
+    remaining=$((HOSTING_SYSTEMCTL_DEADLINE - SECONDS))
+    [ "$remaining" -gt 0 ] || return 1
+    this_delay=5
+    [ "$this_delay" -le "$remaining" ] || this_delay=$remaining
+    sleep "$this_delay"
+  done
+}
+# END HOSTING SYSTEMCTL RETRY HELPER
+systemctl_retry daemon-reload
+systemctl_retry enable --now wickhunter-hosting-readiness.timer >/dev/null
+systemctl_retry is-enabled wickhunter-hosting-readiness.timer >/dev/null
+systemctl_retry is-active wickhunter-hosting-readiness.timer >/dev/null
 
 unset LIQHUNTER_BOOTSTRAP_PASSWORD
 unset LIQHUNTER_HOSTED_MAX_ACCOUNTS
