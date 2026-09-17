@@ -45,3 +45,14 @@ Stripe acceptance of exchange referral rebates before enabling live payouts.
 Beta stays at 0.90.123. The preview uses sample data only on localhost and is not
 included in deployment archives. Public pages/API disclose no private member data
 without the corresponding account/license permission.
+
+## Private deployment verified
+
+Deployed only to `45.76.105.174`: Alpha 0.90.124 and Hub 0.4.42. Both health
+checks passed. Only the installed Alpha license has `earn: true`; default remains
+off. Anonymous earnings and admin requests return 401. Public Beta 0.90.123
+manifest is byte-for-byte unchanged; Alpha Go binary and environment unchanged.
+Rollback files and receipt: `/root/wh-earn-preview-20260916` on that VPS.
+Browser session expired on restart; signed-in live UI review remains for the user.
+Local mock UI was browser-checked; Hub full suite and app auth/navigation/build
+checks passed. No Stripe objects, automatic commissions or payouts were activated.
