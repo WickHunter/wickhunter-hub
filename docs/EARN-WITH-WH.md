@@ -1,6 +1,6 @@
 # Earn with WH — private Alpha / Hub preview
 
-Hub 0.4.42; Alpha app 0.90.124. No public Beta release. Hub data is stored in
+Hub 0.4.43; Alpha app 0.90.125. No public Beta release. Hub data is stored in
 `data/earn.v1.json` using atomic, owner-preserving writes. Back up this file with
 normal Hub data. Dollar amounts are integer USD cents. Never edit the ledger
 in place: use an adjustment or reversal.
@@ -29,24 +29,19 @@ in place: use an adjustment or reversal.
 - Marketplace settlement and payout history can be recorded manually, separately from
   exchange rebates. No estimated profits and no claims based on trading PNL.
 
-## Not activated / outstanding before earning-program launch
+## Remaining before public / live launch
 
-The UI is intentionally truthful about these boundaries. A generated member code is
-reserved locally, but referral checkout is NOT activated, so the share-link control
-is disabled outside the clearly labeled design preview. Stripe coupon/promotion-code
-provisioning, referral attribution, paid-subscription counting, recurring commissions,
-refund/dispute adjustments, automatic marketplace settlement imports, recipient onboarding
-and automatic payouts still need their integrations and end-to-end verification.
-No Stripe object, payment or recipient is created by this preview. Cash earnings and
-subscription credits must stay separate; conversion to invoice credit is not implemented.
-Do not invite public customers to earn yet. Confirm discount/commission duration and
-Stripe acceptance of exchange referral rebates before enabling live payouts.
+The recurring Stripe integration is deployed privately in Sandbox mode. Live
+Global Payouts still needs the restricted payout key, a funded live financial
+account, verified recipient bank details, and live webhook event coverage.
+Automatic dispatch remains OFF. Confirm Stripe acceptance of the exchange rebate
+use case and recipient countries before enabling live payouts.
+Marketplace settlement imports remain manual. Conversion of cash earnings into
+subscription credits is not implemented. These are separate balances.
 
-Beta stays at 0.90.123. The preview uses sample data only on localhost and is not
-included in deployment archives. Public pages/API disclose no private member data
-without the corresponding account/license permission.
+Beta stays at 0.90.123. Preview fixtures are local only and excluded from deployment.
 
-## Private deployment verified
+## Initial preview deployment (historical)
 
 Deployed only to `45.76.105.174`: Alpha 0.90.124 and Hub 0.4.42. Both health
 checks passed. Only the installed Alpha license has `earn: true`; default remains
@@ -59,11 +54,9 @@ checks passed. No Stripe objects, automatic commissions or payouts were activate
 
 ## Stripe integration under private verification (September 16–17)
 
-The sections above describe the deployed 0.4.42 preview. The working branch now
-adds recurring, product-scoped friend discounts; Stripe-hosted referral Checkout;
+The integration deployed with Hub 0.4.43 / Alpha 0.90.125 adds recurring, product-scoped friend discounts; Stripe-hosted referral Checkout;
 charge-backed invoice commissions; subscription counts; refund/dispute adjustments;
-recipient onboarding; and monthly Global Payouts dispatch/reconciliation. These
-changes have not yet been deployed. Marketplace revenue imports remain manual.
+recipient onboarding; and monthly Global Payouts dispatch/reconciliation. Marketplace revenue imports remain manual.
 
 The existing standard billing keys remain responsible for coupons, Checkout and
 invoice verification. Live Global Payouts requires a separate restricted `rk_live_`
@@ -96,7 +89,7 @@ subscription updates/deletion, refunds, dispute creation and dispute closure.
 Country support and fees depend on Stripe's available capabilities. Passing a US
 Sandbox test does not establish every international payout corridor.
 
-Sandbox API verification now includes a successful $18 virtual payout with exactly-once ledger settlement and a $5 returned payout with full balance restoration. The new Sandbox financial account is open; no live payouts were made. Candidate versions: Hub 0.4.43 and Alpha 0.90.125.
+Sandbox API verification now includes a successful $18 virtual payout with exactly-once ledger settlement and a $5 returned payout with full balance restoration. The new Sandbox financial account is open; no live payouts were made. Deployed versions: Hub 0.4.43 and Alpha 0.90.125. The $5 failed payout also reached its terminal failure state and restored the balance.
 
 Admin usability: mobile uses a section selector, fluid settings cards and stacked
 Earn records at 640px and below. Billing/Earn were visually checked at 320px,
@@ -104,3 +97,26 @@ Earn records at 640px and below. Billing/Earn were visually checked at 320px,
 locked autofill values are excluded from save payloads. Cancel retains existing
 stored credentials, and explicit Clear remains supported. Login autofill stays
 available for the separate admin sign-in form.
+
+
+## Final private delivery — September 17
+
+- Runtime: Hub 0.4.43, Alpha 0.90.125. Healthy after account initialization.
+- Six Sandbox plans provisioned using the new saved Sandbox credentials.
+- Alpha test referral activated. Its discount and commission recur on renewals.
+- Sandbox signed webhook configured; an actual Stripe subscription update reached
+  the HTTP endpoint with a verified signature. Its unrelated test subscription was
+  correctly ignored. Invoice commission and terminal payout tests used an isolated
+  Sandbox fixture ledger; they do not represent live money movement.
+- All 61 pre-UI Hub suites passed; subsequent admin (23), billing (29), Earn (11),
+  Stripe (12) checks and the new autofill regression passed. Alpha build and six
+  private feature-gate checks passed. Mobile checked at 320px and 390px.
+- Beta manifest, Alpha Go binary and trading environment unchanged. Live billing
+  keys/config unchanged. Earn is still granted only to the private Alpha license.
+- Restricted live payout key and live activation remain outstanding; automatic
+  payouts are OFF. Sandbox successful, failed and returned payment outcomes passed.
+- Backup and final receipt on Alpha: `/root/wh-earn-stripe-20260917-r3`.
+  Earlier attempts rolled back: r1 caught the missing compiled version module;
+  r2's 40-second health window was shorter than multi-account initialization.
+  r3 allows startup to finish and verifies exact served versions before success.
+- Final admin HTML was installed without another service restart.
