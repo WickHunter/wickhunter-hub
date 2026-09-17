@@ -56,3 +56,44 @@ Rollback files and receipt: `/root/wh-earn-preview-20260916` on that VPS.
 Browser session expired on restart; signed-in live UI review remains for the user.
 Local mock UI was browser-checked; Hub full suite and app auth/navigation/build
 checks passed. No Stripe objects, automatic commissions or payouts were activated.
+
+## Stripe integration under private verification (September 16–17)
+
+The sections above describe the deployed 0.4.42 preview. The working branch now
+adds recurring, product-scoped friend discounts; Stripe-hosted referral Checkout;
+charge-backed invoice commissions; subscription counts; refund/dispute adjustments;
+recipient onboarding; and monthly Global Payouts dispatch/reconciliation. These
+changes have not yet been deployed. Marketplace revenue imports remain manual.
+
+The existing standard billing keys remain responsible for coupons, Checkout and
+invoice verification. Live Global Payouts requires a separate restricted `rk_live_`
+key, saved by an authenticated Hub administrator in Earn settings. Grant Recipient
+Configuration Write, Financial Accounts Read, Payout Methods Write and Outbound
+Payments Write, plus destination-specific permissions required by Stripe. The
+payout key is stored in owner-only `earn-stripe-secrets.v1.json` and never returned
+by admin or member APIs. Sandbox payouts can use the saved Sandbox test key.
+
+Only new general Sandboxes support the tested recipient onboarding path. Legacy
+Test mode rejects this flow even though its dashboard banner also says Sandbox.
+Test invoices and payouts use an isolated ledger under `data/earn-test`. The real
+Sandbox confirmed the coupon/Checkout flow: a $100 test invoice collected $90 and
+credited $18 to the test referral ledger; the live ledger remained at zero. Test
+subscription renewal was canceled at period end. Recipient account-link creation
+also passed; Stripe returned `accounts.stripe.com`, which is explicitly allowed.
+
+Automatic payouts default off. Submission reserves eligible prior-month earnings
+with file and directory fsync before any request. Stable idempotency keys survive
+process restarts; uncertain outcomes retain reservations and require review after
+23 hours. Submitted jobs reconcile even when dispatch is paused. Confirmed failed
+or returned transfers restore amounts owed. A failure in one month does not erase
+the earnings; it is eligible for the next monthly cycle. Stripe-managed ledger
+entries cannot be manually reversed. Pausing enrollment does not discard renewals,
+refunds or disputes for already attributed subscriptions.
+
+Live launch still requires a restricted payout key, funded financial account,
+verified recipient, and configured signed webhooks including invoice paid,
+subscription updates/deletion, refunds, dispute creation and dispute closure.
+Country support and fees depend on Stripe's available capabilities. Passing a US
+Sandbox test does not establish every international payout corridor.
+
+Sandbox API verification now includes a successful $18 virtual payout with exactly-once ledger settlement and a $5 returned payout with full balance restoration. The new Sandbox financial account is open; no live payouts were made. Candidate versions: Hub 0.4.43 and Alpha 0.90.125.

@@ -81,6 +81,7 @@ const DISPATCHED_EVENT_TYPES = new Set([
 ]);
 
 export interface BillingServiceDeps {
+  onVerifiedEvent?: (event: StripeEvent) => Promise<void>;
   now?: () => number;
   /** One injected fetch serves the email provider AND the Stripe portal call. */
   fetchLike?: EmailFetch;
@@ -139,6 +140,7 @@ export class BillingService {
   private readonly now: () => number;
   private readonly fetchLike: EmailFetch;
   private readonly log: (line: string) => void;
+  private readonly onVerifiedEvent: BillingServiceDeps["onVerifiedEvent"];
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
   private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
@@ -150,6 +152,7 @@ export class BillingService {
     private readonly templatesDir: string,
     deps: BillingServiceDeps = {},
   ) {
+    this.onVerifiedEvent = deps.onVerifiedEvent;
     this.store = new BillingStore(dataDir, deps.randomBytes);
     this.now = deps.now ?? Date.now;
     this.fetchLike = deps.fetchLike ?? realFetch;
@@ -295,6 +298,7 @@ export class BillingService {
     let result: ApplyResult;
     try {
       result = await this.applyEvent(ev, cfg);
+      await this.onVerifiedEvent?.(ev);
     } catch (err) {
       const message = (err as Error).message;
       this.store.appendEvent(record("error", message));

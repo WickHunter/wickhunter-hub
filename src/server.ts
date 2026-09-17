@@ -1,3 +1,4 @@
+import { EarnStripeService } from "./earn-stripe.js";
 import { EarnService, earnOwner } from "./earn.js";
 // src/server.ts
 // The hub's HTTP server: node:http, no framework, no runtime dependencies.
@@ -235,6 +236,7 @@ export interface Hub {
 }
 
 export interface HubDeps {
+  earnFetch?: typeof fetch;
   /** Injectable for tests; production is node:child_process.spawn. */
   spawn?: typeof nodeSpawn;
   /** Injectable so candle tests never touch the network. */
@@ -372,6 +374,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // only ever arrive after `createHub` has fully returned), never at
   // construction time.
   let hostingRef: HostingService | null = null;
+  const earn = new EarnService(cfg.dataDir);
+  let earnStripe: EarnStripeService;
   const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
@@ -380,6 +384,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try { licenseLeases?.observeRevocation(licenseId, `license revoked by billing: ${reason}`); }
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
+    onVerifiedEvent: ev => earnStripe.handleEvent(ev),
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
     onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode, input.terminal) ?? false,
   });
@@ -396,7 +401,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // customer (H2). See src/customer-sessions.ts's header for the boundary
   // this deliberately keeps from admin auth and from BillingStore's own
   // per-Stripe-customer, per-mode records.
-  const earn = new EarnService(cfg.dataDir);
+  earnStripe = new EarnStripeService(cfg.dataDir, earn, () => billing.config(), cfg.publicOrigin.replace(/\/+$/, ""), deps.billingNow ?? Date.now, deps.earnFetch);
   const customerSessions = new CustomerSessionService(cfg.dataDir, billing, store, cfg.publicOrigin, {
     now: deps.customerSessionNow,
     fetchLike: deps.customerSessionFetch,
@@ -682,6 +687,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (planKey && !plan) return sendText(res, 404, "unknown plan");
       if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
       if (plan?.checkout === "hosted-bundle") return sendText(res, 403, "hosted bundles require a reserved Checkout Session");
+      const referral = url.searchParams.get("ref");
+      if (referral) { try { return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout"); } catch (e) { return sendText(res, 400, (e as Error).message); } }
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
     // The website reads prices from here, so a price change on the Hub shows
@@ -699,7 +706,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     // ── customer sessions (H2) ──────────────────────────────────────────
     if (m === "GET" && p === "/earn") return earnCustomer(req, res, url);
-    if (p === "/api/customer/earn" || p === "/api/hub/earn" || p === "/api/customer/earn/uid" || p === "/api/hub/earn/uid") return earnCustomer(req, res, url);
+    if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh))?$/.test(p)) return earnCustomer(req, res, url);
     if (m === "GET" && p === "/customer") return customerPage(res);
     if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
@@ -1316,12 +1323,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!allowed) return sendJson(res, 404, { ok: false, error: "Not found" });
     if (url.pathname === "/earn") return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, "earn.html"), "utf8"));
     try {
-      if (req.method === "GET" && !url.pathname.endsWith("/uid")) return sendJson(res, 200, { ok: true, ...earn.view(owner, name) }, { "cache-control": "no-store" });
-      if (req.method !== "POST" || !url.pathname.endsWith("/uid")) return sendJson(res, 405, { ok: false, error: "Method not allowed" });
+      if (req.method === "GET" && /\/earn$/.test(url.pathname)) return sendJson(res, 200, { ok: true, ...earn.view(owner, name), stripe: earnStripe.view(owner) }, { "cache-control": "no-store" });
+      if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "Method not allowed" });
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 4096);
       if (!body) return sendJson(res, 400, { ok: false, error: "Invalid request" });
-      earn.member(owner, name); earn.addUid(owner, body);
+      earn.member(owner, name);
+      if(url.pathname.endsWith('/activate')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.activate(owner) });
+      if(url.pathname.endsWith('/onboard')) return sendJson(res, 200, { ok:true, ...await earnStripe.onboard(owner,body) });
+      if(url.pathname.endsWith('/refresh')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.refresh(owner) });
+      earn.addUid(owner, body);
       return sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
     } catch (error) { return sendJson(res, 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
   }
@@ -1913,7 +1924,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const m = req.method ?? "GET";
     const p = url.pathname;
 
-    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.admin() }, { "cache-control": "no-store" });
+    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.admin(), stripe: earnStripe.admin() }, { "cache-control": "no-store" });
     if (p.startsWith("/admin/api/earn/") && m === "POST") {
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 1_100_000);
@@ -1921,6 +1932,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try {
         let result: unknown;
         switch (p) {
+          case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
+          case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
+          case "/admin/api/earn/stripe-run": result = await earnStripe.run(); break;
+          case "/admin/api/earn/stripe-activate": result = await earnStripe.activate(String(body.owner)); break;
           case "/admin/api/earn/configure": result = earn.configure(body); break;
           case "/admin/api/earn/record": result = earn.record(body); break;
           case "/admin/api/earn/reverse": result = earn.reverse(body); break;
@@ -2605,6 +2620,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           // of calling `listen()` when it wants a hermetic clock, so this
           // never fires unexpectedly in a test.
           hosting.start();
+          earnStripe.start();
           resolve((server.address() as AddressInfo).port);
         });
       }),
@@ -2614,6 +2630,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         marketCaps?.stop();
         liq.stop();
         hosting.stop();
+        earnStripe.stop();
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),

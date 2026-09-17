@@ -3,6 +3,7 @@
  * implicit money movement. CSV imports are reviewed before commit. */
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import fs from 'node:fs';
 import { readJson, writeJsonAtomic } from './jsonfile.js';
 
 export const EXCHANGES = [
@@ -14,10 +15,10 @@ export const EXCHANGES = [
 export const BYBIT_HELP = 'https://www.bybit.com/en/help-center/article/How-to-Transfer-Your-Identity-to-Another-Account';
 export type EarnSource = 'referral' | 'exchange' | 'marketplace';
 type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string };
-type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
-type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
+export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
+export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
-type State = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean }[] };
+export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
 export const tierPercent = (active: number) => active <= 20 ? 20 : active <= 40 ? 30 : 40;
 function text(v: unknown, max = 200): string { if (typeof v !== 'string' || !v.trim() || v.length > max || /[\x00-\x1f]/.test(v)) throw new Error('Invalid or missing text field'); return v.trim(); }
@@ -42,8 +43,13 @@ export function csvRows(input: string): string[][] {
 export class EarnService {
   private file: string;
   constructor(dataDir: string, private now: () => number = Date.now) { this.file=path.join(dataDir,'earn.v1.json'); }
-  private read(): State { return readJson(this.file,{members:[],entries:[],months:[],referrals:[]}); }
-  private save(s: State) { writeJsonAtomic(this.file,s); }
+  private read(): EarnState { return readJson(this.file,{members:[],entries:[],months:[],referrals:[]}); }
+  private save(s: EarnState) {
+    writeJsonAtomic(this.file,s);
+    // A submitted payout must never outlive its on-disk reservation after a power loss.
+    const fd=fs.openSync(this.file,'r');try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+    const parent=fs.openSync(path.dirname(this.file),'r');try{fs.fsyncSync(parent);}finally{fs.closeSync(parent);}
+  }
   private date() { return new Date(this.now()).toISOString(); }
   member(owner: string, name: string) {
     const s=this.read(); let m=s.members.find(x=>x.id===owner);
@@ -51,9 +57,13 @@ export class EarnService {
     return m;
   }
   admin() { return this.read(); }
+  /** Synchronous transaction: never retain state across an awaited network call. */
+  transaction<T>(fn: (state: EarnState) => T): T { const state=this.read(); const result=fn(state);this.save(state);return result; }
+  copyMember(member: Member) { this.transaction(s=>{const i=s.members.findIndex(m=>m.id===member.id);if(i<0)s.members.push(structuredClone(member));else s.members[i]=structuredClone(member);}); }
+
   view(owner: string, name: string) {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);
-    const active=s.referrals.filter(r=>r.code===m.code && r.active).length;
+    const active=s.referrals.filter(r=>r.code===m.code && r.active && (r.paidThrough===undefined || r.paidThrough>this.now())).length;
     return { member:m, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
@@ -96,7 +106,7 @@ export class EarnService {
     const e:Entry={id:randomUUID(),owner,source:src,kind:kind as Entry['kind'],cents:delta,currency:'USD',period:month,reference,note,method,createdAt:this.date(),actor,...(paidAt?{paidAt}:{})};s.entries.push(e);this.save(s);return e;
   }
   reverse(input: Record<string,unknown>) {
-    const s=this.read(), original=s.entries.find(e=>e.id===input.id);if(!original||original.kind==='reversal')throw new Error('Original entry not found');
+    const s=this.read(), original=s.entries.find(e=>e.id===input.id);if(!original||!['earning','adjustment','payout'].includes(original.kind)||original.actor==='stripe')throw new Error('Original entry not found');
     if(s.entries.some(e=>e.reverses===original.id))throw new Error('Entry already reversed');
     const e:Entry={...original,id:randomUUID(),kind:'reversal',cents:-original.cents,reference:'reverse:'+original.id,note:text(input.note,500),createdAt:this.date(),actor:'hub-admin',reverses:original.id};s.entries.push(e);this.save(s);return e;
   }
