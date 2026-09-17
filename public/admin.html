@@ -201,6 +201,62 @@
     .planstable { display:none; }
     .plancards { display:grid; gap:.6rem; }
   }
+
+  /* Admin workspace: fluid settings, readable records and touch navigation. */
+  .mobile-nav { display:none; }
+  .hubpage { min-width:0; }
+  .hubpage > h1, .hubpage > h2 { margin-top:1.3rem !important; }
+  .opsgrid, #venues, .billingcards, .configfields, .readylist { grid-template-columns:repeat(auto-fit,minmax(min(100%,19rem),1fr)); }
+  .secretrow input { min-width:0; }
+  .configgroup, .custcard, .plancard, .venue { min-width:0; }
+  .hubpage p, .billing-savenote { overflow-wrap:anywhere; }
+  [data-hub-page-panel="earn"] > .card { border:1px solid var(--line); border-radius:var(--r); padding:1.1rem; margin:1rem 0; background:var(--raised); min-width:0; }
+  [data-hub-page-panel="earn"] h3 { margin:0 0 .8rem; font-size:1rem; }
+  [data-hub-page-panel="earn"] form { display:block; }
+  [data-hub-page-panel="earn"] form .actions, #earnRates { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr)); align-items:end; gap:.85rem; }
+  [data-hub-page-panel="earn"] label { display:flex; flex-direction:column; gap:.35rem; color:var(--muted); font-size:.85rem; min-width:0; }
+  [data-hub-page-panel="earn"] label:has(input[type="checkbox"]) { flex-direction:row; align-items:center; min-height:44px; color:var(--ink); }
+  [data-hub-page-panel="earn"] input:not([type="checkbox"]), [data-hub-page-panel="earn"] select { width:100%; min-width:0; }
+  input[type="checkbox"] { width:20px; height:20px; min-height:20px; accent-color:var(--accent); flex-shrink:0; }
+  .earn-table { overflow-x:auto; margin-top:.8rem; }
+  .earn-table td { white-space:normal; overflow-wrap:anywhere; max-width:24rem; }
+  .empty-state { padding:.9rem; color:var(--muted); background:var(--inset); border-radius:var(--r-sm); }
+  #earnStripeStatus, #earnError { overflow-wrap:anywhere; }
+  @media (max-width:640px) {
+    body { padding:0 .75rem max(2rem,env(safe-area-inset-bottom)); }
+    .topbar-row { justify-content:space-between; gap:.35rem; }
+    .topbar h1 { font-size:1rem; }
+    .topbar h1 small { display:none; }
+    .topbar-row .actions { gap:.3rem; }
+    #hubVer { font-size:.72rem; }
+    #upgradeHub { font-size:.78rem; padding:.4rem .5rem; }
+    #refresh { font-size:.78rem; padding:.4rem .6rem; }
+    .hubnav { display:none; }
+    .mobile-nav { display:flex; align-items:center; gap:.65rem; padding:.15rem 0 .7rem; color:var(--muted); font-size:.8rem; }
+    .mobile-nav select { flex:1; min-width:0; }
+    button, input:not([type="checkbox"]), select { min-height:44px; }
+    .hubpage > .actions, .hubpage > form { align-items:stretch; }
+    .hubpage > .actions > input, .hubpage > .actions > select, .hubpage > form > input, .hubpage > form > select { flex:1 1 100%; width:100%; min-width:0; }
+    .hubpage > .actions > button, .hubpage > form > button { flex:1 1 auto; }
+    .hubpage label { max-width:100%; }
+    .hubpage .actions > label { flex:1 1 100%; }
+    .hubpage .actions > label > input:not([type="checkbox"]), .hubpage .actions > label > select { width:100%; }
+    .billingcards .save { width:100%; }
+    .billing-savenote { display:block; margin:.5rem 0 0 !important; }
+    .opscard, .venue { padding:.8rem; }
+    .custcard dd { min-width:0; margin:0; overflow-wrap:anywhere; }
+    [data-hub-page-panel="earn"] > .card { padding:.85rem; }
+    [data-hub-page-panel="earn"] .actions { align-items:stretch; }
+    [data-hub-page-panel="earn"] .actions > button { width:100%; }
+    .earn-table { overflow:visible; }
+    .earn-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+    .earn-table table, .earn-table tbody, .earn-table tr, .earn-table td { display:block; width:100%; max-width:none; }
+    .earn-table tr { border:1px solid var(--line); border-radius:var(--r-sm); padding:.55rem; margin:.6rem 0; background:var(--inset); }
+    .earn-table td { display:grid; grid-template-columns:6.3rem minmax(0,1fr); gap:.5rem; padding:.4rem .15rem; border:0; }
+    .earn-table td::before { content:attr(data-label); color:var(--muted); font-size:.75rem; }
+    .earn-table td > button { min-width:0; white-space:normal; }
+  }
+
 </style>
 </head>
 <body>
@@ -234,10 +290,21 @@
     <button type="button" data-hub-page="hosting">Hosting</button>
     <button type="button" data-hub-page="system">System &amp; feedback</button>
   </nav>
+  <label class="mobile-nav" for="hubPageSelect">Section
+    <select id="hubPageSelect" aria-label="Admin section">
+      <option value="licenses">Licenses &amp; installs</option>
+      <option value="market-data">Market data</option>
+      <option value="marketplace">Marketplace</option>
+      <option value="billing">Billing</option>
+      <option value="earn">Earn with WH</option>
+      <option value="hosting">Hosting</option>
+      <option value="system">System &amp; feedback</option>
+    </select>
+  </label>
 </header>
 
 <section class="hubpage" data-hub-page-panel="earn" hidden>
-<h2>Earn with WH</h2><div class="card"><h3>Stripe automation</h3><form id="earnStripeConfig"><div class="actions"><label>Mode <select name="mode"><option value="test">Test</option><option value="live">Live</option></select></label><label><input type="checkbox" name="enabled"> Enable Stripe earning tools</label><label><input type="checkbox" name="automatic"> Monthly automatic payouts</label><label>Payout day (UTC) <input name="payoutDay" type="number" min="1" max="28" value="1"></label><label>Financial account <input name="financialAccount" placeholder="fa_…"></label><label>Payout API key <input name="payoutKey" type="password" autocomplete="new-password" placeholder="Live: rk_live_…; blank keeps saved key"></label><button>Save Stripe settings</button></div></form><div class="actions"><button id="earnStripeCheck">Check Stripe access</button><button id="earnStripeRun">Reconcile / run eligible payouts</button></div><p id="earnStripeStatus" class="muted"></p><div id="earnStripeJobs"></div><p class="muted">Test and live money are separate. Payouts reserve approved prior-month earnings before submission. Refunds and disputes adjust future payable balances. Never record a manual payout for an unresolved Stripe reservation.</p></div><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
+<h2>Earn with WH</h2><p class="muted">Manage member rates, monthly rebates and payouts.</p><div class="card"><h3>Stripe automation</h3><form id="earnStripeConfig"><div class="actions"><label>Mode <select name="mode"><option value="test">Test</option><option value="live">Live</option></select></label><label><input type="checkbox" name="enabled"> Enable Stripe earning tools</label><label><input type="checkbox" name="automatic"> Monthly automatic payouts</label><label>Payout day (UTC) <input name="payoutDay" type="number" min="1" max="28" value="1"></label><label>Financial account <input name="financialAccount" placeholder="fa_…"></label><label>Payout API key <input name="payoutKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved key"></label><button>Save Stripe settings</button></div></form><div class="actions"><button id="earnStripeCheck">Check Stripe access</button><button id="earnStripeRun">Reconcile / run eligible payouts</button></div><p id="earnStripeStatus" class="muted" role="status"></p><div id="earnStripeJobs"></div><p class="muted">Test and live money are separate. Payouts reserve approved prior-month earnings before submission. Refunds and disputes adjust future payable balances. Never record a manual payout for an unresolved Stripe reservation.</p></div><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
 <button id="earnRefresh" type="button">Refresh earnings</button><p id="earnError" role="status"></p>
 <div class="card"><h3>Members &amp; rates</h3><label>Member <select id="earnMember"></select></label>
 <form id="earnRates" class="actions"><label>Customer discount % <input name="discountPercent" type="number" min="0" max="100" required></label><label>Commission % override <input name="commissionPercent" type="number" min="0" max="100" placeholder="Automatic tier"></label><label>Exchange rebate % <input name="rebatePercent" type="number" min="0" max="100" required></label><button>Save rates</button></form><p class="muted">Standard commission tiers: 0–20 = 20%, 21–40 = 30%, 41+ = 40%. A blank override uses the tier.</p><div id="earnUids"></div></div>
@@ -520,11 +587,14 @@ function showHubPage(wanted, remember) {
   document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
     button.setAttribute("aria-selected", String(button.getAttribute("data-hub-page") === page));
   });
+  document.getElementById("hubPageSelect").value = page;
   if (remember && location.hash !== "#" + page) history.replaceState(null, "", "#" + page);
 }
 document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
   button.onclick = () => showHubPage(button.getAttribute("data-hub-page"), true);
 });
+document.getElementById("hubPageSelect").onchange = (event) => showHubPage(event.target.value, true);
+window.addEventListener("hashchange", () => showHubPage(location.hash.slice(1), false));
 showHubPage(location.hash.slice(1), false);
 
 function showGate(msg) {
@@ -1107,7 +1177,7 @@ function mktRenderConfig(config) {
         const otherName = field.name === "HUB_MARKETPLACE_STATUS_CREDENTIAL"
           ? "MARKETPLACE_OPERATOR_STATUS_CREDENTIAL" : "HUB_MARKETPLACE_STATUS_CREDENTIAL";
         const other = wrap.querySelector('[data-marketplace-name="' + otherName + '"]');
-        if (other && other.value !== input.value) other.value = input.value;
+        if (other && other.value !== input.value) { other.readOnly = false; other.value = input.value; }
       };
     }
 
@@ -1115,6 +1185,7 @@ function mktRenderConfig(config) {
     help.className = "confighelp";
     help.textContent = field.help + (field.required ? " Required for readiness." : " Optional/defaultable.");
     card.append(label, input);
+    if (field.secret) protectApiField(input, card);
     card.appendChild(help);
     if (field.state !== "missing") {
       const clear = document.createElement("button");
@@ -1161,7 +1232,7 @@ document.getElementById("mktConfigForm").onsubmit = async (ev) => {
     const name = input.dataset.marketplaceName;
     if (input.dataset.clear === "1") changes[name] = null;
     else if (input.dataset.secret === "1") {
-      if (input.value !== "") changes[name] = input.value;
+      if (apiCredentialValue(input) !== "") changes[name] = apiCredentialValue(input);
     } else if (input.value !== input.dataset.original) {
       changes[name] = input.value === "" ? null : input.value;
     }
@@ -1780,6 +1851,32 @@ document.getElementById("fbExport").onclick = async () => {
 let billingConfig = null;
 let billingCustomers = [];
 
+// Credential fields are opt-in editors. Browser-filled locked values never save.
+function protectApiField(input, container) {
+  input.autocomplete = "new-password";
+  input.spellcheck = false;
+  input.setAttribute("autocapitalize", "none");
+  input.setAttribute("data-1p-ignore", "true");
+  input.setAttribute("data-lpignore", "true");
+  input.setAttribute("data-bwignore", "true");
+  const savedValue = input.value;
+  input.readOnly = true;
+  input.dataset.apiCredential = "1";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.textContent = "Edit key";
+  edit.setAttribute("aria-label", "Edit API credential");
+  edit.onclick = () => {
+    input.readOnly = !input.readOnly;
+    input.value = input.readOnly ? savedValue : "";
+    delete input.dataset.clear;
+    edit.textContent = input.readOnly ? "Edit key" : "Cancel edit";
+    if (!input.readOnly) input.focus();
+  };
+  container.appendChild(edit);
+}
+function apiCredentialValue(input) { return input.readOnly ? "" : input.value; }
+
 function billingSecretField(name, meta, placeholder) {
   const wrap = document.createElement("div");
   wrap.className = "secretrow";
@@ -1792,6 +1889,7 @@ function billingSecretField(name, meta, placeholder) {
   input.placeholder = configured ? ("configured" + (meta.last4 ? " ····" + meta.last4 : "")) : placeholder;
   input.addEventListener("input", () => { delete input.dataset.clear; input.placeholder = configured ? ("configured" + (meta.last4 ? " ····" + meta.last4 : "")) : placeholder; });
   wrap.appendChild(input);
+  protectApiField(input, wrap);
   if (configured) {
     const clear = document.createElement("button");
     clear.type = "button";
@@ -1832,7 +1930,9 @@ function renderStripeCard(mode, data) {
   const wrap = document.getElementById(mode === "test" ? "billingStripeTestFields" : "billingStripeLiveFields");
   wrap.innerHTML = "";
   const pub = billingTextField("publishableKey", data.publishableKey, "pk_" + mode + "_…");
-  wrap.appendChild(billingConfigField("Publishable key", pub));
+  const pubCard = billingConfigField("Publishable key", pub);
+  protectApiField(pub, pubCard);
+  wrap.appendChild(pubCard);
   const secret = billingSecretField("secretKey", data.secretKey, "sk_" + mode + "_… / rk_…");
   wrap.appendChild(billingConfigField("Secret key", secret.wrap));
   const whsec = billingSecretField("webhookSecret", data.webhookSecret, "whsec_…");
@@ -1848,9 +1948,10 @@ async function billingSaveStripe(mode) {
   const payload = {};
   for (const input of wrap.querySelectorAll("[data-field]")) {
     const name = input.dataset.field;
+    if (input.dataset.apiCredential === "1" && input.readOnly && input.dataset.clear !== "1") continue;
     if (input.type === "password") {
       if (input.dataset.clear === "1") payload[name] = null;
-      else if (input.value !== "") payload[name] = input.value;
+      else if (apiCredentialValue(input) !== "") payload[name] = apiCredentialValue(input);
     } else if (input.value !== "") {
       payload[name] = input.value;
     }
@@ -1897,7 +1998,7 @@ document.getElementById("billingEmailSave").onclick = async () => {
     if (input.tagName === "SELECT") { payload[name] = input.value; continue; }
     if (input.type === "password") {
       if (input.dataset.clear === "1") payload[name] = null;
-      else if (input.value !== "") payload[name] = input.value;
+      else if (apiCredentialValue(input) !== "") payload[name] = apiCredentialValue(input);
     } else if (input.value !== "") {
       payload[name] = input.value;
     }
@@ -2450,7 +2551,9 @@ function renderHostingPolicyCard(policy, secrets) {
   const vultrInput = document.createElement("input");
   vultrInput.type = "password"; vultrInput.autocomplete = "off"; vultrInput.dataset.field = "vultrApiKey";
   vultrInput.placeholder = secrets && secrets.vultrApiKey.configured ? "configured (…" + secrets.vultrApiKey.last4 + ") — leave blank to keep" : "not configured";
-  wrap.appendChild(billingConfigField("Vultr API key", vultrInput, "Write-only — never echoed back in full."));
+  const vultrCard = billingConfigField("Vultr API key", vultrInput, "Write-only — never echoed back in full.");
+  protectApiField(vultrInput, vultrCard);
+  wrap.appendChild(vultrCard);
   const regionsInput = document.createElement("input");
   regionsInput.type = "text"; regionsInput.autocomplete = "off"; regionsInput.dataset.field = "regions";
   regionsInput.value = (policy.regions || []).map((r) => r.id + ":" + r.label).join(", ");
@@ -2478,7 +2581,7 @@ document.getElementById("hostingPolicySave").onclick = async () => {
   const secrets = {};
   for (const input of wrap.querySelectorAll("[data-field]")) {
     const name = input.dataset.field;
-    if (name === "vultrApiKey") { if (input.value !== "") secrets.vultrApiKey = input.value; continue; }
+    if (name === "vultrApiKey") { if (apiCredentialValue(input) !== "") secrets.vultrApiKey = apiCredentialValue(input); continue; }
     if (name === "regions") { policy.regions = parseHostingRegions(input.value); continue; }
     if (input.type === "checkbox") policy[name] = input.checked;
     else if (input.type === "number") { if (input.value !== "") policy[name] = Number(input.value); }
@@ -2604,13 +2707,14 @@ document.getElementById("hostingRefreshBtn").onclick = hostingRefresh;
 showGate();
 
 // Earn operations use the existing admin bearer boundary, never a customer cookie.
+protectApiField(document.querySelector('#earnStripeConfig [name=payoutKey]'), document.querySelector('#earnStripeConfig [name=payoutKey]').parentElement);
 let earnState=null, earnPreview=null;
 const earnEl=id=>document.getElementById(id), earnEsc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function earnCall(action,body){return api('/admin/api/earn'+(action?'/'+action:''),body?{method:'POST',headers:{'x-wh-earn':'1'},body:JSON.stringify(body)}:undefined);}
-function earnTable(head,rows){return '<table><thead><tr>'+head.map(h=>'<th>'+earnEsc(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+function earnTable(head,rows){if(!rows.length)return '<p class="empty-state">No records yet.</p>';return '<div class="earn-table"><table><thead><tr>'+head.map(h=>'<th scope="col">'+earnEsc(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map((c,i)=>'<td data-label="'+earnEsc(head[i])+'">'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 async function earnRefresh(){try{const selected=earnEl('earnMember').value;earnState=await earnCall('');const sc=earnState.stripe?.settings;if(sc){const f=earnEl('earnStripeConfig').elements;f.mode.value=sc.mode;f.enabled.checked=sc.enabled;f.automatic.checked=sc.automatic;f.payoutDay.value=sc.payoutDay;f.financialAccount.value=sc.financialAccount;earnEl('earnStripeJobs').innerHTML=earnTable(['Member','Cycle','USD','Status','Stripe payment'],(earnState.stripe.jobs||[]).map(j=>[earnEsc(earnState.members.find(m=>m.id===j.owner)?.name||j.owner),earnEsc(j.cycle),(j.amount/100).toFixed(2),earnEsc(j.status),earnEsc(j.stripeId||j.error||'Pending')]));}earnEl('earnMember').innerHTML=earnState.members.map(m=>'<option value="'+earnEsc(m.id)+'">'+earnEsc(m.name)+' · '+earnEsc(m.code)+'</option>').join('');if(earnState.members.some(m=>m.id===selected))earnEl('earnMember').value=selected;earnSelect();}catch(e){earnEl('earnError').textContent=e.message;}}
 function earnSelect(){if(!earnState)return;const m=earnState.members.find(m=>m.id===earnEl('earnMember').value);if(!m)return;const f=earnEl('earnRates');f.elements.discountPercent.value=m.discountPercent;f.elements.commissionPercent.value=m.commissionPercent??'';f.elements.rebatePercent.value=m.rebatePercent;earnEl('earnUids').innerHTML=earnTable(['Exchange','UID','Verification'],m.uids.map(u=>[earnEsc(u.exchange),earnEsc(u.uid),'<button type="button" data-uid="'+earnEsc(u.uid)+'" data-exchange="'+earnEsc(u.exchange)+'" data-verified="'+u.verified+'">'+(u.verified?'Revoke verification':'Verify main UID & referral')+'</button>']));earnEl('earnUids').querySelectorAll('button').forEach(b=>b.onclick=async()=>{try{await earnCall('configure',{owner:m.id,exchange:b.dataset.exchange,uid:b.dataset.uid,verified:b.dataset.verified!=='true'});await earnRefresh();}catch(e){earnEl('earnError').textContent=e.message;}});earnEl('earnLedger').innerHTML=earnTable(['Date','Program','Type','USD','Reference','Note','Action'],earnState.entries.filter(e=>e.owner===m.id).reverse().map(e=>[earnEsc(e.createdAt.slice(0,10)),earnEsc(e.source),earnEsc(e.kind),(e.cents/100).toFixed(2),earnEsc(e.reference),earnEsc(e.note),['earning','adjustment','payout'].includes(e.kind)&&e.actor!=='stripe'&&!earnState.entries.some(r=>r.reverses===e.id)?'<button data-reverse="'+earnEsc(e.id)+'">Reverse</button>':'']));earnEl('earnLedger').querySelectorAll('[data-reverse]').forEach(b=>b.onclick=async()=>{const note=prompt('Reason for reversing this entry');if(!note)return;try{await earnCall('reverse',{id:b.dataset.reverse,note});await earnRefresh();}catch(e){earnEl('earnError').textContent=e.message;}});}
-earnEl('earnStripeConfig').onsubmit=async e=>{e.preventDefault();const f=e.target.elements;try{await earnCall('stripe-configure',{mode:f.mode.value,enabled:f.enabled.checked,automatic:f.automatic.checked,payoutDay:Number(f.payoutDay.value),financialAccount:f.financialAccount.value.trim(),payoutKey:f.payoutKey.value.trim()});f.payoutKey.value="";earnEl('earnStripeStatus').textContent='Stripe settings saved.';await earnRefresh();}catch(e){earnEl('earnStripeStatus').textContent=e.message;}};
+earnEl('earnStripeConfig').onsubmit=async e=>{e.preventDefault();const f=e.target.elements;try{await earnCall('stripe-configure',{mode:f.mode.value,enabled:f.enabled.checked,automatic:f.automatic.checked,payoutDay:Number(f.payoutDay.value),financialAccount:f.financialAccount.value.trim(),payoutKey:apiCredentialValue(f.payoutKey).trim()});f.payoutKey.value="";f.payoutKey.readOnly=true;f.payoutKey.parentElement.querySelector("button").textContent="Edit key";earnEl('earnStripeStatus').textContent='Stripe settings saved.';await earnRefresh();}catch(e){earnEl('earnStripeStatus').textContent=e.message;}};
 earnEl('earnStripeCheck').onclick=async()=>{try{const r=await earnCall('stripe-readiness',{});earnEl('earnStripeStatus').textContent=r.result.mode+': '+(r.result.accounts.map(a=>a.id+' · '+a.status+' · '+a.currencies.join(', ')).join('; ')||'No financial account is available. Complete Stripe Global Payouts activation.');}catch(e){earnEl('earnStripeStatus').textContent=e.message;}};
 earnEl('earnStripeRun').onclick=async()=>{try{await earnCall('stripe-run',{});await earnRefresh();earnEl('earnStripeStatus').textContent='Reconciliation completed.';}catch(e){earnEl('earnStripeStatus').textContent=e.message;}};
 earnEl('earnRefresh').onclick=earnRefresh;earnEl('earnMember').onchange=earnSelect;

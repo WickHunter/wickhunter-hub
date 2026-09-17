@@ -97,3 +97,10 @@ Country support and fees depend on Stripe's available capabilities. Passing a US
 Sandbox test does not establish every international payout corridor.
 
 Sandbox API verification now includes a successful $18 virtual payout with exactly-once ledger settlement and a $5 returned payout with full balance restoration. The new Sandbox financial account is open; no live payouts were made. Candidate versions: Hub 0.4.43 and Alpha 0.90.125.
+
+Admin usability: mobile uses a section selector, fluid settings cards and stacked
+Earn records at 640px and below. Billing/Earn were visually checked at 320px,
+390px and desktop widths. API credentials require an explicit Edit key action;
+locked autofill values are excluded from save payloads. Cancel retains existing
+stored credentials, and explicit Clear remains supported. Login autofill stays
+available for the separate admin sign-in form.
