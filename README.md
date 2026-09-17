@@ -1,3 +1,4 @@
+<!-- Private Earn with WH preview: 0.4.42; no Beta publication. -->
 # wickhunter-hub
 
 Admin hub for the Wick Hunter beta: license issuing/revocation, beta build
@@ -1724,6 +1725,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.42 — Private Earn with WH page, shared Hub earnings ledger, main exchange UID verification, monthly rebate imports, manual payouts and audit reversals. Per-license earn gate; no public Beta activation.
 
 - v0.4.41 — Report Bybit liquidation subscription acknowledgements per physical socket, including separate refused and pending topic counts across partial reconnects.
 - v0.4.40 — Recover shared candle and liquidation streams from error-only or hanging WebSocket handshakes with generation-fenced reconnects; report Bybit subscriptions as requested until acknowledged.

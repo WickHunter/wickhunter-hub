@@ -1,3 +1,4 @@
+import { EarnService, earnOwner } from "./earn.js";
 // src/server.ts
 // The hub's HTTP server: node:http, no framework, no runtime dependencies.
 //
@@ -395,6 +396,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // customer (H2). See src/customer-sessions.ts's header for the boundary
   // this deliberately keeps from admin auth and from BillingStore's own
   // per-Stripe-customer, per-mode records.
+  const earn = new EarnService(cfg.dataDir);
   const customerSessions = new CustomerSessionService(cfg.dataDir, billing, store, cfg.publicOrigin, {
     now: deps.customerSessionNow,
     fetchLike: deps.customerSessionFetch,
@@ -567,6 +569,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // the README, and a route added to `handle` below is NOT silently
   // rate-limited just by sharing a method — it has to be named here too.
   function isGeneralRateLimitedRoute(m: string, p: string): boolean {
+    if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
         || p === "/api/billing/plans" || p === "/billing"
@@ -695,6 +698,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/billing/portal-session") return billingPortalSession(req, res);
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     // ── customer sessions (H2) ──────────────────────────────────────────
+    if (m === "GET" && p === "/earn") return earnCustomer(req, res, url);
+    if (p === "/api/customer/earn" || p === "/api/hub/earn" || p === "/api/customer/earn/uid" || p === "/api/hub/earn/uid") return earnCustomer(req, res, url);
     if (m === "GET" && p === "/customer") return customerPage(res);
     if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
@@ -1290,10 +1295,41 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return customerSessions.authenticate(sessionCookieFrom(req.headers.cookie));
   }
 
+  async function earnCustomer(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    let owner = "", name = "", allowed = false;
+    if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
+      const identity = authenticatedCustomer(req);
+      if (identity) { owner = earnOwner("email:" + normalizeCustomerEmail(identity.email)); name = identity.email; allowed = Object.values(billing.store.customers()).some(c => c.livemode && normalizeCustomerEmail(c.email) === normalizeCustomerEmail(identity.email) && flagsFor(cfg.dataDir, c.licenseId).earn === true); }
+    } else {
+      // The app forwards its license only in a header. Never trust an owner id from its body.
+      const raw = req.headers["x-license"];
+      const verified = typeof raw === "string" ? store.verify(raw) : null;
+      if (verified?.ok) {
+        const payload = store.decodeGenuine(raw as string)!;
+        allowed = flagsFor(cfg.dataDir, payload.id).earn === true;
+        const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
+        owner = earnOwner(record?.email ? "email:" + normalizeCustomerEmail(record.email) : "license:" + payload.id);
+        name = record?.email || store.get(payload.id)?.name || "WH member";
+      }
+    }
+    if (!owner) return sendJson(res, 401, { ok: false, error: "Sign in with your WH account or an active app license" }, { "cache-control": "no-store" });
+    if (!allowed) return sendJson(res, 404, { ok: false, error: "Not found" });
+    if (url.pathname === "/earn") return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, "earn.html"), "utf8"));
+    try {
+      if (req.method === "GET" && !url.pathname.endsWith("/uid")) return sendJson(res, 200, { ok: true, ...earn.view(owner, name) }, { "cache-control": "no-store" });
+      if (req.method !== "POST" || !url.pathname.endsWith("/uid")) return sendJson(res, 405, { ok: false, error: "Method not allowed" });
+      if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
+      const body = await readJsonBody(req, 4096);
+      if (!body) return sendJson(res, 400, { ok: false, error: "Invalid request" });
+      earn.member(owner, name); earn.addUid(owner, body);
+      return sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
+    } catch (error) { return sendJson(res, 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
+  }
+
   function customerState(req: IncomingMessage, res: ServerResponse): void {
     const identity = authenticatedCustomer(req);
     if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
-    sendJson(res, 200, { ok: true, ...customerSessions.dashboardState(identity) }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, ...customerSessions.dashboardState(identity), earnAvailable: Object.values(billing.store.customers()).some(c => c.livemode && normalizeCustomerEmail(c.email) === normalizeCustomerEmail(identity.email) && flagsFor(cfg.dataDir, c.licenseId).earn === true) }, { "cache-control": "no-store" });
   }
 
   async function customerInstallCommand(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1876,6 +1912,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     adminBackoff.recordSuccess(ip);
     const m = req.method ?? "GET";
     const p = url.pathname;
+
+    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.admin() }, { "cache-control": "no-store" });
+    if (p.startsWith("/admin/api/earn/") && m === "POST") {
+      if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
+      const body = await readJsonBody(req, 1_100_000);
+      if (!body) return sendJson(res, 400, { ok: false, error: "Invalid earnings request" });
+      try {
+        let result: unknown;
+        switch (p) {
+          case "/admin/api/earn/configure": result = earn.configure(body); break;
+          case "/admin/api/earn/record": result = earn.record(body); break;
+          case "/admin/api/earn/reverse": result = earn.reverse(body); break;
+          case "/admin/api/earn/preview": result = earn.previewCsv(body); break;
+          case "/admin/api/earn/import": result = earn.importCsv(body); break;
+          default: return sendJson(res, 404, { ok: false, error: "Not found" });
+        }
+        return sendJson(res, 200, { ok: true, result }, { "cache-control": "no-store" });
+      } catch (error) { return sendJson(res, 400, { ok: false, error: (error as Error).message }); }
+    }
 
     if (m === "GET" && p === "/admin/api/licenses") {
       const roster = readRoster(cfg.dataDir);

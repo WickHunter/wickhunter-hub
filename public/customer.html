@@ -85,7 +85,7 @@
 
   <!-- ── signed out ──────────────────────────────────────────────────── -->
   <div id="signedOut" hidden>
-    <h1>Sign in to your account</h1>
+    <a id="earnLink" class="btn" href="earn" style="float:right" hidden>Earn with WH ↗</a><h1>Sign in to your account</h1>
     <p class="sub">Works for any email you have bought Wick Hunter Unleashed with — even with your server off or your licence lapsed.</p>
     <div class="card">
       <form id="signinForm">
@@ -420,6 +420,7 @@
 
   async function boot() {
     var r = await api("/api/customer/state");
+    document.getElementById("earnLink").hidden = !r.body?.earnAvailable;
     if (r.status === 200 && r.body && r.body.ok) showSignedIn(r.body);
     else showSignedOut();
   }

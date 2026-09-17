@@ -1,0 +1,47 @@
+# Earn with WH — private Alpha / Hub preview
+
+Hub 0.4.42; Alpha app 0.90.124. No public Beta release. Hub data is stored in
+`data/earn.v1.json` using atomic, owner-preserving writes. Back up this file with
+normal Hub data. Dollar amounts are integer USD cents. Never edit the ledger
+in place: use an adjustment or reversal.
+
+## Implemented
+
+- Shared Hub customer page and authenticated Alpha app view; app stores no earnings.
+- Per-license `earn: true` admission on Hub. Off by default. Customer-session access
+  requires a live billing customer with an enabled license. Admin uses existing bearer.
+- App route returns 404 in USER_BUILD, and customer builds strip its nav/view/init.
+- WH standard tiers: 0–20 active subscriptions 20%; 21–40 30%; 41+ 40%.
+- Default friend discount 10%; admin commission/discount/rebate overrides.
+- Bybit, Bitget, Bitunix, WEEX links. No Aster.
+- One main UID per exchange per member, unique across members for that exchange.
+  User declaration does not verify main status: admin must check ownership, main-account
+  status and referral attribution against the exchange's evidence before verification.
+- Exchange rebates: default 50% of commission WH actually received. One complete monthly
+  CSV aggregates across registered exchanges per member. Monthly rebate >= $15 qualifies;
+  smaller totals remain visible on the statement but are not credited or carried forward.
+- Strict CSV header `exchange,uid,commission_usd`; lowercase venue IDs, decimal USD.
+  A preview digest ties commit to reviewed inputs and rate snapshots. One finalized
+  import per completed UTC month; duplicate imports never double-credit.
+- Admin confirmed earnings and signed adjustments by program; manual payouts with
+  actual date, method and unique reference. Payouts cannot exceed that program balance.
+- Original ledger entries persist after reversals. Rate/UID verification changes audited.
+- Marketplace settlement and payout history can be recorded manually, separately from
+  exchange rebates. No estimated profits and no claims based on trading PNL.
+
+## Not activated / outstanding before earning-program launch
+
+The UI is intentionally truthful about these boundaries. A generated member code is
+reserved locally, but referral checkout is NOT activated, so the share-link control
+is disabled outside the clearly labeled design preview. Stripe coupon/promotion-code
+provisioning, referral attribution, paid-subscription counting, recurring commissions,
+refund/dispute adjustments, automatic marketplace settlement imports, recipient onboarding
+and automatic payouts still need their integrations and end-to-end verification.
+No Stripe object, payment or recipient is created by this preview. Cash earnings and
+subscription credits must stay separate; conversion to invoice credit is not implemented.
+Do not invite public customers to earn yet. Confirm discount/commission duration and
+Stripe acceptance of exchange referral rebates before enabling live payouts.
+
+Beta stays at 0.90.123. The preview uses sample data only on localhost and is not
+included in deployment archives. Public pages/API disclose no private member data
+without the corresponding account/license permission.

@@ -230,10 +230,23 @@
     <button type="button" data-hub-page="market-data">Market data</button>
     <button type="button" data-hub-page="marketplace">Marketplace</button>
     <button type="button" data-hub-page="billing">Billing</button>
+    <button type="button" data-hub-page="earn">Earn with WH</button>
     <button type="button" data-hub-page="hosting">Hosting</button>
     <button type="button" data-hub-page="system">System &amp; feedback</button>
   </nav>
 </header>
+
+<section class="hubpage" data-hub-page-panel="earn" hidden>
+<h2>Earn with WH</h2><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
+<button id="earnRefresh" type="button">Refresh earnings</button><p id="earnError" role="status"></p>
+<div class="card"><h3>Members &amp; rates</h3><label>Member <select id="earnMember"></select></label>
+<form id="earnRates" class="actions"><label>Customer discount % <input name="discountPercent" type="number" min="0" max="100" required></label><label>Commission % override <input name="commissionPercent" type="number" min="0" max="100" placeholder="Automatic tier"></label><label>Exchange rebate % <input name="rebatePercent" type="number" min="0" max="100" required></label><button>Save rates</button></form><p class="muted">Standard commission tiers: 0–20 = 20%, 21–40 = 30%, 41+ = 40%. A blank override uses the tier.</p><div id="earnUids"></div></div>
+<div class="card"><h3>Record earnings, adjustments or a manual payout</h3><form id="earnRecord">
+<div class="actions"><label>Program <select name="source"><option value="referral">WH Referrals</option><option value="exchange">Exchange Rebates</option><option value="marketplace">Marketplace provider</option></select></label><label>Entry <select name="kind"><option value="earning">Confirmed earnings</option><option value="adjustment">Adjustment (+/−)</option><option value="payout">Manual payout already sent</option></select></label><label>Amount USD <input name="amount" type="number" step="0.01" required></label><label>Statement month <input name="period" type="month" required></label></div>
+<div class="actions"><label>Unique payment / settlement reference <input name="reference" maxlength="200" required></label><label>Actual payout date <input name="paidAt" type="date"></label><label>Payment method (payouts) <input name="method" maxlength="80" placeholder="Bank transfer"></label><label>Reason / notes <input name="note" maxlength="500" required></label><button>Record entry</button></div></form><p class="muted">A payout reduces available earnings. Payouts cannot exceed the balance. Subscription credits are separate.</p></div>
+<div class="card"><h3>Monthly exchange rebate CSV</h3><p class="muted">Upload one complete month across all exchanges. Columns: <code>exchange,uid,commission_usd</code>. Commission means money WH received. Only verified main account UIDs are accepted. Verify ownership, main-account status and affiliate attribution against the exchange report. Each member’s combined rebate must reach $15; smaller amounts do not carry forward.</p><div class="actions"><label>Completed month <input id="earnCsvMonth" type="month"></label><label>CSV file <input id="earnCsv" type="file" accept=".csv,text/csv"></label><button id="earnPreview">Preview import</button><button id="earnCommit" disabled>Finalize reviewed month</button></div><div id="earnPreviewRows"></div></div>
+<div class="card"><h3>Member earnings ledger</h3><p class="muted">Corrections create a reversal; original records are never deleted.</p><div id="earnLedger" style="overflow:auto"></div></div>
+</section>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
@@ -497,9 +510,10 @@
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
 
-const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "hosting", "system"]);
+const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "earn", "hosting", "system"]);
 function showHubPage(wanted, remember) {
   const page = HUB_PAGES.has(wanted) ? wanted : "licenses";
+  if(page === "earn") queueMicrotask(() => earnRefresh());
   document.querySelectorAll("[data-hub-page-panel]").forEach((panel) => {
     panel.hidden = panel.getAttribute("data-hub-page-panel") !== page;
   });
@@ -2588,6 +2602,21 @@ async function hostingRefresh() {
 document.getElementById("hostingRefreshBtn").onclick = hostingRefresh;
 
 showGate();
+
+// Earn operations use the existing admin bearer boundary, never a customer cookie.
+let earnState=null, earnPreview=null;
+const earnEl=id=>document.getElementById(id), earnEsc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function earnCall(action,body){return api('/admin/api/earn'+(action?'/'+action:''),body?{method:'POST',headers:{'x-wh-earn':'1'},body:JSON.stringify(body)}:undefined);}
+function earnTable(head,rows){return '<table><thead><tr>'+head.map(h=>'<th>'+earnEsc(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+async function earnRefresh(){try{const selected=earnEl('earnMember').value;earnState=await earnCall('');earnEl('earnMember').innerHTML=earnState.members.map(m=>'<option value="'+earnEsc(m.id)+'">'+earnEsc(m.name)+' · '+earnEsc(m.code)+'</option>').join('');if(earnState.members.some(m=>m.id===selected))earnEl('earnMember').value=selected;earnSelect();}catch(e){earnEl('earnError').textContent=e.message;}}
+function earnSelect(){if(!earnState)return;const m=earnState.members.find(m=>m.id===earnEl('earnMember').value);if(!m)return;const f=earnEl('earnRates');f.elements.discountPercent.value=m.discountPercent;f.elements.commissionPercent.value=m.commissionPercent??'';f.elements.rebatePercent.value=m.rebatePercent;earnEl('earnUids').innerHTML=earnTable(['Exchange','UID','Verification'],m.uids.map(u=>[earnEsc(u.exchange),earnEsc(u.uid),'<button type="button" data-uid="'+earnEsc(u.uid)+'" data-exchange="'+earnEsc(u.exchange)+'" data-verified="'+u.verified+'">'+(u.verified?'Revoke verification':'Verify main UID & referral')+'</button>']));earnEl('earnUids').querySelectorAll('button').forEach(b=>b.onclick=async()=>{try{await earnCall('configure',{owner:m.id,exchange:b.dataset.exchange,uid:b.dataset.uid,verified:b.dataset.verified!=='true'});await earnRefresh();}catch(e){earnEl('earnError').textContent=e.message;}});earnEl('earnLedger').innerHTML=earnTable(['Date','Program','Type','USD','Reference','Note','Action'],earnState.entries.filter(e=>e.owner===m.id).reverse().map(e=>[earnEsc(e.createdAt.slice(0,10)),earnEsc(e.source),earnEsc(e.kind),(e.cents/100).toFixed(2),earnEsc(e.reference),earnEsc(e.note),e.kind!=='reversal'&&!earnState.entries.some(r=>r.reverses===e.id)?'<button data-reverse="'+earnEsc(e.id)+'">Reverse</button>':'']));earnEl('earnLedger').querySelectorAll('[data-reverse]').forEach(b=>b.onclick=async()=>{const note=prompt('Reason for reversing this entry');if(!note)return;try{await earnCall('reverse',{id:b.dataset.reverse,note});await earnRefresh();}catch(e){earnEl('earnError').textContent=e.message;}});}
+earnEl('earnRefresh').onclick=earnRefresh;earnEl('earnMember').onchange=earnSelect;
+earnEl('earnRates').onsubmit=async e=>{e.preventDefault();const f=e.target.elements;try{await earnCall('configure',{owner:earnEl('earnMember').value,discountPercent:Number(f.discountPercent.value),commissionPercent:f.commissionPercent.value===''?null:Number(f.commissionPercent.value),rebatePercent:Number(f.rebatePercent.value)});earnEl('earnError').textContent='Rates saved.';await earnRefresh();}catch(err){earnEl('earnError').textContent=err.message;}};
+earnEl('earnRecord').onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.target));b.owner=earnEl('earnMember').value;b.cents=Math.round(Number(b.amount)*100);delete b.amount;try{await earnCall('record',b);earnEl('earnError').textContent='Entry recorded.';await earnRefresh();}catch(err){earnEl('earnError').textContent=err.message;}};
+function earnInvalidate(){earnPreview=null;earnEl('earnCommit').disabled=true;earnEl('earnPreviewRows').textContent='';}earnEl('earnCsv').onchange=earnInvalidate;earnEl('earnCsvMonth').onchange=earnInvalidate;
+earnEl('earnPreview').onclick=async()=>{try{const file=earnEl('earnCsv').files[0];if(!file||file.size>1000000)throw new Error('Choose a CSV up to 1 MB');const csv=await file.text(),period=earnEl('earnCsvMonth').value;const r=await earnCall('preview',{csv,period});earnPreview={csv,period,digest:r.result.digest};earnEl('earnPreviewRows').innerHTML=earnTable(['Member','WH commission','Rebate','Result'],r.result.rows.map(x=>[earnEsc(earnState?.members.find(m=>m.id===x.owner)?.name||x.owner),(x.commissionCents/100).toFixed(2),(x.rebateCents/100).toFixed(2),x.qualified?'Qualifies':'Below $15; no credit']));earnEl('earnCommit').disabled=r.result.alreadyImported;}catch(err){earnInvalidate();earnEl('earnError').textContent=err.message;}};
+earnEl('earnCommit').onclick=async()=>{if(!earnPreview)return;earnEl('earnCommit').disabled=true;try{await earnCall('import',earnPreview);earnEl('earnError').textContent='Month finalized. Qualified rebates credited once.';earnInvalidate();await earnRefresh();}catch(err){earnEl('earnError').textContent=err.message;earnEl('earnCommit').disabled=false;}};
+
 </script>
 </body>
 </html>
