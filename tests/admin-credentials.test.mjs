@@ -12,10 +12,12 @@ const context=vm.createContext({
 });
 vm.runInContext(helper+'\n'+save,context);
 function field(type='password',value=''){
- const input={type,value,dataset:{field:type==='password'?'secretKey':'publishableKey'},setAttribute(){},focus(){}};
+ const input={type,value,dataset:{field:type==='password'?'secretKey':'publishableKey'},setAttribute(){},addEventListener(type,fn){this[type+"Handler"]=fn;},focus(){}};
  const buttons=[];context.protectApiField(input,{appendChild(b){buttons.push(b);}});return {input,edit:buttons[0]};
 }
 const secret=field();fields.push(secret.input);
+secret.input.value='unwanted-password-manager-value';
+secret.input.inputHandler();assert.equal(secret.input.value,'');
 secret.input.value='unwanted-password-manager-value';
 await context.billingSaveStripe('test');assert.equal(payload.stripe.test.secretKey,undefined);
 secret.edit.onclick();assert.equal(secret.input.value,'');assert.equal(secret.input.readOnly,false);

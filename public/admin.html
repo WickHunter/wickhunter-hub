@@ -1862,6 +1862,7 @@ function protectApiField(input, container) {
   const savedValue = input.value;
   input.readOnly = true;
   input.dataset.apiCredential = "1";
+  input.addEventListener("input", () => { if (input.readOnly) input.value = savedValue; });
   const edit = document.createElement("button");
   edit.type = "button";
   edit.textContent = "Edit key";
