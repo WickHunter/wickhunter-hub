@@ -65,14 +65,14 @@ export const FEEDBACK_LOGS_BYTES_MAX = 200 * 1024;
 export const FEEDBACK_ATTACHMENT_BYTES_MAX = 2 * 1024 * 1024;
 export const FEEDBACK_ATTACHMENT_DIMENSION_MAX = 8_192;
 export const FEEDBACK_ATTACHMENT_PIXELS_MAX = 32_000_000;
-export const FEEDBACK_DIAGNOSTICS_BYTES_MAX = 96 * 1024;
-export const FEEDBACK_DIAGNOSTICS_NODES_MAX = 5_000;
-export const FEEDBACK_DIAGNOSTICS_DEPTH_MAX = 12;
+export const FEEDBACK_DIAGNOSTICS_BYTES_MAX = 256 * 1024;
+export const FEEDBACK_DIAGNOSTICS_NODES_MAX = 20_000;
+export const FEEDBACK_DIAGNOSTICS_DEPTH_MAX = 18;
 export const FEEDBACK_DIAGNOSTICS_ARRAY_MAX = 100;
 export const FEEDBACK_DIAGNOSTICS_OBJECT_MAX = 80;
 export const FEEDBACK_DIAGNOSTICS_STRING_MAX = 1_000;
 /** Returned by intake so v2/v3 apps know pictures/diagnostics were understood. */
-export const FEEDBACK_EVIDENCE_SCHEMA = 3;
+export const FEEDBACK_EVIDENCE_SCHEMA = 4;
 
 /** Feedback is an internet-facing, license-authenticated write surface. These
  * limits deliberately leave room for a tester to file the six reports from one

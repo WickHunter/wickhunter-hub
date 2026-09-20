@@ -185,7 +185,7 @@ await test("diagnostics are bounded and secret-shaped values are redacted at the
   // and JSON punctuation still occupy the tracker. Pin the actual UTF-8 JSON
   // contract rather than an estimate of selected value bytes.
   const pathological = { page: "terminal" };
-  for (let group = 0; group < 20; group++) {
+  for (let group = 0; group < 60; group++) {
     const groupPrefix = `group_${String(group).padStart(2, "0")}_`;
     const values = {};
     for (let item = 0; item < 80; item++) {
@@ -237,7 +237,7 @@ await test("v3 runtime evidence keeps server context, pair gaps and decisions th
       method: "POST", body: JSON.stringify(report({ license: soloLicense.token, diagnostics })),
     });
     assert.equal(posted.status, 200);
-    assert.equal(posted.body.evidenceSchema, 3);
+    assert.equal(posted.body.evidenceSchema, FEEDBACK_EVIDENCE_SCHEMA);
     const first = listFeedback(solo.dataDir).find((row) => row.id === posted.body.id);
     assert.equal(first.diagnostics.schemaVersion, 3);
     assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].missingClosedMinutes.length, 1);
@@ -571,6 +571,23 @@ await test("the admin page offers per-row Delete and a Delete-all-fixed, both co
   assert.ok(page.includes("/admin/api/feedback/detail"), "report evidence is loaded on demand");
   assert.match(page, /Recent activity/, "the detail panel names the log evidence");
   assert.match(page, /Debug snapshot/, "the detail panel exposes structured diagnostics");
+});
+
+await test("schema 4 preserves full shared lifecycle evidence and still accepts schema 3", () => {
+  const raw = { schemaVersion: 4, server: { supportBundle: { coverage: { dealHedgeGridState: { status: "captured" } }, evidence: {
+    dealHedgeGridState: { contexts: [{ context: "acct:futures", deals: [{botId: "bot8", lifecycle: {openedWith: {tpPct: 2.5}}, stop: {source: "exchange"}}] }] },
+    consoleAndPreviousBoot: { rows: Array.from({length: 100}, (_, i) => ({ts:i,message:"diagnostic ".repeat(85)})) },
+    currentSettings: { rows: Array.from({length: 100}, (_, i) => ({id:i,description:"setting ".repeat(100)})) },
+    exchangeErrors: {timeout:7}
+  } } } };
+  assert.ok(Buffer.byteLength(JSON.stringify(raw)) > 96 * 1024);
+  const result = preflightFeedbackDiagnostics(raw);
+  assert.equal(result.ok, true);
+  const evidence = result.diagnostics.server.supportBundle.evidence;
+  assert.equal(evidence.dealHedgeGridState.contexts[0].deals[0].lifecycle.openedWith.tpPct, 2.5);
+  assert.equal(evidence.exchangeErrors.timeout, 7);
+  assert.equal(preflightFeedbackDiagnostics({schemaVersion:3}).ok, true);
+  assert.equal(preflightFeedbackDiagnostics({schemaVersion:5}).ok, false);
 });
 
 await h.close();
