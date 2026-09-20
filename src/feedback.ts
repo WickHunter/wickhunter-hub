@@ -65,9 +65,14 @@ export const FEEDBACK_LOGS_BYTES_MAX = 200 * 1024;
 export const FEEDBACK_ATTACHMENT_BYTES_MAX = 2 * 1024 * 1024;
 export const FEEDBACK_ATTACHMENT_DIMENSION_MAX = 8_192;
 export const FEEDBACK_ATTACHMENT_PIXELS_MAX = 32_000_000;
-export const FEEDBACK_DIAGNOSTICS_BYTES_MAX = 24 * 1024;
-/** Returned by intake so v2 apps know pictures/diagnostics were understood. */
-export const FEEDBACK_EVIDENCE_SCHEMA = 2;
+export const FEEDBACK_DIAGNOSTICS_BYTES_MAX = 96 * 1024;
+export const FEEDBACK_DIAGNOSTICS_NODES_MAX = 5_000;
+export const FEEDBACK_DIAGNOSTICS_DEPTH_MAX = 12;
+export const FEEDBACK_DIAGNOSTICS_ARRAY_MAX = 100;
+export const FEEDBACK_DIAGNOSTICS_OBJECT_MAX = 80;
+export const FEEDBACK_DIAGNOSTICS_STRING_MAX = 1_000;
+/** Returned by intake so v2/v3 apps know pictures/diagnostics were understood. */
+export const FEEDBACK_EVIDENCE_SCHEMA = 3;
 
 /** Feedback is an internet-facing, license-authenticated write surface. These
  * limits deliberately leave room for a tester to file the six reports from one
@@ -128,6 +133,12 @@ const QUOTED_SECRET_FIELD = new RegExp(
 );
 const AUTHORIZATION_SCHEME = /\b(authorization)\s*[:=]\s*(?:Bearer|Basic|Token|ApiKey)\s+[A-Za-z0-9._~+/=-]{4,}/gi;
 const COOKIE_HEADER = /\b((?:set[ _-]?)?cookie)\s*[:=]\s*[^\r\n]*/gi;
+const PEM_BLOCK = /-----BEGIN [^-\r\n]+-----[\s\S]*?(?:-----END [^-\r\n]+-----|$)/gi;
+const STRIPE_SECRET = /\b(?:sk_live_|whsec_)[A-Za-z0-9_-]{8,}\b/g;
+const GITHUB_SECRET = /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/g;
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const PREFIXED_SECRET = /\b(?:sk|ghp|github_pat|AKIA)[A-Za-z0-9_-]{8,}\b/g;
+const HEX_SECRET = /\b0x[0-9a-f]{32,}\b|\b[0-9a-f]{64,}\b/gi;
 const SECRET_ASSIGNMENT = new RegExp(
   `\\b(${SECRET_FIELD_SOURCE})\\s*[:=]\\s*(?:"[^"]*"|'[^']*'|[^\\s,;]+)`,
   "gi",
@@ -253,6 +264,12 @@ export class FeedbackQuotaError extends Error {
 export function redactFeedbackText(value: unknown, cap = FEEDBACK_LOG_LINE_MAX): string {
   return String(value ?? "")
     .replace(/\bLHK1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED)
+    .replace(PEM_BLOCK, REDACTED)
+    .replace(STRIPE_SECRET, REDACTED)
+    .replace(GITHUB_SECRET, REDACTED)
+    .replace(JWT, REDACTED)
+    .replace(PREFIXED_SECRET, REDACTED)
+    .replace(HEX_SECRET, REDACTED)
     .replace(QUOTED_SECRET_FIELD, (_m, keyQuote: string, key: string, separator: string, valueQuote: string) =>
       `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${REDACTED}${valueQuote}`)
     .replace(AUTHORIZATION_SCHEME, (_m, key: string) => `${key}=${REDACTED}`)
@@ -265,24 +282,50 @@ export function redactFeedbackText(value: unknown, cap = FEEDBACK_LOG_LINE_MAX):
     .slice(0, cap);
 }
 
-type DiagnosticBudget = { bytes: number; nodes: number };
+type DiagnosticBudget = { bytes: number; nodes: number; truncated: boolean };
+
+// Stable envelope facts must survive tail pruning. The app puts these first,
+// but sorting here keeps that guarantee for older or hostile clients too.
+const DIAGNOSTIC_PRIORITY_KEYS = new Set([
+  "schemaVersion", "generatedAt", "generatedAtMs", "sectionMetadata", "sections",
+  "server", "diagnosticsTruncated", "truncated", "truncation",
+]);
 
 function diagnosticValue(value: unknown, key: string, depth: number, budget: DiagnosticBudget): unknown {
-  if (SECRET_FIELD.test(key)) return REDACTED;
-  if (budget.bytes >= FEEDBACK_DIAGNOSTICS_BYTES_MAX || budget.nodes >= 500) return "[truncated]";
+  // `key` is also a common diagnostic join field (`acct:market`). Treat the
+  // generic spelling as secret only when its value has a credential shape;
+  // explicit names such as apiKey/privateKey remain unconditional.
+  const genericKey = key.toLowerCase() === "key";
+  const genericSecret = typeof value === "string"
+    && (/^LHK1\./.test(value) || /^(?:sk|ghp|github_pat|AKIA)/.test(value) || value.length >= 32);
+  if (SECRET_FIELD.test(key) && (!genericKey || genericSecret)) return REDACTED;
+  if (budget.bytes >= FEEDBACK_DIAGNOSTICS_BYTES_MAX || budget.nodes >= FEEDBACK_DIAGNOSTICS_NODES_MAX) {
+    budget.truncated = true;
+    return "[truncated]";
+  }
   budget.nodes++;
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value === "string") {
-    const clean = redactFeedbackText(value, 1_000);
+    if (value.length > FEEDBACK_DIAGNOSTICS_STRING_MAX) budget.truncated = true;
+    const clean = redactFeedbackText(value, FEEDBACK_DIAGNOSTICS_STRING_MAX);
     budget.bytes += Buffer.byteLength(clean, "utf8");
     return clean;
   }
-  if (depth >= 5) return "[truncated]";
-  if (Array.isArray(value)) return value.slice(0, 50).map((entry) => diagnosticValue(entry, "", depth + 1, budget));
+  if (depth > FEEDBACK_DIAGNOSTICS_DEPTH_MAX) {
+    budget.truncated = true;
+    return "[truncated]";
+  }
+  if (Array.isArray(value)) {
+    if (value.length > FEEDBACK_DIAGNOSTICS_ARRAY_MAX) budget.truncated = true;
+    return value.slice(0, FEEDBACK_DIAGNOSTICS_ARRAY_MAX).map((entry) => diagnosticValue(entry, "", depth + 1, budget));
+  }
   if (!value || typeof value !== "object") return null;
   const out: Record<string, unknown> = {};
-  for (const [rawKey, entry] of Object.entries(value as Record<string, unknown>).slice(0, 80)) {
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > FEEDBACK_DIAGNOSTICS_OBJECT_MAX) budget.truncated = true;
+  entries.sort(([a], [b]) => Number(DIAGNOSTIC_PRIORITY_KEYS.has(b)) - Number(DIAGNOSTIC_PRIORITY_KEYS.has(a)));
+  for (const [rawKey, entry] of entries.slice(0, FEEDBACK_DIAGNOSTICS_OBJECT_MAX)) {
     const cleanKey = String(rawKey).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
     if (cleanKey) out[cleanKey] = diagnosticValue(entry, cleanKey, depth + 1, budget);
   }
@@ -299,7 +342,7 @@ function pruneDiagnosticTail(value: unknown): boolean {
   }
   if (!value || typeof value !== "object") return false;
   const object = value as Record<string, unknown>;
-  const keys = Object.keys(object);
+  const keys = Object.keys(object).filter((key) => !DIAGNOSTIC_PRIORITY_KEYS.has(key));
   if (keys.length === 0) return false;
   const key = keys[keys.length - 1]!;
   const tail = object[key];
@@ -313,8 +356,9 @@ function pruneDiagnosticTail(value: unknown): boolean {
  * punctuation and numeric spellings count too, because UTF-8 JSON bytes are
  * what the request and JSONL tracker actually retain. Later fields are pruned
  * first so stable high-value facts at the front of the snapshot survive. */
-function clampDiagnosticJsonBytes(value: Record<string, unknown>): Record<string, unknown> {
+function clampDiagnosticJsonBytes(value: Record<string, unknown>, budget: DiagnosticBudget): Record<string, unknown> {
   while (Buffer.byteLength(JSON.stringify(value), "utf8") > FEEDBACK_DIAGNOSTICS_BYTES_MAX) {
+    budget.truncated = true;
     if (!pruneDiagnosticTail(value)) return {};
   }
   return value;
@@ -322,10 +366,44 @@ function clampDiagnosticJsonBytes(value: Record<string, unknown>): Record<string
 
 export function normalizeFeedbackDiagnostics(raw: unknown): Record<string, unknown> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const value = diagnosticValue(raw, "", 0, { bytes: 0, nodes: 0 });
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? clampDiagnosticJsonBytes(value as Record<string, unknown>)
-    : {};
+  const budget: DiagnosticBudget = { bytes: 0, nodes: 0, truncated: false };
+  // Count depth from the top-level payload's children. This keeps the
+  // bounded runtime evidence shape (server -> contexts -> bots -> pairs /
+  // decisions) within the advertised depth while still retaining leaf data.
+  const value = diagnosticValue(raw, "", -1, budget);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = value as Record<string, unknown>;
+  if ((raw as Record<string, unknown>).diagnosticsTruncated === true) budget.truncated = true;
+  if (budget.truncated) {
+    out.diagnosticsTruncated = true;
+    out.truncation = {
+      ...(out.truncation && typeof out.truncation === "object" && !Array.isArray(out.truncation) ? out.truncation as Record<string, unknown> : {}),
+      occurred: true,
+      reason: "Hub evidence bounds",
+      maxBytes: FEEDBACK_DIAGNOSTICS_BYTES_MAX,
+      maxNodes: FEEDBACK_DIAGNOSTICS_NODES_MAX,
+      maxDepth: FEEDBACK_DIAGNOSTICS_DEPTH_MAX,
+      maxArrayItems: FEEDBACK_DIAGNOSTICS_ARRAY_MAX,
+      maxObjectKeys: FEEDBACK_DIAGNOSTICS_OBJECT_MAX,
+      maxStringChars: FEEDBACK_DIAGNOSTICS_STRING_MAX,
+    };
+  }
+  return clampDiagnosticJsonBytes(out, budget);
+}
+
+/** Route composition can call this before durable quota accounting. The current
+ * server keeps normalizeFeedbackDiagnostics backward-compatible; this helper
+ * gives it an explicit refusal for future envelopes instead of storing them as
+ * if their fields were understood. */
+export function preflightFeedbackDiagnostics(raw: unknown):
+  | { ok: true; diagnostics: Record<string, unknown> }
+  | { ok: false; error: string; schemaVersion: number } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: true, diagnostics: {} };
+  const version = (raw as Record<string, unknown>).schemaVersion;
+  if (typeof version === "number" && Number.isSafeInteger(version) && version > FEEDBACK_EVIDENCE_SCHEMA) {
+    return { ok: false, error: `unsupported feedback diagnostics schema ${version}; update the Hub before filing this report`, schemaVersion: version };
+  }
+  return { ok: true, diagnostics: normalizeFeedbackDiagnostics(raw) };
 }
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);

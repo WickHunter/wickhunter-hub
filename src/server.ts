@@ -97,7 +97,7 @@ import {
   FeedbackQuotaError, FeedbackRateLimiter,
   appendFeedback, clampLogs, deleteFeedback,
   feedbackDetail, feedbackExport, listFeedback, normalizeFeedbackAttachment,
-  normalizeFeedbackDiagnostics, redactFeedbackText, setFeedbackStatus, type FeedbackStatus,
+  preflightFeedbackDiagnostics, redactFeedbackText, setFeedbackStatus, type FeedbackStatus,
   type FeedbackStorageLimits,
 } from "./feedback.js";
 import type { HubConfig } from "./config.js";
@@ -1074,6 +1074,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (rawText.length > FEEDBACK_TEXT_MAX) {
       return sendJson(res, 400, { ok: false, error: `report text must be ${FEEDBACK_TEXT_MAX} characters or fewer` });
     }
+    const diagnostics = preflightFeedbackDiagnostics(body.diagnostics);
+    if (!diagnostics.ok) return sendJson(res, 400, { ok: false, error: diagnostics.error });
     const text = redactFeedbackText(rawText, FEEDBACK_TEXT_MAX);
     const { logs, truncated } = clampLogs(body.logs);
     const picture = normalizeFeedbackAttachment(body.attachment);
@@ -1091,7 +1093,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         text: text.slice(0, FEEDBACK_TEXT_MAX),
         logs,
         logsTruncated: truncated,
-        diagnostics: normalizeFeedbackDiagnostics(body.diagnostics),
+        diagnostics: diagnostics.diagnostics,
         attachment: picture.attachment,
       }, Date.now(), feedbackStorageLimits);
     } catch (err) {

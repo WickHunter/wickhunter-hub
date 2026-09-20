@@ -7,13 +7,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
+import { createHub } from "../dist/src/server.js";
 import {
   clampLogs,
   listFeedback,
   normalizeFeedbackAttachment,
   normalizeFeedbackDiagnostics,
+  redactFeedbackText,
+  preflightFeedbackDiagnostics,
   FEEDBACK_ATTACHMENT_BYTES_MAX,
   FEEDBACK_DIAGNOSTICS_BYTES_MAX,
+  FEEDBACK_DIAGNOSTICS_ARRAY_MAX,
   FEEDBACK_EVIDENCE_SCHEMA,
   FEEDBACK_LOG_LINES_MAX,
   FEEDBACK_LOGS_BYTES_MAX,
@@ -196,6 +200,111 @@ await test("diagnostics are bounded and secret-shaped values are redacted at the
   assert.ok(exactBytes > FEEDBACK_DIAGNOSTICS_BYTES_MAX * 0.8, "the cap preserves useful early facts rather than dropping the snapshot");
   assert.equal(exact.page, "terminal");
   assert.ok(Object.keys(exact).length < Object.keys(pathological).length, "the pathological tail was pruned");
+});
+
+await test("shared redactor removes provider tokens, JWTs and incomplete PEM blocks", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+  const secretText = [
+    "sk_live_1234567890123456", "whsec_1234567890123456",
+    "ghp_1234567890123456", "gho_1234567890123456", "ghu_1234567890123456",
+    "ghs_1234567890123456", "ghr_1234567890123456", jwt,
+    "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+  ].join(" ");
+  const clean = redactFeedbackText(`runtime evidence ${secretText}`);
+  assert.ok(!clean.includes("sk_live_") && !clean.includes("whsec_") && !clean.includes("ghp_") && !clean.includes("gho_") && !clean.includes("ghu_") && !clean.includes("ghs_") && !clean.includes("ghr_") && !clean.includes("eyJhbGci"));
+  assert.ok(!clean.includes("BEGIN PRIVATE KEY"));
+  assert.match(clean, /runtime evidence/);
+});
+
+await test("v3 runtime evidence keeps server context, pair gaps and decisions through persistence and reload", async () => {
+  const solo = await freshHub();
+  const soloLicense = solo.store.issue("Runtime Evidence", 30);
+  const diagnostics = {
+    schemaVersion: 3,
+    sectionMetadata: { server: { included: true, truncated: false }, bots: { included: true, truncated: false } },
+    server: {
+      generatedAt: 1_800_000_000_000,
+      contexts: [{ key: "binance-main:futures", bots: [{ id: "optimized-1", pairs: [{
+        symbol: "BTCUSDT", missingClosedMinutes: [1_800_000_000_000],
+        decisions: [{ at: 1_800_000_000_001, action: "refused", reason: "current candle tail is catching up" }],
+      }] }] }],
+      apiKey: "must-not-persist",
+    },
+    diagnosticsTruncated: false,
+  };
+  try {
+    const posted = await jsonReq(`${solo.origin}/api/feedback`, {
+      method: "POST", body: JSON.stringify(report({ license: soloLicense.token, diagnostics })),
+    });
+    assert.equal(posted.status, 200);
+    assert.equal(posted.body.evidenceSchema, 3);
+    const first = listFeedback(solo.dataDir).find((row) => row.id === posted.body.id);
+    assert.equal(first.diagnostics.schemaVersion, 3);
+    assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].missingClosedMinutes.length, 1);
+    assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].missingClosedMinutes[0], 1_800_000_000_000);
+    assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].decisions[0].action, "refused");
+    assert.equal(first.diagnostics.server.apiKey, "[redacted]");
+    assert.ok(!JSON.stringify(first.diagnostics).includes("must-not-persist"));
+
+    await solo.close();
+    const restarted = createHub(solo.cfg, { candleSleep: async () => {} });
+    try {
+      await restarted.listen();
+      const afterReload = listFeedback(solo.dataDir).find((row) => row.id === posted.body.id);
+      assert.deepEqual(afterReload.diagnostics.server.contexts[0].bots[0].pairs[0].decisions, diagnostics.server.contexts[0].bots[0].pairs[0].decisions);
+      assert.equal(afterReload.diagnostics.sectionMetadata.server.included, true);
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    // The restart path owns close after the first successful close.
+    try { await solo.close(); } catch { /* already closed */ }
+  }
+});
+
+await test("future diagnostic schemas refuse in preflight and HTTP intake while v2 remains accepted", async () => {
+  const old = preflightFeedbackDiagnostics({ schemaVersion: 2, server: { ok: true } });
+  assert.equal(old.ok, true);
+  const future = preflightFeedbackDiagnostics({ schemaVersion: FEEDBACK_EVIDENCE_SCHEMA + 1, server: { ok: true } });
+  assert.equal(future.ok, false);
+  assert.equal(future.schemaVersion, FEEDBACK_EVIDENCE_SCHEMA + 1);
+
+  const isolated = await freshHub();
+  const license = isolated.store.issue("Future Schema", 30);
+  try {
+    const response = await jsonReq(`${isolated.origin}/api/feedback`, {
+      method: "POST",
+      body: JSON.stringify(report({
+        license: license.token,
+        diagnostics: { schemaVersion: FEEDBACK_EVIDENCE_SCHEMA + 1, server: { futureField: true } },
+      })),
+    });
+    assert.equal(response.status, 400);
+    assert.match(response.body.error, /unsupported feedback diagnostics schema/);
+    assert.equal(listFeedback(isolated.dataDir).length, 0);
+  } finally {
+    await isolated.close();
+  }
+});
+
+await test("oversized evidence reports honest truncation while preserving priority metadata and redacts the full tree", () => {
+  const huge = normalizeFeedbackDiagnostics({
+    schemaVersion: 3,
+    sectionMetadata: { server: { included: true }, pairs: { truncated: false } },
+    server: { contexts: [{ key: "ctx", bots: [{ pairs: [{ symbol: "ETHUSDT", missingClosedMinutes: [1, 2, 3] }] }] }], secret: "do-not-store" },
+    noisy: Array.from({ length: FEEDBACK_DIAGNOSTICS_ARRAY_MAX + 50 }, (_, i) => ({
+      index: i, password: `secret-${i}`, text: "x".repeat(2_000),
+    })),
+    diagnosticsTruncated: false,
+  });
+  assert.equal(huge.schemaVersion, 3);
+  assert.equal(huge.sectionMetadata.server.included, true);
+  assert.equal(huge.server.contexts[0].bots[0].pairs[0].symbol, "ETHUSDT");
+  assert.equal(huge.server.secret, "[redacted]");
+  assert.equal(huge.diagnosticsTruncated, true);
+  assert.equal(huge.truncation.occurred, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(huge), "utf8") <= FEEDBACK_DIAGNOSTICS_BYTES_MAX);
+  assert.ok(!JSON.stringify(huge).includes("do-not-store"));
 });
 
 await test("picture validation accepts a real bounded raster and rejects spoofed or oversized data", async () => {

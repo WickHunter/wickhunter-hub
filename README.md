@@ -1726,6 +1726,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.44 — Bound and redact runtime support evidence, acknowledge diagnostics schema 3, and reject unsupported future evidence schemas before persistence.
+
 - v0.4.42 — Private Earn with WH page, shared Hub earnings ledger, main exchange UID verification, monthly rebate imports, manual payouts and audit reversals. Per-license earn gate; no public Beta activation.
 
 - v0.4.41 — Report Bybit liquidation subscription acknowledgements per physical socket, including separate refused and pending topic counts across partial reconnects.
