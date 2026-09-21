@@ -838,12 +838,17 @@ async function refresh() {
       tr.lastElementChild.appendChild(copy);
       if (l.seat && l.seat.installs.length) {
         const rel = document.createElement("button");
-        rel.textContent = "Release seat";
-        rel.title = "Free this licence's seat now. The next install to check in takes it; the current holder is refused if it is still running.";
+        rel.textContent = "Release check-in seat";
+        rel.title = "Clear the check-in restriction only. This does not transfer or release the signed Go licence binding.";
         rel.onclick = async () => {
-          if (!confirm("Release the seat for " + l.name + "? The next install to check in takes it.")) return;
-          try { await api("/admin/api/licenses/seat/release", { method: "POST", body: JSON.stringify({ id: l.id }) }); }
-          catch (e) { document.getElementById("err").textContent = e.message; }
+          if (!confirm("Release the check-in seat for " + l.name + "? The next install to check in takes it. This does NOT transfer the Go licence to another server; that may require a replacement licence.")) return;
+          try {
+            const result = await api("/admin/api/licenses/seat/release", { method: "POST", body: JSON.stringify({ id: l.id }) });
+            document.getElementById("note").textContent = "Check-in seat released for " + l.name + ". "
+              + (result.goLease?.message || "Go licence binding was not checked; this does not confirm that trading can resume.")
+              + (result.goLease?.boundInstallIds?.length ? " Bound installs: " + result.goLease.boundInstallIds.join(", ") : "");
+          }
+          catch (e) { document.getElementById("err").textContent = e.message; return; }
           refresh();
         };
         tr.lastElementChild.appendChild(rel);

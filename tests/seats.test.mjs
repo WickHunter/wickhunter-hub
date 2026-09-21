@@ -77,7 +77,10 @@ await test("after the holder goes silent for the release window, the new install
 
 await test("admin release frees the seat immediately", async () => {
   const r = await admin("/admin/api/licenses/seat/release", { method: "POST", body: JSON.stringify({ id: L }) });
-  assert.deepEqual(r.body, { ok: true, released: true });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.released, true);
+  assert.equal(r.body.goLease.state, "unbound");
+  assert.deepEqual(r.body.goLease.boundInstallIds, []);
   let seat = await seatOf();
   assert.equal(seat.installs.length, 0);
   assert.ok(seat.releasedAtMs);

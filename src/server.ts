@@ -1973,7 +1973,31 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/admin/api/licenses/seat/release") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.id !== "string" || !body.id) return sendJson(res, 400, { ok: false, error: "expected {id}" });
-      return sendJson(res, 200, { ok: true, released: seats.release(body.id, seatNow()) });
+      if (!store.isKnown(body.id)) return sendJson(res, 404, { ok: false, error: "unknown license id" });
+      // Check-in seats and signed Go leases are separate authorities. Releasing
+      // the former must never suggest that it transferred the latter, or clear
+      // a cryptographic binding so a copied bearer can claim it on another VPS.
+      let goLease: { state: string; boundInstallIds: string[]; message: string } = {
+        state: "unavailable", boundInstallIds: [],
+        message: "Go lease status could not be checked. Releasing the check-in seat does not transfer a Go licence; do not treat this as confirmation that trading can resume.",
+      };
+      try {
+        if (licenseLeases) {
+          const snapshot = licenseLeases.adminSnapshot(body.id);
+          const boundInstallIds = snapshot.activations.filter((a) => a.status === "active").map((a) => a.installId);
+          const locked = snapshot.recoveryLockedLicenses.includes(body.id);
+          goLease = {
+            state: locked ? "recovery-locked" : boundInstallIds.length ? "bound" : "unbound",
+            boundInstallIds,
+            message: locked
+              ? "This licence is recovery-locked. Releasing its check-in seat does not unlock Go activation. Issue a replacement licence for the intended server."
+              : boundInstallIds.length
+                ? "The Go licence remains bound to the listed install(s). A different server still cannot obtain a Go lease just by checking in. For a server move, use a verified rebind or issue a replacement licence; stop the old install and retire its old key after confirming the replacement."
+                : "No active Go binding was found. The next install must still complete signed Go lease activation before new entries can resume.",
+          };
+        }
+      } catch { /* A damaged audit must never be reported as an empty binding. */ }
+      return sendJson(res, 200, { ok: true, released: seats.release(body.id, seatNow()), goLease });
     }
     if (m === "POST" && p === "/admin/api/licenses/seat/limit") {
       const body = await readJsonBody(req);

@@ -14,6 +14,15 @@ For a checkout elsewhere, set `LIQHUNTER_BOT_MODULE` to the app's compiled
 still compares the real app implementation. Local audit results and remaining
 deployment checks are in [Claude handoff](docs/CLAUDE-HANDOFF-2026-09-14.md).
 
+## v0.4.46 — Explain Go licence bindings after check-in seat release
+
+The admin action is now named **Release check-in seat**. Its confirmation and
+result explain that it does not transfer the signed Go licence binding. The
+result lists remaining bound install IDs, distinguishes recovery-locked and
+unavailable lease state, and describes the replacement-licence/rebind path.
+It never clears a Go binding or bypasses proof of possession. This prevents a
+server move from being reported as recovered merely because “Revoked” cleared.
+
 ## v0.4.41 — Bybit subscription status reports partial coverage
 
 Bybit liquidation status counts acknowledged topics across each physical
@@ -1726,6 +1735,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.46 — Distinguish check-in seat release from Go licence recovery. Show surviving bindings, recovery locks and unavailable lease status without weakening machine-bound activation. No customer release publication.
 - v0.4.45 — Accept schema-4 shared support evidence with independently bounded runtime, deal/hedge/grid state, exchange history and host facts. Preserve older schemas and existing storage quotas. No customer release publication.
 
 - v0.4.44 — Bound and redact runtime support evidence, acknowledge diagnostics schema 3, and reject unsupported future evidence schemas before persistence.
