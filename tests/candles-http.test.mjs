@@ -1221,9 +1221,8 @@ await test("the admin page carries the per-exchange panel and refreshes it with 
   // the candle panel — the over-anchored source scan this repo keeps relearning.
   // What matters is that the button refreshes the venue cards; which OTHER
   // panels it also refreshes is not this test's business.
-  const onclick = /document\.getElementById\("refresh"\)\.onclick = \(\) => \{([^}]*)\}/.exec(page);
-  assert.ok(onclick, "the page has a Refresh button handler");
-  assert.match(onclick[1], /\bcdRefresh\(\)/, "the page's Refresh button refreshes the venue cards too");
+  assert.match(page, /loadHubPage\(currentHubPage, true\)/, "Refresh reloads the active section");
+  assert.match(page, /"market-data": \[cdRefresh, mcRefresh, lqRefresh\]/, "Market data loads each status panel");
 });
 
 

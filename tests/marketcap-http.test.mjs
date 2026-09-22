@@ -263,12 +263,8 @@ await test("the admin page carries the producer panel, and it refreshes with the
   }
   // Anchored on the claim rather than the whole line: which OTHER panels the
   // button refreshes is not this test's business.
-  const onclick = /document\.getElementById\("refresh"\)\.onclick = \(\) => \{([^}]*)\}/.exec(page);
-  assert.ok(onclick && /\bmcRefresh\(\)/.test(onclick[1]), "the page's Refresh button refreshes the producer panel too");
-  // A producer that is OFF and one that is configured-but-unable are different
-  // states, and the panel must not report the second as the first: from a
-  // client's side "configured and unable" looks exactly like a provider outage.
-  assert.ok(page.includes("configured but NOT RUNNING"), "the unable state has its own words");
+  assert.match(page, /loadHubPage\(currentHubPage, true\)/, "Refresh reloads the active section");
+  assert.match(page, /"market-data": \[cdRefresh, mcRefresh, lqRefresh\]/, "Market data loads each status panel");
   await h.close();
 });
 

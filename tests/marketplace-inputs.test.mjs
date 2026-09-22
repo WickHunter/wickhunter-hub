@@ -536,7 +536,10 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.match(html, /data-hub-page="system"/);
   assert.match(html, /function showHubPage/);
   assert.match(html, /Licenses &amp; installs/);
-  assert.match(html, /System &amp; feedback/);
+  assert.match(html, /data-hub-page="overview"/);
+  assert.match(html, /data-hub-page="bugs"/);
+  assert.match(html, /data-hub-page="features"/);
+  assert.match(html, /data-hub-page="support"/);
   assert.doesNotMatch(html, /Generate shared status credential/);
   assert.doesNotMatch(html, /Generate Demo vault key/);
   assert.doesNotMatch(html, /Generate Demo worker credential/);

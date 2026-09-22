@@ -257,6 +257,55 @@
     .earn-table td > button { min-width:0; white-space:normal; }
   }
 
+
+  [hidden] { display:none !important; }
+  body { max-width:90rem; }
+  .topbar h1 small { display:none; }
+  .hubnav { flex-wrap:wrap; }
+  .nav-group { display:flex; gap:.35rem; flex-wrap:wrap; align-items:center; }
+  .nav-group + .nav-group { border-top:1px solid var(--line); padding-top:.55rem; margin-top:.15rem; width:100%; }
+  .nav-caption { color:var(--muted); font-size:.75rem; padding:.2rem .4rem; }
+  .hubnav button { padding:.45rem .8rem; border-radius:var(--r-sm); }
+  .briefing-head { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin:1.4rem 0 .8rem; }
+  .briefing-head h2 { margin:0; font-size:1.7rem; }
+  .briefing-head p { margin:.35rem 0; color:var(--muted); }
+  .briefing-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; }
+  .brief-card { text-align:left; padding:1rem; border-radius:var(--r); display:flex; flex-direction:column; gap:.45rem; min-width:0; }
+  .brief-card strong { font-size:1.25rem; }
+  .brief-card small { color:var(--muted); font-size:.83rem; overflow-wrap:anywhere; }
+  .brief-status { font-weight:700; font-size:.82rem; }
+  .brief-status.green { color:var(--long); } .brief-status.red { color:var(--short); } .brief-status.amber { color:var(--warn); } .brief-status.unknown { color:var(--muted); }
+  .brief-columns { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; margin-top:1rem; }
+  .brief-section { border:1px solid var(--line); background:var(--raised); border-radius:var(--r); padding:1rem; min-width:0; }
+  .brief-section h3 { margin:0 0 .7rem; font-size:1rem; }
+  .inbox-item { display:block; width:100%; text-align:left; background:var(--inset); border:1px solid var(--line); padding:.85rem; margin:.6rem 0; border-radius:var(--r-sm); color:var(--ink); overflow-wrap:anywhere; }
+  .inbox-item p { margin:.4rem 0; white-space:pre-wrap; }
+  .inbox-item small { color:var(--muted); }
+  .brief-empty { padding:1rem 0; color:var(--muted); }
+  .hub-error { color:var(--short); overflow-wrap:anywhere; }
+  .archive-tools { margin:1rem 0; border:1px solid var(--line); border-radius:var(--r-sm); padding:.6rem .8rem; }
+  summary { cursor:pointer; min-height:32px; }
+  .report-filters { position:sticky; top:9rem; background:var(--ground); z-index:3; padding:.6rem 0; }
+  #rows tr[hidden], #fbRows tr[hidden] { display:none !important; }
+  #fbRows td.name { overflow-wrap:anywhere; }
+  .support-thread textarea { width:100%; min-height:7rem; padding:.75rem; border-radius:var(--r-sm); }
+  .support-thread .message { padding:.7rem; margin:.6rem 0; background:var(--inset); border:1px solid var(--line); border-radius:var(--r-sm); white-space:pre-wrap; overflow-wrap:anywhere; }
+  @media(max-width:900px) { .briefing-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  @media(max-width:640px) {
+    .briefing-grid { gap:.5rem; } .brief-card { padding:.75rem; } .brief-card strong { font-size:1.05rem; }
+    .brief-columns { grid-template-columns:1fr; } .briefing-head h2 { font-size:1.4rem; }
+    .report-filters { position:static; }
+    .record-table { overflow:visible; }
+    .record-table table, .record-table tbody, .record-table tr, .record-table td { display:block; width:100%; min-width:0 !important; max-width:100% !important; }
+    .record-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+    .record-table tr { border:1px solid var(--line); border-radius:var(--r-sm); padding:.65rem; margin:.65rem 0; background:var(--raised); }
+    .record-table td { position:static !important; background:transparent !important; white-space:normal; overflow-wrap:anywhere; border:0; padding:.35rem 0; }
+    .record-table td[data-label]::before { content:attr(data-label); display:block; font-size:.72rem; color:var(--muted); text-transform:uppercase; }
+    .record-table td button { margin:.15rem .15rem .15rem 0; max-width:100%; white-space:normal; }
+    .record-table td select { max-width:100%; }
+    .brief-section { padding:.8rem; }
+  }
+
 </style>
 </head>
 <body>
@@ -277,31 +326,38 @@
     <h1>Wick Hunter Hub <small>— licensing &amp; operations</small></h1>
     <div class="actions" style="margin-top:0">
       <button type="button" id="refresh">Refresh</button>
-      <button type="button" id="upgradeHub">Upgrade hub</button>
+      <button type="button" id="signOut">Sign out</button>
       <span id="hubVer" class="muted"></span>
     </div>
   </div>
   <nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
-    <button type="button" data-hub-page="licenses">Licenses &amp; installs</button>
-    <button type="button" data-hub-page="market-data">Market data</button>
-    <button type="button" data-hub-page="marketplace">Marketplace</button>
-    <button type="button" data-hub-page="billing">Billing</button>
-    <button type="button" data-hub-page="earn">Earn with WH</button>
-    <button type="button" data-hub-page="hosting">Hosting</button>
-    <button type="button" data-hub-page="system">System &amp; feedback</button>
-  </nav>
-  <label class="mobile-nav" for="hubPageSelect">Section
-    <select id="hubPageSelect" aria-label="Admin section">
-      <option value="licenses">Licenses &amp; installs</option>
-      <option value="market-data">Market data</option>
-      <option value="marketplace">Marketplace</option>
-      <option value="billing">Billing</option>
-      <option value="earn">Earn with WH</option>
-      <option value="hosting">Hosting</option>
-      <option value="system">System &amp; feedback</option>
-    </select>
-  </label>
+<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Human replies</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Billing</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">System</button></div></nav>
+<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Human replies</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Billing</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">System</option></optgroup></select></label>
+<div id="pageNotice" class="hub-error" role="status"></div>
 </header>
+
+<section class="hubpage" data-hub-page-panel="overview" hidden>
+  <div class="briefing-head"><div><h2>Today’s briefing</h2><p id="briefingDate"></p></div><span class="muted" id="briefingUpdated" role="status">Refresh to check current status</span></div>
+  <div class="briefing-grid">
+    <button class="brief-card" data-open-page="market-data"><span>Candle Data</span><strong id="briefCandles" class="brief-status unknown">Checking…</strong><small id="briefCandlesNote">Exchange collector health</small></button>
+    <button class="brief-card" data-open-page="bugs"><span>Bug Reports</span><strong id="briefBugs" class="brief-status unknown">Checking…</strong><small id="briefBugsNote">Unresolved customer reports</small></button>
+    <button class="brief-card" data-open-page="features"><span>Feature Requests</span><strong id="briefFeatures" class="brief-status unknown">Checking…</strong><small id="briefFeaturesNote">Requests awaiting review</small></button>
+    <button class="brief-card" data-open-page="support"><span>Human Replies</span><strong id="briefSupport" class="brief-status unknown">Checking…</strong><small id="briefSupportNote">In-app support conversations</small></button>
+  </div>
+  <p class="muted">Red: needs attention · Amber: review or recovery in progress · Green: clear · Unknown: could not verify. Status reflects all open work, not just today.</p>
+  <div class="brief-columns">
+    <section class="brief-section"><h3>Bug reports needing attention</h3><div id="briefBugList" class="muted">Loading reports…</div><button data-open-page="bugs">All bug reports</button></section>
+    <section class="brief-section"><h3>Waiting for a human answer</h3><div id="briefSupportList" class="muted">Checking inbox…</div><button data-open-page="support">Open support inbox</button></section>
+    <section class="brief-section"><h3>Feature requests to review</h3><div id="briefFeatureList" class="muted">Loading requests…</div><button data-open-page="features">All feature requests</button></section>
+    <section class="brief-section"><h3>Data issues</h3><div id="briefDataList" class="muted">Checking collectors…</div><button data-open-page="market-data">View exchange details</button></section>
+  </div>
+</section>
+<section class="hubpage" data-hub-page-panel="support" hidden>
+  <h2>Human replies</h2><p class="muted">In-app questions and conversations that need your attention.</p>
+  <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="open">Needs a human</option><option value="all">All conversations</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
+  <div id="supportInbox"></div>
+</section>
+
 
 <section class="hubpage" data-hub-page-panel="earn" hidden>
 <h2>Earn with WH</h2><p class="muted">Manage member rates, monthly rebates and payouts.</p><div class="card"><h3>Stripe automation</h3><form id="earnStripeConfig"><div class="actions"><label>Mode <select name="mode"><option value="test">Test</option><option value="live">Live</option></select></label><label><input type="checkbox" name="enabled"> Enable Stripe earning tools</label><label><input type="checkbox" name="automatic"> Monthly automatic payouts</label><label>Payout day (UTC) <input name="payoutDay" type="number" min="1" max="28" value="1"></label><label>Financial account <input name="financialAccount" placeholder="fa_…"></label><label>Payout API key <input name="payoutKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved key"></label><button>Save Stripe settings</button></div></form><div class="actions"><button id="earnStripeCheck">Check Stripe access</button><button id="earnStripeRun">Reconcile / run eligible payouts</button></div><p id="earnStripeStatus" class="muted" role="status"></p><div id="earnStripeJobs"></div><p class="muted">Test and live money are separate. Payouts reserve approved prior-month earnings before submission. Refunds and disputes adjust future payable balances. Never record a manual payout for an unresolved Stripe reservation.</p></div><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
@@ -316,6 +372,7 @@
 </section>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
+<h2>System</h2><div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
 
 <h1 style="margin-top:2.2rem">Machine leases <small>— staged licensing rollout; public verifier only</small></h1>
@@ -481,8 +538,8 @@
 <section class="hubpage" data-hub-page-panel="licenses">
 <h1 style="margin-top:2.2rem">Licenses &amp; install commands</h1>
 <form id="issueForm">
-  <input name="name" placeholder="Tester name" required>
-  <input name="days" type="number" value="30" min="1" max="3650" required> days
+  <label>Customer name <input name="name" placeholder="Customer name" required></label>
+  <label>Days <input name="days" type="number" value="30" min="1" max="3650" required></label>
   <button type="submit">Issue license</button>
 </form>
 
@@ -491,7 +548,7 @@
      Running bots on v0.90.3 or later pick the re-minted key up at their next
      check-in (within five minutes), so there is nothing to send them. -->
 <form id="extendForm" style="margin-top:.6rem">
-  <input name="to" type="date" required>
+  <label>New expiry <input name="to" type="date" required></label>
   <button type="submit">Extend every active license to this date</button>
   <span class="muted" style="margin-left:.5rem">Nothing is shortened. Bots on v0.90.3+ install the new key themselves at check-in; older bots need their row's install command.</span>
 </form>
@@ -502,7 +559,8 @@
   <button type="button" id="copyIssued">Copy invite command</button>
 </div>
 
-<div id="err"></div>
+<div id="err" role="status"></div>
+<div class="actions"><input id="licenseSearch" type="search" placeholder="Search name, install, version or IP" aria-label="Search licenses"><select id="licenseFilter" aria-label="License status"><option value="">All licenses</option><option>active</option><option>expired</option><option>revoked</option></select><span id="licenseCount" class="muted"></span></div>
 <div id="note"></div>
 <div class="tbl"><table>
   <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th>Marketplace</th><th></th></tr></thead>
@@ -546,23 +604,19 @@
 <div id="lqbody"><div class="muted">loading…</div></div>
 </section>
 
-<section class="hubpage" data-hub-page-panel="system" hidden>
-<h1 style="margin-top:2.2rem">Feedback <small>— tester bug reports &amp; feature requests</small></h1>
+<section class="hubpage" data-hub-page-panel="reports" hidden>
+<h2 id="reportsTitle">Bug reports</h2><p class="muted">Review the original report, screenshots and diagnostics, then update its status.</p>
 <div class="actions">
   <button type="button" id="fbRefresh">Refresh</button>
   <button type="button" id="fbExport">Export all (JSON, logs included)</button>
-  <!-- Clearing the fixed pile is the whole point of "stay organised", and doing
-       it one row at a time is the thing that stops getting done. Export first:
-       a delete is permanent and the export is the only copy. -->
-  <button type="button" id="fbClearFixed">Delete all fixed</button>
-  <span class="muted">Export is the file to hand to your assistant for triage — and your only copy once a report is deleted.</span>
   <span id="fbExportNote" class="muted"></span>
 </div>
-<div class="actions">
+<div class="actions report-filters">
   <input id="fbSearch" type="search" placeholder="Search report, tester, context…" aria-label="Search feedback">
   <select id="fbKindFilter" aria-label="Filter feedback kind"><option value="">All kinds</option><option value="bug">Bugs</option><option value="feature">Features</option></select>
-  <select id="fbStatusFilter" aria-label="Filter feedback status"><option value="">All statuses</option><option value="new">New</option><option value="discussing">Discussing</option><option value="fixed">Fixed</option></select>
+  <select id="fbStatusFilter" aria-label="Filter feedback status"><option value="open">Unresolved</option><option value="">All statuses</option><option value="new">New</option><option value="discussing">Discussing</option><option value="fixed">Fixed</option></select>
 </div>
+<details class="archive-tools"><summary>Archive maintenance</summary><p class="muted">Export before deleting. Deleted reports cannot be recovered from the Hub.</p><button type="button" id="fbClearFixed">Delete all fixed</button></details>
 <div id="fbMeta" class="fbmeta"></div>
 <div class="tbl"><table>
   <thead><tr><th>When</th><th>Tester</th><th>Kind</th><th>App / context</th><th>Evidence</th><th>Status</th><th style="white-space:normal">Report</th><th>Actions</th></tr></thead>
@@ -577,24 +631,53 @@
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
 
-const HUB_PAGES = new Set(["licenses", "market-data", "marketplace", "billing", "earn", "hosting", "system"]);
+const HUB_PAGES = new Set(["overview", "bugs", "features", "support", "licenses", "market-data", "marketplace", "billing", "earn", "hosting", "system"]);
+let currentHubPage = "overview";
+const loadedPages = new Set();
+const loadingPages = new Map();
 function showHubPage(wanted, remember) {
-  const page = HUB_PAGES.has(wanted) ? wanted : "licenses";
-  if(page === "earn") queueMicrotask(() => earnRefresh());
-  document.querySelectorAll("[data-hub-page-panel]").forEach((panel) => {
-    panel.hidden = panel.getAttribute("data-hub-page-panel") !== page;
-  });
-  document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
-    button.setAttribute("aria-selected", String(button.getAttribute("data-hub-page") === page));
+  const page = HUB_PAGES.has(wanted) ? wanted : "overview";
+  currentHubPage = page;
+  const panelName = page === "bugs" || page === "features" ? "reports" : page;
+  document.querySelectorAll("[data-hub-page-panel]").forEach(panel => { panel.hidden = panel.getAttribute("data-hub-page-panel") !== panelName; });
+  document.querySelectorAll("#hubNav [data-hub-page]").forEach(button => {
+    const active = button.getAttribute("data-hub-page") === page;
+    button.setAttribute("aria-selected", String(active));
+    if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
   });
   document.getElementById("hubPageSelect").value = page;
-  if (remember && location.hash !== "#" + page) history.replaceState(null, "", "#" + page);
+  if (panelName === "reports") {
+    document.getElementById("fbKindFilter").value = page === "bugs" ? "bug" : "feature";
+    document.getElementById("fbKindFilter").hidden = true;
+    document.getElementById("reportsTitle").textContent = page === "bugs" ? "Bug reports" : "Feature requests";
+    if (loadedPages.has("reports")) fbRender();
+  }
+  if (remember && location.hash !== "#" + page) history.pushState(null, "", "#" + page);
+  if (token) void loadHubPage(page);
 }
-document.querySelectorAll("#hubNav [data-hub-page]").forEach((button) => {
-  button.onclick = () => showHubPage(button.getAttribute("data-hub-page"), true);
+async function loadHubPage(page, force = false) {
+  const key = page === "bugs" || page === "features" ? "reports" : page;
+  if (loadingPages.has(key)) return loadingPages.get(key);
+  if (!force && loadedPages.has(key)) return;
+  const loaders = {
+    overview: [briefingRefresh], reports: [fbRefresh], support: [supportRefresh],
+    licenses: [refresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
+    marketplace: [mktRefresh, mktConfigRefresh, mktProvidersRefresh],
+    billing: [billingConfigRefresh, billingCustomersRefresh, billingEventsRefresh],
+    earn: [earnRefresh], hosting: [hostingRefresh], system: [opsRefresh, leaseRefresh],
+  };
+  const pending = Promise.all((loaders[key] || []).map(fn => fn())).then(() => loadedPages.add(key)).catch(e => {
+    if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
+  }).finally(() => { loadingPages.delete(key); labelRecordTables(); });
+  loadingPages.set(key, pending);
+  return pending;
+}
+document.querySelectorAll("[data-hub-page], [data-open-page]").forEach(button => {
+  button.onclick = () => showHubPage(button.dataset.hubPage || button.dataset.openPage, true);
 });
-document.getElementById("hubPageSelect").onchange = (event) => showHubPage(event.target.value, true);
+document.getElementById("hubPageSelect").onchange = event => showHubPage(event.target.value, true);
 window.addEventListener("hashchange", () => showHubPage(location.hash.slice(1), false));
+document.getElementById("signOut").onclick = () => { token = ""; location.reload(); };
 showHubPage(location.hash.slice(1), false);
 
 function showGate(msg) {
@@ -608,20 +691,8 @@ document.getElementById("gateForm").onsubmit = (ev) => {
   token = ev.target.token.value.trim();
   if (!token) return;
   document.getElementById("gate").style.display = "none";
-  refresh();
-  opsRefresh();
-  leaseRefresh();
-  mktRefresh();
-  mktConfigRefresh();
-  mktProvidersRefresh();
-  cdRefresh();
-  mcRefresh();
-  lqRefresh();
-  fbRefresh();
-  billingConfigRefresh();
-  billingCustomersRefresh();
-  billingEventsRefresh();
-  hostingRefresh();
+  loadedPages.clear();
+  void loadHubPage(currentHubPage, true);
 };
 
 async function api(path, opts) {
@@ -643,13 +714,13 @@ document.getElementById("extendForm").onsubmit = async (ev) => {
   const btn = ev.target.querySelector("button"); btn.disabled = true;
   try {
     const d = await api("/admin/api/licenses/extend", { method: "POST", body: JSON.stringify({ exp }) });
-    document.getElementById("err").textContent = "";
+    document.getElementById("pageNotice").textContent = "";
     document.getElementById("note").textContent =
       "Extended " + d.extended.length + " license(s) to " + to + " (end of day UTC); " + d.unchanged +
       " already ran past that date" + (d.refused.length ? "; REFUSED " + d.refused.map((r) => r.name + " (" + r.error + ")").join(", ") : "") +
       ". Bots on v0.90.3 or later install the new key at their next check-in; for an older bot, use its row's install command.";
   } catch (e) {
-    if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+    if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
   }
   btn.disabled = false;
   refresh();
@@ -663,7 +734,7 @@ function esc(s) { const d = document.createElement("span"); d.textContent = Stri
 function vlabel(v) { const t = String(v || "").trim(); return /^\d/.test(t) ? "v" + t : t; }
 
 async function refresh() {
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   err.textContent = "";
   let data;
   try { data = await api("/admin/api/licenses"); }
@@ -677,6 +748,7 @@ async function refresh() {
   for (const l of data.licenses) {
     const state = l.revoked ? "revoked" : (l.exp <= Date.now() ? "expired" : "active");
     const tr = document.createElement("tr");
+    tr.dataset.licenseState = state;
     if (l.revoked) tr.className = "revoked";
     tr.innerHTML =
       '<td class="name" title="' + esc(l.id) + '">' + esc(l.name) + "</td>" +
@@ -788,7 +860,7 @@ async function refresh() {
             " — send them the install command above. Their bot keeps the OLD expiry until they run it:" +
             " the date is inside the signed key, and the daily check-in cannot change it.";
         } catch (e) {
-          if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+          if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
         }
         save.textContent = "Save";
         refresh();
@@ -820,7 +892,7 @@ async function refresh() {
             document.getElementById("note").textContent = "The alpha switch was saved safely, but the private service is not ready to synchronize yet: " + syncError.message;
           }
         } catch (e) {
-          if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+          if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
         }
         refresh();
       };
@@ -833,7 +905,7 @@ async function refresh() {
           await navigator.clipboard.writeText(d.installCommand);
           copy.textContent = "Copied!";
           setTimeout(() => { copy.textContent = "Copy install command"; }, 1500);
-        } catch (e) { if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message; }
+        } catch (e) { if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message; }
       };
       tr.lastElementChild.appendChild(copy);
       if (l.seat && l.seat.installs.length) {
@@ -848,7 +920,7 @@ async function refresh() {
               + (result.goLease?.message || "Go licence binding was not checked; this does not confirm that trading can resume.")
               + (result.goLease?.boundInstallIds?.length ? " Bound installs: " + result.goLease.boundInstallIds.join(", ") : "");
           }
-          catch (e) { document.getElementById("err").textContent = e.message; return; }
+          catch (e) { document.getElementById("pageNotice").textContent = e.message; return; }
           refresh();
         };
         tr.lastElementChild.appendChild(rel);
@@ -859,7 +931,7 @@ async function refresh() {
       btn.onclick = async () => {
         if (!confirm("Revoke license for " + l.name + "? Their bot stops at its next check-in.")) return;
         try { await api("/admin/api/licenses/revoke", { method: "POST", body: JSON.stringify({ id: l.id }) }); }
-        catch (e) { document.getElementById("err").textContent = e.message; }
+        catch (e) { document.getElementById("pageNotice").textContent = e.message; }
         refresh();
       };
       tr.lastElementChild.appendChild(btn);
@@ -872,7 +944,7 @@ let installCmd = "";
 document.getElementById("issueForm").onsubmit = async (ev) => {
   ev.preventDefault();
   const f = ev.target;
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   err.textContent = "";
   try {
     const data = await api("/admin/api/licenses", {
@@ -890,7 +962,11 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
   } catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; }
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
-document.getElementById("refresh").onclick = () => { refresh(); opsRefresh(); leaseRefresh(); mktRefresh(); mktConfigRefresh(); cdRefresh(); mcRefresh(); lqRefresh(); fbRefresh(); billingConfigRefresh(); billingCustomersRefresh(); billingEventsRefresh(); hostingRefresh(); };
+document.getElementById("refresh").onclick = async () => {
+  const button = document.getElementById("refresh"); button.disabled = true;
+  document.getElementById("pageNotice").textContent = "";
+  try { await loadHubPage(currentHubPage, true); } finally { button.disabled = false; }
+};
 
 // ── self-upgrade ────────────────────────────────────────────────────────────
 async function health() {
@@ -900,7 +976,7 @@ async function health() {
 document.getElementById("upgradeHub").onclick = async () => {
   if (!confirm("Upgrade the hub from the exact verified origin/main commit? A dirty checkout, wrong branch, divergence, or failed build is refused and shown here.")) return;
   const note = document.getElementById("note");
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   err.textContent = ""; note.textContent = "";
   const before = await health();
   let started;
@@ -1363,7 +1439,7 @@ function cdRenderKey(data) {
 // last refused. Deliberately small — one key box, three lines of counts, a slug
 // table and the newest errors.
 async function mcRefresh() {
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   let d;
   try { d = await api("/admin/api/market-caps"); }
   catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
@@ -1464,7 +1540,7 @@ async function mcRefresh() {
 }
 
 async function cdRefresh() {
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   let data;
   try { data = await api("/admin/api/candles"); }
   catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
@@ -1552,7 +1628,7 @@ document.getElementById("cdRefresh").onclick = cdRefresh;
 
 // ── liquidations ──────────────────────────────────────────────────────────
 async function lqRefresh() {
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   let data;
   try { data = await api("/admin/api/liq"); }
   catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
@@ -1590,18 +1666,27 @@ let fbReports = [];
 const fbBytes = (n) => n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + " MB" : n >= 1024 ? Math.round(n / 1024) + " KB" : n + " B";
 const fbValue = (v) => v === null || v === undefined || v === "" ? "—" : String(v);
 async function fbRefresh() {
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   let data;
   try { data = await api("/admin/api/feedback"); }
-  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message; return; }
+  catch (e) { if (e.message !== "unauthorized") err.textContent = e.message;
+    for(const id of ['Bugs','Features'])setBrief(id,'unknown','Unknown','Reports could not be loaded');
+    for(const id of ['briefBugList','briefFeatureList'])document.getElementById(id).textContent='Reports unavailable. Refresh to retry.';
+    throw e;
+  }
   fbReports = data.reports || [];
+  loadedPages.add("reports");
+  renderBriefReports();
+  fbRender();
+}
+function fbRender() {
   fbFixedIds = fbReports.filter((r) => r.status === "fixed").map((r) => r.id);
   const rows = document.getElementById("fbRows");
   rows.innerHTML = "";
   const q = document.getElementById("fbSearch").value.trim().toLowerCase();
   const kind = document.getElementById("fbKindFilter").value;
   const status = document.getElementById("fbStatusFilter").value;
-  const shown = fbReports.filter((r) => (!kind || r.kind === kind) && (!status || r.status === status)
+  const shown = fbReports.filter((r) => (!kind || r.kind === kind) && (!status || (status === "open" ? r.status !== "fixed" : r.status === status))
     && (!q || [r.text, r.name, r.version, r.context, r.page, r.installId, r.licenseId].some((v) => String(v || "").toLowerCase().includes(q))));
   document.getElementById("fbMeta").innerHTML =
     '<span class="fbpill">' + fbReports.length + " total</span>" +
@@ -1612,11 +1697,12 @@ async function fbRefresh() {
   clear.disabled = fbFixedIds.length === 0;
   clear.textContent = fbFixedIds.length ? "Delete all fixed (" + fbFixedIds.length + ")" : "Delete all fixed";
   if (shown.length === 0) {
-    rows.innerHTML = '<tr><td colspan="8">no reports yet</td></tr>';
+    rows.innerHTML = '<tr><td colspan="8">No reports match these filters.</td></tr>';
     return;
   }
   for (const r of shown) {
     const tr = document.createElement("tr");
+    tr.dataset.reportId = r.id;
     if (r.status === "fixed") tr.style.opacity = ".5";
     const range = r.logOldestAt && r.logNewestAt
       ? '<small class="muted">' + esc(fmt(r.logOldestAt)) + " → " + esc(fmt(r.logNewestAt)) + "</small><br>" : "";
@@ -1643,7 +1729,7 @@ async function fbRefresh() {
     }
     sel.onchange = async () => {
       try { await api("/admin/api/feedback/status", { method: "POST", body: JSON.stringify({ id: r.id, status: sel.value }) }); }
-      catch (e) { document.getElementById("err").textContent = e.message; }
+      catch (e) { document.getElementById("pageNotice").textContent = e.message; }
       fbRefresh();
     };
     tr.children[5].appendChild(sel);
@@ -1679,7 +1765,7 @@ async function fbRefresh() {
       const quoted = r.text.length > 90 ? r.text.slice(0, 90) + "…" : r.text;
       if (!confirm("Delete this " + r.kind + " report permanently?\n\n" + quoted + "\n\nThis cannot be undone and it will no longer appear in the export.")) return;
       try { await api("/admin/api/feedback/delete", { method: "POST", body: JSON.stringify({ id: r.id }) }); }
-      catch (e) { document.getElementById("err").textContent = e.message; }
+      catch (e) { document.getElementById("pageNotice").textContent = e.message; }
       fbRefresh();
     };
     tr.children[7].appendChild(del);
@@ -1713,9 +1799,11 @@ async function fbRefresh() {
       }
     };
     tr.children[7].appendChild(exportOne);
+    view.dataset.viewReport = r.id;
     rows.appendChild(tr);
     rows.appendChild(detailRow);
   }
+  labelRecordTables();
   // Kept on the parsed rows rather than re-fetched, so the button counts the
   // same set the table is showing.
 }
@@ -1788,20 +1876,20 @@ function fbRenderDetail(target, r) {
   target.appendChild(activity);
 }
 let fbSearchTimer = null;
-document.getElementById("fbSearch").oninput = () => { clearTimeout(fbSearchTimer); fbSearchTimer = setTimeout(fbRefresh, 150); };
-document.getElementById("fbKindFilter").onchange = fbRefresh;
-document.getElementById("fbStatusFilter").onchange = fbRefresh;
+document.getElementById("fbSearch").oninput = () => { clearTimeout(fbSearchTimer); fbSearchTimer = setTimeout(fbRender, 150); };
+document.getElementById("fbKindFilter").onchange = fbRender;
+document.getElementById("fbStatusFilter").onchange = fbRender;
 document.getElementById("fbClearFixed").onclick = async () => {
   if (fbFixedIds.length === 0) return;
   if (!confirm("Delete " + fbFixedIds.length + " report(s) marked fixed, permanently?\n\nThey will no longer appear in the export. Export first if you want a copy.")) return;
   try { await api("/admin/api/feedback/delete", { method: "POST", body: JSON.stringify({ ids: fbFixedIds }) }); }
-  catch (e) { document.getElementById("err").textContent = e.message; }
+  catch (e) { document.getElementById("pageNotice").textContent = e.message; }
   fbRefresh();
 };
 document.getElementById("fbRefresh").onclick = fbRefresh;
 document.getElementById("fbExport").onclick = async () => {
   const note = document.getElementById("fbExportNote");
-  const err = document.getElementById("err");
+  const err = document.getElementById("pageNotice");
   note.textContent = "";
   err.textContent = "";
   let fileHandle = null;
@@ -2102,7 +2190,7 @@ document.querySelectorAll("#billingModeSwitch button").forEach((btn) => {
       billingConfig = data;
       billingRenderAll(data);
     } catch (e) {
-      if (e.message !== "unauthorized") document.getElementById("err").textContent = e.message;
+      if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
     }
   };
 });
@@ -2729,6 +2817,143 @@ earnEl('earnRecord').onsubmit=async e=>{e.preventDefault();const b=Object.fromEn
 function earnInvalidate(){earnPreview=null;earnEl('earnCommit').disabled=true;earnEl('earnPreviewRows').textContent='';}earnEl('earnCsv').onchange=earnInvalidate;earnEl('earnCsvMonth').onchange=earnInvalidate;
 earnEl('earnPreview').onclick=async()=>{try{const file=earnEl('earnCsv').files[0];if(!file||file.size>1000000)throw new Error('Choose a CSV up to 1 MB');const csv=await file.text(),period=earnEl('earnCsvMonth').value;const r=await earnCall('preview',{csv,period});earnPreview={csv,period,digest:r.result.digest};earnEl('earnPreviewRows').innerHTML=earnTable(['Member','WH commission','Rebate','Result'],r.result.rows.map(x=>[earnEsc(earnState?.members.find(m=>m.id===x.owner)?.name||x.owner),(x.commissionCents/100).toFixed(2),(x.rebateCents/100).toFixed(2),x.qualified?'Qualifies':'Below $15; no credit']));earnEl('earnCommit').disabled=r.result.alreadyImported;}catch(err){earnInvalidate();earnEl('earnError').textContent=err.message;}};
 earnEl('earnCommit').onclick=async()=>{if(!earnPreview)return;earnEl('earnCommit').disabled=true;try{await earnCall('import',earnPreview);earnEl('earnError').textContent='Month finalized. Qualified rebates credited once.';earnInvalidate();await earnRefresh();}catch(err){earnEl('earnError').textContent=err.message;earnEl('earnCommit').disabled=false;}};
+
+// Briefing is computed from current records. No model calls or unattended actions.
+let supportSnapshot = null;
+function setBrief(id, state, title, note) {
+  const el = document.getElementById('brief' + id);
+  el.className = 'brief-status ' + state; el.textContent = title;
+  document.getElementById('brief' + id + 'Note').textContent = note;
+}
+function renderBriefReports() {
+  for (const [kind, card, list] of [['bug','Bugs','briefBugList'], ['feature','Features','briefFeatureList']]) {
+    const open = fbReports.filter(r => r.kind === kind && r.status !== 'fixed').sort((a,b) => (a.status === 'new' ? 0 : 1) - (b.status === 'new' ? 0 : 1) || a.at-b.at);
+    const fresh = open.filter(r => r.status === 'new').length;
+    const color = !open.length ? 'green' : kind === 'bug' ? 'red' : 'amber';
+    setBrief(card, color, color[0].toUpperCase()+color.slice(1)+' · '+open.length+' open', fresh+' new · '+(open.length-fresh)+' in review');
+    const box = document.getElementById(list); box.textContent = '';
+    if (!open.length) { box.textContent = kind === 'bug' ? 'No unresolved bug reports.' : 'No feature requests awaiting review.'; box.className='brief-empty'; }
+    for (const r of open.slice(0,5)) {
+      const b = document.createElement('button'); b.className = 'inbox-item';
+      const meta = document.createElement('small'); meta.textContent = r.name+' · '+fmt(r.at)+' UTC · '+r.status;
+      const p = document.createElement('p'); p.textContent = r.text.length > 220 ? r.text.slice(0,220)+'…' : r.text;
+      b.append(meta,p); b.onclick = () => openReport(r); box.appendChild(b);
+    }
+  }
+}
+async function openReport(r) {
+  document.getElementById('fbSearch').value = '';
+  document.getElementById('fbStatusFilter').value = '';
+  showHubPage(r.kind === 'bug' ? 'bugs' : 'features', true);
+  await loadHubPage(currentHubPage);
+  fbRender();
+  const button = [...document.querySelectorAll('[data-view-report]')].find(b => b.dataset.viewReport === r.id);
+  if (button) { button.click(); button.closest('tr').scrollIntoView({block:'center'}); }
+}
+function renderBriefCandles(data) {
+  const venues = (data.venues || []).filter(v => v.configured);
+  const problems = venues.filter(v => v.health?.state !== 'running' || v.counts?.gapped > 0 || v.counts?.empty > 0 || !v.health?.lastSuccessAt || Date.now()-v.health.lastSuccessAt > 10*60*1000);
+  const failing = problems.some(v => ['failing','stalled'].includes(v.health?.state) || (v.health?.lastSuccessAt && Date.now()-v.health.lastSuccessAt>10*60*1000));
+  const state = !data.enabled || !venues.length ? 'unknown' : failing ? 'red' : problems.length ? 'amber' : 'green';
+  setBrief('Candles', state, state[0].toUpperCase()+state.slice(1), !venues.length ? 'No collectors configured' : (venues.length-problems.length)+'/'+venues.length+' exchanges healthy');
+  const box = document.getElementById('briefDataList'); box.textContent = '';
+  if (!venues.length) box.textContent = 'Candle collection is not configured.';
+  else if (!problems.length) box.textContent = 'All configured collectors are running with no gapped or empty symbols reported.';
+  for (const v of problems) {
+    const item=document.createElement('div'); item.className='inbox-item';
+    const name=document.createElement('strong'); name.textContent=v.venue.toUpperCase()+' · '+(v.health?.state || 'unknown');
+    const detail=document.createElement('p'); detail.textContent=(v.health?.detail || 'Collector status unavailable')+' · '+(v.counts?.gapped || 0)+' gapped · '+(v.counts?.empty || 0)+' empty';
+    item.append(name,detail); box.appendChild(item);
+  }
+}
+async function briefingRefresh() {
+  document.getElementById('briefingDate').textContent = new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric',year:'numeric'});
+  document.getElementById('briefingUpdated').textContent = 'Refreshing…';
+  const results = await Promise.allSettled([
+    fbRefresh(),
+    api('/admin/api/candles').then(renderBriefCandles).catch(e => {
+      setBrief('Candles','unknown','Unknown','Could not load candle health');
+      document.getElementById('briefDataList').textContent = e.message; throw e;
+    }), supportRefresh()
+  ]);
+  document.getElementById('briefingUpdated').textContent = (results.some(r=>r.status==='rejected')?'Some sources unavailable · checked ':'Checked ')+new Date().toLocaleTimeString();
+}
+async function supportRefresh() {
+  try {
+    supportSnapshot = await api('/admin/api/support');
+    renderSupportInbox();
+  } catch(e) {
+    setBrief('Support','unknown','Unknown','Could not load support inbox');
+    document.getElementById('briefSupportList').textContent = 'Support inbox unavailable. Refresh to retry.';
+    document.getElementById('supportInbox').textContent = e.message;
+    throw e;
+  }
+}
+function renderSupportInbox() {
+  const d=supportSnapshot;
+  const items=d.items || [], pending=items.filter(x=>x.status==='open'||(x.status==='human'&&x.messages?.at(-1)?.role!=='human'));
+  setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
+  for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',document.getElementById('supportFilter').value==='open'?pending:items]]) {
+    const box=document.getElementById(id); box.textContent='';
+    if (!rows.length) { box.textContent = d.connected ? 'No questions waiting for a human answer.' : 'Customer support chat is not connected yet.'; }
+    for (const r of rows) {
+      const item=document.createElement('article'); item.className='inbox-item';
+      const meta=document.createElement('small'); meta.textContent=(r.name||r.install||'Customer')+' · '+fmt(r.ts)+' UTC · '+r.status;
+      const text=document.createElement('p'); text.textContent=r.question || '';
+      const note=document.createElement('small'); note.textContent=r.note || '';
+      item.append(meta,text,note);
+      if (r.answer) { const a=document.createElement('p'); a.textContent='Saved answer: '+r.answer; item.appendChild(a); }
+      if (id === 'supportInbox' && r.messages) {
+        const details=document.createElement('details'); details.className='support-thread';
+        const summary=document.createElement('summary'); summary.textContent='Conversation & reply'; details.appendChild(summary);
+        for(const m of r.messages){const msg=document.createElement('div');msg.className='message';msg.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'AI support':'Customer')+' · '+fmt(m.at)+' UTC\n'+m.text;details.appendChild(msg);}
+        const form=document.createElement('form');form.style.display='block';
+        const label=document.createElement('label');label.textContent='Your reply';
+        const input=document.createElement('textarea');input.required=true;input.maxLength=4000;input.placeholder='Reply to this customer';label.appendChild(input);
+        const send=document.createElement('button');send.type='submit';send.textContent='Send human reply';
+        const note=document.createElement('p');note.setAttribute('role','status');
+        let attempt=null;
+        form.onsubmit=async e=>{e.preventDefault();if(!input.value.trim())return;send.disabled=true;
+          if(!attempt||attempt.text!==input.value.trim())attempt={requestId:crypto.randomUUID(),text:input.value.trim()};
+          try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'reply',...attempt})});renderSupportInbox();}
+          catch(e){note.textContent=e.message;send.disabled=false;}
+        };form.append(label,send,note);details.appendChild(form);
+        const actions=document.createElement('div');actions.className='actions';
+        for(const [action,label] of [['takeover','Take over'],['resolve','Resolve conversation']]){
+          const b=document.createElement('button');b.textContent=label;b.onclick=async()=>{b.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action})});renderSupportInbox();}catch(e){note.textContent=e.message;b.disabled=false;}};actions.appendChild(b);
+        }details.appendChild(actions);
+        const learning=document.createElement('details');const heading=document.createElement('summary');heading.textContent='Approve a reusable support answer';learning.appendChild(heading);
+        const info=document.createElement('p');info.className='muted';info.textContent='Remove customer-specific details. Only approved answers enter the shared knowledge base.';learning.appendChild(info);
+        const q=document.createElement('textarea');q.value=r.question||'';q.maxLength=1000;q.setAttribute('aria-label','Reusable question');
+        const a=document.createElement('textarea');a.value=[...r.messages].reverse().find(m=>m.role==='human')?.text||'';a.maxLength=4000;a.setAttribute('aria-label','Approved answer');
+        const approve=document.createElement('button');approve.textContent='Approve knowledge';approve.onclick=async()=>{approve.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'knowledge',question:q.value,answer:a.value})});note.textContent='Approved answer saved.';}catch(e){note.textContent=e.message;approve.disabled=false;}};
+        learning.append(q,a,approve);details.appendChild(learning);item.appendChild(details);
+      }
+      box.appendChild(item);
+    }
+  }
+  document.getElementById('supportMeta').textContent = (d.message || '') + (d.limits ? ' · AI usage $'+(d.spentMicros/1000000).toFixed(2)+' / $'+(d.limits.totalMonthlyMicros/1000000).toFixed(0)+' this month · '+(d.knowledge||[]).length+' approved answers' : '');
+}
+document.getElementById('supportRefresh').onclick=()=>supportRefresh().catch(e=>{document.getElementById('pageNotice').textContent=e.message;});
+document.getElementById('supportFilter').onchange=renderSupportInbox;
+function labelRecordTables() {
+  for (const id of ['rows','fbRows','hostingInstanceRows','mktProviderRows']) {
+    const body=document.getElementById(id), table=body.closest('table');
+    table.parentElement.classList.add('record-table');
+    const labels=[...table.querySelectorAll('thead th')].map(th=>th.textContent||'Actions');
+    for (const row of body.children) for (const [i,td] of [...row.children].entries()) if (td.colSpan===1) td.dataset.label=labels[i]||'Actions';
+  }
+  filterLicenses();
+}
+function filterLicenses() {
+  const q=document.getElementById('licenseSearch').value.trim().toLowerCase(), state=document.getElementById('licenseFilter').value;
+  const rows=[...document.querySelectorAll('#rows tr[data-license-state]')];
+  for(const row of rows) row.hidden=!!((state&&row.dataset.licenseState!==state)||(q&&!row.textContent.toLowerCase().includes(q)));
+  document.getElementById('licenseCount').textContent=rows.filter(r=>!r.hidden).length+' of '+rows.length+' licenses';
+}
+document.getElementById('licenseSearch').oninput=filterLicenses;
+document.getElementById('licenseFilter').onchange=filterLicenses;
+new MutationObserver(()=>labelRecordTables()).observe(document.getElementById('rows'),{childList:true});
 
 </script>
 </body>

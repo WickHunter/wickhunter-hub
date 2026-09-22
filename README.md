@@ -1,3 +1,7 @@
+## v0.4.47 — Daily briefing and customer support
+
+The Hub opens on candle health, unresolved bugs, feature requests and conversations needing a human reply. Customer chat is durable, centrally metered at $50/month overall and $1/month, 200/month and 20/day per licensed user. Website visitors have smaller reply limits. Human replies, takeover, resolution and approval of reusable answers are manual. The Hub briefing does not invoke AI.
+
 <!-- Private Earn with WH preview: 0.4.42; no Beta publication. -->
 # wickhunter-hub
 
@@ -1735,6 +1739,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.47 — Daily briefing, human support inbox, metered customer chat and video transcript knowledge.
 - v0.4.46 — Distinguish check-in seat release from Go licence recovery. Show surviving bindings, recovery locks and unavailable lease status without weakening machine-bound activation. No customer release publication.
 - v0.4.45 — Accept schema-4 shared support evidence with independently bounded runtime, deal/hedge/grid state, exchange history and host facts. Preserve older schemas and existing storage quotas. No customer release publication.
 

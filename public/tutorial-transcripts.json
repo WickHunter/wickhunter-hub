@@ -1,0 +1,620 @@
+[
+  {
+    "id": "uaG8oZXLl_I",
+    "title": "Install Wick Hunter Unleashed on Vultr | Welcome Email to First Login",
+    "url": "https://www.youtube.com/watch?v=uaG8oZXLl_I",
+    "source": "delivery/vultr_install_v1/captions_en.srt",
+    "sha256": "c0e0f2df1ee8e133848bfd7f6e9183b356368ab97a1d9cd48e1202e873e61cd4",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Let's get Wick Hunter Unleashed running on Vultr. This quick walkthrough takes you from your welcome email to your first sign-in. Have a Vultr account and payment method ready. We'll walk through the steps in about five minutes; server provisioning and downloads can take longer. Open your Wick Hunter welcome email and follow the installation link. Keep this page open. It contains your personal install command and license information. Use the command from your own email, and keep the link and license private. The examples in this video contain no real credentials. In Vultr, choose Deploy, then select Shared CPU. Before picking a server location, check your exchange's current regional and API restrictions. Both you and your selected product must be eligible."
+      },
+      {
+        "start": 53,
+        "text": "Hosting in another country does not override account restrictions. Choose a server region the exchange permits. Choose Cloud Compute and select a plan. The recorded setup uses one virtual CPU, one gigabyte of memory, and twenty-five gigabytes of storage. Treat that as a starting example, and check the current Wick Hunter requirements before buying. Review the price shown for your selected region. Under Configure Software, choose a fresh Ubuntu LTS sixty-four-bit image for Intel or AMD. This recording uses Ubuntu twenty-six point zero four. You can name the server Wick Hunter. Review optional backups and their extra charge, confirm a public IPv4 address is included, then check the order summary before selecting Deploy. Wait for provisioning to finish, then open the new instance."
+      },
+      {
+        "start": 107,
+        "text": "Copy its public IP address. Keep the server's login details available privately. Vultr hosting is billed separately from Wick Hunter, and a stopped server still incurs charges while its resources remain allocated. Open Terminal on a Mac, or PowerShell on Windows. Type ssh, a space, then root at your server's IP address, and press Enter. Confirm you're connecting to the intended server and verify its host fingerprint before accepting a first connection. Paste the server password when prompted. No characters appear as you type; that's normal. Once you're connected to the server, return to your private installation page and copy the entire command. Paste it into this remote terminal and press Enter. Keep the address and license exactly as supplied."
+      },
+      {
+        "start": 156,
+        "text": "This installs Wick Hunter on the Vultr server, so make sure the terminal is connected there first. Let the installer download and verify the application. When it asks for the internal secret, press Enter to generate one automatically. This is an application security secret. It is not your exchange API key, and you do not need to invent one. Next, choose a strong dashboard login password with at least eight characters. Store it in your password manager. Typing is hidden here too. This password signs you into Wick Hunter; it is separate from your Vultr account password and the server's root password. Press Enter to continue. The installer saves your license, starts Wick Hunter as a background service, and sets up HTTPS. Leave the terminal open until setup finishes."
+      },
+      {
+        "start": 206,
+        "text": "We've shortened the waiting in this walkthrough. The server can keep running when you close your laptop, as long as the server itself stays online. When setup finishes, copy the dashboard address it prints and open it in your browser. Use HTTPS and your server's address. Confirm the browser accepts the secure connection. If you see an error or certificate warning, stop and resolve it with support before entering passwords or exchange credentials. Enter the dashboard password you just created and select Sign in. When the dashboard opens, your installation is running. This recording shows a Not Trading status. Seeing the dashboard does not confirm that your exchange connection or strategies are ready. Review those separately before enabling a bot."
+      },
+      {
+        "start": 255,
+        "text": "Bookmark your secure dashboard address and keep your install email private. Next, follow the exchange-connection lesson, restrict the trading key to your server IP where supported, and keep withdrawal permissions disabled. Review the account and bot settings before enabling a strategy. You're ready for the next step."
+      }
+    ]
+  },
+  {
+    "id": "ptdVCaZgbbs",
+    "title": "Meet Wick Hunter Unleashed",
+    "url": "https://www.youtube.com/watch?v=ptdVCaZgbbs",
+    "source": "delivery/youtube_uploads_beta_ui_v4/03_promos/platform_teaser_30s/platform_teaser_30s.srt",
+    "sha256": "a926b76c6dd407cf86e9c912a0ef22ce7c66078dba9d021e599557bce431b548",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Markets move fast. Wick Hunter Unleashed turns your rules into an automated workflow that watches, acts, manages, and records\u2014while you stay in control. Choose Liq Scalper, Optimized Liquidation, TV Signal, Hedge Bot, or Manual Bot to shape how positions start, get managed, and receive protection. See bots, deals, activity, and P and L in one workspace. Your strategy, in motion. Trade deliberately\u2014automation never removes market risk."
+      }
+    ]
+  },
+  {
+    "id": "E4J9RnDzHoA",
+    "title": "TV Signal: Every Setting and Command Explained | Wick Hunter",
+    "url": "https://www.youtube.com/watch?v=E4J9RnDzHoA",
+    "source": "delivery/youtube_uploads_beta_ui_v4/02_detailed_bot_guides/tv_signal_complete_guide/tv_signal_complete_guide.srt",
+    "sha256": "577d4b947a6b4eccb88dc6d6600a38b33811329e1b52e60770a9d5ade8f43928",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "TV Signal separates timing from trade management. TradingView evaluates an indicator, strategy, or custom condition and sends an authenticated JSON message. Wick Hunter validates the bot-specific secret, identifies the action and pair, and runs the saved scope and account gates. If an entry is allowed, the TV bot opens the main position and the shared engine manages DCA, take profit, stop protection, ownership, and P and L. For example, an EMA crossover can request a SOL long while Wick Hunter supplies the saved one-hundred-dollar base, three-step ladder, take profit, and stop. The alert chooses when; the TV Signal configuration chooses how the resulting deal is managed. Bot Name identifies this TV Signal instance. Webhook URL is the endpoint TradingView calls, and Secret is the credential inside every message."
+      },
+      {
+        "start": 65,
+        "text": "Both are read-only in the form and should be copied from the intended bot. Several TV bots may exist, each with its own route, secret, pair scope, and strategy. Mixing one bot's URL with another bot's secret is refused. Treat the secret like an API key: do not expose it in screenshots, recordings, chats, forums, or public Pine scripts. If exposed, rotate it. Rotation invalidates every existing message immediately, so update each affected TradingView alert before relying on it again. Open Long and Open Short request a new deal. Each needs the private secret and a symbol. An optional Size is a USDT value for that one deal and overrides Base Order. If the saved base is fifteen dollars but the message includes size one hundred, this deal opens at one hundred dollars."
+      },
+      {
+        "start": 119,
+        "text": "A percent-of-entry DCA also uses that overridden entry size as its basis. An optional Name, Alert, Alert Name, ID, or Strategy field can label the source in notifications. Every open still passes direction, pair scope, blacklists, duplicate cooldown, deal caps, account limits, pricing, and ownership. Spot does not offer open short. TV Signal also accepts management actions. Close exits one symbol and cancels its associated orders. Close All exits every deal owned by this TV bot, never another bot's deals. Add Funds buys the named dollar amount without consuming a planned ladder step. DCA Now fills the next planned step at market and uses that step up. Set TP and Set SL change one deal; a stop value of zero disarms that deal's stop. Pause blocks new entries while open deals remain managed, and Resume allows entries again."
+      },
+      {
+        "start": 183,
+        "text": "A webhook pause does not survive every restart or save. Never attach DCA Now to a repeating alert unless repeated ladder consumption is truly intended. Create the alert on the exact TradingView chart and timeframe intended for the strategy. Choose the condition, set the trigger frequency, paste valid one-line JSON into Message, then enable Webhook URL under Notifications and paste the bot-specific endpoint. The ticker placeholder resolves to the chart symbol saved with the alert. An alert created on BTC can continue sending BTC even after another chart is opened later. Use one alert per chart when relying on the placeholder, or write a literal symbol when the target should never vary. The credential values shown in this tutorial are replaced with safe placeholders."
+      },
+      {
+        "start": 240,
+        "text": "Duplicate Cooldown ignores a repeated open request for the same symbol within the saved number of seconds. With three hundred seconds, a second BTC open after thirty seconds is recorded as a duplicate and does not create another deal. This helps with noisy or retried alerts, but it does not fix an alert that fires at the wrong times. Management actions such as close, add funds, DCA Now, and per-deal exit changes are not suppressed by the open cooldown. Recent Signals and Activity show whether a request was accepted, duplicated, or refused for another reason. Set the interval to match the strategy's expected alert cadence. Direction allows Long, Short, or Both and is checked on every opening action. Pairs can be Any Pair or an Allowlist. Any Pair still requires a valid listing and all universal account rules."
+      },
+      {
+        "start": 297,
+        "text": "Allowlist accepts only the symbols named under Allowed Pairs. The bot Blacklist removes symbols from this instance, and the universal blacklist also applies. If Direction is Both and the allowlist contains only ETHUSDT, valid ETH long and short messages may proceed, while BTC is refused. Scope protects against a validly authenticated alert asking this bot to trade something it was not configured to manage. Size Type selects a fixed dollar amount or percent of balance. Base Order is the initial value used when the alert does not provide Size. Two percent of an eight-thousand-dollar balance targets one hundred sixty dollars. A payload size of seventy-five changes only that deal to seventy-five and leaves the form unchanged. Leverage sets the requested futures leverage and affects margin and liquidation distance, not the configured position value."
+      },
+      {
+        "start": 354,
+        "text": "The complete risk commitment includes the base plus every possible DCA and any separate Hedge Bot exposure. A small base with an aggressive scaled ladder can still become a large position. Max Longs, Max Shorts, and Max Both limit concurrent deals owned by this TV bot. The combined cap is independent and the lower available limit wins. With Max Both two, a third opening message is refused even if its side cap has room. Entry Order Type can be Market, prioritizing immediate execution with possible slippage, or Aggressive Limit, working at the touch and chasing until filled. The signal time is the request time, not a guaranteed fill price. Account-level market limits, another bot's ownership, insufficient balance, or missing price data can still refuse the entry after the message authenticates."
+      },
+      {
+        "start": 413,
+        "text": "DCA On creates the saved automatic ladder. DCA Off makes each new deal the base order only, although Add Funds and DCA Now messages can still deliberately change a live deal. Static uses a typed first deviation and scaling formulas. Scaled ATR prices the first gap from volatility when the deal opens. Builder specifies one size and trigger per row. Price-based Static, ATR, and Builder rows rest as exchange limits. Time-based Builder rows cannot rest and fire only while the bot is running. Choose whether TradingView should control only entry timing or also send management actions; mixing automatic ladders with frequent DCA signals can add exposure faster than expected. DCA Size Type supports dollars, percent of balance, or percent of entry. First DCA is the first add."
+      },
+      {
+        "start": 471,
+        "text": "Orders is the count. Volume Scale multiplies later sizes. A fifty-dollar first add with scale two creates fifty, one hundred, and two hundred dollars. Deviation is the first distance from original entry. Step Scale expands later spacing; three percent with scale two creates cumulative levels at three, nine, and twenty-one percent. On a percent-of-entry ladder, a payload that overrides entry size also changes the dollar value of every percentage-based DCA for that deal. Review the full ladder preview rather than judging risk from the first order. ATR Multiplier converts current volatility into the first gap. ATR Timeframe selects the candle size, and ATR Length selects the number of Wilder-smoothed bars. Minimum Deviation prevents a very tight first level."
+      },
+      {
+        "start": 525,
+        "text": "Maximum Deviation limits an unusually wide one, with zero meaning no ceiling. If ATR is one-point-four percent and the multiplier is two, the raw gap is two-point-eight. A two-percent floor changes nothing, while a two-point-five-percent ceiling clips it to two-point-five. The ATR distance is priced once when the deal opens. Later levels use the configured step logic and stay anchored to the entry rather than continuously drifting with volatility. Builder defines one DCA row at a time, and every row needs its own size. Price rows use a specific offside distance and can rest at the exchange. Time rows wait a chosen period and require Wick Hunter running; their offside check follows the current average because they are drawdown tools. Orders on Exchange limits simultaneous resting DCA limits."
+      },
+      {
+        "start": 579,
+        "text": "Four price rows with a limit of two place only the nearest two while deeper rows remain planned. The limit does not apply to time rows because no exchange order exists until their app-timed condition fires. If the application is offline, resting price orders may fill, but time rows cannot execute. Take Profit can be On or Off. Single mode rests a reduce-only target at the configured percentage from the live average and re-anchors after DCA. Ladder mode distributes closing percentages across several targets. TP Off means TV Signal never takes profit automatically. The deal can then close only through a Close or Close All message, the stop loss, Hedge Bot's coordinated exit when attached, or a manual action. If a TradingView strategy sends entries but no exits, do not disable automatic take profit by accident."
+      },
+      {
+        "start": 635,
+        "text": "A Set TP message changes one open deal without changing the form for future deals. Stop Loss can be On or Off. Offset From chooses original entry or current average. A fifteen-percent long stop from an original one-hundred-dollar entry remains near eighty-five after DCA. Measured from a ninety-five-dollar average, it follows near eighty dollars and seventy-five cents. A Set SL message changes one open deal, and zero disarms that deal's stop. Where supported, Wick Hunter uses an exchange-resident reduce-only stop; a monitored fallback is identified when it cannot. With SL Off and TP Off, the strategy must reliably send exits or the user must close manually. Hedge Bot is separate and should not be treated as a guaranteed substitute for a stop."
+      },
+      {
+        "start": 692,
+        "text": "The complete workflow is: build the alert on the correct chart, copy the URL and payload from the correct TV bot, protect the secret, choose a frequency, and send one very small test. Then review Recent Signals, Deals, and Activity. A TradingView notification that says sent does not prove a trade opened. Wick Hunter may report duplicate cooldown, wrong direction, pair exclusion, another owner, a full deal cap, wrong context, missing price, or an invalid secret. Confirm the resulting position's size, leverage, ladder, take profit, and stop. If a credential was recorded or shared, rotate it before production and replace every affected alert message."
+      }
+    ]
+  },
+  {
+    "id": "wwmlA0kQNZE",
+    "title": "Liq Scalper: Every Setting Explained | Wick Hunter",
+    "url": "https://www.youtube.com/watch?v=wwmlA0kQNZE",
+    "source": "delivery/youtube_uploads_beta_ui_v4/02_detailed_bot_guides/liq_scalper_complete_guide/liq_scalper_complete_guide.srt",
+    "sha256": "cf460fa44660406178749d720df9a946d3ce5a13f96c5547586a83bad058e559",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Liq Scalper is a liquidation-reversal bot. It waits for forced position closures and requires price to be stretched beyond a configured volume-weighted moving-average band. Longs liquidated create forced selling, so the bot's long setup looks below the lower band. Shorts liquidated create forced buying, so the short setup looks above the upper band. Both the liquidation threshold and the price band must pass. An eight-hundred-thousand-dollar long liquidation at two-point-six percent below VWMA may qualify when the minimum is five hundred thousand and the long band is two percent. The same liquidation inside the band is ignored. After entry, the shared DCA and exit engine takes over. Name is the label used in My Bots, Activity, and reporting."
+      },
+      {
+        "start": 56,
+        "text": "Exchange and Account determine where every order is sent. Direction is a hard filter: Long accepts only long reversal setups, Short accepts only short setups, and Both allows either side. Market is tied to the selected trading context; in this release the Liq Scalper trades USDT perpetual futures. For example, a long-only bot ignores a valid short setup even if its liquidation and upper-band thresholds both pass. Choose an account label that makes the destination obvious, and verify the header market before creation because moving the bot to another market requires deleting and recreating it there. Max Longs limits simultaneous long deals owned by this bot. Max Shorts does the same for shorts. Max Both is a separate combined ceiling and is not the sum of the two side values."
+      },
+      {
+        "start": 111,
+        "text": "With Max Longs two, Max Shorts two, and Max Both three, two longs plus one short fill the bot. Another short is skipped even though its side has only one deal. Account-level market limits and ownership rules are also checked, and the lower available ceiling wins. These are entry gates rather than liquidation protection. Raising them allows more concurrent exposure, including several correlated trades during the same market-wide flush. Pair Selection chooses how the watch set is built. Auto by Filters continuously includes pairs that pass this bot's criteria. Manual List skips those criteria and trades only the pairs you name. The bot-specific Blacklist removes symbols from this bot, while the platform-wide blacklist in Settings applies everywhere."
+      },
+      {
+        "start": 164,
+        "text": "Auto mode also shows filtered-out pairs, optional host-subscription limits, and pairs without usable liquidation coverage. In manual mode, BTCUSDT and ETHUSDT form the entire watch set, so a SOL liquidation is ignored even if every filter would have passed. A blacklist still wins over a manual allowlist, which makes it the safer final exclusion layer. Volatility Filters remove pairs whose observed movement does not fit the enabled rules. Min Leverage requires the venue to support at least that leverage; it does not force every deal to use the minimum. Min Max Limit Order and Min Max Market Order require the pair's one-order caps to be large enough for your plan. Max Funding Rate rejects either direction when the absolute rate is above the threshold."
+      },
+      {
+        "start": 217,
+        "text": "For example, a Min Leverage of ten excludes a pair capped by the venue at five. A two-thousand-dollar minimum market-order cap excludes a thin pair whose venue allows only one thousand per market order, even if your current base order is smaller. Min 24-hour Rolling Volume is a trailing-day liquidity floor; blank or zero turns it off. Minimum Coin Market Cap is another optional floor and accepts shorthand such as two-hundred-fifty M. Auto Refresh reruns the pair filter at the chosen interval, with zero turning scheduled refresh off. Exclude Categories removes groups such as stablecoins or leveraged tokens, while Exclude handles named symbols. A five-hundred-thousand-dollar rolling-volume floor rejects a pair trading only three hundred thousand in the trailing day."
+      },
+      {
+        "start": 269,
+        "text": "These filters reduce the watch set before signals arrive; they do not make a remaining pair liquid enough for every possible order size. Min Liquidation Size is the forced-flow threshold in dollars. With one source selected, each print is evaluated individually. With multiple sources, matching execution target and side may be summed over one second. Long Band is the required percentage below VWMA for long entries. Short Band is the required percentage above VWMA for shorts. A one-point-two-million-dollar long liquidation with price three-point-one percent below VWMA passes a five-hundred-thousand minimum and a two-point-five-percent long band. At only one-point-two percent below VWMA, the bot skips it. Lower thresholds create more opportunities but also admit weaker or noisier events."
+      },
+      {
+        "start": 327,
+        "text": "VWMA Period is the number of bars used for the recent volume-weighted average. VWMA Timeframe selects the size of those bars. Twenty bars on five minutes represent roughly one hundred minutes of weighted price history, while twenty bars on one hour represent a much slower reference. Liquidation Sources choose which exchange feeds may contribute a trigger. Wick Hunter maps each source's base coin to a real listing in the bot's execution market; the mark, VWMA, band, and order all use that execution pair. Selecting more feeds can capture more forced flow, but a cross-source sum still requires the same mapped target and side inside its aggregation window. Size Type chooses a fixed dollar base or a percentage of balance. A one-percent setting on a ten-thousand-dollar balance targets a one-hundred-dollar position value under the platform's sizing rules."
+      },
+      {
+        "start": 387,
+        "text": "Size is the amount for the base entry, not the full future DCA commitment. Market prioritizes immediate execution and accepts slippage. Aggressive Limit places at the touch and chases the book until filled, aiming for maker-style execution without waiting indefinitely. Leverage sets the requested futures leverage where supported; it changes margin use and liquidation distance, not the configured position value. Always total the base plus every possible DCA before deciding whether the plan fits the account. DCA Style determines how the ladder's distances are created. Static uses the typed Deviation as the first gap and applies Step Scale to later spacing. Scaled ATR prices the first gap once when the deal opens by multiplying the pair's ATR, then applies the minimum and maximum deviation bounds."
+      },
+      {
+        "start": 441,
+        "text": "If ATR is two percent and the multiplier is one-point-five, the first gap is three percent before bounds. Builder defines each row independently, including its own size and either price-based or time-based behavior. Static and ATR levels rest as exchange limit orders. Time rows cannot rest at the exchange and fire only while Wick Hunter is running. DCA Size Type can be fixed dollars, percent of balance, or percent of the entry. First DCA is the first add's size. Number of Orders is the ladder length; zero disables automatic DCA. Volume Scale multiplies each later size. A one-hundred-dollar first DCA with scale two creates one hundred, two hundred, then four hundred dollars. Deviation is the first distance from entry. Step Scale multiplies each later step."
+      },
+      {
+        "start": 496,
+        "text": "With five-percent deviation and step scale two, the cumulative levels are five, fifteen, and thirty-five percent from entry. Larger scales move capital deeper but can make the final commitment much larger than the base order. ATR Multiplier converts measured volatility into the first DCA gap. ATR Timeframe and ATR Length define that measurement using Wilder's smoothing. Minimum Deviation is a hard floor. Maximum Deviation is a ceiling, with zero meaning no ceiling. If ATR is one-point-two percent and the multiplier is two, the raw gap is two-point-four percent; a three-percent minimum lifts it to three. Builder removes ladder-wide First DCA, Deviation, order count, and scales because every row supplies its own size and trigger. Price rows anchor to the original entry."
+      },
+      {
+        "start": 551,
+        "text": "Time rows wait after entry and require the bot clock, with their offside distance measured from the current average. Orders on Exchange limits how many DCA limits rest at the venue at one time. With five planned levels and a value of two, Wick Hunter places the nearest two and keeps the deeper three in the plan. As a nearer order fills or is removed, the next eligible level can be placed. A lower number reduces open-order count and can simplify the book, but deeper protection depends on Wick Hunter staying available to advance the ladder. Resting orders can fill while the app is offline, which is exposure rather than safety. Time-based Builder rows never count here because they are app-timed market actions, not exchange-resident limits. Take Profit Type can be a single percentage from the live average or a ladder with multiple profit targets and close percentages."
+      },
+      {
+        "start": 610,
+        "text": "A single one-percent target on a one-hundred-dollar long rests near one hundred one. After a DCA moves the average to ninety-eight dollars and twenty-eight cents, Wick Hunter cancels and re-places the target near ninety-nine dollars and twenty-six cents for the live quantity. Take-profit orders are reduce-only where supported so they do not reverse the position. A ladder can scale out gradually, but its close shares must form a valid plan. While Hedge Bot is actively attached, its paired exit rules may coordinate both legs instead. Stop Loss arms a hard exit for the main position; zero or Off disables it. Offset From determines whether the percentage is measured from the original entry or the current average. A ten-percent long stop from an original one-hundred-dollar entry stays near ninety even after DCA."
+      },
+      {
+        "start": 667,
+        "text": "Measured from a ninety-eight-dollar average, it follows near eighty-eight dollars and twenty cents. Where supported, Wick Hunter rests a reduce-only stop at the exchange; a clearly labeled monitored fallback requires the app and live price. The full Liq Scalper chain is liquidation plus band, scope and limits, entry execution, the chosen DCA plan, re-anchored exits, optional separate Hedge Bot attachment, and Activity plus P and L reporting."
+      }
+    ]
+  },
+  {
+    "id": "PWPwbZMoFB8",
+    "title": "Optimized Liquidation Bot: Every Setting Explained | Wick Hunter",
+    "url": "https://www.youtube.com/watch?v=PWPwbZMoFB8",
+    "source": "delivery/youtube_uploads_beta_ui_v4/02_detailed_bot_guides/optimized_liquidation_complete_guide/optimized_liquidation_complete_guide.srt",
+    "sha256": "afedbd331a0c5907cf5a6faab7bc08a872b2cdcc93c88bb789e8eb75f88d7cac",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Optimized Liquidation Bot uses the same counter-trend liquidation idea as Liq Scalper, but it does not apply one typed band to every pair. It studies each pair's recent closed-candle history and computes separate long and short distances from that pair's volume-weighted average. A quieter major might receive a zero-point-eight-percent band while a volatile alt requires two-point-four percent. A qualifying liquidation must still cross the pair's live band and pass all scope, volume, and account gates. After entry, the bot uses the same shared position manager for DCA, take profit, stop protection, ownership, and reporting. Optimization changes the trigger band; it does not guarantee a reversal. Bot Name identifies this instance; several Optimized Liquidation bots can have different pair sets and settings."
+      },
+      {
+        "start": 59,
+        "text": "Direction is a hard long, short, or both filter. Pairs can be By Filters, using this bot's own criteria, or an Allowlist containing only named symbols. Allowed Pairs appears in allowlist mode. The bot Blacklist removes symbols from this instance, and the universal blacklist still applies. For example, an ETH-only allowlist refuses every BTC liquidation even after BTC has complete optimized history. Choose non-overlapping responsibilities deliberately so several bots do not express the same risk across a broad set of correlated pairs. In By Filters mode, this instance owns its own pair criteria, independent of Liq Scalper. Volatility rules shape the movement profile. Min Leverage and the minimum venue limit-order and market-order caps require basic tradability."
+      },
+      {
+        "start": 114,
+        "text": "Max Funding Rate excludes unusually expensive funding in either direction. Min 24-hour Rolling Volume and Minimum Coin Market Cap are optional liquidity and size floors. Auto Refresh reruns the filter, while category and pair exclusions remove known groups or symbols. A one-million-dollar rolling-volume floor excludes a pair with only seven hundred thousand in the trailing day. In Allowlist mode the filter criteria are skipped, but blacklists and venue viability still matter. Long VWMA Risk Level and Short VWMA Risk Level control how unusual a historical move must be on each side. The optimizer finds the tightest distance from VWMA that price did not break through for more than the chosen number of consecutive candles. A higher risk-level value allows a longer historical run beyond the band and therefore tends to produce a tighter band with more possible entries."
+      },
+      {
+        "start": 175,
+        "text": "Long and short values are independent because downside and upside behavior may differ. For example, a level of three tolerates historical stretches lasting up to three candles in a row before the optimizer widens the threshold. This is a frequency and risk dial, not a probability guarantee. Min Long VWMA and Min Short VWMA are hard floors under the computed percentages. Zero means no floor. If a quiet pair measures zero-point-four-two percent and the long floor is zero-point-seven-five, the live long band becomes zero-point-seven-five. If a volatile pair measures two-point-one percent, the same floor changes nothing. A floor can reduce extremely tight entries, but it cannot create a band when the pair has insufficient or unusable history. Long and short floors may differ."
+      },
+      {
+        "start": 224,
+        "text": "Raising them usually means fewer, more stretched entries. Lowering them accepts entries closer to recent VWMA and can increase signal frequency. VWMA Timeframe selects the candle size used by the optimizer. VWMA Period is the number of bars in each weighted average. Lookback is the historical window used to find the side-specific thresholds. A one-hundred-period VWMA on five-minute candles calculates its recent average from one hundred bars while the optimizer evaluates stretches across the chosen lookback. Bands refresh at candle close, never faster than the platform's minimum refresh cadence. Longer lookbacks and smaller timeframes require more candle memory, so the form enforces a history-capacity ceiling instead of silently running an incomplete calculation."
+      },
+      {
+        "start": 274,
+        "text": "A newly added pair waits until enough valid history is available. Liquidation Sources choose which feeds may trigger this bot. Min Liquidation Size is the event threshold, with zero accepting any size. Min 24-hour Volume and Max 24-hour Volume create an optional volume window in millions of dollars; zero disables the corresponding bound. A six-hundred-thousand-dollar event passes a five-hundred-thousand minimum, but it still fails if the pair sits outside a ten-to-five-hundred-million volume window. The pair must also be in scope, have a current optimized band, and cross that band. Candle data and the computed bands must remain fresh; a stale pair stops trading and appears as catching up until current again. Size Type chooses fixed dollars or percent of balance, and Base Order sets the initial position amount."
+      },
+      {
+        "start": 336,
+        "text": "Leverage is the requested futures leverage, affecting margin and liquidation risk rather than the configured position value. Max Longs, Max Shorts, and Max Both limit concurrent deals exactly as they do for Liq Scalper. Two longs plus one short fill a combined cap of three even if both side caps are two. Entry Order Type chooses Market for immediacy or Aggressive Limit to work at the touch and chase until filled. Account-level limits, pair ownership, and available balance can still refuse an otherwise valid optimized signal. DCA can be switched On or Off. Off leaves each new deal as the base order only, although manual management can still change the live position. Static uses a typed first deviation and mathematical size and step scales. Scaled ATR uses the pair's volatility at deal open to price the first gap."
+      },
+      {
+        "start": 395,
+        "text": "Builder defines every row independently and may include time-based actions. Static and ATR levels rest as exchange limit orders and remain anchored to the original entry. Time Builder rows cannot rest at an exchange and are evaluated only while Wick Hunter is running, using the current average for their offside requirement. DCA Size Type can be dollars, percent of balance, or percent of the entry. First DCA sets the first add. Orders sets the count, with zero disabling automatic DCA. Volume Scale multiplies later sizes. A seventy-five-dollar first add with a one-point-five scale becomes seventy-five, one-hundred-twelve-fifty, and one-hundred-sixty-eight-seventy-five. Deviation sets the first distance, and Step Scale expands later spacing. With four percent and a one-point-five step scale, cumulative levels are four, ten, and nineteen percent from entry."
+      },
+      {
+        "start": 453,
+        "text": "Always add the complete ladder commitment before selecting base size and deal caps. Scaled ATR uses the ATR Multiplier, ATR Timeframe, ATR Length, and minimum and maximum deviation bounds. A maximum of zero means no ceiling. Builder supplies one size and trigger per row, so ladder-wide scaling fields disappear. Orders on Exchange limits how many price-based DCA orders rest at once. With six planned price levels and a value of two, only the nearest two are live at the venue while the others wait in the plan. Lower values reduce resting-order count but make future advancement more dependent on the application. Time-based Builder rows never rest and do not count against this limit. Take Profit can be Off, a single percentage from the changing average, or a multi-target ladder."
+      },
+      {
+        "start": 509,
+        "text": "Price and quantity are re-anchored after DCA. Stop Loss can also be Off or a saved percentage, measured from either the original entry or current average. A one-point-five-percent take profit follows a changing average. A twelve-percent stop measured from original entry does not move when DCA changes that average; measured from average, it does. Where supported, exits rest reduce-only at the venue. With TP Off, profit is never taken automatically. With SL Off, there is no automatic hard loss cut. A separate enabled Hedge Bot may attach but does not replace these decisions. Consider an illustrative pair whose history produces a one-point-eight-percent long band above its minimum floor. A nine-hundred-thousand-dollar long liquidation arrives while price is two-point-two percent below VWMA."
+      },
+      {
+        "start": 562,
+        "text": "The event clears a five-hundred-thousand-dollar minimum, the pair sits inside its volume window, the band is current, and account limits remain available. The long entry becomes eligible. If price were only one percent below VWMA, it would be skipped. The Screener's Optimized Values tab shows computed bands, warmup, and refresh state. Activity explains accepted and refused events. Use both surfaces before deciding that a quiet pair or bot is malfunctioning."
+      }
+    ]
+  },
+  {
+    "id": "MOWC-uP1WI8",
+    "title": "Manual Bot: Every Setting Explained | Wick Hunter",
+    "url": "https://www.youtube.com/watch?v=MOWC-uP1WI8",
+    "source": "delivery/youtube_uploads_beta_ui_v4/02_detailed_bot_guides/manual_bot_complete_guide/manual_bot_complete_guide.srt",
+    "sha256": "d6706359671158311661d917b65261200b951e6ac97f37381d58bad4ba95aef1",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Manual Bot manages eligible positions that you opened yourself on the exchange. It never creates an entry, chooses a base size, or sets entry leverage. You make those decisions at the venue. When the bot detects an eligible position, it checks account, market, direction, pair scope, and ownership, then adopts the main leg and applies its saved DCA, take profit, and stop plan. For example, you open an ETH long directly on the exchange. Manual Bot records the existing size and average, creates a managed Deal, and places protection. The platform does not pretend it opened the original trade. When Manual Bot is not created, Wick Hunter does not automatically take over positions it did not open. When the bot is paused, it stops adopting new positions, but deals it already manages continue with their saved ladder and exits."
+      },
+      {
+        "start": 58,
+        "text": "Deletion is refused while it still owns open deals. Suppose ETH is already managed and you pause the bot. ETH remains protected, but a new SOL position opened afterward is left alone. This distinction prevents a pause from abandoning live exposure while still giving you control over future adoption. Always check Deals before changing the bot's state. Direction determines whether future long, short, or both types of outside positions may be adopted. Pairs can be All Pairs, including new exchange listings, or Only These, using the named list. A short-only bot restricted to BTCUSDT leaves a manually opened ETH long untouched. Changing direction or pair scope never abandons a position already managed. If the bot holds a BTC long and you switch to short-only, that existing long keeps its frozen ladder, take profit, and stop until it closes."
+      },
+      {
+        "start": 117,
+        "text": "Scope is a gate for the next adoption, not an emergency close control. Before adoption, Wick Hunter checks whether another bot already owns the main position. Liq Scalper, Optimized Liquidation Bot, and TV Signal positions are left with their original owner. A bot that has just submitted an entry can retain a temporary claim while exchange confirmation is pending, preventing Manual Bot from stepping in during the gap. Hedge Bot's opposite leg belongs to Hedge Bot and is never adopted. For example, if TV Signal has submitted an ETH entry but the exchange response is delayed, the pending claim blocks Manual Bot from creating a competing ladder. If ownership is uncertain, the platform waits rather than guessing. DCA Style selects Static, Scaled ATR, or Builder."
+      },
+      {
+        "start": 174,
+        "text": "Static uses the typed Deviation as its first gap. Scaled ATR prices that gap from the pair's volatility when the position is adopted. Builder defines each row independently. Because Manual Bot did not choose the original entry, the position's average at pickup becomes the ladder anchor. A long adopted at a one-hundred-dollar average with a five-percent Static deviation places its first level near ninety-five. Later manual changes to the exchange position are reconciled, and the take profit follows the live average, but the saved ladder plan follows the deal's adoption rules. DCA Size Type can be dollars, percent of balance, or percent of the adopted entry. First DCA sets the first add. Orders sets how many levels exist, with zero disabling automatic DCA."
+      },
+      {
+        "start": 227,
+        "text": "Volume Scale multiplies later sizes. One hundred dollars with scale two becomes one hundred, two hundred, and four hundred. Deviation sets the first distance, and Step Scale expands later spacing. Five percent with scale two produces cumulative levels at five, fifteen, and thirty-five percent from the pickup average. This ladder can commit substantially more capital than the manual entry, so calculate the full amount before adoption. ATR Multiplier, Timeframe, and Length define the volatility-based first gap. Minimum Deviation prevents an overly tight ladder. Maximum Deviation prevents an overly wide first gap, with zero meaning no ceiling. If ATR is one percent and the multiplier is two-point-five, the raw gap is two-point-five percent. A four-percent minimum lifts it to four."
+      },
+      {
+        "start": 281,
+        "text": "The distance is priced when the position is adopted rather than constantly moving. If ATR cannot be priced, the deal identifies the ladder as pending instead of silently inventing a value. The application can retry after current market data becomes available. Builder replaces the ladder-wide fields with one row per DCA, and every row needs its own size. Price rows use a defined distance and can rest as exchange limits anchored to the pickup entry. Time rows wait after adoption and cannot rest at the exchange because a venue does not understand four hours after my entry. Wick Hunter checks those rows on its own clock, so they require the application online. Their offside distance follows the current average. A four-hour row fires only after the time has elapsed and its drawdown condition remains true."
+      },
+      {
+        "start": 335,
+        "text": "This prevents a timed add from firing during a fully recovered position. Orders on Exchange limits the number of price-based DCA limits resting simultaneously. Four planned levels with a value of one expose only the nearest order at the venue. After it fills or is removed, the next eligible level can be placed. A smaller number reduces open-order clutter and venue slot use, but deeper advancement depends more heavily on Wick Hunter continuing to run. Resting orders can still fill while the application is offline. That adds exposure without the rest of the app being available to react, so an exchange-resident DCA is not protection by itself. Time Builder rows are never included because they do not rest. Take Profit Type can be a single percentage from average or a multiple-target ladder."
+      },
+      {
+        "start": 392,
+        "text": "An adopted long with a one-hundred-dollar average and two-percent single target rests near one hundred two. If DCA moves the average to ninety-six, the target follows to about ninety-seven dollars and ninety-two cents, with quantity updated for the live position. The order is reduce-only where supported. A ladder can scale out across several prices, but its closing percentages must form a valid plan. Manual Bot's settings apply to future adoptions; an existing Deal preserves its frozen plan unless edited from Deals. Stop Loss is a percentage, with zero turning it off. SL Offset From determines whether the stop is measured from the original pickup entry or current average. Ten percent from a one-hundred-dollar pickup stays near ninety after DCA."
+      },
+      {
+        "start": 444,
+        "text": "Ten percent from a ninety-six-dollar current average follows near eighty-six dollars and forty cents. Where supported, Wick Hunter rests a real reduce-only stop at the exchange. If that position or venue cannot support it, the Deal identifies a monitored fallback that requires the app and current price. A stop is risk control, but fast markets can still produce slippage. A manually opened position can also receive Hedge Bot coverage. Manual Bot adopts and owns the main leg. The separately created and enabled Hedge Bot may attach afterward and owns only its opposite-side tranches. A one-thousand-dollar SOL long can be adopted by Manual Bot, then receive up to four hundred dollars of short coverage under the Hedge Bot's settings. That is intended collaboration rather than two managers competing for one position."
+      },
+      {
+        "start": 498,
+        "text": "While attached, paired exit behavior may coordinate both legs. Hedge coverage adds margin, orders, fees, funding, and reversal risk, so it does not replace the Manual Bot stop decision. For a complete test, enable Manual Bot on the intended account and market, choose direction and pair scope, then open one very small position at the exchange. Confirm that it appears in Deals with Manual Bot as owner, that the expected DCA orders, take profit, and stop are present, and that leverage matches what you chose at the venue. If it is not adopted, check whether the bot is created and enabled, the account and market match, the direction and pair are allowed, and no other bot or pending entry owns the symbol. Activity should explain the first refusal instead of requiring guesswork."
+      }
+    ]
+  },
+  {
+    "id": "nX3Ia4c1-24",
+    "title": "Hedge Bot: Every Setting Explained | Wick Hunter",
+    "url": "https://www.youtube.com/watch?v=nX3Ia4c1-24",
+    "source": "delivery/youtube_uploads_beta_ui_v4/02_detailed_bot_guides/hedge_bot_complete_guide/hedge_bot_complete_guide.srt",
+    "sha256": "0ba13ac7a2ded3374312e663ac16169025cf765c1bb7ced2068381c62b92aa7d",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Welcome to Wick Hunter Unleashed. This lesson walks through every Hedge Bot setting with a concrete example, then shows how the settings work as one system. The Hedge Bot does not predict or open the main direction. The main position may be opened manually or by another Wick Hunter bot. The Hedge Bot then builds a smaller position in the opposite direction. For example, if another Wick Hunter bot opens a one-hundred-unit long main, the Hedge Bot might open a twenty-unit short hedge after price moves against it. That hedge can slow the drawdown, protect profit with stops, and contribute to a combined exit. Every number in this video is an educational example, not a recommendation or promise of profit. The exchange account must use Hedge Mode, because the main and hedge need to exist as separate legs."
+      },
+      {
+        "start": 59,
+        "text": "For example, another Wick Hunter bot can open a long position of zero point one zero Bitcoin, then the Hedge Bot can manage a short hedge of zero point zero three Bitcoin at the same time. In one-way mode, that same short order may simply reduce the long from zero point one zero to zero point zero seven instead of creating protection. Check the exchange position mode before enabling the bot. This tutorial is about the Hedge Bot's protective leg; a manual trade or another Wick Hunter bot can create the eligible main position. The Hedge Bot selector chooses which saved bot you are editing. New Hedge Bot creates another independent configuration. For example, you could keep one bot named Majors for Bitcoin and Ethereum, then create a second bot named Altcoins for Solana and other selected markets."
+      },
+      {
+        "start": 115,
+        "text": "Switching the selector changes the settings form to that bot; it does not move an attached position from one bot to another. Use multiple bots only when the rules truly need to differ, because each extra configuration adds another place to audit. Bot enabled is the master gate for new attachments. Disabling it does not abandon positions that are already attached; those positions remain managed. For example, suppose Bitcoin is already attached and protected, then you disable the bot. The Bitcoin hedge continues to be managed, but a new Ethereum position will not attach. Turn the bot back on, and future eligible positions may attach again according to the remaining scope rules. Use this switch to pause expansion safely, not as an emergency close button."
+      },
+      {
+        "start": 171,
+        "text": "Auto-attach decides how eligible main positions enter management. Auto watches every eligible position in the bot's pair scope. Manual only waits for you to attach one explicitly. For example, with Auto selected, a new Solana main position can attach as soon as Wick Hunter sees it. With Manual only selected, that same Solana position remains untouched until you press Attach. Auto is convenient for consistent rules; Manual only gives you a deliberate checkpoint when different positions need different treatment. Pairs controls the bot's market scope. All pairs considers every supported pair. Pair list considers only the symbols you enter. Never attach to is a blacklist applied on top. For example, a pair list containing Bitcoin and Ethereum ignores Solana."
+      },
+      {
+        "start": 227,
+        "text": "Another example: with All pairs selected and Dogecoin in Never attach to, Dogecoin is still excluded. Two Hedge Bots cannot claim the same pair, so if a Majors bot already owns Bitcoin, an Altcoins bot cannot also claim Bitcoin. This prevents two managers from competing over the same position. Templates populate the numeric fields with a starting pattern; they do not lock the settings and they do not change attachment or side modes. For example, Slow begins at a ten percent adverse move and uses a thirty percent global uncovered cap. Moderate begins at eight percent with a thirty-five percent cap. Aggressive begins at five percent with a fifty percent cap. Applying Moderate, then changing its first rung from eight to seven percent, is allowed."
+      },
+      {
+        "start": 281,
+        "text": "Think of a template as a draft that you must review, not a risk label that guarantees suitability. Settings mode controls whether long-main and short-main positions share rules. One config applies the same full setup to both directions. Split by main side stores two independent configurations. For example, One config could use a thirty-five percent uncovered cap and four percent activation for every main position. In Split mode, you might leave long mains at thirty-five and four, while short mains use a twenty percent cap and three percent activation. Remember the mapping: a long main uses a short hedge, while a short main uses a long hedge. Each ladder distance is measured from the main position's current blended average entry. For example, a long main with a one-hundred-dollar average reaches an eight percent adverse rung at ninety-two dollars."
+      },
+      {
+        "start": 338,
+        "text": "If dollar-cost averaging lowers the blended average to ninety-five dollars, the same eight percent rung reanchors to eighty-seven dollars and forty cents. For a short main, adverse direction is upward: an eight percent rung from one hundred dollars is one hundred eight dollars. Reanchoring keeps the ladder tied to the position you actually hold, rather than its original entry. Ladder size is target total hedge coverage as a percentage of the current main position. It is not the size of the next order. For example, with a one-hundred-unit main, the first Moderate rung targets twenty percent, so the bot opens twenty hedge units. At the next rung, the target becomes forty percent. Because twenty are already open, the bot adds only twenty more. If you remove that second rung, the forty percent target disappears."
+      },
+      {
+        "start": 392,
+        "text": "If you add a new rung targeting seventy percent, the bot later adds only enough to move from the existing coverage to seventy. Max without stop limits hedge exposure that is still active without an armed protective stop. It gates new openings; it does not force-close an existing hedge. A ladder row can override the global cap. For example, a first row capped at twenty percent overrides a global cap of thirty-five percent while that row is active. Now compare lower and higher global caps. With a one-hundred-unit main, twenty units already unprotected, and a forty-unit target, a twenty-five percent cap leaves five units of headroom. The engine clips the desired twenty-unit top-up to five. If Minimum tranche is ten percent, five is too small, so the top-up waits."
+      },
+      {
+        "start": 444,
+        "text": "With a fifty percent cap, thirty units of headroom remain, so the full twenty-unit top-up opens and forty units are unprotected. Lower limits reversal and uncovered risk but may delay defense. Higher builds defense faster but uses more margin and exposes more hedge until stops arm. Once a tranche arms, it no longer consumes this cap, freeing budget for another entry. Safe zone is a re-entry buffer after a profitable hedge tranche stops out. It prevents the bot from rebuilding immediately on market noise. For example, with a zero point four percent safe zone, the next price tick does not instantly recreate the stopped tranche; price must move back through the reset boundary first. Minimum tranche filters tiny top-ups. For example, on a one-hundred-unit main with a ten percent minimum, an eight-unit top-up is skipped, while a twelve-unit top-up is large enough to open, assuming exchange minimums are also satisfied."
+      },
+      {
+        "start": 503,
+        "text": "Together, these settings reduce churn, fees, and wasted stop slots. Take-profit activation tells each hedge tranche when it has gained enough to arm a stop. Take-profit offset places that stop on the profitable side of the tranche entry. Offset must be strictly smaller than activation. For example, a short hedge entered at ninety-two dollars with four percent activation arms near eighty-eight dollars and thirty-two cents. A one percent offset places protection near ninety-one dollars and eight cents, before fees and exchange rounding. Another example: activation of four and offset of four is invalid because no profitable room remains. Every tranche tracks its own entry, activation, and stop. An exchange can limit the number of conditional stops on one position; Bybit commonly exposes ten slots."
+      },
+      {
+        "start": 559,
+        "text": "Wick Hunter gives the nearest stops priority at the venue and can track overflow as memory stops. For example, if twelve tranches are armed, the nearest ten may have exchange-resident stops while two are labeled Memory. Those two still react while Wick Hunter is running, but they are not stored at the exchange. If a venue slot opens, Retry exchange stops can attempt to promote eligible memory protection. The practical lesson is simple: memory protection depends on the app staying online. Liquidation tiers can raise the uncovered cap as the main approaches its exchange liquidation price. They can never lower the normal cap, and the effective ceiling is one hundred percent. For example, start with a normal cap of thirty-five percent. A tier named Near could raise it to seventy percent within ten percent of liquidation."
+      },
+      {
+        "start": 613,
+        "text": "A deeper tier could raise it to ninety percent within five percent. At four percent distance, both rows match, so the deepest matching tier wins: the five percent row. Leave the table empty to disable tiers. This can permit faster defense near liquidation, but it does not remove liquidation risk. Paired take profit evaluates the main position, open hedge, and realized hedge profit as one package. When any hedge is open, it owns the exit and the ordinary main take profit is pulled. For example, main profit and loss of negative three hundred twenty dollars, open hedge profit of two hundred sixty, and realized hedge profit of one hundred ten produces combined profit of fifty dollars. The basis controls the target dollars. At zero point seven percent, fourteen thousand dollars of combined notional needs ninety-eight dollars, while ten thousand dollars of main notional needs seventy."
+      },
+      {
+        "start": 678,
+        "text": "Combined basis grows with the hedge; main-only usually fires sooner. Zero is not off. Zero requests the most aggressive break-even combined exit. When the last hedge closes, normal main-exit ownership returns. Trail protected hedge stops controls whether an already armed stop can ratchet toward market price. Gap to stop measures the distance from current price to the stop, not profit from entry. Advance per step sets each ratchet amount, and Cooldown limits how often it can happen. For example, suppose a short hedge has a protected stop at ninety-one dollars and eight cents. When the price-to-stop gap reaches ten percent, a two percent advance moves the stop to about eighty-nine dollars and twenty-six cents. With a sixty-minute cooldown, that tranche cannot advance again until the hour passes."
+      },
+      {
+        "start": 734,
+        "text": "Another tranche may still move because each one is evaluated independently. Turning trail off leaves the original protected stop in place. Per-pair overrides replace one scalar value for one market while every unspecified value inherits from the global configuration. For example, if global Max without stop is thirty-five percent and Bitcoin has an override of fifty, Bitcoin uses fifty while Ethereum still inherits thirty-five. Another example: a global trail gap of ten percent can remain unchanged for most pairs while Solana receives a fifteen percent gap. The panel supports the cap, safe zone, paired-profit fields, activation, offset, minimum tranche, and trail controls. Ladder and liquidation-tier arrays may exist through the API and can be shown or cleared here, but this scalar editor does not author those arrays."
+      },
+      {
+        "start": 790,
+        "text": "The active hedge panel shows the effective system in real time: distance, total hedge, unprotected hedge, safe-zone state, average entry, liquidation distance, paired target, realized hedge profit, and combined profit and loss. For example, total hedge can read forty percent while unprotected reads fifteen percent; the difference is coverage that already has protection. Close hedge legs exits the hedge but leaves the main position open. Retry exchange stops attempts to move eligible memory stops to the venue. Detach tells this bot to stop managing the position, so inspect any remaining orders and risk before confirming it. Here is the complete chain. Ladder distance decides when protection is needed. Target size decides total coverage. Row and global caps limit unprotected exposure."
+      },
+      {
+        "start": 848,
+        "text": "Activation and offset protect profitable tranches. Safe zone controls rebuilding, trailing can ratchet stops, and paired take profit decides the package exit. For example, during a steady decline, a twenty-unit short hedge may reduce the main drawdown and later stop out profitably. During a sharp V-shaped recovery, that same short hedge can lose while the main rebounds. This is not a stop loss, and it cannot prevent liquidation. Hedges use margin, fees, and funding. Monitor the active panel, begin with conservative settings, and choose every value for your own risk."
+      }
+    ]
+  },
+  {
+    "id": "HDsnuv4sLHY",
+    "title": "Monitor and Manage Wick Hunter | Course 8",
+    "url": "https://www.youtube.com/watch?v=HDsnuv4sLHY",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/08_monitoring_and_managing/08_monitoring_and_managing.srt",
+    "sha256": "5a99339ba9d8ab97ef081d8b7b465fbb567b63d08c8fca85ea9f7faba8b3f1da",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Wick Hunter separates live operation into five practical questions. Dashboard asks, what is happening now? My Bots asks, what automation is enabled? Deals asks, what exposure is currently being managed? Activity asks, what did the system do or refuse, and why? P and L then answers, what settled result did the exchange report? Keeping those questions separate makes it easier to diagnose a quiet bot without treating every empty screen as an error. All figures in this lesson are illustrative. The Dashboard is the operational summary. Wallet and equity show account value from different angles. Day P and L reports settled performance for the current UTC day. Margin helps you understand how much account capacity is already committed. Open Deals and Bots Running summarize workload, while the equity curve shows change over the selected window."
+      },
+      {
+        "start": 65,
+        "text": "Closest to Trigger explains which eligible Liq Scalper setup is nearest its thresholds. It is a status view, not a promise that the next setup will open or succeed. My Bots shows each bot's account, market, type, scope, and running state. Pausing normally blocks new deals or new adoptions; it does not abandon positions the bot already manages. Existing DCA, take-profit, stop, and timed behavior follow the live deal's rules until exit. Editing a bot changes future positions, while an open deal keeps its own frozen settings unless you edit that specific deal. Before deleting a bot, confirm it has no open exposure or unresolved orders. The card and its warnings tell you what is safe to do. Deals is the source of truth for positions Wick Hunter currently manages."
+      },
+      {
+        "start": 120,
+        "text": "Each row identifies the pair, side, owner, size, average entry, DCA progress, and available exit protection. A hedge attachment appears beside its main position rather than as an unrelated trade. Open Details to inspect resting orders, protection state, and settings frozen into that deal. If you change a live deal, Wick Hunter re-plans the affected orders and reports whether the exchange accepted them. A position that exists only on the exchange may not appear here until an eligible owner adopts it. Activity is the plain-language decision trail. It records entries, skipped signals, order changes, DCA fills, hedge events, stops, exits, and important account actions. For liquidation decisions, actual values can appear beside the configured values: for example, a twelve-thousand-dollar print versus a fifty-thousand-dollar minimum, or zero-point-three-seven percent stretch versus a one-point-five percent band."
+      },
+      {
+        "start": 182,
+        "text": "The setting recorded at decision time remains attached even if you edit the bot later. A watched signal that failed a rule should have a reason here. P and L summarizes closed results by bot and time range. Net performance should be read with fees and funding, not beside them as an afterthought. Win rate describes frequency, while profit factor compares gross wins with gross losses; neither number alone describes risk. Recently Closed shows the individual settled trades available from the selected exchange. When a venue does not publish a field, Wick Hunter shows a dash instead of inventing zero. If history is still synchronizing or limited by the venue, a coverage note says so. Start with context: confirm the active account and market, then confirm the bot exists and is running there."
+      },
+      {
+        "start": 240,
+        "text": "Next check its pair scope and direction. Activity may name an inside-band decision, liquidation below minimum, deal cap, margin gate, volatility filter, or venue rejection. The Screener can show condition misses and pairs that are still warming. If a liquidation occurred on a pair outside the watch set, the bot never evaluated it, so there may be no Activity row. Absence can therefore mean out of scope, not broken. Use the same short routine every day. First, confirm the correct account, market, synchronization state, and margin. Second, review open Deals and verify the expected take profit, stop, DCA orders, and any hedge attachment. Third, scan Activity for skipped entries, rejected orders, stale prices, or cleanup warnings. Fourth, review P and L after fees and funding, by bot rather than only as one account total."
+      },
+      {
+        "start": 300,
+        "text": "Finally, make one deliberate change at a time and record why. Automation can organize repetition, but disciplined supervision remains your responsibility."
+      }
+    ]
+  },
+  {
+    "id": "YvpY0CipYJU",
+    "title": "Hedge Bot Overview | Wick Hunter Course 7",
+    "url": "https://www.youtube.com/watch?v=YvpY0CipYJU",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/07_hedge_bot_overview/07_hedge_bot_overview.srt",
+    "sha256": "3d3d874a89943283b1cb2ee1a24ce78afa023dc5e6ce1047a152d51b1a44d1e2",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Hedge Bot does not choose or open the main trade. The main position is usually opened by Liq Scalper, Optimized Liquidation Bot, TV Signal, Manual Bot, or directly by the user. Hedge Bot may attach afterward and build a smaller position in the opposite direction as price moves against the main. For example, a one-thousand-dollar long main can receive up to three hundred dollars of short coverage. That reduces net long exposure while the hedge is open. It does not erase the main loss, guarantee a recovery, or replace a hard stop. The main owner remains responsible for the original deal, while Hedge Bot owns only its hedge tranches. The account and market must support Hedge Mode so long and short legs can exist at the same time. A zero-point-one Bitcoin long and a zero-point-zero-three Bitcoin short can then coexist as separate positions."
+      },
+      {
+        "start": 60,
+        "text": "In one-way mode, that same short order may simply reduce the long to zero-point-zero-seven instead of creating protection. Wick Hunter checks the venue and context before attachment, but you should still verify the exchange position mode. The current field-verified home is supported USDT perpetual markets. Spot is long-only, and unsupported one-way markets cannot provide the two independent legs this bot requires. The hedge ladder pairs an adverse distance with a target amount of coverage. For a long main, lower prices move through the rungs; for a short main, higher prices do. Imagine targets of ten percent at a four-percent adverse move, twenty percent at eight, and thirty percent at twelve. When price reaches the second rung, Hedge Bot aims for total coverage near twenty percent of the current main size."
+      },
+      {
+        "start": 113,
+        "text": "It opens only the amount needed to reach that target, not another full twenty percent. Distances re-anchor to the main position's current blended average, so a DCA that changes the main average can also change where future hedge rungs sit. Max without stop is the largest share of the main position allowed in hedge tranches that do not yet have protective stops. Lowering it limits early unprotected coverage but may leave more of the main direction exposed. Raising it allows more protection sooner, but also permits a larger hedge that can lose during a sharp reversal. Suppose the cap is twenty-five percent and twenty percent is already unprotected. A new ten-percent request is clipped to the remaining five-percent headroom. If the Minimum Tranche is eight percent, that clipped five-percent add is too small and waits."
+      },
+      {
+        "start": 164,
+        "text": "After an older tranche earns a stop, it stops consuming the unprotected cap and more headroom becomes available. Each hedge tranche can protect its own profit. TP Activation is the favorable move required before protection arms. TP Offset places the stop on the profitable side of the tranche entry and must be smaller than activation. A short hedge entered at ninety-two dollars with four-percent activation arms near eighty-eight dollars and thirty-two cents. A one-percent offset protects near ninety-one dollars and eight cents, before fees and exchange rounding. Exchange stop capacity is finite, so the nearest eligible stops receive priority. A tranche labeled Memory still depends on Wick Hunter running and receiving a current price, which is weaker protection than an exchange-resident stop."
+      },
+      {
+        "start": 216,
+        "text": "Safe Zone controls when stopped hedge coverage may be rebuilt, helping prevent rapid churn near the main average. Optional trailing can ratchet an already protected hedge stop toward market after a configured gap, advance, and cooldown. Paired Take Profit evaluates the main and hedge as one package while an attachment is active. For example, a main position recovering toward break-even while one short hedge tranche holds profit may reach the combined target even though neither leg alone looks ideal. The coordinated exit then closes the package according to the saved basis. These controls work together, so changing one value can alter how often coverage rebuilds and how long the package remains open. Hedge Bot can reduce directional exposure during a sustained move, preserve profit on individual hedge tranches, and support a combined exit."
+      },
+      {
+        "start": 273,
+        "text": "The tradeoff is more orders, more margin use, fees, funding, and extra configuration risk. During a steady decline, a short hedge against a long main may soften the drawdown. During a sharp V-shaped recovery, that same short hedge can lose while the main rebounds. Hedge Bot is not a guaranteed loss limiter and cannot prevent liquidation. Start with conservative coverage, inspect the active hedge panel, and use the existing comprehensive Hedge Bot tutorial before changing advanced ladder, liquidation-tier, trailing, or per-pair override settings."
+      }
+    ]
+  },
+  {
+    "id": "EhmsGpcKt4o",
+    "title": "Manual Bot Overview | Wick Hunter Course 6",
+    "url": "https://www.youtube.com/watch?v=EhmsGpcKt4o",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/06_manual_bot/06_manual_bot.srt",
+    "sha256": "a753e6d41c9a8c0a0e383bc4794d7559401a0e126813aabb5d28ffdd2ace36d1",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Manual Bot manages eligible perpetual positions that you opened yourself. It never creates an entry and it has no entry size or leverage setting of its own. You choose those on the exchange. When the bot recognizes an eligible position, it can adopt the main leg, place the configured DCA ladder, maintain take profit and stop protection, and attribute the final result to Manual Bot. If Manual Bot is not created or is paused, Wick Hunter does not automatically assume that an outside position should be managed. Before adoption, Wick Hunter checks ownership. A position already managed by Liq Scalper, Optimized Liquidation Bot, or TV Signal is left alone. A bot that has just submitted an entry can retain the claim while the exchange confirms it, preventing Manual Bot from stepping in during that brief gap."
+      },
+      {
+        "start": 61,
+        "text": "The opposite leg created by Hedge Bot belongs to Hedge Bot and is never adopted. These rules keep two independent managers from placing competing ladders or exits on the same exposure. If ownership is uncertain, the app waits instead of guessing. Manual Bot belongs to one account and market. A Manual Bot on Futures USDT will not adopt a position opened on another market. Direction may allow long, short, or both. Pair scope may allow all eligible pairs or only a list you name, while exclusions still stand. These scope settings apply to the next detected position as soon as they are saved. Ladder and exit changes apply to future adoptions; an already managed deal keeps its own frozen settings unless you edit that deal from Deals. Imagine that you open an ETH long directly on the exchange."
+      },
+      {
+        "start": 118,
+        "text": "Manual Bot detects the position, confirms the account, market, direction, pair scope, and ownership, then records the current size and average as the starting position. It appears in Deals and in the bot's Managing Now panel. Protection is placed from the saved plan: resting DCA orders where applicable, a reduce-only take profit, and stop protection. Adoption does not change the leverage you already selected, and it does not pretend the app created the original trade. The DCA distances remain anchored to the average entry at pickup. With five-percent deviation, step scale two, and three orders, the cumulative levels are five, fifteen, and thirty-five percent away. With a first DCA of one hundred dollars and volume scale two, the sizes are one hundred, two hundred, and four hundred dollars."
+      },
+      {
+        "start": 175,
+        "text": "Those resting orders may fill even while the app is offline, which is exposure rather than protection. Every completed add changes position size and average, so the take profit is cancelled and re-placed for the new price and quantity. The fixed take profit is measured from the live average and normally rests on the exchange as a reduce-only order. It moves only when the average or position size changes; it does not trail market price upward. Stop loss may be measured from the initial entry, current average, or an account-balance risk amount, depending on the selected mode. Supported venues receive a real exchange-side stop. When that is not possible, the deal identifies its monitored fallback. Zero disables the corresponding exit, so verify the live deal rather than assuming protection exists."
+      },
+      {
+        "start": 232,
+        "text": "A manually opened main position can still receive Hedge Bot coverage. Manual Bot adopts and owns the main leg. Hedge Bot attaches afterward and owns only its opposite-side tranches. That is the intended collaboration, not an ownership conflict. For example, you open a one-thousand-dollar SOL long, Manual Bot adopts it, and Hedge Bot later builds up to four hundred dollars of short coverage. While the hedge is active, its paired exit can coordinate both legs. Hedge coverage may reduce directional exposure, but fees, funding, and execution risk still apply. If a trade is not adopted, check the common causes in order: Manual Bot is missing or paused; the trade is on a different market; direction or pair scope excludes it; another bot already owns it; or another entry order still has an unresolved claim."
+      },
+      {
+        "start": 290,
+        "text": "My Bots confirms whether Manual Bot is running. Managing Now confirms what it owns. Activity records decisions caused by your scope. Pausing stops new adoptions, but positions already owned continue to be managed through their exit. That protects an existing deal from being abandoned simply because you stopped taking new ones."
+      }
+    ]
+  },
+  {
+    "id": "1tZV5VOp3q8",
+    "title": "Connect TradingView to TV Signal | Wick Hunter Course 5",
+    "url": "https://www.youtube.com/watch?v=1tZV5VOp3q8",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/05_tradingview_signals/05_tradingview_signals.srt",
+    "sha256": "675d4ca45fda0d046b0a296359821c381e9bfa903d8b8314678bd294f5d6a625",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "TV Signal connects a TradingView alert to Wick Hunter's position manager. TradingView decides when a condition has occurred. The alert sends a secured message to one named TV Signal bot. Wick Hunter validates that message, applies the bot's direction, pair scope, deal limits, and account limits, then opens and manages the deal if every gate passes. For example, a Supertrend condition on BTC can request a long. The alert does not need to reproduce the entire DCA and exit configuration. TV Signal uses the size, leverage, ladder, take profit, and stop plan already saved in Wick Hunter, unless the message deliberately overrides a supported deal value. Open My Bots, locate the intended TV Signal bot, and choose Payloads. Copy that bot's webhook URL and the matching JSON template."
+      },
+      {
+        "start": 61,
+        "text": "Each named TV Signal bot has its own route and secret, so do not mix values from two bots. The secret authorizes trading and must be protected like an API credential. This tutorial intentionally redacts both values. If a secret appears in a screenshot, recording, chat, or public strategy script, rotate it and update every alert that uses it. Renaming a bot does not rewrite an existing route, but rotating the secret immediately makes old alert messages invalid. In TradingView, open the exact chart and timeframe the strategy is meant to watch, then create a new alert. Choose the indicator or strategy condition that should fire. This matters because TradingView saves the alert against that chart. The placeholder ticker resolves to the symbol of the chart used when the alert was created."
+      },
+      {
+        "start": 114,
+        "text": "An alert created on BTCUSDT can keep sending BTCUSDT even after you later view another chart. For one alert per chart, the placeholder is convenient. For a fixed strategy pair, writing the intended symbol literally can make the target clearer and reduce wrong-pair mistakes. Paste the copied JSON into TradingView's Message field. A basic opening message contains the private secret, an action such as open long, and a symbol such as BTCUSDT. Keep it as valid one-line JSON and do not add comments. The recording's real value is replaced here with REDACTED. If the alert should open a short, use the matching open-short template and confirm that the TV bot allows short entries. A message can also include a dollar size for that single deal. That overrides the form's Base Order for the deal, so a size of one hundred means a one-hundred-USDT position even if the saved base is smaller."
+      },
+      {
+        "start": 178,
+        "text": "Open the alert's Notifications tab, enable Webhook URL, and paste the endpoint copied from the same TV Signal bot. When the condition fires, TradingView posts the Message JSON to that endpoint. The URL and message work as one credential pair: the route chooses the bot and the secret authorizes the request. Do not publish either one. If TradingView requires account features for webhook alerts, confirm those requirements in your own subscription before relying on the automation. Finally, set a clear alert name so the source is recognizable in TradingView and Wick Hunter's notifications. Choose the alert frequency that matches the strategy. Once per bar close waits for the candle to finish and can reduce intrabar noise. Once per bar can respond sooner but may behave differently while the candle is forming."
+      },
+      {
+        "start": 231,
+        "text": "A strategy order-fill alert should use the strategy's own alert message. Wick Hunter's duplicate cooldown can ignore repeated open requests for the same symbol within the saved number of seconds, but it is not a substitute for a correctly designed alert. For example, a five-minute alert firing twice in thirty seconds may have its second open ignored by a three-hundred-second cooldown, while close and management actions remain available. After the alert fires, TV Signal authenticates the secret, identifies the action and symbol, and checks the bot's live context. An open request must pass direction, pair scope, blacklists, duplicate cooldown, bot deal caps, account limits, pricing, and ownership. An allowed SOL long may become a managed deal with its saved ladder, take profit, and stop."
+      },
+      {
+        "start": 285,
+        "text": "The same message is refused if SOL is blacklisted or another manager already owns the position. Review Recent Signals and Activity for the exact reason. A green TradingView notification only proves that the alert was sent; Wick Hunter's response determines whether anything was traded. Before enabling a repeating TradingView strategy, send one small, deliberate test on the intended account and market. Confirm the exact symbol, direction, size, owner, DCA plan, take profit, stop, and Activity record. Then close or manage it using the method the production strategy will use. Never test by publishing the payload. If either the webhook URL or secret has been exposed, rotate the secret before continuing and replace the message in every affected alert."
+      },
+      {
+        "start": 338,
+        "text": "TV Signal can automate a well-designed strategy, but a malformed or overly frequent alert can automate a mistake just as consistently."
+      }
+    ]
+  },
+  {
+    "id": "-NSZAytGx5M",
+    "title": "Liq Scalper and Optimized Liquidation Bot | Course 4",
+    "url": "https://www.youtube.com/watch?v=-NSZAytGx5M",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/04_liquidation_bots/04_liquidation_bots.srt",
+    "sha256": "54b8a721876f102adcdeae7e91d564d8b38b0b67ea6d0b6f9e0345b483a7c4a3",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "A forced liquidation closes a leveraged position at the market. Long positions being liquidated create forced selling; short positions being liquidated create forced buying. Wick Hunter's liquidation bots are designed around a reversal idea: a large forced move may overshoot, then partially snap back. They do not enter merely because price moved quickly. They combine liquidation flow with a measure of how far price is stretched from a recent volume-weighted average. This is a counter-trend approach, so a market that continues trending can keep moving against the position. Liq Scalper needs two conditions at the same time. First, a liquidation print must clear the configured minimum on the side the bot is allowed to fade. Second, price must already be outside the matching VWMA band."
+      },
+      {
+        "start": 60,
+        "text": "Neither condition is enough by itself. A two-million-dollar liquidation inside the band produces no entry. A price far outside the band with no qualifying liquidation also produces no entry. When both gates pass, the bot takes the other side of the forced flow and hands the position to the shared DCA and exit engine. The direction can feel backward at first. Longs liquidated means leveraged longs were force-closed by selling, pushing price down. A long Liq Scalper setup looks to buy that panic sell below the lower band. Shorts liquidated means forced buying, pushing price up. A short setup looks to sell that panic buy above the upper band. Direction is a hard filter. A long-only bot ignores every short setup, while Both allows either side subject to its long, short, and combined deal limits."
+      },
+      {
+        "start": 119,
+        "text": "The bot belongs to the exchange account and perpetual market selected when it is created. Pair selection may come from filters or a manual list, with bot-specific and platform-wide exclusions. The main entry controls are minimum liquidation size, long and short VWMA bands, and any confirmation filters enabled in the current build. Deal caps limit longs, shorts, and the combined total. Account-level market limits can be lower, and the lower ceiling wins. A broad pair list and high caps can open several correlated positions during the same market-wide flush, each carrying its own ladder. Consider illustrative SOL data. The minimum liquidation size is five hundred thousand dollars, and the long VWMA band is two and a half percent. A one-point-two-million-dollar long liquidation prints while SOL is three-point-one percent below its VWMA."
+      },
+      {
+        "start": 178,
+        "text": "The size gate passes, the lower-band gate passes, and a long entry is eligible if every remaining scope and account rule also passes. If the same liquidation arrives at only one-point-two percent below VWMA, the bot skips it as inside the band. After entry, the configured DCA, take profit, stop, and optional Hedge Bot behavior take over. Optimized Liquidation Bot uses the same liquidation-reversal concept but removes the single typed entry band. It measures each pair against that pair's recent closed-candle history and computes separate long and short bands. A quieter major may receive a tighter measured threshold, while a volatile alt may need much more stretch. Bands refresh as candles close, subject to the configured timeframe, period, and lookback."
+      },
+      {
+        "start": 232,
+        "text": "Newly added pairs wait while their history warms, and a pair with no usable measurement has no entry band and cannot fire. Risk Level controls how unusual a historical move must be before it becomes a band. Minimum Long VWMA and Minimum Short VWMA act as floors under the computed percentages. Suppose a quiet pair measures zero-point-four-two percent and its floor is zero-point-seven-five. The live band becomes zero-point-seven-five. Another pair measuring two-point-one percent is unchanged. A floor does not invent a band when history produced none. Longer lookbacks and smaller timeframes require more candle memory, so the form enforces a capacity ceiling instead of silently overloading the server. Liq Scalper gives you direct control over one long band and one short band for its watch set."
+      },
+      {
+        "start": 290,
+        "text": "That can be easier when you trade a small group of pairs whose behavior you know. Optimized Liquidation Bot is designed for a broader list where one percentage would treat quiet majors and volatile alts as if they moved alike. Everything after entry uses the same shared position manager, so the key difference is how the trigger band is chosen. Neither approach predicts a reversal or guarantees a profitable recovery. Use Activity and the Screener to understand why signals fired or were skipped."
+      }
+    ]
+  },
+  {
+    "id": "YCcds1oAd20",
+    "title": "How a Wick Hunter Trade Works | Course 3",
+    "url": "https://www.youtube.com/watch?v=YCcds1oAd20",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/03_how_a_trade_works/03_how_a_trade_works.srt",
+    "sha256": "b9f61565e5cc54febc36224c7a53587c72c47377ca4f188f5d3b66b8f101875d",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "A Wick Hunter trade moves through a visible sequence: an opportunity appears, risk rules decide whether new exposure is allowed, an order becomes a managed position, and the shared deal engine coordinates averaging and exits. An eligible position may also receive separate Hedge Bot coverage. Every important action is then recorded under the bot that owns the main position. This lesson follows that entire lifecycle using illustrative numbers, not recommended settings. The entry source answers one question: what is allowed to start the position? Liq Scalper responds to a forced-liquidation event beyond its VWMA band. Optimized Liquidation Bot uses a separately calculated band for each pair. TV Signal listens for your secured TradingView alert."
+      },
+      {
+        "start": 54,
+        "text": "You can also open the position yourself. That final case is different: Manual Bot may adopt it, but Manual Bot never creates the entry. Hedge Bot is different again; it waits until a main position already exists. A valid signal is not automatically an order. Wick Hunter checks the selected market, direction, pair scope, blacklists, per-bot deal limits, and account-level exposure controls. Imagine a bot that allows two longs, two shorts, but only three deals combined. Two longs plus one short uses the full combined allowance, so the next signal is skipped even though one short slot still appears available. These gates refuse new exposure; they do not close an existing position or erase its protection. Activity records the first rule that blocked the attempt."
+      },
+      {
+        "start": 108,
+        "text": "When the gates pass, the selected execution method sends the entry. A deal slot is reserved while the order is still being placed, so several simultaneous signals cannot slip through a limit. After the exchange confirms the position, Wick Hunter assigns its owner. Ownership matters because one manager should control the main position's DCA ladder, take profit, stop, history, and P and L attribution. A pending or uncertain order can temporarily retain that claim until the app proves what happened, preventing a second bot from taking over the same exposure. The DCA ladder adds exposure only at the saved distances and sizes. Here is an illustrative long: one thousand dollars opens at one hundred dollars, then a five-hundred-dollar DCA fills at ninety-five."
+      },
+      {
+        "start": 159,
+        "text": "The combined average moves to about ninety-eight dollars and twenty-eight cents. A one-percent take-profit target therefore moves from one hundred one to roughly ninety-nine twenty-six. The ladder's distance plan remains anchored to the original entry, while the take profit follows the changing average. A deeper ladder can improve the recovery price, but it also commits more capital and increases risk. Take profit is normally a reduce-only order on the exchange. It is recalculated after a DCA or manual size change so both its price and quantity match the live position. Where the venue supports it, Wick Hunter also rests a real reduce-only stop order on the exchange. If the venue or position cannot support that order, the deal clearly identifies a monitored fallback that requires the app and a live price."
+      },
+      {
+        "start": 212,
+        "text": "A value of zero turns that protection off. These exits manage risk, but they cannot guarantee the price received during a fast market. Hedge Bot never opens the main position. It may attach afterward, when the exchange, market, pair, and bot settings support it. The main owner stays responsible for the original position, while Hedge Bot owns measured opposite-side coverage in separate tranches. During an active attachment, the hedge workflow can coordinate both legs and their combined exit. For example, a one-thousand-dollar main long with forty-percent coverage holds roughly four hundred dollars short. That can reduce directional exposure, but it also adds orders, fees, funding, and configuration risk. At the exit, Wick Hunter closes or reduces the intended position, cancels remaining ladder orders, and keeps the pair claimed until cleanup is confirmed."
+      },
+      {
+        "start": 270,
+        "text": "It then reconciles the result against information published by the exchange. Deals tells you what is still open. Activity explains entries, skips, changes, fills, and cleanup. P and L attributes the settled result to the owning bot, including available fees and funding. The full workflow is visible, but visibility does not remove trading risk. Start small, verify the exchange, and confirm that every live position has the protection you expect."
+      }
+    ]
+  },
+  {
+    "id": "FtG2RCzt0fo",
+    "title": "Connect Bybit Securely | Wick Hunter Course 2",
+    "url": "https://www.youtube.com/watch?v=FtG2RCzt0fo",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/02_connect_bybit_securely/02_connect_bybit_securely.srt",
+    "sha256": "41b6dfa38454f794fa2d95e24656ad9c2475024479cc4e3badda3f24b3cd5f49",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "This lesson connects a Bybit account to Wick Hunter with a restricted API key. The key needs permission to read the account and place trading orders. It never needs permission to withdraw or transfer funds. Keeping those permissions disabled preserves the non-custodial boundary, even if a trading key is ever exposed. In Bybit, open Account Settings, choose API, and select Create New Key. Choose API Transaction and give the key a recognizable name. Select Read-Write, because a read-only key can display balances and positions but cannot place, change, or close orders. When available, restrict the key to your Wick Hunter server's public IP address. Enable only the trading scope required by the markets you will connect. Contract trading permission is required for futures."
+      },
+      {
+        "start": 57,
+        "text": "Add spot trading only if you intend to use supported spot functionality. Leave Assets, Account Transfer, Subaccount Transfer, Convert, and Withdrawal completely disabled. Wick Hunter has no feature that needs to move funds out of your account. Never enable an entire permission group merely because it is faster. Bybit may request a security verification before creating the key. Complete that step privately, without recording verification codes or opening your inbox on screen. This tutorial skips the private verification process and resumes only after the key is created. Before continuing, confirm one final time that withdrawal and transfer permissions remain off. After creation, Bybit displays the API key and secret. The secret is shown only once."
+      },
+      {
+        "start": 111,
+        "text": "Copy both values directly into Wick Hunter; do not store them in notes, screenshots, recordings, chat, or source code. If either value appears in a recording or is shared accidentally, treat that key as compromised: revoke it immediately and create a replacement. In Wick Hunter, open Accounts and choose Add Account. Select Bybit, add a label you will recognize, and paste the API key and secret into their matching fields. Select only the markets covered by the key's trading permissions. For perpetual futures, choose Hedge Mode so Wick Hunter can manage independent long and short legs when the strategy requires them. Choose Add Account and let Wick Hunter validate each selected market. It checks the credentials, trading scopes, and position mode without placing a test order."
+      },
+      {
+        "start": 164,
+        "text": "A read-only key or missing market permission is refused instead of being presented as ready. Confirm the account card shows the expected market and an active connection before enabling any bot. Keep withdrawals disabled for the entire life of the key."
+      }
+    ]
+  },
+  {
+    "id": "CEb6Ah-wtVo",
+    "title": "What Is Wick Hunter Unleashed? | Course 1",
+    "url": "https://www.youtube.com/watch?v=CEb6Ah-wtVo",
+    "source": "delivery/youtube_uploads_beta_ui_v4/01_beginner_course/01_what_is_wick_hunter/01_what_is_wick_hunter.srt",
+    "sha256": "169e741ac39fe7201f8a80a7099832eed85233dfd56df953d03f98c7cf9f9464",
+    "recordedVersion": "September 2026 recording; current written guide takes precedence",
+    "chunks": [
+      {
+        "start": 4,
+        "text": "Wick Hunter Unleashed is an automated trade-management platform. It connects an exchange account to a collection of specialized bots, then gives those bots one shared system for position sizing, dollar-cost averaging, take profit, stop protection, monitoring, and profit attribution. The goal is not to predict every market move. The goal is to apply a strategy consistently, enforce its limits before new exposure is opened, and keep each managed position visible from entry through cleanup. Throughout this course, all figures are illustrative rather than recommended settings, and automation never removes trading risk. The Dashboard is the operational overview. Wallet and equity show the account snapshot. Day P and L shows the result recorded for the current UTC day."
+      },
+      {
+        "start": 57,
+        "text": "Open Deals tells you how many positions Wick Hunter is managing, including any with Hedge Bot coverage. Bots Running confirms how much automation is enabled, and the equity chart shows how the account changed over time. For example, an illustrative dashboard might show ten-thousand-five dollars of equity, two bots running, and three open deals. That does not tell you whether those deals are safe. It tells you where to begin the review. Different bots answer different entry questions. Liq Scalper looks for qualifying forced liquidations beyond a fixed VWMA band. Optimized Liquidation Bot computes a separate band for every pair. TV Signal lets a TradingView alert request the entry. Manual Bot adopts an eligible position you opened yourself; it never creates the entry."
+      },
+      {
+        "start": 103,
+        "text": "Hedge Bot is different again. It waits until a main position already exists, then may build measured opposite-side coverage. For example, TV Signal can open a long after an alert, the shared deal engine can place its ladder and exits, and Hedge Bot may attach afterward if that account, market, pair, and configuration support it. Before a new position is opened, Wick Hunter applies the bot's scope and the account's risk gates. It checks the selected account and market, allowed direction, pair list and exclusions, bot deal limits, account exposure limits, and whether another manager already owns that symbol. Suppose Max Longs is two, Max Shorts is two, and Max Both is three. Two longs plus one short fill the combined limit, so another short signal is skipped even though its side still appears to have one slot."
+      },
+      {
+        "start": 157,
+        "text": "Activity records the reason. These rules block new exposure; they do not silently close a position already being managed. Once an entry becomes a live position, one bot owns the main deal. That owner coordinates its DCA ladder, take profit, stop protection, history, and P and L attribution. Imagine a one-thousand-dollar long at one hundred dollars, followed by a five-hundred-dollar DCA at ninety-five. The combined average moves to roughly ninety-eight dollars and twenty-eight cents, so a one-percent take-profit target moves to about ninety-nine dollars and twenty-six cents. The ladder can improve the recovery price, but it also adds size and risk. If Hedge Bot attaches, it owns only the separate opposite-side hedge tranches; the main owner does not change."
+      },
+      {
+        "start": 212,
+        "text": "The platform separates four useful questions. My Bots shows what automation exists and whether it is enabled. Deals shows live positions and their protection. Activity explains entries, skips, order changes, fills, and cleanup. P and L shows settled exchange results attributed to the owning bot, including available fees and funding. For example, a BTC signal refused by a pair blacklist appears in Activity but never becomes a Deal. A position that closes later disappears from Deals and becomes part of P and L. This separation makes a quiet bot easier to diagnose without guessing that every empty screen is a failure. The course now moves from foundation to operation. First, connect a restricted exchange API key with withdrawal and transfer permissions disabled."
+      },
+      {
+        "start": 264,
+        "text": "Next, learn the trade lifecycle and the differences among the five supported bot types. Then study the detailed settings tutorials before choosing values. Finally, use Deals and Activity to verify that each live position has the orders and protection you expect. A practical learning sequence is one account, one bot, and one very small position, followed by a complete review of entry, ladder, take profit, stop, and ownership. Wick Hunter organizes automation, but you remain responsible for configuration, supervision, and market risk."
+      }
+    ]
+  }
+]

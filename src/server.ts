@@ -1,3 +1,4 @@
+import { SupportChat, SupportError } from "./support-chat.js";
 import { EarnStripeService } from "./earn-stripe.js";
 import { EarnService, earnOwner } from "./earn.js";
 // src/server.ts
@@ -70,7 +71,7 @@ import { EarnService, earnOwner } from "./earn.js";
 // pathname only. The nginx snippet the installer emits does not add an access
 // log for /hub/ either; if the operator turns one on, that is on them.
 import fs from "node:fs";
-import { createHash, timingSafeEqual, createPublicKey } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual, createPublicKey } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { isIP, type AddressInfo } from "node:net";
@@ -543,6 +544,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     log: (msg) => console.log(msg),
   });
 
+  const support = new SupportChat(cfg.dataDir, cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000});
+  const supportGuestLimiter = new SlidingWindowLimiter({windowMs:24*60*60_000,max:3,maxKeys:4096});
+  const supportSendLimiter = new SlidingWindowLimiter({windowMs:60_000,max:20,maxKeys:4096});
   let upgradeStartedAt = 0;
   let sourceProbeCache: { readonly atMs: number; readonly runtimeKey: string; readonly source: ReturnType<typeof probeSourceCheckout> } | null = null;
 
@@ -574,6 +578,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // the README, and a route added to `handle` below is NOT silently
   // rate-limited just by sharing a method — it has to be named here too.
   function isGeneralRateLimitedRoute(m: string, p: string): boolean {
+    if(p === "/api/support/chat" || p.startsWith("/support/")) return true;
     if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
@@ -663,6 +668,56 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/license/lease/renew") return leaseOperation(req, res, "renew");
     if (m === "POST" && p === "/api/license/lease/deactivate") return leaseOperation(req, res, "deactivate");
     if (m === "POST" && p === "/api/license/lease/rebind") return leaseOperation(req, res, "rebind");
+    if(m === "GET" && (p === "/support" || p === "/support/")) {
+      const html=fs.readFileSync(path.join(cfg.publicDir,"support.html"));
+      res.writeHead(200,{"content-type":"text/html; charset=utf-8","cache-control":"no-store","x-content-type-options":"nosniff","content-security-policy":"frame-ancestors 'self' https://wickhunterunleashed.com https://www.wickhunterunleashed.com"});res.end(html);return;
+    }
+    if(p === "/support/session" || p === "/support/chat") {
+      if(!cfg.adminToken || !cfg.support?.enabled)return sendJson(res,503,{ok:false,error:"Support is not enabled"});
+      const allowedOrigins=new Set([new URL(cfg.publicOrigin).origin,"https://wickhunterunleashed.com","https://www.wickhunterunleashed.com"]);
+      if(req.headers.origin && !allowedOrigins.has(String(req.headers.origin)))return sendJson(res,403,{ok:false,error:"Unsupported origin"});
+      const cookie=String(req.headers.cookie||"").split(";").map(x=>x.trim()).find(x=>x.startsWith("wh_support="))?.slice(11)||"";
+      const [nonce,at,signature]=cookie.split(".");
+      const sign=(value:string)=>createHmac("sha256",cfg.adminToken).update("support-guest:"+value).digest("hex");
+      const expected=sign(nonce+"."+at);
+      const valid=!!signature&&/^[a-f0-9]{64}$/.test(signature)&&/^[a-f0-9]{48}$/.test(nonce)&&Number(at)>Date.now()-30*86400_000&&Number(at)<=Date.now()&&timingSafeEqual(Buffer.from(signature),Buffer.from(expected));
+      if(p === "/support/session" && m === "POST") {
+        if(req.headers["x-wh-support"]!=="1")return sendJson(res,403,{ok:false,error:"Missing support action header"});
+        if(valid)return sendJson(res,200,{ok:true},{"cache-control":"no-store"});
+        const rate=supportGuestLimiter.take(clientIp(req),Date.now());if(!rate.ok)return sendRateLimited(res,rate,"new support sessions");
+        const value=randomBytes(24).toString("hex")+"."+Date.now();
+        return sendJson(res,200,{ok:true},{"cache-control":"no-store","set-cookie":"wh_support="+value+"."+sign(value)+"; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"});
+      }
+      if(!valid)return sendJson(res,401,{ok:false,error:"Start a support session first"});
+      const identity={owner:"guest:"+nonce,name:"Website visitor",licenseId:"website"};
+      try{
+        if(p === "/support/chat"&&m === "GET")return sendJson(res,200,support.customer(identity),{"cache-control":"no-store"});
+        if(p === "/support/chat"&&m === "POST"){
+          if(req.headers["x-wh-support"]!=="1")return sendJson(res,403,{ok:false,error:"Missing support action header"});
+          const rate=supportSendLimiter.take(identity.owner,Date.now());if(!rate.ok)return sendRateLimited(res,rate,"support messages");
+          const body=await readJsonBody(req,16*1024);if(!body)return sendJson(res,400,{ok:false,error:"Expected a message"});
+          body.version="website";
+          return sendJson(res,200,await support.message(identity,body),{"cache-control":"no-store"});
+        }
+      }catch(e){if(e instanceof SupportError)return sendJson(res,e.status,{ok:false,error:e.message});throw e;}
+      return sendJson(res,405,{ok:false,error:"Method not allowed"});
+    }
+    if ((m === "GET" || m === "POST") && p === "/api/support/chat") {
+      const raw = req.headers["x-license"];
+      const verified = typeof raw === "string" ? store.verify(raw) : null;
+      if (!verified?.ok) return sendJson(res,401,{ok:false,error:"An active license is required"});
+      const payload = store.decodeGenuine(raw as string)!;
+      const customer = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
+      const identity = {owner:createHash("sha256").update(customer?.email ? "email:"+normalizeCustomerEmail(customer.email) : "license:"+payload.id).digest("hex"), name:store.get(payload.id)?.name || "WH customer",licenseId:payload.id};
+      try {
+        if(m === "GET") return sendJson(res,200,support.customer(identity,url.searchParams.get("id") || undefined),{"cache-control":"no-store"});
+        const rate=supportSendLimiter.take(identity.owner,Date.now());
+        if(!rate.ok){req.resume();return sendRateLimited(res,rate,"support messages");}
+        const body=await readJsonBody(req,16*1024);
+        if(!body)return sendJson(res,400,{ok:false,error:"Expected a message"});
+        return sendJson(res,200,await support.message(identity,body),{"cache-control":"no-store"});
+      } catch(e) {if(e instanceof SupportError)return sendJson(res,e.status,{ok:false,error:e.message});throw e;}
+    }
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
     if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
@@ -2253,6 +2308,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // the percentile table currently covers, and when it last rebuilt.
     if (m === "GET" && p === "/admin/api/liq") {
       return sendJson(res, 200, { ok: true, recording: cfg.liqRecord ?? true, ...liq.status() });
+    }
+    if (m === "GET" && p === "/admin/api/support") return sendJson(res,200,support.admin(),{"cache-control":"no-store"});
+    if (m === "POST" && p === "/admin/api/support") {
+      if(req.headers["x-hub-csrf"]!=="marketplace-config-v1")return sendJson(res,403,{ok:false,error:"Missing admin action header"});
+      const body=await readJsonBody(req,16*1024);
+      if(!body)return sendJson(res,400,{ok:false,error:"Expected an action"});
+      try{return sendJson(res,200,support.action(body),{"cache-control":"no-store"});}
+      catch(e){if(e instanceof SupportError)return sendJson(res,e.status,{ok:false,error:e.message});throw e;}
     }
     if (m === "GET" && p === "/admin/api/feedback/detail") {
       const id = url.searchParams.get("id") ?? "";

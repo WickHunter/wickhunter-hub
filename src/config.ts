@@ -34,6 +34,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(HERE, "..", "..");
 
 export interface HubConfig {
+  support?: import("./support-chat.js").SupportConfig;
   dataDir: string;      // signing key, licenses.json, revoked.json, roster, check-ins
   releasesDir: string;  // beta tarballs + latest.json (see README release contract)
   publicDir: string;    // admin.html
@@ -230,6 +231,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     host: env.HUB_HOST ?? "127.0.0.1",
     port,
     adminToken: env.HUB_ADMIN_TOKEN ?? "",
+    support: {
+      enabled: env.HUB_SUPPORT_ENABLED === "true",
+      aiEnabled: env.LIQHUNTER_SUPPORT_OPENAI_ENABLED === "true",
+      apiKey: env.LIQHUNTER_SUPPORT_OPENAI_API_KEY ?? "",
+      totalMonthlyMicros: Math.max(0, Math.min(50_000_000, Number(env.HUB_SUPPORT_MONTHLY_USD || 50) * 1_000_000 || 0)),
+      knowledgeFile: env.HUB_SUPPORT_KNOWLEDGE_FILE,
+      legacyFile: env.HUB_SUPPORT_LEGACY_FILE,
+    },
     publicOrigin,
     srcDir: env.HUB_SRC_DIR ?? "/root/dev/wickhunter-hub",
     releasePublicKeys,
