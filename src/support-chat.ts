@@ -130,7 +130,7 @@ export class SupportChat {
       const input=t.messages.slice(-8).map(m=>({role:m.role==='customer'?'user':'assistant',content:m.text}));
       while(input.length>1&&Buffer.byteLength(instructions+JSON.stringify(input))>24000)input.shift();
       if(Buffer.byteLength(instructions+JSON.stringify(input))>24000)throw new Error('Support context bound reached');
-      const res=await this.request('https://api.openai.com/v1/responses',{method:'POST',headers:{authorization:'Bearer '+this.config.apiKey,'content-type':'application/json'},body:JSON.stringify({model:'gpt-5.6-luna',instructions,input,max_output_tokens:1200,reasoning:{effort:'none'},store:false,text:{format:{type:'json_object'}}}),signal:AbortSignal.timeout(45000)});
+      const res=await this.request('https://api.openai.com/v1/responses',{method:'POST',headers:{authorization:'Bearer '+this.config.apiKey,'content-type':'application/json'},body:JSON.stringify({model:'gpt-5.6-luna',instructions,input,max_output_tokens:1200,reasoning:{effort:'none'},store:false,text:{format:{type:'json_schema',name:'support_reply',strict:true,schema:{type:'object',properties:{answer:{type:'string'},human:{type:'boolean'}},required:['answer','human'],additionalProperties:false}}}}),signal:AbortSignal.timeout(45000)});
       if(!res.ok){console.warn('[support] Provider refused request: HTTP '+res.status);throw new Error('Support provider unavailable');}
       const reader=res.body?.getReader();if(!reader)throw new Error('Empty provider response');
       const chunks:Uint8Array[]=[];let size=0;

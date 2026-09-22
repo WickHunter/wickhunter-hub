@@ -1,3 +1,7 @@
+## v0.4.49 — Structured support replies
+
+Use a strict answer/handoff response schema so ordinary customer questions can receive structured replies without requiring JSON wording in customer messages.
+
 ## v0.4.48 — Customer answer feedback
 
 Customers can mark an answer resolved or request more human support. Feedback is saved on the answer, and requests remain visible in the human reply queue.
@@ -1743,6 +1747,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.49 — Use the provider’s strict structured output schema for support replies.
 - v0.4.48 — Save customer feedback and route unresolved answers to human support.
 - v0.4.47 — Daily briefing, human support inbox, metered customer chat and video transcript knowledge.
 - v0.4.46 — Distinguish check-in seat release from Go licence recovery. Show surviving bindings, recovery locks and unavailable lease status without weakening machine-bound activation. No customer release publication.

@@ -68,7 +68,7 @@ try{
  const reply=await(await fetch(h.origin+'/support/chat',{headers:guestHeaders})).json();assert.equal(reply.threads[0].messages.at(-1).text,'Human website answer');
 }finally{await h.close();}
 const grounded=new SupportChat(tmpDir('support-grounded'),{...cfg,aiEnabled:true,apiKey:'fake',knowledgeFile:fileURLToPath(new URL('../public/support-knowledge.json',import.meta.url))},async(url,init)=>{
- const payload=JSON.parse(init.body);assert.match(payload.instructions,/Published September 2026 tutorial transcript/);assert.match(payload.instructions,/youtube\.com\/watch/);assert.ok(Buffer.byteLength(payload.instructions+JSON.stringify(payload.input))<=24000);return provider();
+ const payload=JSON.parse(init.body);assert.equal(payload.text.format.type,'json_schema');assert.equal(payload.text.format.strict,true);assert.match(payload.instructions,/Published September 2026 tutorial transcript/);assert.match(payload.instructions,/youtube\.com\/watch/);assert.ok(Buffer.byteLength(payload.instructions+JSON.stringify(payload.input))<=24000);return provider();
 });
 await grounded.message(identity,{text:'How does Hedge Bot minimum tranche coverage work?',requestId:'grounded-request',version:'0.90.129'});
 assert.equal(grounded.customer(identity).threads[0].messages.at(-1).role,'assistant');
