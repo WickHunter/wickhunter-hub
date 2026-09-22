@@ -345,6 +345,7 @@
     <button class="brief-card" data-open-page="support"><span>Human Replies</span><strong id="briefSupport" class="brief-status unknown">Checking…</strong><small id="briefSupportNote">In-app support conversations</small></button>
   </div>
   <p class="muted">Red: needs attention · Amber: review or recovery in progress · Green: clear · Unknown: could not verify. Status reflects all open work, not just today.</p>
+  <section class="brief-section" style="margin-top:1rem" aria-labelledby="supportBudgetTitle"><h3 id="supportBudgetTitle">AI support budget</h3><p id="supportBudgetSummary" role="status">Checking this month’s usage…</p><progress id="supportBudgetProgress" max="100" value="0" aria-label="Monthly AI support budget used" style="width:100%;accent-color:var(--accent)"></progress><p id="supportBudgetDetail" class="muted"></p><form id="supportBudgetForm"><label>Monthly limit ($) <input id="supportBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><button type="submit">Save monthly limit</button></form><p class="muted">Changes apply immediately without resetting usage. $0 pauses AI replies; human support stays available. Per-user limits remain $1/month, 200 replies/month and 20/day.</p><p id="supportBudgetNotice" role="status"></p></section>
   <div class="brief-columns">
     <section class="brief-section"><h3>Bug reports needing attention</h3><div id="briefBugList" class="muted">Loading reports…</div><button data-open-page="bugs">All bug reports</button></section>
     <section class="brief-section"><h3>Waiting for a human answer</h3><div id="briefSupportList" class="muted">Checking inbox…</div><button data-open-page="support">Open support inbox</button></section>
@@ -2883,7 +2884,7 @@ async function supportRefresh() {
     supportSnapshot = await api('/admin/api/support');
     renderSupportInbox();
   } catch(e) {
-    setBrief('Support','unknown','Unknown','Could not load support inbox');
+    setBrief('Support','unknown','Unknown','Could not load support inbox');document.getElementById('supportBudgetSummary').textContent='Budget usage unavailable. Refresh to retry.';
     document.getElementById('briefSupportList').textContent = 'Support inbox unavailable. Refresh to retry.';
     document.getElementById('supportInbox').textContent = e.message;
     throw e;
@@ -2891,6 +2892,14 @@ async function supportRefresh() {
 }
 function renderSupportInbox() {
   const d=supportSnapshot;
+  const budget=d.budget;
+  if(budget){
+    const money=n=>'$'+(n/1000000).toFixed(n<1000000?3:2),remaining=Math.max(0,budget.limitMicros-budget.usedMicros),pct=budget.limitMicros?budget.usedMicros/budget.limitMicros*100:100;
+    document.getElementById('supportBudgetSummary').textContent=money(budget.usedMicros)+' used & reserved / '+money(budget.limitMicros)+' monthly limit · '+money(remaining)+' remaining';
+    const bar=document.getElementById('supportBudgetProgress');bar.value=Math.min(100,pct);bar.style.accentColor=pct>=100?'var(--short)':pct>=80?'var(--warn)':'var(--long)';
+    document.getElementById('supportBudgetDetail').textContent=budget.month+' · Resets '+new Date(budget.resetsAt).toISOString().slice(0,10)+' at 00:00 UTC · '+money(budget.reservedMicros)+' reserved for pending or uncertain requests';
+    const field=document.getElementById('supportBudgetLimit');if(document.activeElement!==field)field.value=budget.limitMicros/1000000;
+  }
   const items=d.items || [], pending=items.filter(x=>x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages?.at(-1)?.role!=='human')));
   setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
   for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',document.getElementById('supportFilter').value==='open'?pending:items]]) {
@@ -2934,6 +2943,7 @@ function renderSupportInbox() {
   }
   document.getElementById('supportMeta').textContent = (d.message || '') + (d.limits ? ' · AI usage $'+(d.spentMicros/1000000).toFixed(2)+' / $'+(d.limits.totalMonthlyMicros/1000000).toFixed(0)+' this month · '+(d.knowledge||[]).length+' approved answers' : '');
 }
+document.getElementById('supportBudgetForm').onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button'),note=document.getElementById('supportBudgetNotice');button.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({action:'budget',monthlyLimitUsd:Number(document.getElementById('supportBudgetLimit').value)})});renderSupportInbox();note.textContent='Monthly limit saved. Existing usage was kept.';}catch(e){note.textContent=e.message;}finally{button.disabled=false;}};
 document.getElementById('supportRefresh').onclick=()=>supportRefresh().catch(e=>{document.getElementById('pageNotice').textContent=e.message;});
 document.getElementById('supportFilter').onchange=renderSupportInbox;
 function labelRecordTables() {

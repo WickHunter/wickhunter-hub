@@ -10,7 +10,7 @@ const dom=new JSDOM(fs.readFileSync('public/admin.html','utf8'),{url:'https://hu
  if(pathname.endsWith('/api/feedback'))body.reports=reports;
  if(pathname.endsWith('/api/feedback/detail'))body.report={...reports[0],logs:[],diagnostics:{}};
  if(pathname.endsWith('/api/candles'))Object.assign(body,{enabled:true,venues:[{venue:'bybit',configured:true,health:{state:'running',lastSuccessAt:Date.now()},counts:{gapped:0,empty:0}}]});
- if(pathname.endsWith('/api/support'))Object.assign(body,{connected:true,items:[{id:'handoff',status:'human',question:'Help',messages:[{role:'assistant',text:'A human can help.'}]}],message:'Connected'});
+ if(pathname.endsWith('/api/support'))Object.assign(body,{connected:true,budget:{limitMicros:50_000_000,usedMicros:12_000_000,reservedMicros:0,resetsAt:Date.UTC(2026,9,1),month:'2026-09'},items:[{id:'handoff',status:'human',question:'Help',messages:[{role:'assistant',text:'A human can help.'}]}],message:'Connected'});
  return {status:200,ok:true,json:async()=>body};};
  w.HTMLElement.prototype.scrollIntoView=()=>{};
 }});
@@ -23,6 +23,7 @@ assert.match(doc.getElementById('briefBugs').textContent,/Red · 1 open/);
 assert.match(doc.getElementById('briefFeatures').textContent,/Amber · 1 open/);
 assert.equal(doc.getElementById('briefCandles').textContent,'Green');
 assert.match(doc.getElementById('briefSupport').textContent,/Red · 1 waiting/);
+assert.match(doc.getElementById('supportBudgetSummary').textContent,/\$12.00 used.*\$50.00.*\$38.00 remaining/);
 assert.equal(calls.some(x=>x.includes('billing')),false,'do not fetch settings on entry');
 doc.querySelector('[data-hub-page="bugs"]').click();await settle();
 assert.equal(doc.querySelector('[data-hub-page-panel="reports"]').hidden,false);

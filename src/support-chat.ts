@@ -22,7 +22,7 @@ interface Thread {
 }
 interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
-interface State { schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
+interface State { monthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
 const MAX_BYTES = 16 * 1024 * 1024;
 const RESERVE_MICROS = 8_000; // 24k UTF-8 input bytes + 1200 output tokens, conservatively bounded.
 const clean = (x: unknown, n: number) => redactFeedbackText(typeof x === 'string' ? x : '', n).trim();
@@ -46,11 +46,12 @@ export class SupportChat {
   private thread(id: string) { const t=this.state.threads.find(t=>t.id===id); if(!t)throw new SupportError('Conversation not found',404); return t; }
   private owned(identity: SupportIdentity,id:string) {const t=this.thread(id);if(t.owner!==identity.owner)throw new SupportError('Conversation not found',404);return t;}
   private period() { const iso=new Date(this.now()).toISOString();return {month:iso.slice(0,7),day:iso.slice(0,10)}; }
+  private monthlyLimit() { return this.state.monthlyLimitMicros ?? this.config.totalMonthlyMicros; }
   allowance(owner: string) {
     const p=this.period(), monthly=this.state.usage.filter(u=>u.month===p.month), mine=monthly.filter(u=>u.owner===owner);
     return {monthlyRemaining:Math.max(0,(owner.startsWith("guest:")?10:200)-mine.length),dailyRemaining:Math.max(0,(owner.startsWith("guest:")?5:20)-mine.filter(u=>u.day===p.day).length),
       userRemainingMicros:Math.max(0,1_000_000-mine.reduce((a,u)=>a+u.micros,0)),
-      totalRemainingMicros:Math.max(0,this.config.totalMonthlyMicros-monthly.reduce((a,u)=>a+u.micros,0)),
+      totalRemainingMicros:Math.max(0,this.monthlyLimit()-monthly.reduce((a,u)=>a+u.micros,0)),
       resetsAt:Date.UTC(Number(p.month.slice(0,4)),Number(p.month.slice(5,7)),1)};
   }
   customer(identity:SupportIdentity,id?:string) {
@@ -77,7 +78,8 @@ export class SupportChat {
     return {ok:true,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
       message:this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.',
       items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
-      knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.config.totalMonthlyMicros},
+      knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},
+      budget:{limitMicros:this.monthlyLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0),reservedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.pending).reduce((a,u)=>a+u.micros,0),resetsAt:this.allowance('').resetsAt,month:this.period().month},
       spentMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0)};
   }
   async message(identity:SupportIdentity,body:Record<string,unknown>) {
@@ -159,6 +161,12 @@ export class SupportChat {
     return this.customer(identity,threadId);
   }
   action(body:Record<string,unknown>) {
+    if(body.action==='budget'){
+      const dollars=body.monthlyLimitUsd;
+      if(typeof dollars!=='number'||!Number.isFinite(dollars)||dollars<0||dollars>10000||Math.abs(dollars*100-Math.round(dollars*100))>0.000001)throw new SupportError('Enter a monthly limit from $0 to $10,000, in whole cents.');
+      const previousMicros=this.monthlyLimit(),limitMicros=Math.round(dollars*1_000_000);
+      this.edit(s=>{s.monthlyLimitMicros=limitMicros;s.budgetHistory=[...(s.budgetHistory||[]),{at:this.now(),previousMicros,limitMicros}].slice(-100);});return this.admin();
+    }
     const id=clean(body.id,80),action=clean(body.action,30);this.thread(id);
     this.edit(s=>{
       const t=s.threads.find(t=>t.id===id)!;

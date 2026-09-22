@@ -1,3 +1,7 @@
+## v0.4.50 — Visible, adjustable support budget
+
+Show used and reserved AI spending, remaining budget, monthly reset and an owner-controlled spending limit on the daily briefing. Saving a new limit persists across restarts and never resets usage.
+
 ## v0.4.49 — Structured support replies
 
 Use a strict answer/handoff response schema so ordinary customer questions can receive structured replies without requiring JSON wording in customer messages.
@@ -1747,6 +1751,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.50 — Show budget progress and let the owner adjust the monthly support cap.
 - v0.4.49 — Use the provider’s strict structured output schema for support replies.
 - v0.4.48 — Save customer feedback and route unresolved answers to human support.
 - v0.4.47 — Daily briefing, human support inbox, metered customer chat and video transcript knowledge.

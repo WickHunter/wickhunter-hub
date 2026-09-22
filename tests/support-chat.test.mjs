@@ -25,6 +25,11 @@ await chat.message(identity,{id,text:'One more question',requestId:'request-0002
 assert.equal(chat.customer(identity,id).threads[0].status,'human');
 chat.action({id,action:'knowledge',question:'How to begin?',answer:'Open the guide.'});
 assert.equal(chat.admin().knowledge.length,1);
+const originalUsage=chat.admin().spentMicros;chat.action({action:'budget',monthlyLimitUsd:75});assert.equal(chat.admin().budget.limitMicros,75_000_000);assert.equal(chat.admin().spentMicros,originalUsage);assert.equal(new SupportChat(dir,cfg).admin().budget.limitMicros,75_000_000);
+assert.throws(()=>chat.action({action:'budget',monthlyLimitUsd:-1}),e=>e.status===400);
+assert.throws(()=>chat.action({action:'budget',monthlyLimitUsd:'100'}),e=>e.status===400);
+chat.action({action:'budget',monthlyLimitUsd:0});assert.equal(chat.allowance('owner').totalRemainingMicros,0);
+
 let calls=0;
 const provider=async()=>{calls++;return new Response(JSON.stringify({status:'completed',usage:{input_tokens:100,output_tokens:20},output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({answer:'Read the guide.',human:false})}]}]}));};
 const ai=new SupportChat(tmpDir('support-ai'),{...cfg,aiEnabled:true,apiKey:'fake'},provider);
