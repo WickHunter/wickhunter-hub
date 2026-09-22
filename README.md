@@ -1,3 +1,7 @@
+## v0.4.52 — Direct human replies in the support inbox
+
+Show all app and website chats with visible reply composers. Keep historical one-way questions in a separate reference section, outside the human-reply count. Briefing conversations open directly to their reply box.
+
 ## v0.4.51 — Timestamped support tutorials
 
 Support answers link directly to the cited moment in a video tutorial.

@@ -331,8 +331,8 @@
     </div>
   </div>
   <nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
-<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Human replies</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Billing</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">System</button></div></nav>
-<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Human replies</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Billing</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">System</option></optgroup></select></label>
+<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Support inbox</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Billing</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">System</button></div></nav>
+<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Support inbox</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Billing</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">System</option></optgroup></select></label>
 <div id="pageNotice" class="hub-error" role="status"></div>
 </header>
 
@@ -354,9 +354,9 @@
   </div>
 </section>
 <section class="hubpage" data-hub-page-panel="support" hidden>
-  <h2>Human replies</h2><p class="muted">In-app questions and conversations that need your attention.</p>
-  <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="open">Needs a human</option><option value="all">All conversations</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
-  <div id="supportInbox"></div>
+  <h2>Support inbox</h2><p class="muted">Read and reply to app and website chats below. Sending a human reply takes over the conversation and pauses AI replies. The customer sees your reply in their chat.</p>
+  <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="all">All chats</option><option value="open">Needs a human reply</option><option value="active">Active chats</option><option value="resolved">Resolved chats</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
+  <p id="supportReplyNotice" role="status"></p><div id="supportInbox"></div><details id="supportLegacy"><summary>Earlier one-way questions <span id="supportLegacyCount"></span></summary><p class="muted">These were imported from the old support system and have no customer reply channel. They are kept for reference. To receive a reply, the customer needs to start a new chat in the updated Alpha app or on the website. Beta has not been updated.</p><div id="supportLegacyItems"></div></details>
 </section>
 
 
@@ -2900,44 +2900,49 @@ function renderSupportInbox() {
     document.getElementById('supportBudgetDetail').textContent=budget.month+' · Resets '+new Date(budget.resetsAt).toISOString().slice(0,10)+' at 00:00 UTC · '+money(budget.reservedMicros)+' reserved for pending or uncertain requests';
     const field=document.getElementById('supportBudgetLimit');if(document.activeElement!==field)field.value=budget.limitMicros/1000000;
   }
-  const items=d.items || [], pending=items.filter(x=>x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages?.at(-1)?.role!=='human')));
+  const items=(d.items || []).filter(x=>Array.isArray(x.messages)), legacy=(d.items || []).filter(x=>!Array.isArray(x.messages)), pending=items.filter(x=>x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages?.at(-1)?.role!=='human')));
   setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
-  for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',document.getElementById('supportFilter').value==='open'?pending:items]]) {
+  const filter=document.getElementById('supportFilter').value;
+  const filtered=filter==='open'?pending:filter==='active'?items.filter(x=>x.status!=='resolved'):filter==='resolved'?items.filter(x=>x.status==='resolved'):items;
+  document.getElementById('supportLegacyCount').textContent='('+legacy.length+')';
+  document.getElementById('supportLegacy').hidden=!legacy.length;
+  for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',filtered],['supportLegacyItems',legacy]]) {
     const box=document.getElementById(id); box.textContent='';
-    if (!rows.length) { box.textContent = d.connected ? 'No questions waiting for a human answer.' : 'Customer support chat is not connected yet.'; }
+    if (!rows.length) { box.textContent = !d.connected ? 'Customer support chat is not connected yet.' : id==='briefSupportList'||filter==='open' ? 'No chats need a human reply. Open the support inbox to see all chats.' : items.length ? 'No chats match this filter. Choose All chats to see every conversation.' : 'No two-way chats yet. Start a chat in the updated Alpha app or on the website; it will appear here with a reply box.'; }
     for (const r of rows) {
-      const item=document.createElement('article'); item.className='inbox-item';
-      const meta=document.createElement('small'); meta.textContent=(r.name||r.install||'Customer')+' · '+fmt(r.ts)+' UTC · '+r.status;
+      const item=document.createElement('article'); item.className='inbox-item';if(id==='supportInbox')item.id='support-'+r.id;
+      const meta=document.createElement('small'); meta.textContent=(r.name||r.install||'Customer')+' · '+fmt(r.updatedAt||r.ts)+' UTC · '+(r.messages?(r.version==='website'?'Website':'App'+(r.version?' '+r.version:''))+' · ':'')+(r.status==='assistant'?'AI conversation':r.status==='resolved'?'Resolved':r.messages?(pending.includes(r)?'Needs a human reply':'Waiting for customer'):'Earlier one-way question');
       const text=document.createElement('p'); text.textContent=r.question || '';
       const note=document.createElement('small'); note.textContent=r.note || '';
       item.append(meta,text,note);
       if (r.answer) { const a=document.createElement('p'); a.textContent='Saved answer: '+r.answer; item.appendChild(a); }
       if (id === 'supportInbox' && r.messages) {
         const details=document.createElement('details'); details.className='support-thread';
-        const summary=document.createElement('summary'); summary.textContent='Conversation & reply'; details.appendChild(summary);
+        const summary=document.createElement('summary'); summary.textContent='Conversation history ('+r.messages.length+' messages)'; details.appendChild(summary);details.open=pending.includes(r);item.appendChild(details);
         for(const m of r.messages){const msg=document.createElement('div');msg.className='message';msg.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'AI support':'Customer')+' · '+fmt(m.at)+' UTC\n'+m.text;details.appendChild(msg);}
-        const form=document.createElement('form');form.style.display='block';
+        const form=document.createElement('form');form.className='support-thread';form.style.display='block';
         const label=document.createElement('label');label.textContent='Your reply';
-        const input=document.createElement('textarea');input.required=true;input.maxLength=4000;input.placeholder='Reply to this customer';label.appendChild(input);
+        const input=document.createElement('textarea');input.required=true;input.maxLength=4000;input.placeholder='Write your reply to this customer…';input.setAttribute('aria-label','Reply to '+(r.name||'customer'));label.appendChild(input);
         const send=document.createElement('button');send.type='submit';send.textContent='Send human reply';
         const note=document.createElement('p');note.setAttribute('role','status');
         let attempt=null;
         form.onsubmit=async e=>{e.preventDefault();if(!input.value.trim())return;send.disabled=true;
           if(!attempt||attempt.text!==input.value.trim())attempt={requestId:crypto.randomUUID(),text:input.value.trim()};
-          try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'reply',...attempt})});renderSupportInbox();}
+          try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'reply',...attempt})});renderSupportInbox();document.getElementById('supportReplyNotice').textContent='Reply sent. The customer can see it in their chat.';}
           catch(e){note.textContent=e.message;send.disabled=false;}
-        };form.append(label,send,note);details.appendChild(form);
+        };form.append(label,send,note);item.appendChild(form);
         const actions=document.createElement('div');actions.className='actions';
         for(const [action,label] of [['takeover','Take over'],['resolve','Resolve conversation']]){
           const b=document.createElement('button');b.textContent=label;b.onclick=async()=>{b.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action})});renderSupportInbox();}catch(e){note.textContent=e.message;b.disabled=false;}};actions.appendChild(b);
-        }details.appendChild(actions);
+        }item.appendChild(actions);
         const learning=document.createElement('details');const heading=document.createElement('summary');heading.textContent='Approve a reusable support answer';learning.appendChild(heading);
         const info=document.createElement('p');info.className='muted';info.textContent='Remove customer-specific details. Only approved answers enter the shared knowledge base.';learning.appendChild(info);
         const q=document.createElement('textarea');q.value=r.question||'';q.maxLength=1000;q.setAttribute('aria-label','Reusable question');
         const a=document.createElement('textarea');a.value=[...r.messages].reverse().find(m=>m.role==='human')?.text||'';a.maxLength=4000;a.setAttribute('aria-label','Approved answer');
         const approve=document.createElement('button');approve.textContent='Approve knowledge';approve.onclick=async()=>{approve.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'knowledge',question:q.value,answer:a.value})});note.textContent='Approved answer saved.';}catch(e){note.textContent=e.message;approve.disabled=false;}};
-        learning.append(q,a,approve);details.appendChild(learning);item.appendChild(details);
+        learning.append(q,a,approve);item.appendChild(learning);
       }
+      if(id==='briefSupportList'){const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{document.getElementById('supportFilter').value='all';showHubPage('support',true);await loadHubPage('support');const target=document.getElementById('support-'+r.id);target?.scrollIntoView({block:'center'});target?.querySelector('form textarea')?.focus();};item.appendChild(open);}
       box.appendChild(item);
     }
   }
