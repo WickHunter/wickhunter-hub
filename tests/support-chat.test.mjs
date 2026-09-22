@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
 import { SupportChat,SupportError } from '../dist/src/support-chat.js';
 import { tmpDir,freshHub } from './helpers.mjs';
 const cfg={enabled:true,aiEnabled:false,apiKey:'',totalMonthlyMicros:50_000_000};
@@ -62,7 +63,7 @@ try{
  assert.equal((await fetch(h.origin+'/admin/api/support',{method:'POST',headers:{...auth,'x-hub-csrf':'marketplace-config-v1'},body:JSON.stringify({id:guest.threads[0].id,action:'reply',text:'Human website answer',requestId:'website-human-reply'})})).status,200);
  const reply=await(await fetch(h.origin+'/support/chat',{headers:guestHeaders})).json();assert.equal(reply.threads[0].messages.at(-1).text,'Human website answer');
 }finally{await h.close();}
-const grounded=new SupportChat(tmpDir('support-grounded'),{...cfg,aiEnabled:true,apiKey:'fake',knowledgeFile:new URL('../public/support-knowledge.json',import.meta.url).pathname},async(url,init)=>{
+const grounded=new SupportChat(tmpDir('support-grounded'),{...cfg,aiEnabled:true,apiKey:'fake',knowledgeFile:fileURLToPath(new URL('../public/support-knowledge.json',import.meta.url))},async(url,init)=>{
  const payload=JSON.parse(init.body);assert.match(payload.instructions,/Published September 2026 tutorial transcript/);assert.match(payload.instructions,/youtube\.com\/watch/);assert.ok(Buffer.byteLength(payload.instructions+JSON.stringify(payload.input))<=24000);return provider();
 });
 await grounded.message(identity,{text:'How does Hedge Bot minimum tranche coverage work?',requestId:'grounded-request',version:'0.90.129'});
