@@ -2891,7 +2891,7 @@ async function supportRefresh() {
 }
 function renderSupportInbox() {
   const d=supportSnapshot;
-  const items=d.items || [], pending=items.filter(x=>x.status==='open'||(x.status==='human'&&x.messages?.at(-1)?.role!=='human'));
+  const items=d.items || [], pending=items.filter(x=>x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages?.at(-1)?.role!=='human')));
   setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
   for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',document.getElementById('supportFilter').value==='open'?pending:items]]) {
     const box=document.getElementById(id); box.textContent='';

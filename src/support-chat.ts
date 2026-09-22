@@ -15,10 +15,10 @@ export interface SupportConfig {
   legacyFile?: string;
 }
 export interface SupportIdentity { owner: string; name: string; licenseId: string }
-interface Message { id: string; role: 'customer' | 'assistant' | 'human'; text: string; at: number }
+interface Message { id: string; role: 'customer' | 'assistant' | 'human'; text: string; at: number; feedback?: 'helpful'|'needs_help' }
 interface Thread {
   id: string; owner: string; name: string; licenseId: string; version: string;
-  ts: number; updatedAt: number; status: 'human' | 'assistant' | 'resolved'; messages: Message[];
+  ts: number; updatedAt: number; waitingForHuman?: boolean; status: 'human' | 'assistant' | 'resolved'; messages: Message[];
 }
 interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
@@ -76,12 +76,18 @@ export class SupportChat {
   admin() {
     return {ok:true,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
       message:this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.',
-      items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version}))].sort((a,b)=>b.updatedAt-a.updatedAt),
+      items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
       knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.config.totalMonthlyMicros},
       spentMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0)};
   }
   async message(identity:SupportIdentity,body:Record<string,unknown>) {
     if(!this.config.enabled)throw new SupportError('Customer chat is not enabled',503);
+    if(body.action==='resolve'||body.action==='human'){
+      const id=clean(body.id,80);const t=this.owned(identity,id);const replyId=clean(body.replyId,80);
+      const reply=t.messages.find(m=>m.id===replyId&&m.role!=='customer');if(!reply)throw new SupportError('Choose a support reply first');
+      this.edit(s=>{const current=s.threads.find(t=>t.id===id)!;current.messages.find(m=>m.id===replyId)!.feedback=body.action==='resolve'?'helpful':'needs_help';current.status=body.action==='resolve'?'resolved':'human';current.waitingForHuman=body.action==='human';current.updatedAt=this.now();});
+      return this.customer(identity,id);
+    }
     const text=clean(body.text,4000), requestId=clean(body.requestId,80), id=clean(body.id,80);
     if(!text||!/^[-A-Za-z0-9_]{8,80}$/.test(requestId))throw new SupportError('A message and unique request ID are required');
     const prior=this.state.threads.find(t=>t.owner===identity.owner&&t.messages.some(m=>m.role==='customer'&&m.id===requestId));
@@ -96,12 +102,12 @@ export class SupportChat {
         if(s.threads.length>=500)throw new SupportError('The support inbox is full. Please use Report a bug.',507);
         thread={id:randomUUID(),owner:identity.owner,name:identity.name,licenseId:identity.licenseId,version:clean(body.version,40),ts:this.now(),updatedAt:this.now(),status:human?'human':'assistant',messages:[]};s.threads.push(thread);
       }
-      const t=s.threads.find(t=>t.id===thread!.id)!;t.messages.push({id:requestId,role:'customer',text,at:this.now()});t.updatedAt=this.now();if(t.status==='resolved')t.status='human';
+      const t=s.threads.find(t=>t.id===thread!.id)!;t.messages.push({id:requestId,role:'customer',text,at:this.now()});t.updatedAt=this.now();if(t.status==='resolved')t.status='human';if(t.status==='human')t.waitingForHuman=true;
     });
     const threadId=thread!.id;
     const quota=this.allowance(identity.owner);
     if(this.thread(threadId).status==='human'||human||!this.config.aiEnabled||!this.config.apiKey||!quota.dailyRemaining||!quota.monthlyRemaining||quota.userRemainingMicros<RESERVE_MICROS||quota.totalRemainingMicros<RESERVE_MICROS){
-      this.edit(s=>{s.threads.find(t=>t.id===threadId)!.status='human';});return this.customer(identity,threadId);
+      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;});return this.customer(identity,threadId);
     }
     const reservation=randomUUID();
     this.edit(s=>{s.usage=s.usage.filter(u=>u.month===this.period().month);s.usage.push({id:reservation,owner:identity.owner,...this.period(),micros:RESERVE_MICROS,pending:true});});
@@ -143,10 +149,10 @@ export class SupportChat {
         // late AI answer over that decision; usage is still accounted for.
         if(target.status!=='assistant')return;
         target.messages.push({id:randomUUID(),role:'assistant',text:clean(answer.answer,6000),at:this.now()});target.updatedAt=this.now();
-        if(answer.human)target.status='human';
+        if(answer.human){target.status='human';target.waitingForHuman=true;}
       });
     } catch {
-      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;if(t.status==='assistant')t.status='human';});
+      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;if(t.status==='assistant'){t.status='human';t.waitingForHuman=true;}});
     } finally {this.busy.delete(identity.owner);}
     return this.customer(identity,threadId);
   }
@@ -159,8 +165,8 @@ export class SupportChat {
         if(!answer||!/^[-A-Za-z0-9_]{8,80}$/.test(requestId))throw new SupportError('An answer and request ID are required');
         if(t.messages.some(m=>m.id===requestId&&m.role==='human'))return;
         if(t.messages.length>=100)throw new SupportError('Conversation message limit reached',409);
-        t.messages.push({id:requestId,role:'human',text:answer,at:this.now()});t.status='human';
-      }else if(action==='resolve')t.status='resolved';
+        t.messages.push({id:requestId,role:'human',text:answer,at:this.now()});t.status='human';t.waitingForHuman=false;
+      }else if(action==='resolve'){t.status='resolved';t.waitingForHuman=false;}
       else if(action==='takeover')t.status='human';
       else if(action==='knowledge'){
         const question=clean(body.question,1000),answer=clean(body.answer,4000);

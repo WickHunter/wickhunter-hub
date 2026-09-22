@@ -16,6 +16,10 @@ chat.action({id,action:'reply',text:'Open the guide',requestId:'reply-00001'});
 chat.action({id,action:'reply',text:'Open the guide',requestId:'reply-00001'});
 assert.equal(chat.customer(identity,id).threads[0].messages.length,2);
 assert.equal(new SupportChat(dir,cfg).customer(identity,id).threads[0].messages[1].text,'Open the guide');
+await chat.message(identity,{id,replyId:'reply-00001',action:'resolve'});assert.equal(chat.customer(identity,id).threads[0].status,'resolved');assert.equal(chat.customer(identity,id).threads[0].messages[1].feedback,'helpful');
+await chat.message(identity,{id,replyId:'reply-00001',action:'human'});assert.equal(chat.admin().items.find(t=>t.id===id).waitingForHuman,true);assert.equal(chat.customer(identity,id).threads[0].messages[1].feedback,'needs_help');
+await assert.rejects(chat.message({...identity,owner:'intruder'},{id,replyId:'reply-00001',action:'resolve'}),e=>e.status===404);
+
 chat.action({id,action:'resolve'});
 await chat.message(identity,{id,text:'One more question',requestId:'request-0002'});
 assert.equal(chat.customer(identity,id).threads[0].status,'human');
