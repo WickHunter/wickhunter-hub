@@ -1,3 +1,7 @@
+## v0.4.51 — Timestamped support tutorials
+
+Support answers link directly to the cited moment in a video tutorial.
+
 ## v0.4.50 — Visible, adjustable support budget
 
 Show used and reserved AI spending, remaining budget, monthly reset and an owner-controlled spending limit on the daily briefing. Saving a new limit persists across restarts and never resets usage.
