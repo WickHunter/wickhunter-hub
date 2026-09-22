@@ -178,6 +178,7 @@ export class SupportChat {
         t.messages.push({id:requestId,role:'human',text:answer,at:this.now()});t.status='human';t.waitingForHuman=false;
       }else if(action==='resolve'){t.status='resolved';t.waitingForHuman=false;}
       else if(action==='takeover')t.status='human';
+      else if(action==='reopen'){t.status='human';t.waitingForHuman=true;}
       else if(action==='knowledge'){
         const question=clean(body.question,1000),answer=clean(body.answer,4000);
         if(!question||!answer)throw new SupportError('Review both the question and answer before approving knowledge');

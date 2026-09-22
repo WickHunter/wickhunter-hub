@@ -1,3 +1,7 @@
+## v0.4.54 — Compact support inbox and active-market health
+
+Show open chats as compact rows, expand one conversation to reply, and close finished chats into a separate Closed view. Keep history and drafts; reopen manually or when the customer sends a new message. Candle health counts active markets, with inactive contracts shown separately and their history retained.
+
 ## v0.4.52 — Direct human replies in the support inbox
 
 Show all app and website chats with visible reply composers. Keep historical one-way questions in a separate reference section, outside the human-reply count. Briefing conversations open directly to their reply box.
@@ -828,7 +832,8 @@ The **Exchanges** panel on the admin page shows one card per venue: RUNNING /
 STALLED / FAILING (a collector that last succeeded 40 minutes ago on a 1-minute
 cadence is stalled even if nothing threw — it is never "idle", there is always a
 tail to advance), last success and last error with times, symbols split into
-seedable / backfilling / gapped / empty, oldest and newest candle held, total
+seedable / backfilling / gapped / empty for active markets, plus inactive contracts
+listed separately. Active-market health includes oldest and newest candle held, total
 missing minutes with the worst offenders named, and pairs first listed in the
 last 24h with how much history they hold so far. A venue with no collector says
 so rather than showing zeroes that would read as a working collector with an
@@ -1758,6 +1763,11 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.54 — Compact open-chat inbox with persistent close/reopen and preserved drafts; separate inactive contracts from active candle health.
+- v0.4.53 — Preserve paid Marketplace configuration when its admin form is saved.
+- v0.4.52 — Add direct human replies to the support inbox.
+- v0.4.51 — Link support tutorials to the cited video timestamp.
 
 - v0.4.50 — Show budget progress and let the owner adjust the monthly support cap.
 - v0.4.49 — Use the provider’s strict structured output schema for support replies.

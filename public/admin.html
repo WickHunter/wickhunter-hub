@@ -306,6 +306,25 @@
     .brief-section { padding:.8rem; }
   }
 
+  .support-card { padding:0; }
+  .support-row { display:flex; align-items:center; gap:.8rem; padding:.75rem 1rem; }
+  .support-open { flex:1; min-width:0; border:0; border-radius:.3rem; background:transparent; padding:.2rem; text-align:left; color:var(--ink); }
+  .support-open strong,.support-open small,.support-open-hint { display:block; }
+  .support-subject { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.95rem; }
+  .support-open small { font-size:.78rem; margin:.25rem 0; }
+  .support-open-hint { font-size:.78rem; color:var(--accent); }
+  .support-status { font-size:.78rem; color:var(--muted); }
+  .support-status.waiting { color:var(--warn); }
+  .support-close { flex-shrink:0; font-size:.82rem; padding:.5rem .7rem; }
+  .support-panel { border-top:1px solid var(--line); padding:1rem; }
+  .support-history { max-height:24rem; overflow-y:auto; margin-bottom:1rem; overscroll-behavior:contain; }
+  .support-history .message { padding:.7rem .8rem; margin:.4rem 0; border-left:2px solid var(--line); }
+  .support-history .message.human { border-color:var(--accent); }
+  .support-history .message p { font-size:.9rem; }
+  .support-thread textarea,.support-learning textarea { display:block; width:100%; min-height:5rem; resize:vertical; margin:.4rem 0; }
+  .support-learning { margin-top:.8rem; color:var(--muted); font-size:.85rem; }
+  @media(max-width:640px) { .support-row { flex-wrap:wrap; gap:.5rem; padding:.65rem; } .support-open { flex-basis:100%; } .support-status { flex:1; } .support-panel { padding:.65rem; } }
+
 </style>
 </head>
 <body>
@@ -354,8 +373,8 @@
   </div>
 </section>
 <section class="hubpage" data-hub-page-panel="support" hidden>
-  <h2>Support inbox</h2><p class="muted">Read and reply to app and website chats below. Sending a human reply takes over the conversation and pauses AI replies. The customer sees your reply in their chat.</p>
-  <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="all">All chats</option><option value="open">Needs a human reply</option><option value="active">Active chats</option><option value="resolved">Resolved chats</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
+  <h2>Support inbox</h2><p class="muted">Open a chat to read and reply. Close it when finished; its history stays in Closed. A new customer message reopens it.</p>
+  <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="active">Open chats</option><option value="open">Needs a human reply</option><option value="resolved">Closed</option><option value="all">All chats</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
   <p id="supportReplyNotice" role="status"></p><div id="supportInbox"></div><details id="supportLegacy"><summary>Earlier one-way questions <span id="supportLegacyCount"></span></summary><p class="muted">These were imported from the old support system and have no customer reply channel. They are kept for reference. To receive a reply, the customer needs to start a new chat in the updated Alpha app or on the website. Beta has not been updated.</p><div id="supportLegacyItems"></div></details>
 </section>
 
@@ -1587,9 +1606,11 @@ async function cdRefresh() {
       + '<span class="bkt b-backfilling"><b>' + v.counts.backfilling + "</b> backfilling</span>"
       + '<span class="bkt b-gapped"><b>' + v.counts.gapped + "</b> gapped</span>"
       + '<span class="bkt b-empty"><b>' + v.counts.empty + "</b> empty</span>"
+      + (v.counts.inactive ? '<span class="bkt b-empty"><b>' + v.counts.inactive + "</b> inactive</span>" : "")
       + (v.counts.newLast24h ? '<span class="bkt b-new"><b>' + v.counts.newLast24h + "</b> new in 24h</span>" : "")
       + "</div>";
 
+    html += '<p class="muted">Data health covers active markets. Inactive contracts keep their history but are excluded from gaps and empty counts.</p>';
     html += "<dl>"
       + "<dt>Symbols tracked</dt><dd>" + v.counts.tracked
         + (v.counts.delisted ? ' <span class="muted">(' + v.counts.delisted + " delisted)</span>" : "") + "</dd>"
@@ -2821,6 +2842,9 @@ earnEl('earnCommit').onclick=async()=>{if(!earnPreview)return;earnEl('earnCommit
 
 // Briefing is computed from current records. No model calls or unattended actions.
 let supportSnapshot = null;
+let supportExpandedId = null;
+const supportDrafts = new Map();
+const supportReplyAttempts = new Map();
 function setBrief(id, state, title, note) {
   const el = document.getElementById('brief' + id);
   el.className = 'brief-status ' + state; el.textContent = title;
@@ -2900,53 +2924,85 @@ function renderSupportInbox() {
     document.getElementById('supportBudgetDetail').textContent=budget.month+' · Resets '+new Date(budget.resetsAt).toISOString().slice(0,10)+' at 00:00 UTC · '+money(budget.reservedMicros)+' reserved for pending or uncertain requests';
     const field=document.getElementById('supportBudgetLimit');if(document.activeElement!==field)field.value=budget.limitMicros/1000000;
   }
-  const items=(d.items || []).filter(x=>Array.isArray(x.messages)), legacy=(d.items || []).filter(x=>!Array.isArray(x.messages)), pending=items.filter(x=>x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages?.at(-1)?.role!=='human')));
+  const items=(d.items || []).filter(x=>Array.isArray(x.messages)), legacy=(d.items || []).filter(x=>!Array.isArray(x.messages));
+  const pending=items.filter(x=>x.status!=='resolved'&&(x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages.at(-1)?.role!=='human'))));
+  const active=items.filter(x=>x.status!=='resolved'),closed=items.filter(x=>x.status==='resolved');
   setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
   const filter=document.getElementById('supportFilter').value;
-  const filtered=filter==='open'?pending:filter==='active'?items.filter(x=>x.status!=='resolved'):filter==='resolved'?items.filter(x=>x.status==='resolved'):items;
+  const filtered=[...(filter==='open'?pending:filter==='active'?active:filter==='resolved'?closed:items)]
+    .sort((a,b)=>Number(pending.includes(b))-Number(pending.includes(a))||(b.updatedAt||b.ts)-(a.updatedAt||a.ts));
+  for(const [value,label,count] of [['active','Open chats',active.length],['open','Needs a human reply',pending.length],['resolved','Closed',closed.length],['all','All chats',items.length]])
+    document.querySelector('#supportFilter option[value="'+value+'"]').textContent=label+' ('+count+')';
   document.getElementById('supportLegacyCount').textContent='('+legacy.length+')';
   document.getElementById('supportLegacy').hidden=!legacy.length;
+  const notice=document.getElementById('supportReplyNotice');
+  const act=async(r,action,button)=>{
+    button.disabled=true;
+    try{
+      supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action})});
+      if(action==='resolve')supportExpandedId=null;
+      if(action==='reopen'){supportExpandedId=r.id;document.getElementById('supportFilter').value='active';}
+      renderSupportInbox();
+      notice.textContent=action==='resolve'?'Chat closed. Its history is saved in Closed.':action==='reopen'?'Chat reopened.':'You have taken over this chat. AI replies are paused.';
+    }catch(e){notice.textContent=e.message;button.disabled=false;}
+  };
   for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',filtered],['supportLegacyItems',legacy]]) {
     const box=document.getElementById(id); box.textContent='';
-    if (!rows.length) { box.textContent = !d.connected ? 'Customer support chat is not connected yet.' : id==='briefSupportList'||filter==='open' ? 'No chats need a human reply. Open the support inbox to see all chats.' : items.length ? 'No chats match this filter. Choose All chats to see every conversation.' : 'No two-way chats yet. Start a chat in the updated Alpha app or on the website; it will appear here with a reply box.'; }
+    if(!rows.length){box.className='brief-empty';box.textContent=!d.connected?'Customer support chat is not connected yet.':id==='briefSupportList'||filter==='open'?'No chats need a human reply.':filter==='resolved'?'No closed chats yet.':filter==='active'?'You’re caught up. No open chats. Previous conversations are in Closed.':'No chats yet.';}else box.className='';
     for (const r of rows) {
-      const item=document.createElement('article'); item.className='inbox-item';if(id==='supportInbox')item.id='support-'+r.id;
-      const meta=document.createElement('small'); meta.textContent=(r.name||r.install||'Customer')+' · '+fmt(r.updatedAt||r.ts)+' UTC · '+(r.messages?(r.version==='website'?'Website':'App'+(r.version?' '+r.version:''))+' · ':'')+(r.status==='assistant'?'AI conversation':r.status==='resolved'?'Resolved':r.messages?(pending.includes(r)?'Needs a human reply':'Waiting for customer'):'Earlier one-way question');
-      const text=document.createElement('p'); text.textContent=r.question || '';
-      const note=document.createElement('small'); note.textContent=r.note || '';
-      item.append(meta,text,note);
-      if (r.answer) { const a=document.createElement('p'); a.textContent='Saved answer: '+r.answer; item.appendChild(a); }
-      if (id === 'supportInbox' && r.messages) {
-        const details=document.createElement('details'); details.className='support-thread';
-        const summary=document.createElement('summary'); summary.textContent='Conversation history ('+r.messages.length+' messages)'; details.appendChild(summary);details.open=pending.includes(r);item.appendChild(details);
-        for(const m of r.messages){const msg=document.createElement('div');msg.className='message';msg.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'AI support':'Customer')+' · '+fmt(m.at)+' UTC\n'+m.text;details.appendChild(msg);}
-        const form=document.createElement('form');form.className='support-thread';form.style.display='block';
-        const label=document.createElement('label');label.textContent='Your reply';
-        const input=document.createElement('textarea');input.required=true;input.maxLength=4000;input.placeholder='Write your reply to this customer…';input.setAttribute('aria-label','Reply to '+(r.name||'customer'));label.appendChild(input);
-        const send=document.createElement('button');send.type='submit';send.textContent='Send human reply';
-        const note=document.createElement('p');note.setAttribute('role','status');
-        let attempt=null;
-        form.onsubmit=async e=>{e.preventDefault();if(!input.value.trim())return;send.disabled=true;
-          if(!attempt||attempt.text!==input.value.trim())attempt={requestId:crypto.randomUUID(),text:input.value.trim()};
-          try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'reply',...attempt})});renderSupportInbox();document.getElementById('supportReplyNotice').textContent='Reply sent. The customer can see it in their chat.';}
-          catch(e){note.textContent=e.message;send.disabled=false;}
-        };form.append(label,send,note);item.appendChild(form);
-        const actions=document.createElement('div');actions.className='actions';
-        for(const [action,label] of [['takeover','Take over'],['resolve','Resolve conversation']]){
-          const b=document.createElement('button');b.textContent=label;b.onclick=async()=>{b.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action})});renderSupportInbox();}catch(e){note.textContent=e.message;b.disabled=false;}};actions.appendChild(b);
-        }item.appendChild(actions);
-        const learning=document.createElement('details');const heading=document.createElement('summary');heading.textContent='Approve a reusable support answer';learning.appendChild(heading);
+      const item=document.createElement('article');item.className='inbox-item';if(id==='supportInbox')item.id='support-'+r.id;
+      const channel=r.version==='website'?'Website':'App';
+      const metaText=(r.name||r.install||'Customer')+' · '+channel+' · '+fmt(r.updatedAt||r.ts)+' UTC';
+      if(id!=='supportInbox'){
+        const meta=document.createElement('small');meta.textContent=metaText;
+        const text=document.createElement('p');text.textContent=r.question||'';item.append(meta,text);
+        if(id==='briefSupportList'){
+          const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{supportExpandedId=r.id;document.getElementById('supportFilter').value='active';showHubPage('support',true);await loadHubPage('support');const target=document.getElementById('support-'+r.id);target?.scrollIntoView({block:'center'});target?.querySelector('form textarea')?.focus();};item.appendChild(open);
+        }
+        box.appendChild(item);continue;
+      }
+      const expanded=supportExpandedId===r.id,isClosed=r.status==='resolved';
+      item.classList.add('support-card');
+      const row=document.createElement('div');row.className='support-row';
+      const open=document.createElement('button');open.className='support-open';open.type='button';open.setAttribute('aria-expanded',String(expanded));open.setAttribute('aria-controls','support-panel-'+r.id);
+      const subject=document.createElement('strong');subject.className='support-subject';subject.textContent=r.question||'Support conversation';
+      const meta=document.createElement('small');meta.textContent=metaText;
+      const hint=document.createElement('span');hint.className='support-open-hint';hint.textContent=expanded?'Collapse ↑':isClosed?'View history ↓':'Read & reply ↓';
+      open.append(subject,meta,hint);open.onclick=()=>{supportExpandedId=expanded?null:r.id;renderSupportInbox();document.getElementById('support-'+r.id)?.querySelector('.support-open')?.focus();};
+      const status=document.createElement('span');status.className='support-status'+(pending.includes(r)?' waiting':'');status.textContent=isClosed?'Closed':pending.includes(r)?'Needs reply':r.status==='assistant'?'AI conversation':'Waiting for customer';
+      const close=document.createElement('button');close.type='button';close.className='support-close';close.textContent=isClosed?'Reopen':'Close chat';close.dataset.supportAction=isClosed?'reopen':'resolve';close.onclick=()=>act(r,isClosed?'reopen':'resolve',close);
+      row.append(open,status,close);item.appendChild(row);
+      const panel=document.createElement('div');panel.id='support-panel-'+r.id;panel.className='support-panel';panel.hidden=!expanded;item.appendChild(panel);
+      if(expanded){
+        const history=document.createElement('div');history.className='support-history';history.setAttribute('aria-label','Conversation history');
+        for(const m of r.messages){const msg=document.createElement('div');msg.className='message '+m.role;const who=document.createElement('small');who.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'AI support':'Customer')+' · '+fmt(m.at)+' UTC';const body=document.createElement('p');body.textContent=m.text;msg.append(who,body);history.appendChild(msg);}panel.appendChild(history);
+        if(!isClosed){
+          const form=document.createElement('form');form.className='support-thread';
+          const label=document.createElement('label');label.textContent='Your reply';
+          const input=document.createElement('textarea');input.required=true;input.rows=3;input.maxLength=4000;input.placeholder='Write a reply…';input.setAttribute('aria-label','Reply to '+(r.name||'customer'));input.value=supportDrafts.get(r.id)||'';input.oninput=()=>supportDrafts.set(r.id,input.value);label.appendChild(input);
+          const send=document.createElement('button');send.type='submit';send.textContent='Send reply';
+          const note=document.createElement('p');note.setAttribute('role','status');
+          form.onsubmit=async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;supportDrafts.set(r.id,input.value);send.disabled=true;
+            let attempt=supportReplyAttempts.get(r.id);if(!attempt||attempt.text!==text){attempt={requestId:crypto.randomUUID(),text};supportReplyAttempts.set(r.id,attempt);}
+            try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'reply',...attempt})});supportDrafts.delete(r.id);supportReplyAttempts.delete(r.id);renderSupportInbox();notice.textContent='Reply sent. The customer can see it in their chat.';}
+            catch(e){note.textContent=e.message;send.disabled=false;}
+          };
+          const actions=document.createElement('div');actions.className='actions';actions.appendChild(send);
+          if(r.status==='assistant'){const take=document.createElement('button');take.type='button';take.textContent='Take over from AI';take.onclick=()=>act(r,'takeover',take);actions.appendChild(take);}
+          form.append(label,actions,note);panel.appendChild(form);
+        }
+        const learning=document.createElement('details');learning.className='support-learning';const heading=document.createElement('summary');heading.textContent='Save a reusable answer';learning.appendChild(heading);
         const info=document.createElement('p');info.className='muted';info.textContent='Remove customer-specific details. Only approved answers enter the shared knowledge base.';learning.appendChild(info);
         const q=document.createElement('textarea');q.value=r.question||'';q.maxLength=1000;q.setAttribute('aria-label','Reusable question');
         const a=document.createElement('textarea');a.value=[...r.messages].reverse().find(m=>m.role==='human')?.text||'';a.maxLength=4000;a.setAttribute('aria-label','Approved answer');
-        const approve=document.createElement('button');approve.textContent='Approve knowledge';approve.onclick=async()=>{approve.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'knowledge',question:q.value,answer:a.value})});note.textContent='Approved answer saved.';}catch(e){note.textContent=e.message;approve.disabled=false;}};
-        learning.append(q,a,approve);item.appendChild(learning);
+        const approve=document.createElement('button');approve.textContent='Approve answer';approve.onclick=async()=>{approve.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action:'knowledge',question:q.value,answer:a.value})});notice.textContent='Approved answer saved.';}catch(e){notice.textContent=e.message;}finally{approve.disabled=false;}};
+        learning.append(q,a,approve);panel.appendChild(learning);
       }
-      if(id==='briefSupportList'){const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{document.getElementById('supportFilter').value='all';showHubPage('support',true);await loadHubPage('support');const target=document.getElementById('support-'+r.id);target?.scrollIntoView({block:'center'});target?.querySelector('form textarea')?.focus();};item.appendChild(open);}
       box.appendChild(item);
     }
   }
-  document.getElementById('supportMeta').textContent = (d.message || '') + (d.limits ? ' · AI usage $'+(d.spentMicros/1000000).toFixed(2)+' / $'+(d.limits.totalMonthlyMicros/1000000).toFixed(0)+' this month · '+(d.knowledge||[]).length+' approved answers' : '');
+  document.getElementById('supportMeta').textContent=active.length+' open · '+pending.length+' need a human reply · '+closed.length+' closed';
+
 }
 document.getElementById('supportBudgetForm').onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button'),note=document.getElementById('supportBudgetNotice');button.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({action:'budget',monthlyLimitUsd:Number(document.getElementById('supportBudgetLimit').value)})});renderSupportInbox();note.textContent='Monthly limit saved. Existing usage was kept.';}catch(e){note.textContent=e.message;}finally{button.disabled=false;}};
 document.getElementById('supportRefresh').onclick=()=>supportRefresh().catch(e=>{document.getElementById('pageNotice').textContent=e.message;});

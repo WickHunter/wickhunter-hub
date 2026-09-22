@@ -721,6 +721,30 @@ await test("symbols fall into exactly one bucket and the counts add up to tracke
   );
 });
 
+await test("inactive contracts are separated from active candle health without deleting history", async () => {
+  const { svc, dataDir } = serviceWith("bitget", stubVenue().fetchLike);
+  const store = new CandleStore(`${dataDir}/candles`), collector = svc.collector("bitget");
+  let resumed = false;
+  const list = async () => ({ok:true,status:200,json:async()=>({code:"00000",data:[
+    {symbol:"ACTIVEUSDT",symbolStatus:"normal"},
+    {symbol:"HALTEDUSDT",symbolStatus:resumed?"normal":"maintain"},
+    {symbol:"EMPTYUSDT",symbolStatus:"maintain"},
+  ]})});
+  await collector.refreshSymbols(list, NOW - 10 * 86_400_000);
+  store.write("bitget", "ACTIVEUSDT", Array.from({length:2000},(_,i)=>mk(NEWEST_CLOSED-(1999-i)*MINUTE_MS,i)));
+  store.write("bitget", "HALTEDUSDT", [mk(NEWEST_CLOSED-4*MINUTE_MS,1),mk(NEWEST_CLOSED,2)]);
+  await svc.prepareStatus();
+  let s=svc.status(NOW).find(v=>v.venue==="bitget");
+  assert.equal(s.counts.tracked,3);assert.equal(s.counts.active,1);assert.equal(s.counts.inactive,2);
+  assert.equal(s.counts.seedable,1);assert.equal(s.counts.gapped,0);assert.equal(s.counts.empty,0);
+  assert.equal(s.totalMissingMinutes,0);assert.deepEqual(s.worstGaps,[]);
+  assert.equal(store.coverage("bitget","HALTEDUSDT",true).interiorMissing,3,"historical holes remain intact");
+  resumed=true;await collector.refreshSymbols(list,NOW);
+  s=svc.status(NOW).find(v=>v.venue==="bitget");
+  assert.equal(s.counts.active,2);assert.equal(s.counts.inactive,1);assert.equal(s.counts.gapped,1);
+  assert.equal(s.totalMissingMinutes,3);assert.deepEqual(s.worstGaps,[{symbol:"HALTEDUSDT",missingMinutes:3}],"a reactivated market is checked immediately");
+});
+
 /** A deep symbol whose newest candle is `behindMin` minutes old. */
 async function deepSymbolBehind(behindMin) {
   const { svc, dataDir } = serviceWith("bitget", stubVenue().fetchLike);
