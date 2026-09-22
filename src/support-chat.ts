@@ -131,7 +131,7 @@ export class SupportChat {
       while(input.length>1&&Buffer.byteLength(instructions+JSON.stringify(input))>24000)input.shift();
       if(Buffer.byteLength(instructions+JSON.stringify(input))>24000)throw new Error('Support context bound reached');
       const res=await this.request('https://api.openai.com/v1/responses',{method:'POST',headers:{authorization:'Bearer '+this.config.apiKey,'content-type':'application/json'},body:JSON.stringify({model:'gpt-5.6-luna',instructions,input,max_output_tokens:1200,reasoning:{effort:'none'},store:false,text:{format:{type:'json_object'}}}),signal:AbortSignal.timeout(45000)});
-      if(!res.ok)throw new Error('Support provider unavailable');
+      if(!res.ok){console.warn('[support] Provider refused request: HTTP '+res.status);throw new Error('Support provider unavailable');}
       const reader=res.body?.getReader();if(!reader)throw new Error('Empty provider response');
       const chunks:Uint8Array[]=[];let size=0;
       for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>256*1024){await reader.cancel();throw new Error('Provider response exceeds bound');}chunks.push(value);}
@@ -151,7 +151,9 @@ export class SupportChat {
         target.messages.push({id:randomUUID(),role:'assistant',text:clean(answer.answer,6000),at:this.now()});target.updatedAt=this.now();
         if(answer.human){target.status='human';target.waitingForHuman=true;}
       });
-    } catch {
+    } catch (error) {
+      const known=['Support context bound reached','Support provider unavailable','Empty provider response','Provider response exceeds bound','Incomplete provider response','Invalid provider answer','Missing usage'];
+      console.warn('[support] '+(error instanceof Error&&known.includes(error.message)?error.message:'Response unavailable or invalid'));
       this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;if(t.status==='assistant'){t.status='human';t.waitingForHuman=true;}});
     } finally {this.busy.delete(identity.owner);}
     return this.customer(identity,threadId);
