@@ -2644,3 +2644,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
   check-in intake (ledger + roster), keyed install.sh + release downloads,
   admin surface (CLI, HTTP API, one static page), install-hub.sh with nginx
   snippet emission and retry-loop health check, tester install.sh template.
+
+### Marketplace setup and paid billing
+
+Fresh Marketplace setup defaults to mock. If the private deployment already uses Stripe or MoonPay, Hub setup refuses configuration edits instead of resetting the payment mode or removing vendor credentials. Manage paid billing through the private deployment workflow; the status bridge reports the configured rail and its required inputs.

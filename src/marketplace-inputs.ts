@@ -242,7 +242,7 @@ const DEFINITIONS: readonly InternalDefinition[] = Object.freeze([
   d({ name: "HUB_MARKETPLACE_STATUS_TIMEOUT_MS", label: "Status timeout (ms)", group: "bridge", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "3000", help: "Managed automatically." }, integer("HUB_MARKETPLACE_STATUS_TIMEOUT_MS", 250, 15_000)),
 
   d({ name: "MARKETPLACE_ENABLED", label: "Marketplace enabled", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["1"], help: "Enabled automatically for the private alpha service only." }, (v) => exact(v, "MARKETPLACE_ENABLED", ["1"])),
-  d({ name: "MARKETPLACE_SUBSCRIPTION_MODE", label: "Subscription mode", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["mock"], help: "Fixed to mock while vendor billing is deferred; no payment route is enabled." }, (v) => exact(v, "MARKETPLACE_SUBSCRIPTION_MODE", ["mock"])),
+  d({ name: "MARKETPLACE_SUBSCRIPTION_MODE", label: "Subscription mode", group: "service", setup: "deployment", secret: false, required: true, kind: "select", options: ["mock", "moonpay", "stripe"], help: "Fresh installs default to mock. Paid billing is deployment-managed; this setup workflow cannot change or overwrite an existing paid rail." }, (v) => exact(v, "MARKETPLACE_SUBSCRIPTION_MODE", ["mock", "moonpay", "stripe"])),
   d({ name: "MARKETPLACE_HTTP_HOST", label: "Private API host", group: "service", setup: "automatic", secret: false, required: false, kind: "select", options: ["127.0.0.1", "::1"], placeholder: "127.0.0.1", help: "Fixed automatically to loopback." }, (v) => exact(v, "MARKETPLACE_HTTP_HOST", ["127.0.0.1", "::1"])),
   d({ name: "MARKETPLACE_HTTP_PORT", label: "Private API port", group: "service", setup: "automatic", secret: false, required: false, kind: "number", placeholder: "8099", help: "Managed automatically." }, integer("MARKETPLACE_HTTP_PORT", 1, 65_535)),
   d({ name: "MARKETPLACE_STORE", label: "System of record", group: "service", setup: "automatic", secret: false, required: true, kind: "select", options: ["postgres"], help: "Fixed automatically to durable PostgreSQL." }, (v) => exact(v, "MARKETPLACE_STORE", ["postgres"])),
@@ -744,7 +744,7 @@ function applyAutomaticSetup(next: Map<string, string>, config: MarketplaceInput
     MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS: "60000",
     MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS: "180000",
   })) put(name, value);
-  next.set("MARKETPLACE_SUBSCRIPTION_MODE", "mock");
+  put("MARKETPLACE_SUBSCRIPTION_MODE", "mock");
 
   put("LIQHUNTER_MARKETPLACE_URL", config.publicMarketplaceOrigin);
 
@@ -848,6 +848,15 @@ function applyUpdate(current: ReadonlyMap<string, string>, update: MarketplaceIn
   const generate = update.generate ?? [];
   if (!Array.isArray(generate) || generate.some((name) => typeof name !== "string")) {
     throw new MarketplaceInputError(null, "generate must be a list of approved internal credential names");
+  }
+  const mode = current.get("MARKETPLACE_SUBSCRIPTION_MODE") ?? "mock";
+  // The setup helper owns mock Alpha configuration, not paid-rail deployment.
+  // Refuse before any serialization/restart rather than erase vendor inputs
+  // or silently switch a paid installation back to mock.
+  if (mode !== "mock" || (changes.MARKETPLACE_SUBSCRIPTION_MODE !== undefined
+    && changes.MARKETPLACE_SUBSCRIPTION_MODE !== "mock")) {
+    throw new MarketplaceInputError("MARKETPLACE_SUBSCRIPTION_MODE",
+      "paid billing is deployment-managed; use the private deployment workflow to edit this installation. No settings were saved or services restarted");
   }
   const next = new Map(current);
   for (const [name, raw] of Object.entries(changes)) {

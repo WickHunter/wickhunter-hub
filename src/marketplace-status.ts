@@ -96,7 +96,7 @@ export type MarketplaceStatusFetch = (
 
 const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boolean; readonly action: string }[] = Object.freeze([
   { name: "MARKETPLACE_ENABLED", secret: false, action: "Set to 1 only on the dedicated private Marketplace API and worker services." },
-  { name: "MARKETPLACE_SUBSCRIPTION_MODE", secret: false, action: "The Hub fixes this to mock while MoonPay is deferred; do not enable a payment mode." },
+  { name: "MARKETPLACE_SUBSCRIPTION_MODE", secret: false, action: "Fresh installs default to mock. Existing paid rails are deployment-managed and never overwritten by Hub setup." },
   { name: "MARKETPLACE_HTTP_HOST", secret: false, action: "Keep the private API on loopback unless an authenticated private network is deliberately configured." },
   { name: "MARKETPLACE_HTTP_PORT", secret: false, action: "Set the private Marketplace API listen port, or use its documented default." },
   { name: "MARKETPLACE_STORE", secret: false, action: "Set to postgres before retaining Demo evidence, followers, or subscription state." },
@@ -118,6 +118,11 @@ const PRIVATE_REQUIRED: readonly { readonly name: string; readonly secret: boole
   { name: "MARKETPLACE_DEMO_WORKER_CREDENTIAL", secret: true, action: "Set the dedicated Demo receipt/worker credential (minimum 32 characters)." },
   { name: "MARKETPLACE_DEMO_EVIDENCE_INTERVAL_MS", secret: false, action: "Set or accept the documented Demo evidence collection cadence." },
   { name: "MARKETPLACE_DEMO_EVIDENCE_MAX_AGE_MS", secret: false, action: "Set the maximum evidence age used by Marketplace sellability gates." },
+  { name: "STRIPE_COMMERCE_SECRET_KEY", secret: true, action: "Required only for Stripe subscriptions; managed in the private deployment environment." },
+  { name: "STRIPE_COMMERCE_WEBHOOK_SECRET", secret: true, action: "Required only for Stripe subscriptions; managed in the private deployment environment." },
+  { name: "STRIPE_COMMERCE_CURRENCY", secret: false, action: "Required only for Stripe subscriptions; managed in the private deployment environment." },
+  { name: "STRIPE_COMMERCE_SUCCESS_URL", secret: false, action: "Required only for Stripe subscriptions; managed in the private deployment environment." },
+  { name: "STRIPE_COMMERCE_CANCEL_URL", secret: false, action: "Required only for Stripe subscriptions; managed in the private deployment environment." },
   { name: "MOONPAY_COMMERCE_ENVIRONMENT", secret: false, action: "Deferred in mock mode; no operator input is accepted or stored." },
   { name: "MOONPAY_COMMERCE_PUBLIC_KEY", secret: true, action: "Deferred in mock mode; no operator input is accepted or stored." },
   { name: "MOONPAY_COMMERCE_SECRET_KEY", secret: true, action: "Deferred in mock mode; no operator input is accepted or stored." },

@@ -68,8 +68,8 @@ await test("schema exposes the complete census but accepts only current external
   assert.equal(byName.get("MOONPAY_COMMERCE_PRICING_ASSET").required, false);
   assert.equal(byName.get("MOONPAY_COMMERCE_MONTHLY_INTERVAL").required, false);
   assert.equal(byName.get("MOONPAY_COMMERCE_YEARLY_INTERVAL").required, false);
-  assert.equal(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").setup, "automatic");
-  assert.deepEqual(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").options, ["mock"]);
+  assert.equal(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").setup, "deployment");
+  assert.deepEqual(byName.get("MARKETPLACE_SUBSCRIPTION_MODE").options, ["mock", "moonpay", "stripe"]);
   assert.equal(byName.get("MOONPAY_COMMERCE_SECRET_KEY").setup, "deferred");
   assert.deepEqual(
     MARKETPLACE_INPUT_DEFINITIONS.filter((field) => field.setup === "operator").map((field) => field.name),
@@ -206,6 +206,22 @@ await test("automatic setup purges deferred MoonPay and migrates the obsolete va
   assert.match(bytes, /^MARKETPLACE_DEMO_WORKER_IP_ALLOWLIST="\[\\"203\.0\.113\.7\\", \\"2001:db8::7\\"\]"$/m,
     "valid legacy monolithic state is retained for API-role distribution");
   assert.doesNotMatch(bytes, /^MOONPAY_COMMERCE_/m);
+});
+
+await test("Hub setup never switches a paid installation to mock or restarts it", async () => {
+  for (const mode of ["stripe", "moonpay"]) {
+    const { cfg } = config(`marketplace-preserve-${mode}`);
+    const before = `MARKETPLACE_SUBSCRIPTION_MODE="${mode}"\n`;
+    fs.writeFileSync(cfg.envFile, before, { mode: 0o600 });
+    for (const update of [{ automatic: true }, { changes: { MARKETPLACE_WORKER_INTERVAL_MS: "500" } }, { changes: { MARKETPLACE_SUBSCRIPTION_MODE: "mock" }, automatic: true }]) {
+      const fake = fakeSpawner();
+      await assert.rejects(applyMarketplaceInputUpdate(cfg, update, fake.spawn), /paid billing is deployment-managed/);
+      assert.equal(fs.readFileSync(cfg.envFile, "utf8"), before);
+      assert.equal(fake.calls.length, 0);
+    }
+  }
+  const { cfg } = config("marketplace-cannot-enable-paid");
+  await assert.rejects(applyMarketplaceInputUpdate(cfg, { changes: { MARKETPLACE_SUBSCRIPTION_MODE: "stripe" } }, fakeSpawner().spawn), /paid billing is deployment-managed/);
 });
 
 await test("a successful update is atomic, 0600, masked, and restarts only the exact hardcoded private units", async () => {
