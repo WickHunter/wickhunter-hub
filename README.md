@@ -1,3 +1,7 @@
+## v0.4.57 — Live support inbox
+
+Refresh incoming replies while the inbox is open, keeping the selected ticket, reply draft, cursor and history scroll position. Pause updates while reviewing a reusable answer.
+
 ## v0.4.56 — Mobile support
 
 On phones, open a ticket into a full-screen conversation and return with All chats. Keep readable text, larger touch targets and the reply composer above the keyboard. Website support adapts to the keyboard too.
@@ -1771,6 +1775,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.57 — Incoming support replies refresh automatically without losing drafts, cursor position or the current history view.
 
 - v0.4.56 — Mobile support opens a full-screen ticket with an All chats return action, keyboard-aware composer and larger touch targets.
 

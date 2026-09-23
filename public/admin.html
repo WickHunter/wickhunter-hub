@@ -3072,6 +3072,27 @@ function renderSupportInbox() {
 
 }
 document.getElementById('supportBudgetForm').onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button'),note=document.getElementById('supportBudgetNotice');button.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({action:'budget',monthlyLimitUsd:Number(document.getElementById('supportBudgetLimit').value)})});renderSupportInbox();note.textContent='Monthly limit saved. Existing usage was kept.';}catch(e){note.textContent=e.message;}finally{button.disabled=false;}};
+let supportPollBusy=false;
+async function supportPoll(){
+  const page=document.querySelector('[data-hub-page-panel="support"]');
+  if(supportPollBusy||document.hidden||page.hidden||!token||document.querySelector('#supportInbox button:disabled, #supportInbox .support-learning[open]'))return;
+  supportPollBusy=true;
+  try{
+    const prior=supportSnapshot,next=await api('/admin/api/support');
+    if(page.hidden||supportSnapshot!==prior||document.querySelector('#supportInbox button:disabled, #supportInbox .support-learning[open]'))return;
+    const notice=document.getElementById('supportReplyNotice');if(notice.textContent==='Updates paused. Refresh to reconnect.')notice.textContent='';
+    if(JSON.stringify(next)===JSON.stringify(supportSnapshot))return;
+    const currentId=supportExpandedId,field=document.querySelector('#supportInbox .support-thread textarea');
+    const focused=document.activeElement===field,selection=field?[field.selectionStart,field.selectionEnd,field.selectionDirection]:null;
+    const history=document.querySelector('#supportInbox .support-history'),scroll=history?.scrollTop||0,follow=!history||history.scrollHeight-scroll-history.clientHeight<48;
+    supportSnapshot=next;renderSupportInbox();
+    if(supportExpandedId===currentId){
+      const updated=document.querySelector('#supportInbox .support-history');if(updated&&!follow)updated.scrollTop=scroll;
+      const input=document.querySelector('#supportInbox .support-thread textarea');if(focused&&input){input.focus({preventScroll:true});input.setSelectionRange(...selection);}
+    }
+  }catch{document.getElementById('supportReplyNotice').textContent='Updates paused. Refresh to reconnect.';}finally{supportPollBusy=false;}
+}
+setInterval(supportPoll,15000);
 document.getElementById('supportRefresh').onclick=()=>supportRefresh().catch(e=>{document.getElementById('pageNotice').textContent=e.message;});
 document.getElementById('supportFilter').onchange=()=>{supportMobileList=true;renderSupportInbox();};
 function supportViewport(){const v=window.visualViewport;document.getElementById('supportInbox').style.setProperty('--support-viewport-height',(v?.height||window.innerHeight)+'px');document.getElementById('supportInbox').style.setProperty('--support-viewport-top',(v?.offsetTop||0)+'px');}

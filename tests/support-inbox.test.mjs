@@ -62,6 +62,17 @@ try {
  toggle(oldId);assert.equal(doc.querySelectorAll('#supportInbox .support-panel:not([hidden])').length,1,'only one chat expands at a time');
  assert.equal(doc.querySelector('[data-ticket-id="'+id+'"]').getAttribute('aria-current'),'false');
  input=article(oldId).querySelector('textarea');input.value='Second ticket draft';input.dispatchEvent(new w.Event('input'));toggle(id);assert.equal(article(id).querySelector('textarea').value,'');toggle(oldId);assert.equal(article(oldId).querySelector('textarea').value,'Second ticket draft');
+ // Incoming replies refresh in place while the operator is drafting.
+ Object.defineProperty(doc,'hidden',{value:false,configurable:true});
+ input=article(oldId).querySelector('form textarea');input.focus();input.setSelectionRange(2,7);
+ await chat({id:oldId,text:'One more detail for this ticket',requestId:'inbox-live-update',human:true});
+ await w.eval('supportPoll()');
+ assert.match(article(oldId).textContent,/One more detail for this ticket/);
+ const kept=article(oldId).querySelector('form textarea');assert.equal(kept.value,'Second ticket draft');assert.equal(doc.activeElement,kept);assert.equal(kept.selectionStart,2);assert.equal(kept.selectionEnd,7);
+ assert.equal(doc.querySelector('[data-ticket-id="'+oldId+'"]').getAttribute('aria-current'),'true');
+ const learning=article(oldId).querySelector('.support-learning');learning.open=true;const answer=learning.querySelectorAll('textarea')[1];answer.value='Answer being reviewed';
+ await chat({id:oldId,text:'Another incoming message',requestId:'inbox-learning-update',human:true});await w.eval('supportPoll()');assert.equal(answer.value,'Answer being reviewed');assert.equal(answer.isConnected,true);
+ learning.open=false;await w.eval('supportPoll()');assert.match(article(oldId).textContent,/Another incoming message/);
  assert.equal(errors.length,0,errors.join('\n'));
  console.log('Support inbox: persistent ticket column, preserved drafts, real reply delivery, failed-close recovery, persistent close, closed history and both reopen paths verified');
 } finally {dom?.window.close();await h.close();}
