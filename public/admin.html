@@ -341,7 +341,7 @@
   #supportReplyNotice:empty { display:none; }
   .support-back { display:none; }
   @media(max-width:700px) {
-    body:has(#supportInbox.support-messenger:not(.support-mobile-list)){overflow:hidden}
+    body:has([data-hub-page-panel="support"]:not([hidden]) #supportInbox.support-messenger:not(.support-mobile-list)){overflow:hidden}
     #supportInbox.support-messenger { display:block; height:auto; min-height:220px; }
     .support-mobile-list .support-card { display:none; }
     .support-mobile-list .support-tickets { border:0; max-height:70dvh; }

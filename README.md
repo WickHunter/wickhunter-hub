@@ -1,3 +1,7 @@
+## v0.4.58 — Mobile navigation
+
+Limit the full-screen support scroll lock to the visible inbox so other Hub pages remain scrollable when switching sections.
+
 ## v0.4.57 — Live support inbox
 
 Refresh incoming replies while the inbox is open, keeping the selected ticket, reply draft, cursor and history scroll position. Pause updates while reviewing a reusable answer.
@@ -1775,6 +1779,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.58 — Release the mobile support scroll lock when another Hub section is visible.
 
 - v0.4.57 — Incoming support replies refresh automatically without losing drafts, cursor position or the current history view.
 
