@@ -24,12 +24,12 @@ try {
  const article=id=>doc.getElementById('support-'+id);
  const toggle=id=>doc.querySelector('[data-ticket-id="'+id+'"]').click();
  const act=(id,action)=>article(id).querySelector(`[data-support-action="${action}"]`).click();
- assert.equal(doc.getElementById('supportFilter').value,'active');
+ assert.equal(doc.getElementById('supportFilter').value,'active');assert.ok(doc.getElementById('supportInbox').classList.contains('support-mobile-list'));
  assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,1,'closed chats and legacy questions stay out of default inbox');
  assert.match(doc.getElementById('supportLegacyItems').textContent,/An earlier one-way question/);
  assert.match(doc.getElementById('briefSupport').textContent,/1 waiting/);
  assert.ok(article(id).querySelector('form'),'first open ticket is ready to reply');
- toggle(id);
+ toggle(id);assert.equal(doc.getElementById('supportInbox').classList.contains('support-mobile-list'),false);article(id).querySelector('.support-back').click();assert.equal(doc.getElementById('supportInbox').classList.contains('support-mobile-list'),true);toggle(id);
  let input=article(id).querySelector('form textarea');assert.equal(input.closest('details'),null,'reply is visible when chat opens');
  input.value='Draft kept while collapsed';input.dispatchEvent(new w.Event('input'));toggle(id);toggle(id);
  assert.equal(article(id).querySelector('form textarea').value,'Draft kept while collapsed');

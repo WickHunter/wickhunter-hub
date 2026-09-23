@@ -1,3 +1,7 @@
+## v0.4.56 — Mobile support
+
+On phones, open a ticket into a full-screen conversation and return with All chats. Keep readable text, larger touch targets and the reply composer above the keyboard. Website support adapts to the keyboard too.
+
 ## v0.4.55 — Support messenger
 
 Persistent ticket list, full conversation pane, saved reply drafts, close/reopen controls, and quieter customer support. Admin deletion removes only the selected support thread and retains usage and approved knowledge.
@@ -1767,6 +1771,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.56 — Mobile support opens a full-screen ticket with an All chats return action, keyboard-aware composer and larger touch targets.
 
 - v0.4.55 — Two-pane support messenger, full-width replies, saved drafts and formatted customer chat. Compact resolution feedback clears the customer view; targeted admin deletion preserves usage and unrelated conversations.
 

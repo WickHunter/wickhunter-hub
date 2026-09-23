@@ -339,7 +339,22 @@
   .support-thread [role="status"]:empty { display:none; }
   .support-learning { flex-shrink:0; max-height:230px; overflow:auto; padding:0 20px 6px; color:var(--muted); font-size:12px; }
   #supportReplyNotice:empty { display:none; }
-  @media(max-width:700px) { #supportInbox.support-messenger { grid-template-columns:minmax(0,1fr); grid-template-rows:160px minmax(0,1fr); height:780px; max-height:1100px; } .support-tickets { border-right:0; border-bottom:1px solid var(--line); } .support-ticket { padding:10px 14px; } .support-ticket .support-preview { display:none; } .support-row { padding:12px; gap:8px; flex-wrap:wrap; } .support-heading { min-width:150px; } .support-history,.support-thread { padding:12px; } .support-history .message { max-width:95%; } }
+  .support-back { display:none; }
+  @media(max-width:700px) {
+    body:has(#supportInbox.support-messenger:not(.support-mobile-list)){overflow:hidden}
+    #supportInbox.support-messenger { display:block; height:auto; min-height:220px; }
+    .support-mobile-list .support-card { display:none; }
+    .support-mobile-list .support-tickets { border:0; max-height:70dvh; }
+    #supportInbox.support-messenger:not(.support-mobile-list) { position:fixed; inset:0; z-index:1000; height:var(--support-viewport-height,100dvh); top:var(--support-viewport-top,0px); bottom:auto; border:0; border-radius:0; padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px); background:var(--bg); }
+    .support-messenger:not(.support-mobile-list) .support-tickets { display:none; }
+    .support-messenger:not(.support-mobile-list) .support-card { height:100%; }
+    .support-back { display:block; min-height:44px; font-size:14px; padding:8px 10px; flex-basis:100%; text-align:left; border:0; background:transparent; color:var(--accent); }
+    .support-ticket { min-height:90px; padding:14px 16px; }.support-ticket strong{font-size:15px}.support-ticket small{font-size:12px}
+    .support-row { display:grid; grid-template-columns:1fr auto; grid-template-areas:"back close" "heading heading" "status status"; padding:6px 12px 10px; gap:6px 10px; }.support-back{grid-area:back}.support-heading { grid-area:heading; min-width:0; }.support-heading strong{font-size:15px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.support-row .support-status{grid-area:status;font-size:12px}.support-close{grid-area:close;min-height:44px}
+    .support-history { padding:14px 12px; }.support-history .message{max-width:94%}.support-history .support-body,.support-history .message p{font-size:15px}
+    .support-thread{padding:8px 12px}.support-thread textarea,.support-learning textarea{font-size:16px;min-height:60px}.support-thread button{min-height:44px;font-size:14px}.support-learning{padding:0 12px 6px}
+  }
+
 
 </style>
 </head>
@@ -2859,6 +2874,7 @@ earnEl('earnCommit').onclick=async()=>{if(!earnPreview)return;earnEl('earnCommit
 // Briefing is computed from current records. No model calls or unattended actions.
 let supportSnapshot = null;
 let supportExpandedId = null;
+let supportMobileList = true;
 const supportDrafts = new Map();
 const supportReplyAttempts = new Map();
 function setBrief(id, state, title, note) {
@@ -2981,8 +2997,8 @@ function renderSupportInbox() {
     button.disabled=true;
     try{
       supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({id:r.id,action})});
-      if(action==='resolve')supportExpandedId=null;
-      if(action==='reopen'){supportExpandedId=r.id;document.getElementById('supportFilter').value='active';}
+      if(action==='resolve'){supportExpandedId=null;supportMobileList=true;}
+      if(action==='reopen'){supportExpandedId=r.id;supportMobileList=false;document.getElementById('supportFilter').value='active';}
       renderSupportInbox();
       notice.textContent=action==='resolve'?'Chat closed. Its history is saved in Closed.':action==='reopen'?'Chat reopened.':'You have taken over this chat.';
     }catch(e){notice.textContent=e.message;button.disabled=false;}
@@ -2991,7 +3007,7 @@ function renderSupportInbox() {
   for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',filtered],['supportLegacyItems',legacy]]) {
     const box=document.getElementById(id); box.textContent='';
     if(!rows.length){box.className='brief-empty';box.textContent=!d.connected?'Customer support chat is not connected yet.':id==='briefSupportList'||filter==='open'?'No chats need a human reply.':filter==='resolved'?'No closed chats yet.':filter==='active'?'You’re caught up. No open chats. Previous conversations are in Closed.':'No chats yet.';}else box.className='';
-    let tickets;if(id==='supportInbox'&&rows.length){box.className='support-messenger';tickets=document.createElement('nav');tickets.className='support-tickets';tickets.setAttribute('aria-label','Support conversations');box.appendChild(tickets);}
+    let tickets;if(id==='supportInbox'&&rows.length){box.className='support-messenger'+(supportMobileList?' support-mobile-list':'');tickets=document.createElement('nav');tickets.className='support-tickets';tickets.setAttribute('aria-label','Support conversations');box.appendChild(tickets);}
     for (const r of rows) {
       const item=document.createElement('article');item.className='inbox-item';if(id==='supportInbox')item.id='support-'+r.id;
       const channel=r.version==='website'?'Website':'App';
@@ -3000,7 +3016,7 @@ function renderSupportInbox() {
         const meta=document.createElement('small');meta.textContent=metaText;
         const text=document.createElement('p');text.textContent=r.question||'';item.append(meta,text);
         if(id==='briefSupportList'){
-          const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{supportExpandedId=r.id;document.getElementById('supportFilter').value='active';showHubPage('support',true);await loadHubPage('support');document.querySelector('#supportInbox form textarea')?.focus();};item.appendChild(open);
+          const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{supportExpandedId=r.id;supportMobileList=false;document.getElementById('supportFilter').value='active';showHubPage('support',true);await loadHubPage('support');document.querySelector('#supportInbox form textarea')?.focus();};item.appendChild(open);
         }
         box.appendChild(item);continue;
       }
@@ -3012,7 +3028,7 @@ function renderSupportInbox() {
       const preview=document.createElement('span');preview.className='support-preview';preview.textContent=r.messages.at(-1)?.text||'';
       const stamp=document.createElement('small');stamp.textContent=fmt(r.updatedAt||r.ts)+' UTC';
       const badge=document.createElement('span');badge.className='support-status'+(pending.includes(r)?' waiting':'');badge.textContent=statusText;
-      ticket.append(name,subject,preview,stamp,badge);ticket.onclick=()=>{supportExpandedId=r.id;renderSupportInbox();document.querySelector('[data-ticket-id="'+r.id+'"]')?.focus();};tickets.appendChild(ticket);
+      ticket.append(name,subject,preview,stamp,badge);ticket.onclick=()=>{supportExpandedId=r.id;supportMobileList=false;renderSupportInbox();document.querySelector('[data-ticket-id="'+r.id+'"]')?.focus();};tickets.appendChild(ticket);
       if(!expanded)continue;
       item.classList.add('support-card');
       const row=document.createElement('div');row.className='support-row';
@@ -3021,7 +3037,7 @@ function renderSupportInbox() {
       const meta=document.createElement('small');meta.textContent=metaText;open.append(title,meta);
       const status=document.createElement('span');status.className='support-status'+(pending.includes(r)?' waiting':'');status.textContent=statusText;
       const close=document.createElement('button');close.type='button';close.className='support-close';close.textContent=isClosed?'Reopen':'Close chat';close.dataset.supportAction=isClosed?'reopen':'resolve';close.onclick=()=>act(r,isClosed?'reopen':'resolve',close);
-      row.append(open,status,close);item.appendChild(row);
+      const back=document.createElement('button');back.type='button';back.className='support-back';back.textContent='‹ All chats';back.onclick=()=>{supportMobileList=true;renderSupportInbox();};row.append(back,open,status,close);item.appendChild(row);
       const panel=document.createElement('div');panel.id='support-panel-'+r.id;panel.className='support-panel';panel.hidden=!expanded;item.appendChild(panel);
       if(expanded){
         const history=document.createElement('div');history.className='support-history';history.setAttribute('aria-label','Conversation history');
@@ -3057,7 +3073,9 @@ function renderSupportInbox() {
 }
 document.getElementById('supportBudgetForm').onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button'),note=document.getElementById('supportBudgetNotice');button.disabled=true;try{supportSnapshot=await api('/admin/api/support',{method:'POST',body:JSON.stringify({action:'budget',monthlyLimitUsd:Number(document.getElementById('supportBudgetLimit').value)})});renderSupportInbox();note.textContent='Monthly limit saved. Existing usage was kept.';}catch(e){note.textContent=e.message;}finally{button.disabled=false;}};
 document.getElementById('supportRefresh').onclick=()=>supportRefresh().catch(e=>{document.getElementById('pageNotice').textContent=e.message;});
-document.getElementById('supportFilter').onchange=renderSupportInbox;
+document.getElementById('supportFilter').onchange=()=>{supportMobileList=true;renderSupportInbox();};
+function supportViewport(){const v=window.visualViewport;document.getElementById('supportInbox').style.setProperty('--support-viewport-height',(v?.height||window.innerHeight)+'px');document.getElementById('supportInbox').style.setProperty('--support-viewport-top',(v?.offsetTop||0)+'px');}
+window.visualViewport?.addEventListener('resize',supportViewport);window.visualViewport?.addEventListener('scroll',supportViewport);window.addEventListener('resize',supportViewport);supportViewport();
 function labelRecordTables() {
   for (const id of ['rows','fbRows','hostingInstanceRows','mktProviderRows']) {
     const body=document.getElementById(id), table=body.closest('table');
