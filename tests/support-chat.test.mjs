@@ -41,7 +41,7 @@ const before=calls;await bounded.message(identity,{text:'Help',requestId:'cap-re
 let finish;const inFlight=new SupportChat(tmpDir('support-flight'),{...cfg,aiEnabled:true,apiKey:'fake'},()=>new Promise(r=>{finish=r;}));
 const run=inFlight.message(identity,{text:'Help',requestId:'first-request'});
 await assert.rejects(inFlight.message(identity,{text:'Second',requestId:'second-request'}),e=>e.status===409);
-const tid=inFlight.admin().items[0].id;inFlight.action({id:tid,action:'takeover'});finish(await provider());await run;
+const tid=inFlight.admin().items[0].id;assert.throws(()=>inFlight.action({id:tid,action:'delete'}),e=>e.status===409);inFlight.action({id:tid,action:'takeover'});finish(await provider());await run;
 assert.equal(inFlight.customer(identity,tid).threads[0].messages.length,1);
 assert.equal(inFlight.customer(identity,tid).threads[0].status,'human');
 const failedDir=tmpDir('support-timeout');const failed=new SupportChat(failedDir,{...cfg,aiEnabled:true,apiKey:'fake'},async()=>{throw new Error('timeout');});
@@ -78,3 +78,13 @@ const grounded=new SupportChat(tmpDir('support-grounded'),{...cfg,aiEnabled:true
 await grounded.message(identity,{text:'How does Hedge Bot minimum tranche coverage work?',requestId:'grounded-request',version:'0.90.129'});
 assert.equal(grounded.customer(identity).threads[0].messages.at(-1).role,'assistant');
 console.log('Support: durable delivery, ownership, idempotency, takeover, quotas, reservations and HTTP auth passed');
+
+// Delete exactly one support conversation; preserve every other persisted field.
+const other=await chat.message({...identity,owner:'other-owner',licenseId:'other-license'},{text:'Keep this conversation',requestId:'keep-request'});
+const beforeDelete=JSON.parse(fs.readFileSync(dir+'/support-chat.v1.json','utf8'));
+chat.action({id,action:'delete'});
+const afterDelete=JSON.parse(fs.readFileSync(dir+'/support-chat.v1.json','utf8'));
+assert.deepEqual(afterDelete,{...beforeDelete,threads:beforeDelete.threads.filter(t=>t.id!==id)});
+assert.equal(new SupportChat(dir,cfg).customer(identity).threads.length,0);
+assert.equal(chat.customer({...identity,owner:'other-owner'},other.threads[0].id).threads.length,1);
+assert.throws(()=>chat.action({id,action:'delete'}),e=>e.status===404);

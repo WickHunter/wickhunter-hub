@@ -22,13 +22,13 @@ try {
  dom=new JSDOM(fs.readFileSync('public/admin.html','utf8'),{url:h.origin+'/admin',runScripts:'dangerously',virtualConsole:vc,beforeParse(w){w.fetch=(url,opts)=>fetch(new URL(url,h.origin),opts);w.HTMLElement.prototype.scrollIntoView=()=>{};}});
  const w=dom.window,doc=w.document;await w.eval('token="test-admin-token";showHubPage("support",true);supportRefresh()');
  const article=id=>doc.getElementById('support-'+id);
- const toggle=id=>article(id).querySelector('.support-open').click();
+ const toggle=id=>doc.querySelector('[data-ticket-id="'+id+'"]').click();
  const act=(id,action)=>article(id).querySelector(`[data-support-action="${action}"]`).click();
  assert.equal(doc.getElementById('supportFilter').value,'active');
- assert.equal(doc.querySelectorAll('#supportInbox article').length,1,'closed chats and legacy questions stay out of default inbox');
+ assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,1,'closed chats and legacy questions stay out of default inbox');
  assert.match(doc.getElementById('supportLegacyItems').textContent,/An earlier one-way question/);
  assert.match(doc.getElementById('briefSupport').textContent,/1 waiting/);
- assert.equal(article(id).querySelector('form'),null,'cards start compact');
+ assert.ok(article(id).querySelector('form'),'first open ticket is ready to reply');
  toggle(id);
  let input=article(id).querySelector('form textarea');assert.equal(input.closest('details'),null,'reply is visible when chat opens');
  input.value='Draft kept while collapsed';input.dispatchEvent(new w.Event('input'));toggle(id);toggle(id);
@@ -49,18 +49,19 @@ try {
  w.fetch=realFetch;act(id,'resolve');await until(()=>!article(id));
  assert.match(doc.getElementById('supportReplyNotice').textContent,/Chat closed/);
  assert.match(doc.getElementById('supportInbox').textContent,/No open chats/);
- await w.eval('supportRefresh()');assert.equal(doc.querySelectorAll('#supportInbox article').length,0,'close survives a server refresh');
+ await w.eval('supportRefresh()');assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,0,'close survives a server refresh');
  doc.getElementById('supportFilter').value='resolved';doc.getElementById('supportFilter').dispatchEvent(new w.Event('change'));
- assert.equal(doc.querySelectorAll('#supportInbox article').length,2);
+ assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,2);
  toggle(id);assert.equal(article(id).querySelector('form'),null,'closed chat is read-only until reopened');
  assert.match(article(id).textContent,/Human UI verification reply/);
  act(id,'reopen');await until(()=>doc.getElementById('supportFilter').value==='active');
  assert.ok(article(id).querySelector('form'));assert.match(doc.getElementById('briefSupport').textContent,/1 waiting/);
  // A customer can also reopen a closed thread without losing its history.
  await chat({id:oldId,text:'I need another answer',requestId:'inbox-customer-reopen',human:true});await w.eval('supportRefresh()');
- assert.equal(doc.querySelectorAll('#supportInbox article').length,2);
+ assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,2);
  toggle(oldId);assert.equal(doc.querySelectorAll('#supportInbox .support-panel:not([hidden])').length,1,'only one chat expands at a time');
- assert.equal(article(id).querySelector('.support-open').getAttribute('aria-expanded'),'false');
+ assert.equal(doc.querySelector('[data-ticket-id="'+id+'"]').getAttribute('aria-current'),'false');
+ input=article(oldId).querySelector('textarea');input.value='Second ticket draft';input.dispatchEvent(new w.Event('input'));toggle(id);assert.equal(article(id).querySelector('textarea').value,'');toggle(oldId);assert.equal(article(oldId).querySelector('textarea').value,'Second ticket draft');
  assert.equal(errors.length,0,errors.join('\n'));
- console.log('Support inbox: compact rows, preserved drafts, real reply delivery, failed-close recovery, persistent close, closed history and both reopen paths verified');
+ console.log('Support inbox: persistent ticket column, preserved drafts, real reply delivery, failed-close recovery, persistent close, closed history and both reopen paths verified');
 } finally {dom?.window.close();await h.close();}

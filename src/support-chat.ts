@@ -167,7 +167,11 @@ export class SupportChat {
       const previousMicros=this.monthlyLimit(),limitMicros=Math.round(dollars*1_000_000);
       this.edit(s=>{s.monthlyLimitMicros=limitMicros;s.budgetHistory=[...(s.budgetHistory||[]),{at:this.now(),previousMicros,limitMicros}].slice(-100);});return this.admin();
     }
-    const id=clean(body.id,80),action=clean(body.action,30);this.thread(id);
+    const id=clean(body.id,80),action=clean(body.action,30),thread=this.thread(id);
+    if(action==='delete'){
+      if(this.busy.has(thread.owner))throw new SupportError('A reply is in progress. Try again shortly.',409);
+      this.edit(s=>{s.threads=s.threads.filter(t=>t.id!==id);});return this.admin();
+    }
     this.edit(s=>{
       const t=s.threads.find(t=>t.id===id)!;
       if(action==='reply'){

@@ -1,24 +1,53 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wick Hunter Support</title><style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a0c12;color:#e9ecf5}*{box-sizing:border-box}body{margin:0;padding:18px;max-width:700px;margin:auto}h1{font-size:20px;margin:0 0 8px}p,small{color:#aeb8cc;line-height:1.5}button,input,select{font:inherit;min-height:44px;border:1px solid #343d52;border-radius:9px;background:#151b27;color:inherit;padding:10px;max-width:100%}button{cursor:pointer}button:disabled{opacity:.5}#messages{height:48vh;min-height:200px;overflow:auto;border:1px solid #252d40;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px}.message{border-radius:10px;background:#171e2d;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}.customer{background:#29244b}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}form{display:flex;gap:8px}input{flex:1;min-width:0}#status{min-height:38px}a{color:#b5acff}#question{width:100%}</style></head><body>
-<h1>Wick Hunter Support</h1><p>Ask about setup or subscriptions, or request a human. Conversations are saved for support. Don’t send passwords, API keys or payment details.</p>
-<div class="toolbar"><select id="threads" aria-label="Conversation"><option value="">New conversation</option></select><button id="human">Ask a human</button><button id="refresh">Refresh</button></div>
-<div id="messages" role="log" aria-live="polite"></div><p id="status" role="status">Connecting…</p>
-<div id="feedback" hidden><p>Did this answer your question?</p><div class="toolbar"><button id="resolved">Yes, resolved</button><button id="more">I need more support</button></div></div><form id="chat"><input id="question" aria-label="Your message" placeholder="How can we help?" maxlength="4000" required><button id="send">Send</button></form>
-<p><small>Website visitors get up to 5 AI replies/day and 10/month. Human support remains available. Replies arrive here while you keep this browser session. For account-specific help, use in-app support.</small></p>
-<p><a href="https://www.youtube.com/@wickhunter9006/videos" target="_blank" rel="noopener">Video tutorials</a></p>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a0c12;color:#e9ecf5}*{box-sizing:border-box}body{margin:0 auto;padding:20px;max-width:760px;height:100dvh;min-height:380px;display:flex;flex-direction:column;gap:14px}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:20px;margin:0}p,small{color:#aeb8cc;line-height:1.5}button,input{font:inherit;min-height:42px;border:1px solid #343d52;border-radius:10px;background:#151b27;color:inherit;padding:10px 14px;max-width:100%}button{cursor:pointer}button:disabled{opacity:.5}#messages{flex:1;min-height:0;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px;border:1px solid #252d40;border-radius:14px}.message{flex-shrink:0;border-radius:14px;background:#171e2d;padding:14px 16px;overflow-wrap:anywhere;font-size:14px;line-height:1.6;max-width:92%;width:fit-content}.message p{margin:0 0 10px;color:inherit}.message p:last-child{margin-bottom:0}.message li{margin:6px 0}.message ol,.message ul{padding-left:22px}.message small{display:block;font-size:11px;margin-bottom:6px}.customer{background:#5145af;margin-left:auto}form{display:flex;gap:10px}input{flex:1;min-width:0}#send{background:#7061ed}#status{margin:0;font-size:12px}#status:empty{display:none}a{color:#b5acff}#feedback{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;flex-shrink:0}#feedback[hidden]{display:none}#feedback button{font-size:12px;min-height:30px;padding:5px 9px}#feedback span{color:#aeb8cc}footer{font-size:11px;color:#aeb8cc}header a{font-size:12px}@media(max-width:480px){body{padding:12px;gap:10px}.message{max-width:96%}#messages{padding:10px}}
+</style></head><body>
+<header><h1>Support</h1><a href="https://www.youtube.com/@wickhunter9006/videos" target="_blank" rel="noopener">Video tutorials</a></header>
+<div id="messages" role="log" aria-live="polite"></div><div id="feedback" hidden><span>Did that help?</span><button id="resolved">Yes, resolved</button><button id="more">Need more help</button></div>
+<p id="status" role="status">Connecting…</p><form id="chat"><input id="question" aria-label="Your message" placeholder="Write a message…" maxlength="4000" required><button id="send">Send</button></form>
+<footer>Keep this browser session to receive replies. Never share passwords, API keys or payment details.</footer>
 <script>
-const root=location.pathname.replace(/\/$/,'');let state=null,current='',freshSelected=false,human=false,busy=false,attempt=null;
+const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null;
 const el=id=>document.getElementById(id);
+const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function swFormat(text){
+  const saved=[];
+  const keep=html=>'\uE000'+(saved.push(html)-1)+'\uE001';
+  const link=(label,url)=>{try{const u=new URL(url);if(!['https:','http:'].includes(u.protocol))return esc(label);const a=document.createElement('a');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=label;return a.outerHTML;}catch{return esc(label);}};
+  const inline=raw=>{
+    let t=raw.replace(/`([^`\n]+)`/g,(_,code)=>keep('<code>'+esc(code)+'</code>'));
+    t=t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,(_,label,url)=>keep(link(label,url)));
+    t=t.replace(/https?:\/\/[^\s<>\uE000\uE001]+/g,url=>{const tail=url.match(/[.,!?;:]+$/)?.[0]||'';url=url.slice(0,url.length-tail.length);return keep(link(/^https:\/\/www\.youtube\.com\/watch\?v=/.test(url)?'Watch tutorial':url,url))+tail;});
+    return esc(t).replace(/\*\*([^\n]+?)\*\*/g,'<strong>$1</strong>').replace(/\*([^*\n]+)\*/g,'<em>$1</em>').replace(/\uE000(\d+)\uE001/g,(_,i)=>saved[Number(i)]||'');
+  };
+  let value=String(text||'').replace(/[\uE000\uE001]/g,'').replace(/\r\n?/g,'\n');
+  const steps=[...value.matchAll(/(?:^|\s)(\d{1,2})\.\s/g)];
+  if(steps.length>1&&steps.every((m,i)=>Number(m[1])===i+1))value=value.replace(/(^|\s)(\d{1,2})\.\s/g,'\n$2. ');
+  let out='',paragraph=[],list='';
+  const flush=()=>{if(paragraph.length){out+='<p>'+inline(paragraph.join(' '))+'</p>';paragraph=[];}};
+  const endList=()=>{if(list){out+='</'+list+'>';list='';}};
+  for(const raw of value.split('\n')){
+    const line=raw.trim();if(!line){flush();continue;}
+    const ordered=line.match(/^\d+[.)]\s+(.+)/),bullet=line.match(/^[-*]\s+(.+)/);
+    if(ordered||bullet){flush();const kind=ordered?'ol':'ul';if(list!==kind){endList();out+='<'+kind+'>';list=kind;}out+='<li>'+inline((ordered||bullet)[1])+'</li>';}
+    else{endList();if(/^#{1,3}\s/.test(line)){flush();out+='<p><strong>'+inline(line.replace(/^#{1,3}\s+/,''))+'</strong></p>';}else paragraph.push(line);}
+  }
+  flush();endList();return out;
+}
 async function call(path,body){const r=await fetch(root+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-wh-support':'1'},...(body?{body:JSON.stringify(body)}:{})});const d=await r.json();if(!d.ok)throw new Error(d.error||'Support unavailable');return d;}
-function render(d,selectFirst=true){state=d;const list=d.threads||[];if(!current&&!freshSelected&&selectFirst&&list.length)current=list[0].id;el('threads').textContent='';const fresh=new Option('New conversation','');el('threads').append(fresh);for(const t of list)el('threads').append(new Option((t.messages.find(m=>m.role==='customer')?.text||'Conversation').slice(0,60),t.id));el('threads').value=current;
- const t=list.find(t=>t.id===current);el('messages').textContent='';for(const m of t?.messages||[]){const p=document.createElement('div');p.className='message '+m.role;p.textContent=(m.role==='customer'?'You':m.role==='human'?'WH team':'AI support')+'\n'+m.text;const raw=p.textContent;p.textContent='';const re=/https:\/\/www\.youtube\.com\/watch\?v=[A-Za-z0-9_-]{11}(?:&t=\d+)?/g;let end=0;for(const match of raw.matchAll(re)){p.append(document.createTextNode(raw.slice(end,match.index)));const a=document.createElement('a');a.href=match[0];a.target='_blank';a.rel='noopener';a.textContent='Watch tutorial';p.append(a);end=match.index+match[0].length;}p.append(document.createTextNode(raw.slice(end)));el('messages').append(p);}el('messages').scrollTop=el('messages').scrollHeight;
- const last=t?.messages.at(-1);el('feedback').hidden=!last||last.role==='customer'||!!last.feedback||t.status==='resolved';
- el('status').textContent=(t?.status==='human'?'The team can reply here. ':t?.status==='resolved'?'Resolved. A new message reopens this conversation. ':'')+(d.aiEnabled?d.allowance.dailyRemaining+' AI replies left today.':'Human support is available; AI replies are currently off.');}
+function render(d){state=d;const list=d.threads||[];
+ if(current&&(!list.some(t=>t.id===current)||list.find(t=>t.id===current)?.status==='resolved'))current='';
+ if(!current&&list[0]?.status!=='resolved')current=list[0]?.id||'';
+ const t=list.find(t=>t.id===current),box=el('messages'),feedback=el('feedback');
+ const scroll=box.scrollTop,follow=box.scrollHeight-scroll-box.clientHeight<48;
+ feedback.remove();box.textContent='';
+ for(const m of t?.messages||[]){const p=document.createElement('div');p.className='message '+m.role;if(m.role!=='customer'){const who=document.createElement('small');who.textContent=m.role==='human'?'WH team':'Support';p.appendChild(who);}const body=document.createElement('div');body.innerHTML=swFormat(m.text);p.appendChild(body);box.appendChild(p);}
+ if(!t){const hello=document.createElement('div');hello.className='message';hello.textContent='How can we help?';box.appendChild(hello);}
+ const last=t?.messages.at(-1);feedback.hidden=!last||last.role==='customer'||!!last.feedback||t.status==='resolved';box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
+ el('status').textContent=t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled?'':'Send a message to our team.';
+}
 async function load(){if(busy)return;try{render(await call('/chat'));}catch(e){el('status').textContent=e.message;}}
-el('threads').onchange=()=>{current=el('threads').value;freshSelected=!current;human=false;render(state,false);};
-async function feedback(action){if(busy)return;const t=state?.threads.find(t=>t.id===current),last=t?.messages.at(-1);if(!last)return;busy=true;try{render(await call('/chat',{id:t.id,replyId:last.id,action}));}catch(e){el('status').textContent=e.message;}finally{busy=false;}}
+async function feedback(action){if(busy)return;const t=state?.threads.find(t=>t.id===current),last=t?.messages.at(-1);if(!last)return;busy=true;try{const d=await call('/chat',{id:t.id,replyId:last.id,action});if(action==='resolve'){current='';attempt=null;el('question').value='';}render(d);}catch(e){el('status').textContent=e.message;}finally{busy=false;}}
 el('resolved').onclick=()=>feedback('resolve');el('more').onclick=()=>feedback('human');
-el('human').onclick=()=>{human=true;el('status').textContent='Write your message to the team below.';el('question').focus();};el('refresh').onclick=load;
-el('chat').onsubmit=async e=>{e.preventDefault();if(busy)return;const text=el('question').value.trim();if(!text)return;if(!attempt||attempt.text!==text||attempt.id!==current)attempt={id:current,text,human,requestId:crypto.randomUUID()};busy=true;el('send').disabled=true;el('status').textContent='Sending…';try{const d=await call('/chat',attempt);current=d.threads[0].id;freshSelected=false;attempt=null;human=false;el('question').value='';render(d);}catch(e){el('status').textContent=e.message+' Your message is still in the box.';}finally{busy=false;el('send').disabled=false;}};
+el('chat').onsubmit=async e=>{e.preventDefault();if(busy)return;const text=el('question').value.trim();if(!text)return;if(!attempt||attempt.text!==text||attempt.id!==current)attempt={id:current,text,human:false,requestId:crypto.randomUUID()};busy=true;el('send').disabled=true;el('status').textContent='Sending…';try{const d=await call('/chat',attempt);current=d.threads[0].id;attempt=null;el('question').value='';render(d);}catch(e){el('status').textContent=e.message+' Your message is still in the box.';}finally{busy=false;el('send').disabled=false;}};
 call('/session',{}).then(load).catch(e=>{el('status').textContent=e.message;});setInterval(()=>{if(!document.hidden)load();},15000);
 </script></body></html>

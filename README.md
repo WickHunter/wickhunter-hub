@@ -1,3 +1,7 @@
+## v0.4.55 — Support messenger
+
+Persistent ticket list, full conversation pane, saved reply drafts, close/reopen controls, and quieter customer support. Admin deletion removes only the selected support thread and retains usage and approved knowledge.
+
 ## v0.4.54 — Compact support inbox and active-market health
 
 Show open chats as compact rows, expand one conversation to reply, and close finished chats into a separate Closed view. Keep history and drafts; reopen manually or when the customer sends a new message. Candle health counts active markets, with inactive contracts shown separately and their history retained.
@@ -1763,6 +1767,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.55 — Two-pane support messenger, full-width replies, saved drafts and formatted customer chat. Compact resolution feedback clears the customer view; targeted admin deletion preserves usage and unrelated conversations.
 
 - v0.4.54 — Compact open-chat inbox with persistent close/reopen and preserved drafts; separate inactive contracts from active candle health.
 - v0.4.53 — Preserve paid Marketplace configuration when its admin form is saved.

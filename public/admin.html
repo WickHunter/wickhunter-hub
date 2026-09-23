@@ -306,24 +306,40 @@
     .brief-section { padding:.8rem; }
   }
 
-  .support-card { padding:0; }
-  .support-row { display:flex; align-items:center; gap:.8rem; padding:.75rem 1rem; }
-  .support-open { flex:1; min-width:0; border:0; border-radius:.3rem; background:transparent; padding:.2rem; text-align:left; color:var(--ink); }
-  .support-open strong,.support-open small,.support-open-hint { display:block; }
-  .support-subject { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.95rem; }
-  .support-open small { font-size:.78rem; margin:.25rem 0; }
-  .support-open-hint { font-size:.78rem; color:var(--accent); }
-  .support-status { font-size:.78rem; color:var(--muted); }
+  #supportInbox.support-messenger { display:grid; grid-template-columns:minmax(240px,30%) minmax(0,1fr); height:clamp(420px,calc(100dvh - 310px),850px); border:1px solid var(--line); border-radius:14px; overflow:hidden; background:var(--raised); }
+  .support-tickets { overflow-y:auto; border-right:1px solid var(--line); min-width:0; }
+  .support-ticket { display:block; width:100%; border:0; border-bottom:1px solid var(--line); border-radius:0; padding:16px; text-align:left; background:transparent; color:var(--ink); }
+  .support-ticket[aria-current="true"] { background:color-mix(in srgb,var(--accent) 16%,transparent); box-shadow:inset 3px 0 var(--accent); }
+  .support-ticket strong,.support-ticket small,.support-preview { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .support-ticket strong { font-size:14px; margin:6px 0; }
+  .support-ticket small,.support-preview { font-size:12px; color:var(--muted); }
+  .support-ticket .support-status { display:inline-block; margin-top:10px; }
+  .support-card { display:flex; flex-direction:column; min-height:0; min-width:0; padding:0; margin:0; border:0; border-radius:0; }
+  .support-row { display:flex; align-items:center; gap:16px; padding:16px 20px; border-bottom:1px solid var(--line); }
+  .support-heading { flex:1; min-width:0; }
+  .support-heading strong { display:block; overflow-wrap:anywhere; font-size:15px; }
+  .support-heading small { display:block; font-size:12px; margin-top:5px; }
+  .support-status { font-size:12px; color:var(--muted); }
   .support-status.waiting { color:var(--warn); }
-  .support-close { flex-shrink:0; font-size:.82rem; padding:.5rem .7rem; }
-  .support-panel { border-top:1px solid var(--line); padding:1rem; }
-  .support-history { max-height:24rem; overflow-y:auto; margin-bottom:1rem; overscroll-behavior:contain; }
-  .support-history .message { padding:.7rem .8rem; margin:.4rem 0; border-left:2px solid var(--line); }
-  .support-history .message.human { border-color:var(--accent); }
-  .support-history .message p { font-size:.9rem; }
-  .support-thread textarea,.support-learning textarea { display:block; width:100%; min-height:5rem; resize:vertical; margin:.4rem 0; }
-  .support-learning { margin-top:.8rem; color:var(--muted); font-size:.85rem; }
-  @media(max-width:640px) { .support-row { flex-wrap:wrap; gap:.5rem; padding:.65rem; } .support-open { flex-basis:100%; } .support-status { flex:1; } .support-panel { padding:.65rem; } }
+  .support-close { flex-shrink:0; font-size:13px; padding:8px 12px; }
+  .support-panel { display:flex; flex:1; flex-direction:column; min-height:0; min-width:0; }
+  .support-history { flex:1; min-height:0; overflow-y:auto; padding:20px; overscroll-behavior:contain; }
+  .support-history .message { max-width:85%; width:fit-content; padding:12px 16px; margin:0 0 16px; background:var(--bg); border:1px solid var(--line); border-radius:14px 14px 14px 4px; overflow-wrap:anywhere; }
+  .support-history .message.human { margin-left:auto; border-radius:14px 14px 4px 14px; background:color-mix(in srgb,var(--accent) 13%,var(--bg)); }
+  .support-history .message small { font-size:11px; }
+  .support-history .support-body { font-size:14px; line-height:1.6; }
+  .support-history .support-body ol,.support-history .support-body ul { padding-left:20px; }
+  .support-history .support-body li { margin:6px 0; }
+  .support-history .message p { font-size:14px; line-height:1.6; margin:6px 0 0; white-space:pre-wrap; }
+  .support-thread { display:block; width:100%; margin:0; flex-shrink:0; padding:12px 20px; border-top:1px solid var(--line); }
+  .support-thread label { display:block; width:100%; font-size:12px; color:var(--muted); }
+  .support-thread textarea,.support-learning textarea { display:block; width:100%; min-height:72px; max-height:160px; resize:vertical; margin:6px 0 10px; font:inherit; font-size:14px; }
+  .support-thread .actions { margin:0; }
+  .support-thread button { font-size:13px; min-height:34px; padding:6px 12px; }
+  .support-thread [role="status"]:empty { display:none; }
+  .support-learning { flex-shrink:0; max-height:230px; overflow:auto; padding:0 20px 6px; color:var(--muted); font-size:12px; }
+  #supportReplyNotice:empty { display:none; }
+  @media(max-width:700px) { #supportInbox.support-messenger { grid-template-columns:minmax(0,1fr); grid-template-rows:160px minmax(0,1fr); height:780px; max-height:1100px; } .support-tickets { border-right:0; border-bottom:1px solid var(--line); } .support-ticket { padding:10px 14px; } .support-ticket .support-preview { display:none; } .support-row { padding:12px; gap:8px; flex-wrap:wrap; } .support-heading { min-width:150px; } .support-history,.support-thread { padding:12px; } .support-history .message { max-width:95%; } }
 
 </style>
 </head>
@@ -373,9 +389,9 @@
   </div>
 </section>
 <section class="hubpage" data-hub-page-panel="support" hidden>
-  <h2>Support inbox</h2><p class="muted">Open a chat to read and reply. Close it when finished; its history stays in Closed. A new customer message reopens it.</p>
+  <h2>Support inbox</h2>
   <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="active">Open chats</option><option value="open">Needs a human reply</option><option value="resolved">Closed</option><option value="all">All chats</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
-  <p id="supportReplyNotice" role="status"></p><div id="supportInbox"></div><details id="supportLegacy"><summary>Earlier one-way questions <span id="supportLegacyCount"></span></summary><p class="muted">These were imported from the old support system and have no customer reply channel. They are kept for reference. To receive a reply, the customer needs to start a new chat in the updated Alpha app or on the website. Beta has not been updated.</p><div id="supportLegacyItems"></div></details>
+  <p id="supportReplyNotice" role="status"></p><div id="supportInbox"></div><details id="supportLegacy"><summary>Earlier one-way questions <span id="supportLegacyCount"></span></summary><p class="muted">These older questions have no reply channel. Customers can start a new chat in the app or on the website.</p><div id="supportLegacyItems"></div></details>
 </section>
 
 
@@ -2914,6 +2930,31 @@ async function supportRefresh() {
     throw e;
   }
 }
+function supportFormat(text){
+  const saved=[];
+  const keep=html=>'\uE000'+(saved.push(html)-1)+'\uE001';
+  const link=(label,url)=>{try{const u=new URL(url);if(!['https:','http:'].includes(u.protocol))return esc(label);const a=document.createElement('a');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=label;return a.outerHTML;}catch{return esc(label);}};
+  const inline=raw=>{
+    let t=raw.replace(/`([^`\n]+)`/g,(_,code)=>keep('<code>'+esc(code)+'</code>'));
+    t=t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,(_,label,url)=>keep(link(label,url)));
+    t=t.replace(/https?:\/\/[^\s<>\uE000\uE001]+/g,url=>{const tail=url.match(/[.,!?;:]+$/)?.[0]||'';url=url.slice(0,url.length-tail.length);return keep(link(/^https:\/\/www\.youtube\.com\/watch\?v=/.test(url)?'Watch tutorial':url,url))+tail;});
+    return esc(t).replace(/\*\*([^\n]+?)\*\*/g,'<strong>$1</strong>').replace(/\*([^*\n]+)\*/g,'<em>$1</em>').replace(/\uE000(\d+)\uE001/g,(_,i)=>saved[Number(i)]||'');
+  };
+  let value=String(text||'').replace(/[\uE000\uE001]/g,'').replace(/\r\n?/g,'\n');
+  const steps=[...value.matchAll(/(?:^|\s)(\d{1,2})\.\s/g)];
+  if(steps.length>1&&steps.every((m,i)=>Number(m[1])===i+1))value=value.replace(/(^|\s)(\d{1,2})\.\s/g,'\n$2. ');
+  let out='',paragraph=[],list='';
+  const flush=()=>{if(paragraph.length){out+='<p>'+inline(paragraph.join(' '))+'</p>';paragraph=[];}};
+  const endList=()=>{if(list){out+='</'+list+'>';list='';}};
+  for(const raw of value.split('\n')){
+    const line=raw.trim();if(!line){flush();continue;}
+    const ordered=line.match(/^\d+[.)]\s+(.+)/),bullet=line.match(/^[-*]\s+(.+)/);
+    if(ordered||bullet){flush();const kind=ordered?'ol':'ul';if(list!==kind){endList();out+='<'+kind+'>';list=kind;}out+='<li>'+inline((ordered||bullet)[1])+'</li>';}
+    else{endList();if(/^#{1,3}\s/.test(line)){flush();out+='<p><strong>'+inline(line.replace(/^#{1,3}\s+/,''))+'</strong></p>';}else paragraph.push(line);}
+  }
+  flush();endList();return out;
+}
+
 function renderSupportInbox() {
   const d=supportSnapshot;
   const budget=d.budget;
@@ -2943,12 +2984,14 @@ function renderSupportInbox() {
       if(action==='resolve')supportExpandedId=null;
       if(action==='reopen'){supportExpandedId=r.id;document.getElementById('supportFilter').value='active';}
       renderSupportInbox();
-      notice.textContent=action==='resolve'?'Chat closed. Its history is saved in Closed.':action==='reopen'?'Chat reopened.':'You have taken over this chat. AI replies are paused.';
+      notice.textContent=action==='resolve'?'Chat closed. Its history is saved in Closed.':action==='reopen'?'Chat reopened.':'You have taken over this chat.';
     }catch(e){notice.textContent=e.message;button.disabled=false;}
   };
+  if(!filtered.some(r=>r.id===supportExpandedId))supportExpandedId=filtered[0]?.id||null;
   for (const [id,rows] of [['briefSupportList',pending.slice(0,5)],['supportInbox',filtered],['supportLegacyItems',legacy]]) {
     const box=document.getElementById(id); box.textContent='';
     if(!rows.length){box.className='brief-empty';box.textContent=!d.connected?'Customer support chat is not connected yet.':id==='briefSupportList'||filter==='open'?'No chats need a human reply.':filter==='resolved'?'No closed chats yet.':filter==='active'?'You’re caught up. No open chats. Previous conversations are in Closed.':'No chats yet.';}else box.className='';
+    let tickets;if(id==='supportInbox'&&rows.length){box.className='support-messenger';tickets=document.createElement('nav');tickets.className='support-tickets';tickets.setAttribute('aria-label','Support conversations');box.appendChild(tickets);}
     for (const r of rows) {
       const item=document.createElement('article');item.className='inbox-item';if(id==='supportInbox')item.id='support-'+r.id;
       const channel=r.version==='website'?'Website':'App';
@@ -2957,29 +3000,36 @@ function renderSupportInbox() {
         const meta=document.createElement('small');meta.textContent=metaText;
         const text=document.createElement('p');text.textContent=r.question||'';item.append(meta,text);
         if(id==='briefSupportList'){
-          const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{supportExpandedId=r.id;document.getElementById('supportFilter').value='active';showHubPage('support',true);await loadHubPage('support');const target=document.getElementById('support-'+r.id);target?.scrollIntoView({block:'center'});target?.querySelector('form textarea')?.focus();};item.appendChild(open);
+          const open=document.createElement('button');open.textContent='Open chat & reply';open.onclick=async()=>{supportExpandedId=r.id;document.getElementById('supportFilter').value='active';showHubPage('support',true);await loadHubPage('support');document.querySelector('#supportInbox form textarea')?.focus();};item.appendChild(open);
         }
         box.appendChild(item);continue;
       }
       const expanded=supportExpandedId===r.id,isClosed=r.status==='resolved';
+      const statusText=isClosed?'Closed':pending.includes(r)?'Needs reply':r.status==='assistant'?'Support':'Waiting for customer';
+      const ticket=document.createElement('button');ticket.className='support-ticket';ticket.type='button';ticket.dataset.ticketId=r.id;ticket.setAttribute('aria-current',String(expanded));
+      const name=document.createElement('small');name.textContent=(r.name||'Customer')+' · '+channel;
+      const subject=document.createElement('strong');subject.textContent=r.question||'Support conversation';
+      const preview=document.createElement('span');preview.className='support-preview';preview.textContent=r.messages.at(-1)?.text||'';
+      const stamp=document.createElement('small');stamp.textContent=fmt(r.updatedAt||r.ts)+' UTC';
+      const badge=document.createElement('span');badge.className='support-status'+(pending.includes(r)?' waiting':'');badge.textContent=statusText;
+      ticket.append(name,subject,preview,stamp,badge);ticket.onclick=()=>{supportExpandedId=r.id;renderSupportInbox();document.querySelector('[data-ticket-id="'+r.id+'"]')?.focus();};tickets.appendChild(ticket);
+      if(!expanded)continue;
       item.classList.add('support-card');
       const row=document.createElement('div');row.className='support-row';
-      const open=document.createElement('button');open.className='support-open';open.type='button';open.setAttribute('aria-expanded',String(expanded));open.setAttribute('aria-controls','support-panel-'+r.id);
-      const subject=document.createElement('strong');subject.className='support-subject';subject.textContent=r.question||'Support conversation';
-      const meta=document.createElement('small');meta.textContent=metaText;
-      const hint=document.createElement('span');hint.className='support-open-hint';hint.textContent=expanded?'Collapse ↑':isClosed?'View history ↓':'Read & reply ↓';
-      open.append(subject,meta,hint);open.onclick=()=>{supportExpandedId=expanded?null:r.id;renderSupportInbox();document.getElementById('support-'+r.id)?.querySelector('.support-open')?.focus();};
-      const status=document.createElement('span');status.className='support-status'+(pending.includes(r)?' waiting':'');status.textContent=isClosed?'Closed':pending.includes(r)?'Needs reply':r.status==='assistant'?'AI conversation':'Waiting for customer';
+      const open=document.createElement('div');open.className='support-heading';
+      const title=document.createElement('strong');title.textContent=r.question||'Support conversation';
+      const meta=document.createElement('small');meta.textContent=metaText;open.append(title,meta);
+      const status=document.createElement('span');status.className='support-status'+(pending.includes(r)?' waiting':'');status.textContent=statusText;
       const close=document.createElement('button');close.type='button';close.className='support-close';close.textContent=isClosed?'Reopen':'Close chat';close.dataset.supportAction=isClosed?'reopen':'resolve';close.onclick=()=>act(r,isClosed?'reopen':'resolve',close);
       row.append(open,status,close);item.appendChild(row);
       const panel=document.createElement('div');panel.id='support-panel-'+r.id;panel.className='support-panel';panel.hidden=!expanded;item.appendChild(panel);
       if(expanded){
         const history=document.createElement('div');history.className='support-history';history.setAttribute('aria-label','Conversation history');
-        for(const m of r.messages){const msg=document.createElement('div');msg.className='message '+m.role;const who=document.createElement('small');who.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'AI support':'Customer')+' · '+fmt(m.at)+' UTC';const body=document.createElement('p');body.textContent=m.text;msg.append(who,body);history.appendChild(msg);}panel.appendChild(history);
+        for(const m of r.messages){const msg=document.createElement('div');msg.className='message '+m.role;const who=document.createElement('small');who.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'Support':'Customer')+' · '+fmt(m.at)+' UTC';const body=document.createElement('div');body.className='support-body';body.innerHTML=supportFormat(m.text);msg.append(who,body);history.appendChild(msg);}panel.appendChild(history);
         if(!isClosed){
           const form=document.createElement('form');form.className='support-thread';
-          const label=document.createElement('label');label.textContent='Your reply';
-          const input=document.createElement('textarea');input.required=true;input.rows=3;input.maxLength=4000;input.placeholder='Write a reply…';input.setAttribute('aria-label','Reply to '+(r.name||'customer'));input.value=supportDrafts.get(r.id)||'';input.oninput=()=>supportDrafts.set(r.id,input.value);label.appendChild(input);
+          const label=document.createElement('label');label.textContent='';
+          const input=document.createElement('textarea');input.required=true;input.rows=2;input.maxLength=4000;input.placeholder='Write a reply…';input.setAttribute('aria-label','Reply to '+(r.name||'customer'));input.value=supportDrafts.get(r.id)||'';input.oninput=()=>supportDrafts.set(r.id,input.value);label.appendChild(input);
           const send=document.createElement('button');send.type='submit';send.textContent='Send reply';
           const note=document.createElement('p');note.setAttribute('role','status');
           form.onsubmit=async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;supportDrafts.set(r.id,input.value);send.disabled=true;
@@ -2988,7 +3038,7 @@ function renderSupportInbox() {
             catch(e){note.textContent=e.message;send.disabled=false;}
           };
           const actions=document.createElement('div');actions.className='actions';actions.appendChild(send);
-          if(r.status==='assistant'){const take=document.createElement('button');take.type='button';take.textContent='Take over from AI';take.onclick=()=>act(r,'takeover',take);actions.appendChild(take);}
+          if(r.status==='assistant'){const take=document.createElement('button');take.type='button';take.textContent='Take over';take.onclick=()=>act(r,'takeover',take);actions.appendChild(take);}
           form.append(label,actions,note);panel.appendChild(form);
         }
         const learning=document.createElement('details');learning.className='support-learning';const heading=document.createElement('summary');heading.textContent='Save a reusable answer';learning.appendChild(heading);
@@ -2999,6 +3049,7 @@ function renderSupportInbox() {
         learning.append(q,a,approve);panel.appendChild(learning);
       }
       box.appendChild(item);
+      const history=item.querySelector('.support-history');if(history)history.scrollTop=history.scrollHeight;
     }
   }
   document.getElementById('supportMeta').textContent=active.length+' open · '+pending.length+' need a human reply · '+closed.length+' closed';
