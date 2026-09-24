@@ -1,3 +1,7 @@
+## v0.4.59 — Audit corrections
+
+Escape feedback content in admin views, bound support storage by actual serialized bytes, keep active support conversations visible, and deduplicate concurrent Stripe deliveries while retrying failed Earn hooks. Lease-ledger rotation is deliberately deferred until its crash recovery preserves signed history.
+
 ## v0.4.58 — Mobile navigation
 
 Limit the full-screen support scroll lock to the visible inbox so other Hub pages remain scrollable when switching sections.
@@ -1779,6 +1783,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.59 — Harden support storage and admin rendering; deduplicate billing delivery and retry failed after-commit hooks.
 
 - v0.4.58 — Release the mobile support scroll lock when another Hub section is visible.
 
