@@ -35,14 +35,15 @@ function swFormat(text){
 }
 async function call(path,body){const r=await fetch(root+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-wh-support':'1'},...(body?{body:JSON.stringify(body)}:{})});const d=await r.json();if(!d.ok)throw new Error(d.error||'Support unavailable');return d;}
 function render(d){state=d;const list=d.threads||[];
- if(current&&(!list.some(t=>t.id===current)||list.find(t=>t.id===current)?.status==='resolved'))current='';
- if(!current&&list[0]?.status!=='resolved')current=list[0]?.id||'';
+ const visible=t=>!!t&&(t.status!=='resolved'||(['human','assistant'].includes(t.messages?.at(-1)?.role)&&t.messages.at(-1).feedback!=='helpful'));
+ if(!visible(list.find(t=>t.id===current)))current='';
+ if(!current)current=(list.find(t=>t.status!=='resolved')||list.find(visible))?.id||'';
  const t=list.find(t=>t.id===current),box=el('messages'),feedback=el('feedback');
  const scroll=box.scrollTop,follow=box.scrollHeight-scroll-box.clientHeight<48;
  feedback.remove();box.textContent='';
  for(const m of t?.messages||[]){const p=document.createElement('div');p.className='message '+m.role;if(m.role!=='customer'){const who=document.createElement('small');who.textContent=m.role==='human'?'WH team':'Support';p.appendChild(who);}const body=document.createElement('div');body.innerHTML=swFormat(m.text);p.appendChild(body);box.appendChild(p);}
  if(!t){const hello=document.createElement('div');hello.className='message';hello.textContent='How can we help?';box.appendChild(hello);}
- const last=t?.messages.at(-1);feedback.hidden=!last||last.role==='customer'||!!last.feedback||t.status==='resolved';box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
+ const last=t?.messages.at(-1);feedback.hidden=!last||last.role==='customer'||!!last.feedback;box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
  el('status').textContent=t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled?'':'Send a message to our team.';
 }
 async function load(){if(busy)return;try{render(await call('/chat'));}catch(e){el('status').textContent=e.message;}}

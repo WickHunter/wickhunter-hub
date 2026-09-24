@@ -11,7 +11,8 @@ try{
  await wait();const d=dom.window.document;
  assert.equal(d.querySelector('#threads'),null);assert.equal(d.querySelector('#human'),null);assert.equal(d.querySelectorAll('#messages ol li').length,2);assert.equal(d.querySelector('#messages strong').textContent,'Settings');assert.equal(d.querySelector('#feedback').parentElement.id,'messages');assert.equal(d.querySelector('#feedback').hidden,false);assert.ok(!/AI support|AI replies/.test(d.body.textContent));
  d.querySelector('#more').click();await wait();assert.equal(last.action,'human');assert.equal(d.querySelector('#feedback').hidden,true);
- thread.messages.push({id:'human-reply',role:'human',text:'Answer from the team'});await dom.window.eval('load()');
+ thread.messages.push({id:'human-reply',role:'human',text:'Answer from the team'});thread.status='resolved';await dom.window.eval('load()');
+ assert.ok(d.querySelector('#messages').textContent.includes('Answer from the team'));assert.equal(d.querySelector('#feedback').hidden,false);
  d.querySelector('#resolved').click();await wait();assert.equal(last.action,'resolve');assert.ok(!d.querySelector('#messages').textContent.includes('Answer from the team'));assert.equal(d.querySelector('#feedback').hidden,true);
  thread.status='human';await dom.window.eval('load()');empty=true;await dom.window.eval('load()');assert.equal(d.querySelector('#messages').textContent.includes('How can we help?'),true);
  assert.deepEqual(errors,[]);console.log('Website support: formatted answers, compact feedback, human handoff, resolution and deleted-thread reset passed');
