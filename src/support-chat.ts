@@ -79,7 +79,7 @@ export class SupportChat {
       // Keep live conversations visible when a customer's older resolved
       // history would otherwise occupy all twenty list slots.
       const active=(a.status==='resolved'?0:1)-(b.status==='resolved'?0:1);
-      return active||b.updatedAt-a.updatedAt;
+      return -active||b.updatedAt-a.updatedAt;
     }).slice(0,20);
     return {ok:true,enabled:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,threads:threads.map(({owner,licenseId,...t})=>t),allowance:this.allowance(identity.owner)};
   }

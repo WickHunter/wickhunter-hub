@@ -294,12 +294,22 @@ export class BillingService {
       this.store.appendEvent(record("ignored", `a ${ev.livemode ? "live" : "test"} event arrived at the ${mode} endpoint`));
       return { status: 200, body: { ok: true, outcome: "ignored" } };
     }
-    if (this.store.seenEvent(ev.id)) {
-      this.store.appendEvent(record("duplicate", null));
-      return { status: 200, body: { ok: true, outcome: "duplicate" } };
-    }
     if (this.inFlight.has(ev.id)) {
       return { status: 409, body: { ok: false, error: "event is already being applied; Stripe will retry" } };
+    }
+    if (this.store.seenEvent(ev.id)) {
+      this.inFlight.add(ev.id);
+      try {
+        await this.onVerifiedEvent?.(ev);
+      } catch (err) {
+        const message = (err as Error).message;
+        this.log(`[billing] duplicate after-commit hook for ${ev.id} failed: ${message}`);
+        this.inFlight.delete(ev.id);
+        return { status: 500, body: { ok: false, error: "event after-commit work could not be completed; Stripe will retry" } };
+      }
+      this.inFlight.delete(ev.id);
+      this.store.appendEvent(record("duplicate", null));
+      return { status: 200, body: { ok: true, outcome: "duplicate" } };
     }
     this.inFlight.add(ev.id);
     let result: ApplyResult;
@@ -315,12 +325,17 @@ export class BillingService {
     this.store.markSeen(ev.id, receivedAtMs);
     this.store.appendEvent(record(result.outcome, result.note));
     this.log(`[billing] ${ev.type} ${ev.id} (${ev.livemode ? "live" : "test"}): ${result.outcome}${result.note ? ` — ${result.note}` : ""}`);
-    this.inFlight.delete(ev.id);
-    // Earn is an after-commit side effect. Its own ledger is idempotent; a
-    // failure must not turn an already-applied licence event into a Stripe
-    // retry that can mutate the licence a second time.
+    // Earn is an after-commit side effect. The seen marker above guards the
+    // licence mutation on Stripe retry; a hook failure stays a 5xx so the
+    // duplicate path below can retry only this idempotent side effect.
     try { await this.onVerifiedEvent?.(ev); }
-    catch (err) { this.log(`[billing] after-commit hook for ${ev.id} failed: ${(err as Error).message}`); }
+    catch (err) {
+      const message = (err as Error).message;
+      this.log(`[billing] after-commit hook for ${ev.id} failed: ${message}`);
+      this.inFlight.delete(ev.id);
+      return { status: 500, body: { ok: false, error: "event after-commit work could not be completed; Stripe will retry" } };
+    }
+    this.inFlight.delete(ev.id);
     return { status: 200, body: { ok: true, outcome: result.outcome } };
   }
 
