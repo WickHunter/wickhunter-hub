@@ -1142,7 +1142,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         ip,
         licenseId: payload.id,
         name: payload.name,
-        installId: typeof body.installId === "string" ? body.installId.slice(0, 64) : "",
+        installId: typeof body.installId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(body.installId) ? body.installId : "",
         version: typeof body.version === "string" ? body.version.slice(0, 32) : "",
         kind,
         text: text.slice(0, FEEDBACK_TEXT_MAX),

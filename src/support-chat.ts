@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { readJson, writeJsonAtomic } from './jsonfile.js';
+import { readJson, writeTextAtomic } from './jsonfile.js';
 import { redactFeedbackText } from './feedback.js';
 
 export interface SupportConfig {
@@ -24,6 +24,9 @@ interface Reservation { id: string; owner: string; month: string; day: string; m
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
 interface State { monthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
 const MAX_BYTES = 16 * 1024 * 1024;
+const GUEST_OWNER_BYTES = 256 * 1024;
+const OWNER_BYTES = 2 * 1024 * 1024;
+const GUEST_TOTAL_BYTES = 4 * 1024 * 1024;
 const RESERVE_MICROS = 8_000; // 24k UTF-8 input bytes + 1200 output tokens, conservatively bounded.
 const clean = (x: unknown, n: number) => redactFeedbackText(typeof x === 'string' ? x : '', n).trim();
 export class SupportError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
@@ -31,16 +34,33 @@ export class SupportChat {
   private state: State;
   private readonly file: string;
   private busy = new Set<string>();
+  /** Corrupt or oversized support data must not stop licence and billing
+   * services from booting. Keep the old file untouched and expose a read-only
+   * support view until an operator repairs it. */
+  unavailable: string | null = null;
   constructor(dataDir: string, readonly config: SupportConfig, private request: typeof fetch = fetch, private now = Date.now) {
     this.file = path.join(dataDir, 'support-chat.v1.json');
-    if (fs.existsSync(this.file) && fs.statSync(this.file).size > MAX_BYTES) throw new Error('Support storage exceeds its bound');
-    this.state = readJson<State>(this.file, {schema:1, threads:[], usage:[], knowledge:[]});
-    if(this.state.schema!==1 || !Array.isArray(this.state.threads) || !Array.isArray(this.state.usage) || !Array.isArray(this.state.knowledge)) throw new Error('Invalid support state');
+    const empty: State = {schema:1, threads:[], usage:[], knowledge:[]};
+    try {
+      if (fs.existsSync(this.file) && fs.statSync(this.file).size > MAX_BYTES) throw new Error('Support storage exceeds its bound');
+      const loaded = readJson<State>(this.file, empty);
+      if(loaded.schema!==1 || !Array.isArray(loaded.threads) || !Array.isArray(loaded.usage) || !Array.isArray(loaded.knowledge)) throw new Error('Invalid support state');
+      this.state = loaded;
+    } catch (error) {
+      this.state = empty;
+      this.unavailable = 'Support storage could not be loaded ('+(error instanceof Error?error.message:'unreadable')+'); support is read-only until the operator repairs '+this.file;
+      console.error('[support] '+this.unavailable);
+    }
     // Pending provider calls after a restart retain their full reservation.
   }
   private commit(next: State) {
-    if(Buffer.byteLength(JSON.stringify(next))>MAX_BYTES) throw new SupportError('Support storage is full; contact the team or use Report a bug.',507);
-    writeJsonAtomic(this.file,next); this.state=next;
+    if(this.unavailable) throw new SupportError('Support is temporarily unavailable. Please use Report a bug.',503);
+    const text=JSON.stringify(next)+'\n';
+    if(Buffer.byteLength(text)>MAX_BYTES) throw new SupportError('Support storage is full; contact the team or use Report a bug.',507);
+    writeTextAtomic(this.file,text); this.state=next;
+  }
+  private storedBytes(match:(t:Thread)=>boolean) {
+    let n=0;for(const t of this.state.threads)if(match(t))for(const m of t.messages)n+=Buffer.byteLength(m.text);return n;
   }
   private edit(fn: (s: State)=>void) { const next=structuredClone(this.state); fn(next); this.commit(next); }
   private thread(id: string) { const t=this.state.threads.find(t=>t.id===id); if(!t)throw new SupportError('Conversation not found',404); return t; }
@@ -76,7 +96,7 @@ export class SupportChat {
   }
   admin() {
     return {ok:true,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
-      message:this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.',
+      message:this.unavailable??(this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.'),
       items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
       knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},
       budget:{limitMicros:this.monthlyLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0),reservedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.pending).reduce((a,u)=>a+u.micros,0),resetsAt:this.allowance('').resetsAt,month:this.period().month},
@@ -95,6 +115,10 @@ export class SupportChat {
     const prior=this.state.threads.find(t=>t.owner===identity.owner&&t.messages.some(m=>m.role==='customer'&&m.id===requestId));
     if(prior)return this.customer(identity,prior.id);
     if(this.busy.has(identity.owner))throw new SupportError('A reply is already in progress. Please wait.',409);
+    const guest=identity.owner.startsWith('guest:'),add=Buffer.byteLength(text);
+    if(this.storedBytes(t=>t.owner===identity.owner)+add>(guest?GUEST_OWNER_BYTES:OWNER_BYTES)
+      ||(guest&&this.storedBytes(t=>t.owner.startsWith('guest:'))+add>GUEST_TOTAL_BYTES))
+      throw new SupportError('Support storage for this conversation history is full. Please use Report a bug.',507);
     let thread=id?this.owned(identity,id):null;
     if(thread&&thread.messages.length>=100)throw new SupportError('This conversation is full. Start a new conversation.',409);
     const human=body.human===true || thread?.status==='human';
@@ -174,6 +198,7 @@ export class SupportChat {
     }
     this.edit(s=>{
       const t=s.threads.find(t=>t.id===id)!;
+      let touch=true;
       if(action==='reply'){
         const answer=clean(body.text,4000),requestId=clean(body.requestId,80);
         if(!answer||!/^[-A-Za-z0-9_]{8,80}$/.test(requestId))throw new SupportError('An answer and request ID are required');
@@ -184,6 +209,9 @@ export class SupportChat {
       else if(action==='takeover')t.status='human';
       else if(action==='reopen'){t.status='human';t.waitingForHuman=true;}
       else if(action==='knowledge'){
+        // Approving reusable knowledge is a staff metadata action. It must not
+        // make an old ticket look like a fresh customer conversation.
+        touch=false;
         const question=clean(body.question,1000),answer=clean(body.answer,4000);
         if(!question||!answer)throw new SupportError('Review both the question and answer before approving knowledge');
         const prior=s.knowledge.find(k=>k.sourceId===id&&k.question===question);
@@ -191,7 +219,7 @@ export class SupportChat {
         if(s.knowledge.length>=200)throw new SupportError('Knowledge limit reached',409);
         s.knowledge.push({id:randomUUID(),question,answer,sourceId:id,version:t.version,at:this.now()});
       }else throw new SupportError('Unknown support action');
-      t.updatedAt=this.now();
+      if(touch)t.updatedAt=this.now();
     });return this.admin();
   }
 }

@@ -778,7 +778,10 @@ document.getElementById("extendForm").onsubmit = async (ev) => {
 };
 
 function fmt(ms) { return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) : "—"; }
-function esc(s) { const d = document.createElement("span"); d.textContent = String(s); return d.innerHTML; }
+// This helper is used in both text nodes and quoted attributes. textContent
+// followed by innerHTML leaves quotes literal, so escape the attribute syntax
+// explicitly before concatenating row markup.
+function esc(s) { return String(s ?? "").replace(/[&<>"'`]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;" })[c]); }
 // Versions are shown the way the project writes them everywhere else — v0.74.80,
 // not 0.74.80. Anything already carrying a `v`, or not version-shaped at all, is
 // passed through untouched rather than gaining a second one.

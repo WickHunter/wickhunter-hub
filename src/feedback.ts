@@ -332,23 +332,37 @@ function diagnosticValue(value: unknown, key: string, depth: number, budget: Dia
   return out;
 }
 
-function pruneDiagnosticTail(value: unknown): boolean {
+const jsonBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
+
+/** Remove one tail leaf and return the exact JSON bytes removed. Recursive
+ * descent only serializes the leaf (or the small container that is removed),
+ * so a hostile snapshot is not re-stringified once per leaf. */
+function pruneDiagnosticTail(value: unknown): number {
   if (Array.isArray(value)) {
-    if (value.length === 0) return false;
+    if (value.length === 0) return 0;
     const tail = value[value.length - 1];
-    if (tail && typeof tail === "object" && pruneDiagnosticTail(tail)) return true;
+    if (tail && typeof tail === "object") {
+      const saved = pruneDiagnosticTail(tail);
+      if (saved) return saved;
+    }
+    const saved = jsonBytes(tail) + (value.length > 1 ? 1 : 0);
     value.pop();
-    return true;
+    return saved;
   }
-  if (!value || typeof value !== "object") return false;
+  if (!value || typeof value !== "object") return 0;
   const object = value as Record<string, unknown>;
-  const keys = Object.keys(object).filter((key) => !DIAGNOSTIC_PRIORITY_KEYS.has(key));
-  if (keys.length === 0) return false;
+  const all = Object.keys(object);
+  const keys = all.filter((key) => !DIAGNOSTIC_PRIORITY_KEYS.has(key));
+  if (keys.length === 0) return 0;
   const key = keys[keys.length - 1]!;
   const tail = object[key];
-  if (tail && typeof tail === "object" && pruneDiagnosticTail(tail)) return true;
+  if (tail && typeof tail === "object") {
+    const saved = pruneDiagnosticTail(tail);
+    if (saved) return saved;
+  }
+  const saved = jsonBytes(key) + 1 + jsonBytes(tail) + (all.length > 1 ? 1 : 0);
   delete object[key];
-  return true;
+  return saved;
 }
 
 /** The construction budget above cheaply stops hostile depth/node/string
@@ -357,11 +371,15 @@ function pruneDiagnosticTail(value: unknown): boolean {
  * what the request and JSONL tracker actually retain. Later fields are pruned
  * first so stable high-value facts at the front of the snapshot survive. */
 function clampDiagnosticJsonBytes(value: Record<string, unknown>, budget: DiagnosticBudget): Record<string, unknown> {
-  while (Buffer.byteLength(JSON.stringify(value), "utf8") > FEEDBACK_DIAGNOSTICS_BYTES_MAX) {
+  let bytes = jsonBytes(value);
+  while (bytes > FEEDBACK_DIAGNOSTICS_BYTES_MAX) {
     budget.truncated = true;
-    if (!pruneDiagnosticTail(value)) return {};
+    const saved = pruneDiagnosticTail(value);
+    if (!saved) return {};
+    bytes -= saved;
   }
-  return value;
+  // Keep a final exact check as the contract guard if the accounting changes.
+  return jsonBytes(value) <= FEEDBACK_DIAGNOSTICS_BYTES_MAX ? value : {};
 }
 
 export function normalizeFeedbackDiagnostics(raw: unknown): Record<string, unknown> {
@@ -388,7 +406,25 @@ export function normalizeFeedbackDiagnostics(raw: unknown): Record<string, unkno
       maxStringChars: FEEDBACK_DIAGNOSTICS_STRING_MAX,
     };
   }
-  return clampDiagnosticJsonBytes(out, budget);
+  const clamped = clampDiagnosticJsonBytes(out, budget);
+  // The byte pass can be the first bound hit (construction did not exceed its
+  // node/string budget). Keep the wire honest in that case too, then enforce
+  // the cap once more after adding the priority marker.
+  if (budget.truncated && clamped.diagnosticsTruncated !== true) {
+    clamped.diagnosticsTruncated = true;
+    clamped.truncation = {
+      occurred: true,
+      reason: "Hub evidence bounds",
+      maxBytes: FEEDBACK_DIAGNOSTICS_BYTES_MAX,
+      maxNodes: FEEDBACK_DIAGNOSTICS_NODES_MAX,
+      maxDepth: FEEDBACK_DIAGNOSTICS_DEPTH_MAX,
+      maxArrayItems: FEEDBACK_DIAGNOSTICS_ARRAY_MAX,
+      maxObjectKeys: FEEDBACK_DIAGNOSTICS_OBJECT_MAX,
+      maxStringChars: FEEDBACK_DIAGNOSTICS_STRING_MAX,
+    };
+    return clampDiagnosticJsonBytes(clamped, budget);
+  }
+  return clamped;
 }
 
 /** Route composition can call this before durable quota accounting. The current
@@ -521,7 +557,10 @@ export function normalizeFeedbackAttachment(raw: unknown): FeedbackAttachmentVal
     return { ok: false, error: `picture dimensions must be at most ${FEEDBACK_ATTACHMENT_DIMENSION_MAX} px per side and ${FEEDBACK_ATTACHMENT_PIXELS_MAX.toLocaleString()} pixels total` };
   }
   const fallback = mimeType === "image/png" ? "screenshot.png" : mimeType === "image/webp" ? "screenshot.webp" : "screenshot.jpg";
-  const name = redactFeedbackText(String(obj.name ?? "").split(/[\\/]/).pop() ?? "", 120) || fallback;
+  const rawName = redactFeedbackText(String(obj.name ?? "").split(/[\\/]/).pop() ?? "", 120);
+  // Feedback names are displayed in a quoted admin attribute. Keep a small
+  // portable filename alphabet so a report cannot smuggle markup into it.
+  const name = /^[A-Za-z0-9 ._()\-]{1,120}$/.test(rawName) ? rawName : fallback;
   return {
     ok: true,
     attachment: {

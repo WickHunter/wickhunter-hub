@@ -144,6 +144,9 @@ export class BillingService {
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
   private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
+  /** Prevent concurrent deliveries of the same event from both entering the
+   * licence mutation before the durable seen marker is written. */
+  private readonly inFlight = new Set<string>();
 
   constructor(
     readonly dataDir: string,
@@ -295,19 +298,29 @@ export class BillingService {
       this.store.appendEvent(record("duplicate", null));
       return { status: 200, body: { ok: true, outcome: "duplicate" } };
     }
+    if (this.inFlight.has(ev.id)) {
+      return { status: 409, body: { ok: false, error: "event is already being applied; Stripe will retry" } };
+    }
+    this.inFlight.add(ev.id);
     let result: ApplyResult;
     try {
       result = await this.applyEvent(ev, cfg);
-      await this.onVerifiedEvent?.(ev);
     } catch (err) {
       const message = (err as Error).message;
       this.store.appendEvent(record("error", message));
       this.log(`[billing] ${ev.type} ${ev.id} failed: ${message}`);
+      this.inFlight.delete(ev.id);
       return { status: 500, body: { ok: false, error: "event could not be applied; Stripe will retry" } };
     }
     this.store.markSeen(ev.id, receivedAtMs);
     this.store.appendEvent(record(result.outcome, result.note));
     this.log(`[billing] ${ev.type} ${ev.id} (${ev.livemode ? "live" : "test"}): ${result.outcome}${result.note ? ` — ${result.note}` : ""}`);
+    this.inFlight.delete(ev.id);
+    // Earn is an after-commit side effect. Its own ledger is idempotent; a
+    // failure must not turn an already-applied licence event into a Stripe
+    // retry that can mutate the licence a second time.
+    try { await this.onVerifiedEvent?.(ev); }
+    catch (err) { this.log(`[billing] after-commit hook for ${ev.id} failed: ${(err as Error).message}`); }
     return { status: 200, body: { ok: true, outcome: result.outcome } };
   }
 
@@ -789,13 +802,16 @@ export class BillingService {
     const bootstrapExp = f.mode === "payment" ? now + oneOffDays * DAY_MS : now + cfg.policy.bootstrapDays * DAY_MS;
     const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, bootstrapExp, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
-    if (f.mode === "payment" && !created) {
+    const checkoutMarker = f.sessionId ? `cs:${f.sessionId}` : "";
+    const alreadyApplied = checkoutMarker !== "" && rec.chargeIds.includes(checkoutMarker);
+    if (f.mode === "payment" && !created && !alreadyApplied) {
       // A repeat one-time purchase stacks on whatever is left.
       const current = this.licenses.get(rec.licenseId);
       const base = current ? Math.max(current.exp, now) : now;
       note += this.extendLicense(rec, base + oneOffDays * DAY_MS, cfg, now) ? "; licence extended" : "";
     }
     if (f.mode === "subscription") rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
+    this.noteCharge(rec, checkoutMarker);
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
     this.store.putCustomer(rec);

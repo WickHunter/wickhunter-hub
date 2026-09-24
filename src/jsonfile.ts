@@ -53,9 +53,15 @@ export function readJson<T>(file: string, fallback: T): T {
 }
 
 export function writeJsonAtomic(file: string, value: unknown): void {
+  writeTextAtomic(file, JSON.stringify(value, null, 2) + "\n");
+}
+
+/** Atomic write for callers that already serialized and measured the exact
+ * bytes that must land on disk. */
+export function writeTextAtomic(file: string, text: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
   matchDirectoryOwner(tmp); // before the rename: the service never sees a root-owned registry
   fs.renameSync(tmp, file);
 }
