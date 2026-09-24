@@ -39,6 +39,7 @@ const LEASE_SIGNATURE_DOMAIN = Buffer.from("WICKHUNTER\0LICENSE_LEASE\0V1\0", "u
 const MAX_OUTSTANDING_CHALLENGES = 8;
 const MAX_CHALLENGES_PER_LICENSE_PER_HOUR = 120;
 const MAX_LEDGER_BYTES = 128 * 1024 * 1024;
+const LEDGER_ROTATE_BYTES = 64 * 1024 * 1024;
 const RAW_PUBLIC_KEY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -140,6 +141,10 @@ export interface LicenseLeaseConfig {
   readonly challengeTtlMs?: number;
   readonly maxClockSkewMs?: number;
   readonly defaultMaxMachines?: number;
+  /** Test seam for exercising signed ledger rotation without filling a disk. */
+  readonly ledgerRotateBytes?: number;
+  /** Test seam for retaining a bounded hard ceiling below the production default. */
+  readonly ledgerMaxBytes?: number;
 }
 
 export interface LicenseLeaseDeps {
@@ -172,6 +177,13 @@ type LeaseAuditEvent =
       readonly eventId: string;
       readonly kind: "ledger_initialized";
       readonly atMs: number;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly eventId: string;
+      readonly kind: "ledger_checkpoint";
+      readonly atMs: number;
+      readonly checkpoint: LedgerCheckpoint;
     }
   | {
       readonly schemaVersion: 1;
@@ -245,6 +257,16 @@ interface LedgerHead {
   readonly lastHash: string;
   readonly updatedAtMs: number;
   readonly sig: string;
+}
+
+interface LedgerCheckpoint {
+  readonly priorLastHash: string | null;
+  readonly activations: readonly LeaseActivation[];
+  readonly challenges: readonly ChallengeFacts[];
+  readonly consumed: readonly { readonly nonceHash: string; readonly result: LeaseOperationResult }[];
+  readonly seatOverrides: readonly { readonly licenseId: string; readonly maxMachines: number }[];
+  readonly adminRecoveryLocked: readonly string[];
+  readonly maxServerTimeMs: number;
 }
 
 interface ReplayState {
@@ -701,6 +723,55 @@ function validateAuditEvent(event: LeaseAuditEvent): void {
   }
   switch (event.kind) {
     case "ledger_initialized": return;
+    case "ledger_checkpoint": {
+      const c = event.checkpoint;
+      if (c === null || typeof c !== "object" || !Array.isArray(c.activations)
+        || !Array.isArray(c.challenges) || !Array.isArray(c.consumed)
+        || !Array.isArray(c.seatOverrides) || !Array.isArray(c.adminRecoveryLocked)
+        || !(c.priorLastHash === null || /^[a-f0-9]{64}$/.test(c.priorLastHash))
+        || !Number.isSafeInteger(c.maxServerTimeMs) || c.maxServerTimeMs < 0
+        || c.activations.length > 100_000 || c.challenges.length > 100_000
+        || c.consumed.length > 100_000 || c.seatOverrides.length > 100_000
+        || c.adminRecoveryLocked.length > 100_000) {
+        throw new Error("lease audit checkpoint state is malformed");
+      }
+      for (const activation of c.activations) validateActivation(activation);
+      for (const challenge of c.challenges) {
+        validateAuditEvent({ schemaVersion: 1, eventId: event.eventId + ":challenge", kind: "challenge_issued", atMs: challenge.issuedAtMs, challenge });
+      }
+      for (let i = 1; i < c.challenges.length; i++) {
+        if (c.challenges[i - 1]!.issuedAtMs > c.challenges[i]!.issuedAtMs) {
+          throw new Error("lease audit checkpoint challenges are out of order");
+        }
+      }
+      const seenConsumed = new Set<string>();
+      for (const row of c.consumed) {
+        if (row === null || typeof row !== "object" || !/^[a-f0-9]{64}$/.test(row.nonceHash)
+          || seenConsumed.has(row.nonceHash) || row.result?.replayed !== true) {
+          throw new Error("lease audit checkpoint consumed nonce state is malformed");
+        }
+        seenConsumed.add(row.nonceHash);
+        validateActivation(row.result.activation);
+        if (row.result.lease !== null) {
+          if (!validLeasePayload(row.result.lease.payload)
+            || row.result.lease.payload.licenseId !== row.result.activation.licenseId
+            || row.result.lease.payload.activationId !== row.result.activation.id
+            || row.result.lease.payload.sequence !== row.result.activation.lastSequence
+            || row.result.lease.payload.expiresAtMs !== row.result.activation.lastLeaseExpiresAtMs) {
+            throw new Error("lease audit checkpoint carries a mismatched lease");
+          }
+        }
+      }
+      const seenSeats = new Set<string>();
+      for (const row of c.seatOverrides) {
+        boundedText("checkpoint seat override licenseId", row.licenseId, 128);
+        finiteInt("checkpoint seat override", row.maxMachines, 1, 64);
+        if (seenSeats.has(row.licenseId)) throw new Error("lease audit checkpoint repeats a seat override");
+        seenSeats.add(row.licenseId);
+      }
+      for (const id of c.adminRecoveryLocked) boundedText("checkpoint recovery lock licenseId", id, 128);
+      return;
+    }
     case "challenge_issued":
       {
         const c = event.challenge;
@@ -752,6 +823,26 @@ function validateAuditEvent(event: LeaseAuditEvent): void {
   }
 }
 
+function applyCheckpoint(state: ReplayState, checkpoint: LedgerCheckpoint): void {
+  state.activations.clear();
+  state.challenges.clear();
+  state.challengesByLicense.clear();
+  state.consumed.clear();
+  state.seatOverrides.clear();
+  state.adminRecoveryLocked.clear();
+  for (const activation of checkpoint.activations) state.activations.set(activation.id, activation);
+  for (const challenge of checkpoint.challenges) {
+    state.challenges.set(challenge.nonceHash, challenge);
+    const rows = state.challengesByLicense.get(challenge.licenseId) ?? [];
+    rows.push(challenge);
+    state.challengesByLicense.set(challenge.licenseId, rows);
+  }
+  for (const row of checkpoint.consumed) state.consumed.set(row.nonceHash, row.result);
+  for (const row of checkpoint.seatOverrides) state.seatOverrides.set(row.licenseId, row.maxMachines);
+  for (const id of checkpoint.adminRecoveryLocked) state.adminRecoveryLocked.add(id);
+  state.maxServerTimeMs = Math.max(state.maxServerTimeMs, checkpoint.maxServerTimeMs);
+}
+
 function emptyReplay(): ReplayState {
   return {
     activations: new Map(), challenges: new Map(), challengesByLicense: new Map(), consumed: new Map(), seatOverrides: new Map(),
@@ -788,6 +879,8 @@ export class LicenseLeaseService {
   private readonly challengeTtlMs: number;
   private readonly maxClockSkewMs: number;
   private readonly defaultMaxMachines: number;
+  private readonly ledgerRotateBytes: number;
+  private readonly ledgerMaxBytes: number;
   private replayCache: ReplayCache | null = null;
   private readonly wallClockAnchorMs: number;
   private readonly monotonicAnchorMs: number;
@@ -808,6 +901,8 @@ export class LicenseLeaseService {
     this.challengeTtlMs = finiteInt("challengeTtlMs", cfg.challengeTtlMs ?? DEFAULT_CHALLENGE_TTL_MS, 10_000, 60 * 60_000);
     this.maxClockSkewMs = finiteInt("maxClockSkewMs", cfg.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS, 0, 60 * 60_000);
     this.defaultMaxMachines = finiteInt("defaultMaxMachines", cfg.defaultMaxMachines ?? DEFAULT_MAX_MACHINES, 1, 64);
+    this.ledgerMaxBytes = finiteInt("ledgerMaxBytes", cfg.ledgerMaxBytes ?? MAX_LEDGER_BYTES, 1024, MAX_LEDGER_BYTES);
+    this.ledgerRotateBytes = finiteInt("ledgerRotateBytes", cfg.ledgerRotateBytes ?? LEDGER_ROTATE_BYTES, 512, this.ledgerMaxBytes - 1);
     this.wallClockAnchorMs = finiteInt("server clock", this.now(), 0, Number.MAX_SAFE_INTEGER);
     this.monotonicAnchorMs = this.monotonicNow();
     if (!Number.isFinite(this.monotonicAnchorMs) || this.monotonicAnchorMs < 0) throw new Error("monotonic server clock is unavailable");
@@ -939,6 +1034,20 @@ export class LicenseLeaseService {
           if (index !== 0 || state.events.length !== 1) {
             throw new Error(`lease audit line ${index + 1} puts the schema marker anywhere but first`);
           }
+          break;
+        case "ledger_checkpoint":
+          if (index !== 0 || state.events.length !== 1 || line.previousHash !== null) {
+            throw new Error(`lease audit line ${index + 1} puts the signed checkpoint anywhere but first`);
+          }
+          for (const row of event.checkpoint.consumed) {
+            if (row.result.lease !== null) {
+              const verifiedLease = verifyLicenseLease(row.result.lease.token, keyring);
+              if (!verifiedLease.ok || JSON.stringify(verifiedLease.payload) !== JSON.stringify(row.result.lease.payload)) {
+                throw new Error(`lease audit line ${index + 1} carries an invalid checkpoint lease`);
+              }
+            }
+          }
+          applyCheckpoint(state, event.checkpoint);
           break;
         case "challenge_issued":
           if (state.challenges.has(event.challenge.nonceHash)) {
@@ -1083,6 +1192,7 @@ export class LicenseLeaseService {
     state.maxServerTimeMs = Math.max(state.maxServerTimeMs, event.atMs);
     switch (event.kind) {
       case "ledger_initialized": break;
+      case "ledger_checkpoint": applyCheckpoint(state, event.checkpoint); break;
       case "challenge_issued": {
         state.challenges.set(event.challenge.nonceHash, event.challenge);
         const rows = state.challengesByLicense.get(event.challenge.licenseId) ?? [];
@@ -1118,6 +1228,63 @@ export class LicenseLeaseService {
     };
   }
 
+  /** Replace a full segment with a signed, self-contained checkpoint. The
+   * prior segment is copied aside before the atomic ledger replacement, so a
+   * crash before replacement leaves the old signed pair intact. */
+  private rotateWithCheckpoint(state: ReplayState, atMs: number): void {
+    const checkpointAt = Math.max(atMs, state.maxServerTimeMs);
+    const challenges = [...state.challenges.values()].filter((challenge) => challenge.expiresAtMs > checkpointAt);
+    const retained = new Set(challenges.map((challenge) => challenge.nonceHash));
+    const consumed = [...state.consumed.entries()]
+      .filter(([nonceHash]) => retained.has(nonceHash))
+      .map(([nonceHash, result]) => ({ nonceHash, result }));
+    const checkpoint: LedgerCheckpoint = {
+      priorLastHash: state.lastHash,
+      activations: [...state.activations.values()],
+      challenges,
+      consumed,
+      seatOverrides: [...state.seatOverrides.entries()].map(([licenseId, maxMachines]) => ({ licenseId, maxMachines })),
+      adminRecoveryLocked: [...state.adminRecoveryLocked],
+      maxServerTimeMs: checkpointAt,
+    };
+    const event: LeaseAuditEvent = {
+      schemaVersion: 1, eventId: this.randomId(), kind: "ledger_checkpoint", atMs: checkpointAt, checkpoint,
+    };
+    validateAuditEvent(event);
+    const unsigned = { v: 1 as const, kid: this.keyStore.activeKeyId, previousHash: null, event };
+    const line: LedgerLine = { ...unsigned, sig: this.keyStore.sign(lineUnsigned(unsigned)) };
+    const encoded = JSON.stringify(line) + "\n";
+    if (Buffer.byteLength(encoded) >= this.ledgerMaxBytes) {
+      throw new Error("lease audit checkpoint is larger than its configured safety ceiling");
+    }
+    fs.mkdirSync(path.dirname(this.ledgerFile), { recursive: true });
+    const suffix = randomBytes(12).toString("hex");
+    const tmp = `${this.ledgerFile}.rotate.${process.pid}.${suffix}`;
+    writeExclusiveDurable(tmp, encoded);
+    try {
+      if (fs.existsSync(this.ledgerFile)) {
+        const archive = `${this.ledgerFile}.${checkpointAt}.${suffix}.archive`;
+        fs.copyFileSync(this.ledgerFile, archive);
+        const archiveFd = fs.openSync(archive, "r");
+        try { fs.fsyncSync(archiveFd); } finally { fs.closeSync(archiveFd); }
+        if (fs.existsSync(this.ledgerHeadFile)) {
+          const headArchive = `${archive}.head`;
+          fs.copyFileSync(this.ledgerHeadFile, headArchive);
+          const headFd = fs.openSync(headArchive, "r");
+          try { fs.fsyncSync(headFd); } finally { fs.closeSync(headFd); }
+        }
+        fsyncDirectory(path.dirname(this.ledgerFile));
+      }
+      fs.renameSync(tmp, this.ledgerFile);
+      fsyncDirectory(path.dirname(this.ledgerFile));
+      this.writeHead(1, lineHash(line), checkpointAt);
+      this.replayCache = null;
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+      throw err;
+    }
+  }
+
   private appendEvent(event: LeaseAuditEvent, expectedLastHash: string | null): void {
     let fd: number | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1140,12 +1307,17 @@ export class LicenseLeaseService {
     }
     if (fd === null) throw new Error("lease audit writer lock could not be acquired");
     try {
-      const state = this.replay();
+      let state = this.replay();
       if (state.lastHash !== expectedLastHash) {
         throw new Error("lease audit changed concurrently; retry from a fresh challenge or admin snapshot");
       }
       validateAuditEvent(event);
       if (state.eventIds.has(event.eventId)) throw new Error(`lease audit event id ${event.eventId} already exists`);
+      const size = fs.existsSync(this.ledgerFile) ? fs.statSync(this.ledgerFile).size : 0;
+      if (size >= this.ledgerRotateBytes) {
+        this.rotateWithCheckpoint(state, event.atMs);
+        state = this.replay();
+      }
       const unsigned = {
         v: 1 as const,
         kid: this.keyStore.activeKeyId,
@@ -1153,7 +1325,7 @@ export class LicenseLeaseService {
         event,
       };
       const line: LedgerLine = { ...unsigned, sig: this.keyStore.sign(lineUnsigned(unsigned)) };
-      if (fs.existsSync(this.ledgerFile) && fs.statSync(this.ledgerFile).size >= MAX_LEDGER_BYTES) {
+      if (fs.existsSync(this.ledgerFile) && fs.statSync(this.ledgerFile).size >= this.ledgerMaxBytes) {
         throw new Error("lease audit ledger reached its configured safety ceiling; archive with a signed operator procedure before accepting more mutations");
       }
       durableAppendLine(this.ledgerFile, line);

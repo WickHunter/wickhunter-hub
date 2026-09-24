@@ -207,6 +207,31 @@ await test("renewal survives restart, advances sequence, and resists a backwards
   assert.ok(renewed.lease.payload.serverTimeMs >= activated.lease.payload.serverTimeMs);
 });
 
+await test("lease ledger rotates through a signed checkpoint and preserves active state", () => {
+  const f = serviceFixture({ config: { ledgerRotateBytes: 4_096, ledgerMaxBytes: 16_384, challengeTtlMs: 10_000 } });
+  const key = installKey();
+  const activated = activate(f, key).result;
+  let current = activated;
+  for (let i = 0; i < 30; i++) {
+    f.now += 300_001;
+    const challenge = f.service.challenge(f.issued.token, {
+      purpose: "renew", activationId: current.activation.id,
+      installId: "install-a", installPublicKey: key.publicKey,
+    });
+    current = f.service.renew(f.issued.token, challenge.nonce, proof(challenge, key.privateKey));
+  }
+  assert.equal(current.activation.lastSequence, 31);
+  assert.ok(fs.readdirSync(f.dataDir).some((name) => name.endsWith(".archive")));
+  assert.ok(fs.readdirSync(f.dataDir).some((name) => name.endsWith(".archive.head")));
+  const restarted = new LicenseLeaseService(f.dataDir, f.store, {
+    leaseDurationMs: 60 * 60_000, cachedGraceMs: 6 * 60 * 60_000,
+    challengeTtlMs: 10_000, maxClockSkewMs: 30_000,
+    ledgerRotateBytes: 4_096, ledgerMaxBytes: 16_384,
+  }, { now: () => f.now, monotonicNow: () => 1_000 });
+  assert.equal(restarted.adminSnapshot(f.issued.payload.id).activations[0].lastSequence, 31);
+  assert.ok(restarted.adminSnapshot().audit.some((event) => event.kind === "ledger_checkpoint"));
+});
+
 await test("rebind requires both old and replacement private keys and invalidates the old binding", () => {
   const f = serviceFixture();
   const oldKey = installKey();

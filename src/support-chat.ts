@@ -75,7 +75,12 @@ export class SupportChat {
       resetsAt:Date.UTC(Number(p.month.slice(0,4)),Number(p.month.slice(5,7)),1)};
   }
   customer(identity:SupportIdentity,id?:string) {
-    const threads=id?[this.owned(identity,id)]:this.state.threads.filter(t=>t.owner===identity.owner).sort((a,b)=>b.updatedAt-a.updatedAt).slice(0,20);
+    const threads=id?[this.owned(identity,id)]:this.state.threads.filter(t=>t.owner===identity.owner).sort((a,b)=>{
+      // Keep live conversations visible when a customer's older resolved
+      // history would otherwise occupy all twenty list slots.
+      const active=(a.status==='resolved'?0:1)-(b.status==='resolved'?0:1);
+      return active||b.updatedAt-a.updatedAt;
+    }).slice(0,20);
     return {ok:true,enabled:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,threads:threads.map(({owner,licenseId,...t})=>t),allowance:this.allowance(identity.owner)};
   }
   private legacy() {
@@ -124,7 +129,11 @@ export class SupportChat {
     const human=body.human===true || thread?.status==='human';
     this.edit(s=>{
       if(!thread){
-        if(s.threads.filter(t=>t.owner===identity.owner).length>=20)throw new SupportError('Conversation limit reached. Continue an existing conversation.',409);
+        // Resolved history remains available to the customer, but it must not
+        // permanently prevent a new conversation. Active conversations still
+        // have a bounded cap so a single owner cannot exhaust the inbox with
+        // open work.
+        if(s.threads.filter(t=>t.owner===identity.owner&&t.status!=='resolved').length>=20)throw new SupportError('Conversation limit reached. Continue an existing conversation.',409);
         if(s.threads.length>=500)throw new SupportError('The support inbox is full. Please use Report a bug.',507);
         thread={id:randomUUID(),owner:identity.owner,name:identity.name,licenseId:identity.licenseId,version:clean(body.version,40),ts:this.now(),updatedAt:this.now(),status:human?'human':'assistant',messages:[]};s.threads.push(thread);
       }

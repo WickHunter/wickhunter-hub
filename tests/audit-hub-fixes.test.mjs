@@ -84,6 +84,19 @@ await test("approving knowledge does not reorder an old support thread", async (
   assert.equal(chat.admin().items.find((item) => item.id === id).updatedAt, before);
 });
 
+await test("resolved support history does not exhaust new conversations", async () => {
+  const chat = new SupportChat(tmpDir("support-thread-cap"), { enabled: true, aiEnabled: false, apiKey: "", totalMonthlyMicros: 1_000_000 });
+  const identity = { owner: "licensed-thread-cap", name: "Customer", licenseId: "lic" };
+  for (let i = 0; i < 20; i++) {
+    const created = await chat.message(identity, { text: `Question ${i}`, requestId: `thread-request-${String(i).padStart(2, "0")}` });
+    chat.action({ id: created.threads[0].id, action: "resolve" });
+  }
+  const next = await chat.message(identity, { text: "A new question", requestId: "thread-request-new" });
+  assert.equal(next.ok, true);
+  assert.equal(next.threads[0].status, "human");
+  assert.equal(next.threads.filter((thread) => thread.status !== "resolved").length, 1);
+});
+
 await test("one checkout session cannot extend twice when a delivery is replayed", async () => {
   const dir = tmpDir("billing-replay");
   const licenses = new LicenseStore(dir);
