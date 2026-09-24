@@ -11,6 +11,8 @@
 //   data/billing-role-migration.v1.json     one-shot marker: has the pre-dispatcher customer file
 //                                            been folded into the role index yet
 //   data/billing-bundle-subscriptions.v1.json per-subscription event watermark and terminal tombstone
+//   data/billing-checkout-sessions.v1/<sha256(session)>.json one durable marker per paid checkout session
+//   data/billing-checkout-pending.v1/<sha256(customer)>.json one recovery pointer per customer
 //   data/billing-tokens.v1.json      install-page and one-time install tokens (HASHED)
 //   data/billing-events.v1.jsonl     every webhook event received, with its outcome
 //   data/billing-events-seen.v1.json bounded set of event ids, for idempotent replay
@@ -31,6 +33,11 @@ export const ROLE_SUBSCRIPTIONS_FILE = "billing-role-subscriptions.v1.json";
 export const ROLE_INDEX_FILE = "billing-role-index.v1.json";
 export const ROLE_MIGRATION_MARKER_FILE = "billing-role-migration.v1.json";
 export const BUNDLE_SUBSCRIPTIONS_FILE = "billing-bundle-subscriptions.v1.json";
+export const CHECKOUT_SESSIONS_DIR = "billing-checkout-sessions.v1";
+export const CHECKOUT_PENDING_DIR = "billing-checkout-pending.v1";
+/** Kept as a source-compatibility name for callers that only need to locate
+ * the old, never-released aggregate ledger. New markers never use it. */
+export const CHECKOUT_SESSIONS_FILE = "billing-checkout-sessions.v1.json";
 
 /** How many event ids we remember. Stripe retries for up to three days; this
  *  is years of a small shop's events, and the ledger keeps the full history. */
@@ -136,6 +143,33 @@ export interface BundleSubscriptionRecord {
   updatedAtMs: number;
 }
 
+/** A payment-mode Checkout Session is a purchase, not a short-lived webhook
+ * event. This ledger deliberately has no eviction: the bounded chargeIds and
+ * seen-event caches are useful indexes, but cannot be the authority for a
+ * money-bearing purchase after either cache rotates. `pending` makes the
+ * license write recoverable if the process dies between the marker and the
+ * license registry writes. */
+export interface CheckoutSessionRecord {
+  sessionId: string;
+  customerKey: string;
+  licenseId: string | null;
+  /** The exact expiry this purchase is allowed to establish. */
+  targetExpMs: number;
+  newCustomer: boolean;
+  status: "pending" | "applied";
+  createdAtMs: number;
+  updatedAtMs: number;
+  /** Facts needed to recover a pending first purchase after a restart. They
+   * are optional only so an operator can inspect an older pre-release marker;
+   * newly written records always carry them. */
+  email?: string;
+  name?: string;
+  livemode?: boolean;
+  planKey?: string | null;
+  subscriptionId?: string;
+  paymentIntentId?: string;
+}
+
 export const roleSubscriptionKey = (customerKey: string, role: BillingRole): string => `${customerKey}::${role}`;
 
 const hashToken = (raw: string): string => createHash("sha256").update(raw).digest("hex");
@@ -155,6 +189,8 @@ export class BillingStore {
   private readonly roleIndexFile: string;
   private readonly roleMigrationFile: string;
   private readonly bundleSubscriptionsFile: string;
+  private readonly checkoutSessionsDir: string;
+  private readonly checkoutPendingDir: string;
 
   constructor(readonly dataDir: string, private readonly randomBytes: (n: number) => Buffer = nodeRandomBytes) {
     this.customersFile = path.join(dataDir, CUSTOMERS_FILE);
@@ -165,7 +201,126 @@ export class BillingStore {
     this.roleIndexFile = path.join(dataDir, ROLE_INDEX_FILE);
     this.roleMigrationFile = path.join(dataDir, ROLE_MIGRATION_MARKER_FILE);
     this.bundleSubscriptionsFile = path.join(dataDir, BUNDLE_SUBSCRIPTIONS_FILE);
+    this.checkoutSessionsDir = path.join(dataDir, CHECKOUT_SESSIONS_DIR);
+    this.checkoutPendingDir = path.join(dataDir, CHECKOUT_PENDING_DIR);
     this.migrateLegacySoftwareRoles();
+  }
+
+  private checkoutSessionPath(sessionId: string): string {
+    return path.join(this.checkoutSessionsDir, `${hashToken(sessionId)}.json`);
+  }
+
+  private checkoutPendingPath(customerKey: string): string {
+    return path.join(this.checkoutPendingDir, `${hashToken(customerKey)}.json`);
+  }
+
+  private validateCheckoutSession(raw: unknown, sessionId: string): CheckoutSessionRecord | null {
+    if (raw === undefined) return null;
+    const rec = raw as Partial<CheckoutSessionRecord> | null;
+    if (!rec || Array.isArray(rec) || rec.sessionId !== sessionId || !rec.customerKey ||
+      (rec.licenseId !== null && (typeof rec.licenseId !== "string" || !rec.licenseId)) ||
+      !Number.isFinite(rec.targetExpMs) || typeof rec.newCustomer !== "boolean" ||
+      (rec.status !== "pending" && rec.status !== "applied") ||
+      !Number.isFinite(rec.createdAtMs) || !Number.isFinite(rec.updatedAtMs) ||
+      (rec.email !== undefined && typeof rec.email !== "string") ||
+      (rec.name !== undefined && typeof rec.name !== "string") ||
+      (rec.livemode !== undefined && typeof rec.livemode !== "boolean") ||
+      (rec.planKey !== undefined && rec.planKey !== null && typeof rec.planKey !== "string") ||
+      (rec.subscriptionId !== undefined && typeof rec.subscriptionId !== "string") ||
+      (rec.paymentIntentId !== undefined && typeof rec.paymentIntentId !== "string") ||
+      (rec.status === "applied" && !rec.licenseId)
+    ) throw new Error(`corrupt checkout-session marker for ${sessionId}`);
+    return rec as CheckoutSessionRecord;
+  }
+
+  private readCheckoutSession(sessionId: string): CheckoutSessionRecord | null {
+    if (!sessionId) return null;
+    return this.validateCheckoutSession(readJson<unknown>(this.checkoutSessionPath(sessionId), undefined), sessionId);
+  }
+
+  getCheckoutSession(sessionId: string): CheckoutSessionRecord | null {
+    return this.readCheckoutSession(sessionId);
+  }
+
+  /** Atomically claim a session in this Hub process. The synchronous
+   * read/modify/rename means concurrent webhook continuations cannot both
+   * create a first marker; the BillingService customer queue serializes the
+   * surrounding license mutation as well. */
+  claimCheckoutSession(input: Omit<CheckoutSessionRecord, "status" | "updatedAtMs"> & { now: number }): { created: boolean; record: CheckoutSessionRecord } {
+    if (!input.sessionId || !input.customerKey || !Number.isFinite(input.targetExpMs) || !Number.isFinite(input.createdAtMs) || !Number.isFinite(input.now)) {
+      throw new Error("invalid checkout-session marker");
+    }
+    const existing = this.readCheckoutSession(input.sessionId);
+    if (existing) {
+      if (existing.customerKey !== input.customerKey) throw new Error(`checkout session ${input.sessionId} changed customer`);
+      // A first purchase records `newCustomer: true` before issuing the
+      // licence. On recovery or replay the customer row exists, so the
+      // caller's freshly observed shape can legitimately be false while the
+      // durable marker remains authoritative.
+      return { created: false, record: existing };
+    }
+    const record: CheckoutSessionRecord = {
+      sessionId: input.sessionId,
+      customerKey: input.customerKey,
+      licenseId: input.licenseId,
+      targetExpMs: input.targetExpMs,
+      newCustomer: input.newCustomer,
+      status: "pending",
+      createdAtMs: input.createdAtMs,
+      updatedAtMs: input.now,
+      email: input.email,
+      name: input.name,
+      livemode: input.livemode,
+      planKey: input.planKey,
+      subscriptionId: input.subscriptionId,
+      paymentIntentId: input.paymentIntentId,
+    };
+    writeJsonAtomic(this.checkoutSessionPath(input.sessionId), record);
+    return { created: true, record };
+  }
+
+  /** Update a claimed marker, refusing identity changes and backwards state
+   * transitions. A corrupt or half-shaped marker fails closed through the
+   * validation above rather than silently treating a purchase as new. */
+  putCheckoutSession(record: CheckoutSessionRecord): void {
+    if (!record.sessionId || !record.customerKey || !Number.isFinite(record.targetExpMs) || !Number.isFinite(record.createdAtMs) || !Number.isFinite(record.updatedAtMs) || (record.status === "applied" && !record.licenseId)) {
+      throw new Error("invalid checkout-session marker");
+    }
+    this.validateCheckoutSession(record, record.sessionId);
+    const existing = this.readCheckoutSession(record.sessionId);
+    if (existing) {
+      if (existing.customerKey !== record.customerKey || existing.newCustomer !== record.newCustomer) throw new Error(`checkout session ${record.sessionId} identity changed`);
+      if (existing.licenseId && existing.licenseId !== record.licenseId) throw new Error(`checkout session ${record.sessionId} license changed`);
+      if (existing.targetExpMs !== record.targetExpMs) throw new Error(`checkout session ${record.sessionId} target changed`);
+      if (existing.status === "applied" && record.status !== "applied") throw new Error(`checkout session ${record.sessionId} was already applied`);
+    }
+    writeJsonAtomic(this.checkoutSessionPath(record.sessionId), record);
+  }
+
+  /** A single durable pointer lets a later checkout recover a marker that
+   * was left pending by a crash. It is intentionally one file per customer;
+   * it is not an evictable or globally rewritten index. */
+  getPendingCheckout(customerKey: string): string | null {
+    if (!customerKey) return null;
+    const raw = readJson<unknown>(this.checkoutPendingPath(customerKey), undefined);
+    if (raw === undefined) return null;
+    const rec = raw as { customerKey?: unknown; sessionId?: unknown } | null;
+    if (!rec || Array.isArray(rec) || rec.customerKey !== customerKey || typeof rec.sessionId !== "string" || !rec.sessionId) {
+      throw new Error(`corrupt pending checkout pointer for ${customerKey}`);
+    }
+    return rec.sessionId;
+  }
+
+  putPendingCheckout(customerKey: string, sessionId: string): void {
+    if (!customerKey || !sessionId) throw new Error("invalid pending checkout pointer");
+    writeJsonAtomic(this.checkoutPendingPath(customerKey), { customerKey, sessionId });
+  }
+
+  clearPendingCheckout(customerKey: string, sessionId: string): void {
+    const file = this.checkoutPendingPath(customerKey);
+    const current = this.getPendingCheckout(customerKey);
+    if (current !== sessionId) return;
+    try { fs.unlinkSync(file); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
   }
 
   getBundleSubscription(subscriptionId: string): BundleSubscriptionRecord | null {

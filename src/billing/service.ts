@@ -41,7 +41,7 @@ import {
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
-import { BillingStore, roleSubscriptionKey, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
@@ -147,6 +147,10 @@ export class BillingService {
   /** Prevent concurrent deliveries of the same event from both entering the
    * licence mutation before the durable seen marker is written. */
   private readonly inFlight = new Set<string>();
+  /** Serialize all checkout mutations for one customer. Different Stripe
+   * event ids can describe the same paid session, and different paid sessions
+   * for one customer must calculate their target from the latest expiry. */
+  private readonly checkoutLocks = new Map<string, Promise<void>>();
 
   constructor(
     readonly dataDir: string,
@@ -811,27 +815,186 @@ export class BillingService {
     if (f.mode !== "subscription" && f.mode !== "payment") return { outcome: "ignored", note: `checkout mode ${f.mode || "?"}` };
     if (f.paymentStatus === "unpaid") return { outcome: "ignored", note: "payment not confirmed yet (async_payment_succeeded will follow)" };
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "checkout carried neither a customer nor an email" };
+    const known = this.findCustomer(f.customerId, f.email);
+    const lockKeys = [...new Set([known?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
+    return this.withCheckoutLocks(lockKeys, () => f.mode === "payment"
+      ? this.onPaymentCheckout(ev, cfg, f)
+      : this.onSubscriptionCheckout(ev, cfg, f));
+  }
+
+  /** Checkout sessions are durable purchases. The bounded chargeIds list is
+   * retained as a fast legacy index, but this marker is the authority for a
+   * payment-mode session after that list rotates or the Hub restarts. */
+  private async onPaymentCheckout(ev: StripeEvent, cfg: BillingConfig, f: ReturnType<typeof checkoutFacts>): Promise<ApplyResult> {
+    if (!f.sessionId) throw new Error("payment checkout is missing its Stripe session id");
     const now = this.now();
     const planKey = this.planKeyOf(f.metadata, cfg);
     const oneOffDays = this.oneOffDaysFor(f.metadata, planByKey(cfg, planKey), cfg);
-    const bootstrapExp = f.mode === "payment" ? now + oneOffDays * DAY_MS : now + cfg.policy.bootstrapDays * DAY_MS;
+    const beforeRecovery = this.findCustomer(f.customerId, f.email);
+    const recoveryKeys = [...new Set([beforeRecovery?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
+    for (const key of recoveryKeys) await this.recoverPendingCheckout(key, cfg, now, ev);
+    const existing = this.findCustomer(f.customerId, f.email);
+    // If Stripe adds a customer id to a session that was first observed by
+    // email, retain the BillingStore row's canonical key for the marker.
+    const customerKey = existing?.key ?? (f.customerId || `email:${f.email}`);
+    const newCustomer = existing === null;
+    let licenseId: string | null = null;
+    let targetExpMs: number;
+    if (existing) {
+      const current = this.licenses.get(existing.licenseId);
+      if (!current) throw new Error(`checkout customer ${customerKey} has no license registry entry`);
+      licenseId = existing.licenseId;
+      targetExpMs = this.paymentTarget(existing, current.exp, oneOffDays, cfg, now);
+      // A legacy marker already proved that this purchase was applied before
+      // the durable ledger existed. Preserve it and migrate the fact without
+      // touching the expiry again.
+      if (existing.chargeIds.includes(`cs:${f.sessionId}`) && !this.store.getCheckoutSession(f.sessionId)) {
+        this.store.putCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs: current.exp, newCustomer: false, status: "applied", createdAtMs: now, updatedAtMs: now });
+        return { outcome: "duplicate", note: "checkout session was already applied" };
+      }
+    } else {
+      targetExpMs = this.capExp({ livemode: ev.livemode, createdAtMs: now }, now + oneOffDays * DAY_MS, cfg);
+    }
+    // The pointer is written before the marker so a crash between these two
+    // writes leaves only a harmless stale pointer, which the next checkout
+    // clears after observing the missing marker.
+    this.store.putPendingCheckout(customerKey, f.sessionId);
+    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId });
+    const marker = claimed.record;
+    if (!claimed.created && marker.status === "applied") {
+      this.assertAppliedCheckout(marker);
+      this.store.clearPendingCheckout(customerKey, f.sessionId);
+      return { outcome: "duplicate", note: "checkout session was already applied" };
+    }
+    const { rec, created } = this.ensureCustomer(
+      { customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey },
+      cfg,
+      marker.targetExpMs,
+      now,
+    );
+    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`checkout session ${f.sessionId} changed license`);
+    if (!marker.licenseId) {
+      marker.licenseId = rec.licenseId;
+      marker.updatedAtMs = now;
+      this.store.putCheckoutSession(marker);
+    }
+    const current = this.licenses.get(rec.licenseId);
+    if (!current) throw new Error(`checkout session ${f.sessionId} has no license registry entry`);
+    if (marker.newCustomer) {
+      // The initial issue used marker.targetExpMs. If a crash happened after
+      // the issue but before this marker update, replay only repairs a short
+      // write; it never adds another one-off term.
+      if (current.exp < marker.targetExpMs) this.licenses.setExpiry(rec.licenseId, marker.targetExpMs, now);
+    } else {
+      // `targetExpMs` was persisted before this mutation. Replaying after a
+      // crash therefore writes the same expiry again, never a second term.
+      this.extendLicense(rec, marker.targetExpMs, cfg, now);
+    }
+    const checkoutMarker = `cs:${f.sessionId}`;
+    this.noteCharge(rec, checkoutMarker);
+    this.noteCharge(rec, f.paymentIntentId);
+    this.touch(rec, ev, now);
+    this.store.putCustomer(rec);
+    marker.status = "applied";
+    marker.updatedAtMs = now;
+    this.store.putCheckoutSession(marker);
+    this.store.clearPendingCheckout(customerKey, f.sessionId);
+    let note = marker.newCustomer && created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
+    note += await this.sendWelcomeIfNeeded(rec, cfg, now);
+    return { outcome: "applied", note };
+  }
+
+  /** Finish a marker left pending by a prior process before calculating a
+   * later purchase's target. This ordering preserves every paid term: B must
+   * see A's expiry even when A's final write was interrupted. */
+  private async recoverPendingCheckout(customerKey: string, cfg: BillingConfig, now: number, ev: StripeEvent): Promise<void> {
+    const sessionId = this.store.getPendingCheckout(customerKey);
+    if (!sessionId) return;
+    const marker = this.store.getCheckoutSession(sessionId);
+    if (!marker) { this.store.clearPendingCheckout(customerKey, sessionId); return; }
+    if (marker.customerKey !== customerKey) throw new Error(`pending checkout ${sessionId} changed customer`);
+    if (marker.status === "applied") { this.store.clearPendingCheckout(customerKey, sessionId); return; }
+    const email = marker.email ?? (customerKey.startsWith("email:") ? customerKey.slice("email:".length) : "");
+    const { rec } = this.ensureCustomer({
+      customerId: customerKey.startsWith("email:") ? "" : customerKey,
+      email,
+      name: marker.name ?? email,
+      subscriptionId: marker.subscriptionId ?? "",
+      livemode: marker.livemode ?? ev.livemode,
+      planKey: marker.planKey ?? null,
+    }, cfg, marker.targetExpMs, now);
+    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`pending checkout ${sessionId} changed license`);
+    if (!marker.licenseId) {
+      marker.licenseId = rec.licenseId;
+      marker.updatedAtMs = now;
+      this.store.putCheckoutSession(marker);
+    }
+    const current = this.licenses.get(rec.licenseId);
+    if (!current) throw new Error(`pending checkout ${sessionId} has no license registry entry`);
+    if (marker.newCustomer) {
+      if (current.exp < marker.targetExpMs) this.licenses.setExpiry(rec.licenseId, marker.targetExpMs, now);
+    } else {
+      this.extendLicense(rec, marker.targetExpMs, cfg, now);
+    }
+    this.noteCharge(rec, `cs:${sessionId}`);
+    this.noteCharge(rec, marker.paymentIntentId ?? "");
+    this.touch(rec, ev, now);
+    this.store.putCustomer(rec);
+    marker.status = "applied";
+    marker.updatedAtMs = now;
+    this.store.putCheckoutSession(marker);
+    this.store.clearPendingCheckout(customerKey, sessionId);
+    await this.sendWelcomeIfNeeded(rec, cfg, now);
+  }
+
+  private async onSubscriptionCheckout(ev: StripeEvent, cfg: BillingConfig, f: ReturnType<typeof checkoutFacts>): Promise<ApplyResult> {
+    const now = this.now();
+    const planKey = this.planKeyOf(f.metadata, cfg);
+    const bootstrapExp = now + cfg.policy.bootstrapDays * DAY_MS;
     const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, bootstrapExp, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
-    const checkoutMarker = f.sessionId ? `cs:${f.sessionId}` : "";
-    const alreadyApplied = checkoutMarker !== "" && rec.chargeIds.includes(checkoutMarker);
-    if (f.mode === "payment" && !created && !alreadyApplied) {
-      // A repeat one-time purchase stacks on whatever is left.
-      const current = this.licenses.get(rec.licenseId);
-      const base = current ? Math.max(current.exp, now) : now;
-      note += this.extendLicense(rec, base + oneOffDays * DAY_MS, cfg, now) ? "; licence extended" : "";
-    }
-    if (f.mode === "subscription") rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
-    this.noteCharge(rec, checkoutMarker);
+    rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
+    this.noteCharge(rec, f.sessionId ? `cs:${f.sessionId}` : "");
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
     this.store.putCustomer(rec);
     note += await this.sendWelcomeIfNeeded(rec, cfg, now);
     return { outcome: "applied", note };
+  }
+
+  private paymentTarget(rec: CustomerRecord, currentExp: number, oneOffDays: number, cfg: BillingConfig, now: number): number {
+    const current = this.licenses.get(rec.licenseId);
+    if (!current) throw new Error(`customer ${rec.key} has no license registry entry`);
+    const raw = Math.max(currentExp, now) + oneOffDays * DAY_MS;
+    return Math.min(this.capExp(rec, raw, cfg), current.iat + MAX_LICENSE_DAYS * DAY_MS);
+  }
+
+  private assertAppliedCheckout(marker: CheckoutSessionRecord): void {
+    if (!marker.licenseId) throw new Error(`applied checkout session ${marker.sessionId} has no license`);
+    const rec = this.store.getCustomer(marker.customerKey) ?? this.store.findByLicense(marker.licenseId);
+    if (!rec || rec.key !== marker.customerKey || rec.licenseId !== marker.licenseId || !this.licenses.get(marker.licenseId)) {
+      throw new Error(`applied checkout session ${marker.sessionId} has inconsistent durable state`);
+    }
+  }
+
+  private async withCheckoutLocks(keys: string[], fn: () => Promise<ApplyResult>): Promise<ApplyResult> {
+    const unique = [...new Set(keys)].sort();
+    const turns: Array<{ key: string; turn: Promise<void>; release: () => void; prior: Promise<void> }> = [];
+    for (const key of unique) {
+      const prior = this.checkoutLocks.get(key) ?? Promise.resolve();
+      let release!: () => void;
+      const turn = new Promise<void>((resolve) => { release = resolve; });
+      this.checkoutLocks.set(key, turn);
+      turns.push({ key, turn, release, prior });
+    }
+    await Promise.all(turns.map((entry) => entry.prior));
+    try { return await fn(); }
+    finally {
+      for (const entry of turns.reverse()) {
+        entry.release();
+        if (this.checkoutLocks.get(entry.key) === entry.turn) this.checkoutLocks.delete(entry.key);
+      }
+    }
   }
 
   private async onInvoicePaid(ev: StripeEvent, cfg: BillingConfig): Promise<ApplyResult> {
