@@ -1,3 +1,7 @@
+## v0.4.61 — Hub audit follow-up
+
+Keep eligible Earn entry visible on the signed-in customer dashboard and show destination hosts for customer- or assistant-authored support links in the admin inbox.
+
 ## v0.4.60 — Checkout recovery
 
 Record each paid checkout durably so webhook replays cannot add the same subscription term twice. Recover interrupted checkouts before applying later purchases, including customer identity and plan details. Purchases whose old markers were already evicted remain a migration limitation.
@@ -1788,6 +1792,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.61 — Keep eligible Earn visible after sign-in and show destination hosts for untrusted support links.
 - v0.4.60 — Persist checkout receipts and recover interrupted purchases before later payments.
 - v0.4.59 — Harden support storage and admin rendering; deduplicate billing delivery and retry failed after-commit hooks.
 
