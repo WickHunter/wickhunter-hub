@@ -85,7 +85,7 @@
 
   <!-- ── signed out ──────────────────────────────────────────────────── -->
   <div id="signedOut" hidden>
-    <a id="earnLink" class="btn" href="earn" style="float:right" hidden>Earn with WH ↗</a><h1>Sign in to your account</h1>
+    <h1>Sign in to your account</h1>
     <p class="sub">Works for any email you have bought Wick Hunter Unleashed with — even with your server off or your licence lapsed.</p>
     <div class="card">
       <form id="signinForm">
@@ -102,7 +102,10 @@
   <div id="signedIn" hidden>
     <div class="row" style="justify-content:space-between;margin-bottom:6px">
       <h1 style="margin:0">Your account</h1>
-      <button class="btn quiet" type="button" id="signOut">Sign out</button>
+      <div class="row">
+        <a id="earnLink" class="btn" href="earn" hidden>Earn with WH ↗</a>
+        <button class="btn quiet" type="button" id="signOut">Sign out</button>
+      </div>
     </div>
     <p class="sub" id="accountEmail"></p>
 

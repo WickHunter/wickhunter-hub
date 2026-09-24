@@ -14,6 +14,9 @@ const escSource = html.match(/function esc\(s\) \{[\s\S]*?\n\}/)?.[0];
 assert.ok(escSource, "admin esc helper is present");
 const dom = new JSDOM("<!doctype html><body></body>", { runScripts: "outside-only" });
 dom.window.eval(escSource);
+const supportFormatSource = html.match(/function supportFormat\(text, trusted\)\{[\s\S]*?\n\}\n\nfunction renderSupportInbox/)?.[0]?.replace(/\n\nfunction renderSupportInbox$/, "");
+assert.ok(supportFormatSource, "admin support formatter is present");
+dom.window.eval(supportFormatSource);
 
 await test("admin feedback attributes escape quotes and backticks", () => {
   const payload = 'a" onmouseover="window.pwned=1`';
@@ -23,6 +26,36 @@ await test("admin feedback attributes escape quotes and backticks", () => {
   assert.equal(span.attributes.length, 1);
   assert.equal(span.getAttribute("title"), payload);
   assert.equal(span.getAttribute("onmouseover"), null);
+});
+
+await test("admin support links show the destination host for untrusted messages", () => {
+  const untrusted = dom.window.supportFormat("[Stripe dashboard](https://evil.example/stripe-login)", false);
+  assert.match(untrusted, /Stripe dashboard \(evil\.example\)/);
+  const trusted = dom.window.supportFormat("[Team runbook](https://evil.example/runbook)", true);
+  assert.equal(trusted, '<p><a href="https://evil.example/runbook" target="_blank" rel="noopener noreferrer">Team runbook</a></p>');
+  const lookalike = dom.window.supportFormat("[WH login](https://wickhunter.example/login)", false);
+  assert.match(lookalike, /WH login \(wickhunter\.example\)/);
+  assert.match(untrusted, /target="_blank" rel="noopener noreferrer"/);
+});
+
+await test("customer dashboard shows eligible Earn link on signed-in surface", async () => {
+  const customerHtml = fs.readFileSync(path.join(process.cwd(), "public/customer.html"), "utf8");
+  const customerDom = new JSDOM(customerHtml, {
+    url: "https://hub.test/customer",
+    runScripts: "dangerously",
+    beforeParse(window) {
+      window.fetch = async () => ({ status: 200, ok: true, json: async () => ({ ok: true, email: "member@example.com", software: [], hosting: { available: false }, earnAvailable: true }) });
+    },
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(customerDom.window.document.getElementById("signedOut").hidden, true);
+    assert.equal(customerDom.window.document.getElementById("signedIn").hidden, false);
+    assert.equal(customerDom.window.document.getElementById("earnLink").hidden, false);
+    assert.equal(customerDom.window.document.getElementById("earnLink").getAttribute("href"), "earn");
+  } finally {
+    customerDom.window.close();
+  }
 });
 
 await test("feedback attachment names reject attribute syntax", () => {

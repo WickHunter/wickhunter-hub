@@ -2949,10 +2949,10 @@ async function supportRefresh() {
     throw e;
   }
 }
-function supportFormat(text){
+function supportFormat(text, trusted){
   const saved=[];
   const keep=html=>'\uE000'+(saved.push(html)-1)+'\uE001';
-  const link=(label,url)=>{try{const u=new URL(url);if(!['https:','http:'].includes(u.protocol))return esc(label);const a=document.createElement('a');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=label;return a.outerHTML;}catch{return esc(label);}};
+  const link=(label,url)=>{try{const u=new URL(url);if(!['https:','http:'].includes(u.protocol))return esc(label);const a=document.createElement('a');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=trusted||label===url?label:label+' ('+u.host+')';return a.outerHTML;}catch{return esc(label);}};
   const inline=raw=>{
     let t=raw.replace(/`([^`\n]+)`/g,(_,code)=>keep('<code>'+esc(code)+'</code>'));
     t=t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,(_,label,url)=>keep(link(label,url)));
@@ -3044,7 +3044,7 @@ function renderSupportInbox() {
       const panel=document.createElement('div');panel.id='support-panel-'+r.id;panel.className='support-panel';panel.hidden=!expanded;item.appendChild(panel);
       if(expanded){
         const history=document.createElement('div');history.className='support-history';history.setAttribute('aria-label','Conversation history');
-        for(const m of r.messages){const msg=document.createElement('div');msg.className='message '+m.role;const who=document.createElement('small');who.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'Support':'Customer')+' · '+fmt(m.at)+' UTC';const body=document.createElement('div');body.className='support-body';body.innerHTML=supportFormat(m.text);msg.append(who,body);history.appendChild(msg);}panel.appendChild(history);
+        for(const m of r.messages){const msg=document.createElement('div');msg.className='message '+m.role;const who=document.createElement('small');who.textContent=(m.role==='human'?'WH team':m.role==='assistant'?'Support':'Customer')+' · '+fmt(m.at)+' UTC';const body=document.createElement('div');body.className='support-body';body.innerHTML=supportFormat(m.text,m.role==='human');msg.append(who,body);history.appendChild(msg);}panel.appendChild(history);
         if(!isClosed){
           const form=document.createElement('form');form.className='support-thread';
           const label=document.createElement('label');label.textContent='';
