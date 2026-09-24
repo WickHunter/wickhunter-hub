@@ -1,3 +1,7 @@
+## v0.4.60 — Checkout recovery
+
+Record each paid checkout durably so webhook replays cannot add the same subscription term twice. Recover interrupted checkouts before applying later purchases, including customer identity and plan details. Purchases whose old markers were already evicted remain a migration limitation.
+
 ## v0.4.59 — Audit corrections
 
 Escape feedback content in admin views, bound support storage by actual serialized bytes, keep active support conversations visible, and deduplicate concurrent Stripe deliveries while retrying failed Earn hooks. Lease-ledger rotation is deliberately deferred until its crash recovery preserves signed history.
@@ -1784,6 +1788,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.60 — Persist checkout receipts and recover interrupted purchases before later payments.
 - v0.4.59 — Harden support storage and admin rendering; deduplicate billing delivery and retry failed after-commit hooks.
 
 - v0.4.58 — Release the mobile support scroll lock when another Hub section is visible.

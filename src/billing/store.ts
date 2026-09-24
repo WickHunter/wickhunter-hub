@@ -217,7 +217,7 @@ export class BillingStore {
   private validateCheckoutSession(raw: unknown, sessionId: string): CheckoutSessionRecord | null {
     if (raw === undefined) return null;
     const rec = raw as Partial<CheckoutSessionRecord> | null;
-    if (!rec || Array.isArray(rec) || rec.sessionId !== sessionId || !rec.customerKey ||
+    if (!rec || Array.isArray(rec) || rec.sessionId !== sessionId || typeof rec.customerKey !== "string" || !rec.customerKey ||
       (rec.licenseId !== null && (typeof rec.licenseId !== "string" || !rec.licenseId)) ||
       !Number.isFinite(rec.targetExpMs) || typeof rec.newCustomer !== "boolean" ||
       (rec.status !== "pending" && rec.status !== "applied") ||
