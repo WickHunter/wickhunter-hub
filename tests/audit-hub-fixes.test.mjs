@@ -40,21 +40,37 @@ await test("admin support links show the destination host for untrusted messages
 
 await test("customer dashboard shows eligible Earn link on signed-in surface", async () => {
   const customerHtml = fs.readFileSync(path.join(process.cwd(), "public/customer.html"), "utf8");
-  const customerDom = new JSDOM(customerHtml, {
+  const loadCustomer = (earnAvailable) => new JSDOM(customerHtml, {
     url: "https://hub.test/customer",
     runScripts: "dangerously",
     beforeParse(window) {
-      window.fetch = async () => ({ status: 200, ok: true, json: async () => ({ ok: true, email: "member@example.com", software: [], hosting: { available: false }, earnAvailable: true }) });
+      window.fetch = async () => ({ status: 200, ok: true, json: async () => ({ ok: true, email: "member@example.com", software: [], hosting: { available: false }, earnAvailable }) });
     },
   });
+  const customerDom = loadCustomer(true);
   try {
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(customerDom.window.document.getElementById("signedOut").hidden, true);
-    assert.equal(customerDom.window.document.getElementById("signedIn").hidden, false);
-    assert.equal(customerDom.window.document.getElementById("earnLink").hidden, false);
-    assert.equal(customerDom.window.document.getElementById("earnLink").getAttribute("href"), "earn");
+    const document = customerDom.window.document;
+    const signedOut = document.getElementById("signedOut");
+    const signedIn = document.getElementById("signedIn");
+    const earnLink = document.getElementById("earnLink");
+    assert.equal(signedOut.hidden, true);
+    assert.equal(signedIn.hidden, false);
+    assert.equal(earnLink.closest("#signedIn"), signedIn);
+    for (let node = earnLink; node; node = node.parentElement) assert.equal(node.hidden, false, "eligible link has no hidden ancestor");
+    assert.equal(earnLink.hidden, false);
+    assert.equal(earnLink.getAttribute("href"), "earn");
   } finally {
     customerDom.window.close();
+  }
+  const ineligibleDom = loadCustomer(false);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const document = ineligibleDom.window.document;
+    assert.equal(document.getElementById("signedIn").hidden, false);
+    assert.equal(document.getElementById("earnLink").hidden, true, "ineligible signed-in member keeps Earn link hidden");
+  } finally {
+    ineligibleDom.window.close();
   }
 });
 
