@@ -379,6 +379,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // only ever arrive after `createHub` has fully returned), never at
   // construction time.
   let hostingRef: HostingService | null = null;
+  let earnOutboxTimer: ReturnType<typeof setInterval> | null = null;
+  let earnOutboxRunning = false;
   const earn = new EarnService(cfg.dataDir);
   let earnStripe: EarnStripeService;
   const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
@@ -1270,6 +1272,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (raw === null) return sendJson(res, 413, { ok: false, error: "webhook body too large or unreadable" });
     const reply = await billing.handleWebhook(mode, raw, req.headers);
     sendJson(res, reply.status, reply.body, { "cache-control": "no-store" });
+    if (reply.status === 200) setImmediate(() => {
+      if (!earnOutboxRunning) return;
+      void billing.drainAfterCommit().catch((err) =>
+        console.warn(`[billing] Earn outbox drain failed: ${(err as Error).message}`));
+    });
   }
 
   function pageTokenOf(p: string): string {
@@ -2733,16 +2740,31 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           // never fires unexpectedly in a test.
           hosting.start();
           earnStripe.start();
+          earnOutboxRunning = true;
+          earnOutboxTimer = setInterval(() => {
+            if (!earnOutboxRunning) return;
+            void billing.drainAfterCommit().catch((err) =>
+              console.warn(`[billing] Earn outbox drain failed: ${(err as Error).message}`));
+          }, 15_000);
+          earnOutboxTimer.unref();
+          setImmediate(() => {
+            if (!earnOutboxRunning) return;
+            void billing.drainAfterCommit().catch((err) =>
+              console.warn(`[billing] Earn outbox startup drain failed: ${(err as Error).message}`));
+          });
           resolve((server.address() as AddressInfo).port);
         });
       }),
     close: () =>
       new Promise<void>((resolve, reject) => {
+        earnOutboxRunning = false;
         candles.stop();
         marketCaps?.stop();
         liq.stop();
         hosting.stop();
         earnStripe.stop();
+        if (earnOutboxTimer) clearInterval(earnOutboxTimer);
+        earnOutboxTimer = null;
         server.close((err) => (err ? reject(err) : resolve()));
         server.closeAllConnections();
       }),

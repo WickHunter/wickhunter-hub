@@ -42,6 +42,7 @@ import {
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
@@ -78,6 +79,11 @@ const DISPATCHED_EVENT_TYPES = new Set([
   "charge.succeeded",
   "charge.refunded",
   "charge.dispute.created",
+]);
+const EARN_HOOK_TYPES = new Set([
+  "invoice.paid", "invoice.payment_succeeded",
+  "customer.subscription.updated", "customer.subscription.deleted",
+  "charge.refunded", "charge.dispute.created", "charge.dispute.closed",
 ]);
 
 export interface BillingServiceDeps {
@@ -141,6 +147,8 @@ export class BillingService {
   private readonly fetchLike: EmailFetch;
   private readonly log: (line: string) => void;
   private readonly onVerifiedEvent: BillingServiceDeps["onVerifiedEvent"];
+  private readonly afterCommitOutbox: AfterCommitOutbox | null;
+  private drainingAfterCommit: Promise<{ completed: number; failed: number }> | null = null;
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
   private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
@@ -160,6 +168,7 @@ export class BillingService {
     deps: BillingServiceDeps = {},
   ) {
     this.onVerifiedEvent = deps.onVerifiedEvent;
+    this.afterCommitOutbox = deps.onVerifiedEvent ? new AfterCommitOutbox(dataDir) : null;
     this.store = new BillingStore(dataDir, deps.randomBytes);
     this.now = deps.now ?? Date.now;
     this.fetchLike = deps.fetchLike ?? realFetch;
@@ -167,6 +176,36 @@ export class BillingService {
     this.onRevoke = deps.onRevoke ?? (() => {});
     this.onHostingEvent = deps.onHostingEvent ?? (() => {});
     this.onBundleEvent = deps.onBundleEvent;
+  }
+
+  /** Run at startup and on a timer, outside the Stripe request. An Earn
+   * failure leaves the row durable for the next pass; the hook's own invoice
+   * and event identities make a crash after hook success replay-safe. */
+  drainAfterCommit(limit = 25): Promise<{ completed: number; failed: number }> {
+    if (!this.afterCommitOutbox || !this.onVerifiedEvent) return Promise.resolve({ completed: 0, failed: 0 });
+    if (this.drainingAfterCommit) return this.drainingAfterCommit;
+    const run = async () => {
+      let completed = 0, failed = 0;
+      const ready = this.afterCommitOutbox!.pending().filter((row) =>
+        row.committed || this.store.seenEvent(row.event.id));
+      for (const row of ready.slice(0, limit)) {
+        try {
+          if (!row.committed) {
+            if (!this.store.seenEvent(row.event.id)) continue;
+            this.afterCommitOutbox!.commit(row.event.id);
+          }
+          await this.onVerifiedEvent!(row.event);
+          this.afterCommitOutbox!.complete(row.event.id);
+          completed++;
+        } catch (error) {
+          failed++;
+          this.log(`[billing] Earn outbox event ${row.event.id} remains pending: ${(error as Error).message}`);
+        }
+      }
+      return { completed, failed };
+    };
+    this.drainingAfterCommit = run().finally(() => { this.drainingAfterCommit = null; });
+    return this.drainingAfterCommit;
   }
 
   /** The one write path for a hosting-role record: persists it exactly as
@@ -301,17 +340,25 @@ export class BillingService {
     if (this.inFlight.has(ev.id)) {
       return { status: 409, body: { ok: false, error: "event is already being applied; Stripe will retry" } };
     }
-    if (this.store.seenEvent(ev.id)) {
-      this.inFlight.add(ev.id);
-      try {
-        await this.onVerifiedEvent?.(ev);
-      } catch (err) {
-        const message = (err as Error).message;
-        this.log(`[billing] duplicate after-commit hook for ${ev.id} failed: ${message}`);
-        this.inFlight.delete(ev.id);
-        return { status: 500, body: { ok: false, error: "event after-commit work could not be completed; Stripe will retry" } };
+    // Stage first, even for a duplicate from an older Hub build. The Earn
+    // handler is idempotent, while a missing historical handoff must not be
+    // assumed complete. A disk refusal here returns 5xx before core mutation.
+    const needsEarn = !!this.afterCommitOutbox && EARN_HOOK_TYPES.has(ev.type);
+    if (needsEarn) {
+      try { this.afterCommitOutbox!.stage(ev, receivedAtMs); }
+      catch (err) {
+        this.log(`[billing] could not stage Earn event ${ev.id}: ${(err as Error).message}`);
+        return { status: 500, body: { ok: false, error: "event handoff could not be persisted; Stripe will retry" } };
       }
-      this.inFlight.delete(ev.id);
+    }
+    if (this.store.seenEvent(ev.id)) {
+      if (needsEarn) {
+        try { this.afterCommitOutbox!.commit(ev.id); }
+        catch (err) {
+          this.log(`[billing] could not commit Earn duplicate ${ev.id}: ${(err as Error).message}`);
+          return { status: 500, body: { ok: false, error: "event handoff could not be persisted; Stripe will retry" } };
+        }
+      }
       this.store.appendEvent(record("duplicate", null));
       return { status: 200, body: { ok: true, outcome: "duplicate" } };
     }
@@ -327,18 +374,18 @@ export class BillingService {
       return { status: 500, body: { ok: false, error: "event could not be applied; Stripe will retry" } };
     }
     this.store.markSeen(ev.id, receivedAtMs);
+    if (needsEarn) {
+      try { this.afterCommitOutbox!.commit(ev.id); }
+      catch (err) {
+        this.log(`[billing] Earn handoff for committed event ${ev.id} awaits retry: ${(err as Error).message}`);
+        this.inFlight.delete(ev.id);
+        return { status: 500, body: { ok: false, error: "event handoff could not be persisted; Stripe will retry" } };
+      }
+    }
     this.store.appendEvent(record(result.outcome, result.note));
     this.log(`[billing] ${ev.type} ${ev.id} (${ev.livemode ? "live" : "test"}): ${result.outcome}${result.note ? ` — ${result.note}` : ""}`);
-    // Earn is an after-commit side effect. The seen marker above guards the
-    // licence mutation on Stripe retry; a hook failure stays a 5xx so the
-    // duplicate path below can retry only this idempotent side effect.
-    try { await this.onVerifiedEvent?.(ev); }
-    catch (err) {
-      const message = (err as Error).message;
-      this.log(`[billing] after-commit hook for ${ev.id} failed: ${message}`);
-      this.inFlight.delete(ev.id);
-      return { status: 500, body: { ok: false, error: "event after-commit work could not be completed; Stripe will retry" } };
-    }
+    // Stripe may now be acknowledged. Earn runs from the durable outbox on
+    // the server timer and cannot hold this HTTP response behind its queue.
     this.inFlight.delete(ev.id);
     return { status: 200, body: { ok: true, outcome: result.outcome } };
   }
