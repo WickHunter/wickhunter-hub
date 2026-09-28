@@ -1,11 +1,12 @@
 {
   "scope": "Hub source review only; no runtime deploy, live Stripe call, payout, customer message, or version bump",
   "baseline": "55e8bdffde176400896ad9d9eb1bf7b4db1f7f21",
-  "reviewedHead": "009b245",
+  "reviewedHead": "009b245 (plus later Hub header update)",
   "validation": {
     "build": "npm run build passed",
     "focused": "server, seats, flags, rate-limit-http, admin, billing, license-seat-recovery, license-leases-http passed after MKT-M9",
-    "full": "69/69 suites passed with PATH=/opt/homebrew/bin:$PATH and LIQHUNTER_BOT_MODULE set to the built Alpha size-percentiles module; default macOS run fails in backup-script (Apple Bash lacks mapfile) and liq-percentiles (Linux default sibling path absent)."
+    "full": "69/69 suites passed with PATH=/opt/homebrew/bin:$PATH and LIQHUNTER_BOT_MODULE set to the built Alpha size-percentiles module; default macOS run fails in backup-script (Apple Bash lacks mapfile) and liq-percentiles (Linux default sibling path absent).",
+    "latestRoute": "npm run build and tests/server.test.mjs 21/21 passed after header-first /api/latest and /download addition"
   },
   "findings": [
     {
@@ -50,7 +51,7 @@
     },
     {
       "id": "DM-17",
-      "disposition": "accepted_limitation",
+      "disposition": "confirmed_open",
       "evidence": "Billing marks the core event seen before Earn work, preventing replayed license mutation, but still awaits Earn serial handling. A failed Earn hook produces 500 for an already-applied core event; Stripe retry repeats only the idempotent hook. Safe decoupling needs a durable Earn outbox/acknowledgment contract not present in this source pass.",
       "source": "src/billing/service.ts:304-343; src/earn-stripe.ts:124-146",
       "tests": "tests/billing-payment-replay.test.mjs; tests/earn-stripe.test.mjs",
@@ -60,7 +61,7 @@
     },
     {
       "id": "DM-18",
-      "disposition": "blocked_external",
+      "disposition": "confirmed_open",
       "evidence": "Earn owner is a hash of normalized billing email, falling back to license ID. The customer session uses email while the license route uses the current customer email; a past identity change could detach an existing money ledger. Migrating unknown existing owners requires verified customer-to-owner history, absent from this checkout.",
       "source": "src/server.ts:1374-1391; src/earn.ts:22,57-66; src/billing/store.ts CustomerRecord",
       "tests": "source review",
