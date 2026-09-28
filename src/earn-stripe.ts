@@ -10,6 +10,7 @@ type Settings={mode:BillingMode; enabled:boolean; automatic:boolean; payoutDay:n
 type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:string;amount:number;allocations:{source:EarnSource;cents:number}[];status:string;created:number;stripeId?:string;error?:string;released?:boolean;paid?:boolean;returned?:boolean;checked?:number};
 type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean};
 const sources:EarnSource[]=['referral','exchange','marketplace'];
+const POSTED_RECHECK_MS=6*60*60_000;
 const defaults:Settings={mode:'test',enabled:false,automatic:false,payoutDay:1,financialAccount:''};
 const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String((v as StripeObject).id||''):'';
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
@@ -169,7 +170,8 @@ export class EarnStripeService {
  run(){return this.serial(async()=>{
   const c=this.settings();const mode=c.mode,ledger=this.ledger(mode);let jobs=book(ledger.admin()).jobs as Job[];
   // Reconcile even when automatic dispatch is paused. Submitted money still needs accounting.
-  for(const rail of ['test','live'] as const){const candidates=(book(this.ledger(rail).admin()).jobs as Job[]).filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)).sort((a,b)=>(a.checked||0)-(b.checked||0));for(const job of candidates.slice(0,100))try{await this.reconcile(rail,job);}catch(e){this.jobError(rail,job.id,e);}}
+  for(const rail of ['test','live'] as const){const candidates=(book(this.ledger(rail).admin()).jobs as Job[]).filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
+    && (j.status!=='posted'||this.now()-(j.checked||0)>=POSTED_RECHECK_MS)).sort((a,b)=>(a.checked||0)-(b.checked||0));for(const job of candidates.slice(0,100))try{await this.reconcile(rail,job);}catch(e){this.jobError(rail,job.id,e);}}
   if(!c.enabled||!c.automatic)return;
   const date=new Date(this.now());if(date.getUTCDate()<c.payoutDay)return;const cycle=date.toISOString().slice(0,7);
   const fa=await this.payoutApi(mode).call('GET','/v2/money_management/financial_accounts/'+c.financialAccount);if(fa.status!=='open'||fa.livemode!==(mode==='live'))throw Error('The payout financial account is not open in this mode');

@@ -76,8 +76,10 @@ await test('reserve before sending; unknown network outcome retries same key aft
  svc=new EarnStripeService(dir,ledger,()=>cfg,'https://hub.example',()=>now,fake);failSubmit=false;await svc.run();assert.equal(sends,1);assert.equal(svc.admin().jobs[0].status,'processing');
 });
 await test('posted settles once; returned funds restore owed earnings and paid total',async()=>{
- payouts.get('obp_1').status='posted';await svc.run();await svc.run();assert.equal(ledger.view(owner,'Referrer').paidCents,2700);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);
- payouts.get('obp_1').status='returned';await svc.run();await svc.run();assert.equal(ledger.view(owner,'Referrer').paidCents,0);assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);assert.equal(sends,1);
+ payouts.get('obp_1').status='posted';await svc.run();const postedReads=calls.filter(c=>c.endpoint==='/v2/money_management/outbound_payments/obp_1').length;
+ await svc.run();assert.equal(calls.filter(c=>c.endpoint==='/v2/money_management/outbound_payments/obp_1').length,postedReads);
+ assert.equal(ledger.view(owner,'Referrer').paidCents,2700);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);
+ payouts.get('obp_1').status='returned';now+=6*60*60_000;await svc.run();await svc.run();assert.equal(ledger.view(owner,'Referrer').paidCents,0);assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);assert.equal(sends,1);
 });
 await test('accepted payout plus failed status read never releases money',async()=>{
  now=Date.parse('2026-10-17T12:00:00Z');postReadFailure=true;await svc.run();assert.equal(sends,2);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.admin().jobs[1].status,'submitting');postReadFailure=false;payouts.get('obp_2').status='failed';await svc.run();assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);
