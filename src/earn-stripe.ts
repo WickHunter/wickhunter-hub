@@ -59,7 +59,7 @@ export class EarnStripeService {
   if(m.discountPercent===0){
    if(p.promotion)await this.api(c.mode).call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
    const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'))];
-   this.updateProfile(c.mode,owner,{code:m.code,promotion:null,signature:null,legacyCodes,appliedDiscountPercent:0});
+   this.updateProfile(c.mode,owner,{code:m.code,promotion:null,signature:null,legacyCodes,appliedDiscountPercent:0,everActivated:!!p.promotion||p.everActivated===true});
    return this.view(owner);
   }
   const api=this.api(c.mode);
@@ -67,7 +67,7 @@ export class EarnStripeService {
   const products:string[]=[];for(const plan of plans){const priceId=this.billing().stripe[c.mode].priceIds[plan.key];if(!priceId)continue;const price=await api.call('GET','/v1/prices/'+priceId);if(price.active===true&&price.recurring?.interval===plan.interval&&price.currency==='usd')products.push(id(price.product));}
   if(!products.length)throw Error('Create the recurring WH software plans in Stripe first');
   const signature=hash(JSON.stringify([m.code,m.discountPercent,[...new Set(products)].sort()]));if(p.signature===signature&&p.promotion){
-   if(!Number.isInteger(p.appliedDiscountPercent))this.updateProfile(c.mode,owner,{appliedDiscountPercent:m.discountPercent});
+   if(!Number.isInteger(p.appliedDiscountPercent)||!Array.isArray(p.products))this.updateProfile(c.mode,owner,{appliedDiscountPercent:m.discountPercent,products:[...new Set(products)],everActivated:true});
    return this.view(owner);
   }
   if(m.discountPercent<1)throw Error('Referral discounts must be at least 1% to create a promotion code');
@@ -82,7 +82,7 @@ export class EarnStripeService {
   if(!id(promo))throw Error('Stripe did not return a promotion code');
   if(p.promotion)await api.call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
   const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'&&v!==code))];
-  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes,appliedDiscountPercent:m.discountPercent});return this.view(owner);
+  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes,appliedDiscountPercent:m.discountPercent,products:[...new Set(products)],everActivated:true});return this.view(owner);
  });}
  checkout(code:string,planKey?:string|null){return this.serial(async()=>{
   const c=this.settings();if(!c.enabled)throw Error('Referrals are not available');const b=book(this.ledger(c.mode).admin()),members=this.liveLedger.admin().members;const found=Object.entries(b.profiles).find(([owner,p])=>{
@@ -142,10 +142,21 @@ export class EarnStripeService {
   const inv=await api.call('GET','/v1/invoices/'+invoiceId,{'expand[0]':'payments.data.payment.payment_intent'});
   const subscription=id(inv.parent?.subscription_details?.subscription)||id(inv.subscription);if(!subscription||inv.status!=='paid'||inv.currency!=='usd'||inv.livemode!==(mode==='live'))return;
   const sub=await api.call('GET','/v1/subscriptions/'+subscription);const member=this.liveLedger.admin().members.find(m=>m.code===sub.metadata?.wh_earn_code);if(!member)return;
-  const p=this.profile(mode,member.id);if(!p.promotion)return;
+  const p=this.profile(mode,member.id);if(!p.promotion&&!p.everActivated)return;
   const cfg=this.billing(),allowed=new Set(cfg.plans.filter(p=>p.role==='software'&&p.interval&&p.checkout==='payment-link').map(p=>cfg.stripe[mode].priceIds[p.key]).filter(Boolean));
-  const items=sub.items?.data||[];if(!items.length||sub.items?.has_more||items.some((i:StripeObject)=>!allowed.has(id(i.price))))return;
-  const lines=inv.lines?.data||[];if(!lines.length||inv.lines?.has_more||lines.some((l:StripeObject)=>!allowed.has(id(l.pricing?.price_details?.price)||id(l.price))))return;
+  const items=sub.items?.data||[];if(!items.length||sub.items?.has_more)return;
+  const lines=inv.lines?.data||[];if(!lines.length||inv.lines?.has_more)return;
+  const prices=[...new Set([...items.map((i:StripeObject)=>id(i.price)),...lines.map((l:StripeObject)=>id(l.pricing?.price_details?.price)||id(l.price))])];
+  const historical=prices.filter(price=>price&&!allowed.has(price));
+  if(prices.some(price=>!price)||historical.length>4)return;
+  if(historical.length){
+   const products=new Set(Array.isArray(p.products)?p.products.filter((v:unknown)=>typeof v==='string'):[]);
+   if(!products.size)return; // A legacy profile needs a proved activation/catalogue before admitting old prices.
+   for(const priceId of historical){
+    const price=await api.call('GET','/v1/prices/'+priceId);
+    if(!products.has(id(price.product))||price.currency!=='usd'||!['month','year'].includes(price.recurring?.interval))return;
+   }
+  }
   const cust=await api.call('GET','/v1/customers/'+id(inv.customer));if(earnOwner('email:'+String(cust.email||'').trim().toLowerCase())===member.id)return;
   const paid=money(inv.amount_paid),total=money(inv.total_excluding_tax);if(paid===null||total===null||paid===0)return;
   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');

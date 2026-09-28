@@ -13,6 +13,8 @@ const fake=async (url,init)=>{
  const u=new URL(url),endpoint=u.pathname,mode=init.headers.authorization.includes('live')?'live':'test',live=mode==='live';const body=init.method==='POST'?(endpoint.startsWith('/v2')?JSON.parse(init.body):Object.fromEntries(new URLSearchParams(init.body))):{};
  calls.push({endpoint,body,headers:init.headers,method:init.method});const ok=(v,status=200)=>new Response(JSON.stringify(v),{status});
  if(endpoint==='/v1/prices/price_month')return ok({id:'price_month',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
+ if(endpoint==='/v1/prices/price_legacy')return ok({id:'price_legacy',active:false,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
+ if(endpoint==='/v1/prices/price_hosting')return ok({id:'price_hosting',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_hosting'});
  if(endpoint.startsWith('/v1/coupons/'))return ok({error:{code:'resource_missing'}},404);if(endpoint==='/v1/coupons')return ok({id:body.id,percent_off:Number(body.percent_off),duration:body.duration,metadata:{managed_by:'wh-earn'}});if(endpoint==='/v1/promotion_codes')return init.method==='GET'?ok({data:[]}):ok({id:'promo_'+mode});if(endpoint.startsWith('/v1/promotion_codes/'))return ok({});
  if(endpoint==='/v1/checkout/sessions')return ok({url:'https://checkout.stripe.com/test-session'});
  if(endpoint.startsWith('/v1/invoices/'))return ok({id:endpoint.split('/').at(-1),customer:'cus_friend',status:'paid',currency,livemode:live,amount_paid:paid,total_excluding_tax:total,total_taxes:[{amount:900}],parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[{pricing:{price_details:{price:priceId}},period:{end:now/1000+86400}}]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}});
@@ -118,6 +120,11 @@ await test('definite recipient validation refusal permits corrected facts with a
   local.stop();
  } finally {fs.rmSync(isolated,{recursive:true,force:true});}
 });
+await test('a grandfathered inactive price on the proved software product still earns',async()=>{
+ const before=ledger.view(owner,'Referrer').balances.referral;
+ priceId='price_legacy';await svc.handleEvent(event('invoice.paid','evt_grandfathered',{id:'in_grandfathered'}));priceId='price_month';
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before+1800);
+});
 await test('zero discount retires the Stripe promotion and refuses referral checkout',async()=>{
  ledger.configure({owner,discountPercent:0});
  const before=calls.length;await svc.activate(owner);
@@ -125,6 +132,9 @@ await test('zero discount retires the Stripe promotion and refuses referral chec
  assert.equal(svc.view(owner).referralUrl,null);
  assert.equal(svc.view(owner).appliedDiscountPercent,0);
  await assert.rejects(svc.checkout(member.code,'monthly'),/discount is not active/);
+ const beforeBalance=ledger.view(owner,'Referrer').balances.referral;
+ await svc.handleEvent(event('invoice.paid','evt_existing_after_pause',{id:'in_existing_after_pause'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,beforeBalance+1800,'an existing referred subscription still earns after enrollment pauses');
 });
 }finally{svc.stop();fs.rmSync(dir,{recursive:true,force:true});}
 summary('earn-stripe');
