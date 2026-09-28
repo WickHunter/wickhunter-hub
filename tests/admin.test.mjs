@@ -64,7 +64,7 @@ await test("issue with bad inputs -> 400", async () => {
 await test("list shows the issued license with its last-seen", async () => {
   await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: issuedId, installId: "adm-inst", version: "0.9.1", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: issuedId, installId: "adm-inst", version: "0.9.1", ts: Date.now(), token: issuedToken }),
   });
   const r = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
   const row = r.body.licenses.find((l) => l.id === issuedId);
@@ -207,7 +207,7 @@ await test("two installs on one key are flagged; a reinstall is not", async () =
   for (const installId of ["aaaaaaaa-1111", "bbbbbbbb-2222"]) {
     await jsonReq(`${h.origin}/api/license/checkin`, {
       method: "POST",
-      body: JSON.stringify({ licenseId: sharedId, installId, version: "0.74.80", ts: Date.now() }),
+      body: JSON.stringify({ licenseId: sharedId, installId, version: "0.74.80", ts: Date.now(), token: shared.body.token }),
     });
   }
   // One machine that was replaced: the OLD install checked in days ago and has
@@ -220,7 +220,7 @@ await test("two installs on one key are flagged; a reinstall is not", async () =
                      ts: Date.now(), ip: "10.0.0.9", at: Date.now() - 9 * 86_400_000 }) + "\n");
   await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: soloId, installId: "new-install", version: "0.74.80", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: soloId, installId: "new-install", version: "0.74.80", ts: Date.now(), token: solo.body.token }),
   });
 
   const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
@@ -247,12 +247,12 @@ await test("the sharing flag reaches the admin page, and v0.4.1 ENFORCES one ins
   });
   const id = issued.body.license.id;
   const one = await jsonReq(`${h.origin}/api/license/checkin`, {
-    method: "POST", body: JSON.stringify({ licenseId: id, installId: "one", version: "0.74.80", ts: Date.now() }),
+    method: "POST", body: JSON.stringify({ licenseId: id, installId: "one", version: "0.74.80", ts: Date.now(), token: issued.body.token }),
   });
   assert.equal(one.status, 200);
   assert.ok(!one.body.revoked, "the first install holds the seat");
   const two = await jsonReq(`${h.origin}/api/license/checkin`, {
-    method: "POST", body: JSON.stringify({ licenseId: id, installId: "two", version: "0.74.80", ts: Date.now() }),
+    method: "POST", body: JSON.stringify({ licenseId: id, installId: "two", version: "0.74.80", ts: Date.now(), token: issued.body.token }),
   });
   assert.equal(two.status, 200);
   assert.equal(two.body.revoked, true, "a second live install is refused");
@@ -299,7 +299,7 @@ await test("a check-in presenting the OLD genuine token receives the re-minted o
 });
 await test("a bare licence id gets NO token — the id is not a secret, the token is", async () => {
   const c = await checkin({});
-  assert.equal(c.status, 200);
+  assert.equal(c.status, 401);
   assert.equal("token" in c.body, false, JSON.stringify(c.body));
 });
 await test("presenting the NEW token gets nothing more (not later)", async () => {
@@ -308,11 +308,13 @@ await test("presenting the NEW token gets nothing more (not later)", async () =>
 });
 await test("another tester's genuine token does not unlock this id", async () => {
   const c = await checkin({ token: otherToken });
+  assert.equal(c.status, 401);
   assert.equal("token" in c.body, false);
 });
 await test("a forged token gets nothing", async () => {
   const [p, body] = oldToken.split(".");
   const c = await checkin({ token: `${p}.${body}.${"A".repeat(86)}` });
+  assert.equal(c.status, 401);
   assert.equal("token" in c.body, false);
 });
 await test("a revoked licence gets nothing, even with its genuine old token", async () => {

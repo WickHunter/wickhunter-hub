@@ -70,10 +70,11 @@ await test("health reports exact runtime, build, source comparison, and upgrade 
 });
 
 await test("checkin records to jsonl + roster and answers ok", async () => {
-  const lic = h.store.issue("Checkin Tester", 30).payload;
+  const issued = h.store.issue("Checkin Tester", 30);
+  const lic = issued.payload;
   const r = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: lic.id, installId: "inst-1", version: "0.9.0", ts: 1723000000000 }),
+    body: JSON.stringify({ licenseId: lic.id, installId: "inst-1", version: "0.9.0", ts: 1723000000000, token: issued.token }),
   });
   assert.equal(r.status, 200);
   // v0.2.11 — `flags` joined the reply, ALWAYS present even when empty. That is
@@ -99,11 +100,12 @@ await test("checkin records to jsonl + roster and answers ok", async () => {
 });
 
 await test("checkin for a revoked license answers revoked:true (and still records)", async () => {
-  const lic = h.store.issue("Revoked Tester", 30).payload;
+  const issued = h.store.issue("Revoked Tester", 30);
+  const lic = issued.payload;
   h.store.revoke(lic.id);
   const r = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: lic.id, installId: "inst-2", version: "0.9.0", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: lic.id, installId: "inst-2", version: "0.9.0", ts: Date.now(), token: issued.token }),
   });
   // v0.2.11 — flags travel to a REVOKED install too, for the same reason
   // `latest` does: the reply describes what this build would show, and a
@@ -114,12 +116,45 @@ await test("checkin for a revoked license answers revoked:true (and still record
   assert.equal(readRoster(h.dataDir)[lic.id].installId, "inst-2");
 });
 
-await test("checkin for an id this hub never issued answers revoked:true", async () => {
+await test("checkin for an id this hub never issued requires a signed token", async () => {
   const r = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
     body: JSON.stringify({ licenseId: "not-ours", installId: "inst-3", version: "0.9.0", ts: Date.now() }),
   });
-  assert.deepEqual(r.body, { ok: true, revoked: true, latest: "0.9.0", flags: {}, subscription: null });
+  assert.equal(r.status, 401);
+  assert.equal(Object.hasOwn(r.body, "subscription"), false);
+});
+
+await test("bare, forged, and mismatched check-ins cannot write a seat or read account data", async () => {
+  const owner = h.store.issue("Private Checkin Owner", 30);
+  const other = h.store.issue("Different Checkin Owner", 30);
+  const claims = [{}, { token: "LHK1.fake.signature" }, { token: other.token }];
+  for (const claim of claims) {
+    const r = await jsonReq(`${h.origin}/api/license/checkin`, {
+      method: "POST",
+      body: JSON.stringify({ licenseId: owner.payload.id, installId: "intruder", version: "0.9.0", ts: Date.now(), ...claim }),
+    });
+    assert.equal(r.status, 401);
+    assert.deepEqual(Object.keys(r.body).sort(), ["error", "ok"]);
+    assert.equal(readRoster(h.dataDir)[owner.payload.id], undefined);
+  }
+  const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: { "x-hub-admin": h.cfg.adminToken } });
+  const row = list.body.licenses.find((x) => x.id === owner.payload.id);
+  assert.equal(row.seat, null);
+});
+
+await test("a genuine expired token may receive its signed extension", async () => {
+  const old = h.store.issue("Expired Renewal", 1, Date.now() - 2 * 86_400_000);
+  assert.equal(h.store.verify(old.token).reason, "expired");
+  const extended = h.store.setExpiry(old.payload.id, Date.now() + 7 * 86_400_000);
+  assert.ok(extended);
+  const r = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST",
+    body: JSON.stringify({ licenseId: old.payload.id, installId: "lapsed-install", version: "0.9.0", ts: Date.now(), token: old.token }),
+  });
+  assert.equal(r.status, 200);
+  assert.equal(h.store.verify(r.body.token).ok, true);
+  assert.equal(r.body.exp, extended.exp);
 });
 
 await test("malformed checkin body is a 400", async () => {

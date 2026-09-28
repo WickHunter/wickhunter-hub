@@ -21,18 +21,20 @@ import path from "node:path";
 
 const h = await freshHub();
 const AUTH = { "x-hub-admin": "test-admin-token" };
+const tokens = new Map();
 
 const issue = async (name) => {
   const r = await jsonReq(`${h.origin}/admin/api/licenses`, {
     method: "POST", headers: AUTH, body: JSON.stringify({ name, days: 30 }),
   });
   assert.equal(r.status, 200, `issue ${name}`);
+  tokens.set(r.body.license.id, r.body.token);
   return r.body.license.id;
 };
 const checkin = async (licenseId) => {
   const r = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId, installId: "install-1", version: "0.75.2", ts: Date.now() }),
+    body: JSON.stringify({ licenseId, installId: "install-1", version: "0.75.2", ts: Date.now(), token: tokens.get(licenseId) }),
   });
   assert.equal(r.status, 200);
   return r.body;
@@ -95,14 +97,12 @@ await test("turning the default off darkens everyone who has no override", async
   assert.deepEqual((await checkin(alpha)).flags, { dcaStyles: true });
 });
 
-await test("an unknown licence id still gets a reply with flags (and no crash)", async () => {
-  const b = await checkin("not-a-licence-this-hub-issued");
-  assert.equal(b.ok, true);
-  assert.equal(b.revoked, true, "unknown ids are revoked — that is the kill switch");
-  // Flags travel to revoked installs for the same reason `latest` does: the
-  // reply describes what this BUILD would show, and nothing here grants access
-  // to anything. The licence gate is a separate mechanism at the submit seam.
-  assert.ok(Object.prototype.hasOwnProperty.call(b, "flags"));
+await test("an unknown bare licence id cannot read flags", async () => {
+  const r = await jsonReq(`${h.origin}/api/license/checkin`, {
+    method: "POST", body: JSON.stringify({ licenseId: "not-a-licence-this-hub-issued", installId: "install-1", version: "0.75.2", ts: Date.now() }),
+  });
+  assert.equal(r.status, 401);
+  assert.equal(Object.hasOwn(r.body, "flags"), false);
 });
 
 await test("a revoked licence still receives its flags", async () => {
@@ -183,20 +183,14 @@ await test("constructor and prototype are refused for the same reason", async ()
   assert.equal({}.dcaStyles, undefined);
 });
 
-await test("an UNAUTHENTICATED check-in cannot make its own row vanish from the roster", async () => {
-  // Same root cause on a path with no admin token at all: `roster[licenseId]`
-  // with the id `__proto__` sets the object's prototype instead of adding a
-  // row, so the check-in silently disappears — and `sharingSignals`, the one
-  // thing that catches a shared key, never sees it.
+await test("an unauthenticated prototype-shaped id cannot write a roster row", async () => {
   const r = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
     body: JSON.stringify({ licenseId: "__proto__", installId: "inst-x", version: "0.75.4", ts: Date.now() }),
   });
-  assert.equal(r.status, 200);
+  assert.equal(r.status, 401);
   const roster = JSON.parse(fs.readFileSync(path.join(h.dataDir, "roster.json"), "utf8"));
-  assert.ok(Object.prototype.hasOwnProperty.call(roster, "__proto__"),
-    "the row must be RECORDED as an ordinary key, not swallowed as a prototype");
-  assert.equal(roster.__proto__.installId, "inst-x");
+  assert.equal(Object.prototype.hasOwnProperty.call(roster, "__proto__"), false);
 });
 
 await test("the hub keeps NO registry of valid flag names — the bot owns that", async () => {

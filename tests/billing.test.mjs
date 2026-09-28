@@ -300,7 +300,7 @@ await test("Manage billing opens a Customer Portal session through the secret ke
 await test("check-in carries `subscription` for a licence bound to a Stripe customer, and null when unbound", async () => {
   const bound = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: licenseA.id, installId: "inst-A", version: "0.90.6", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: licenseA.id, installId: "inst-A", version: "0.90.6", ts: Date.now(), token: tokenA_v1 }),
   });
   assert.equal(bound.status, 200);
   // licenseA's checkout carried no `metadata.plan` (an untagged link), so
@@ -313,10 +313,11 @@ await test("check-in carries `subscription` for a licence bound to a Stripe cust
     portalAvailable: true,
   });
 
-  const bare = h.store.issue("No Billing Tester", 30).payload;
+  const bareIssued = h.store.issue("No Billing Tester", 30);
+  const bare = bareIssued.payload;
   const unbound = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
-    body: JSON.stringify({ licenseId: bare.id, installId: "inst-nobilling", version: "0.90.6", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: bare.id, installId: "inst-nobilling", version: "0.90.6", ts: Date.now(), token: bareIssued.token }),
   });
   assert.equal(unbound.status, 200);
   assert.equal(unbound.body.subscription, null, "no Stripe customer is bound to this licence");
@@ -401,7 +402,7 @@ await test("POST /api/billing/portal-session answers 503 when billing is not con
 
 // ── live mode ───────────────────────────────────────────────────────────────
 
-let licenseB, pageTokenB, licenseC;
+let licenseB, pageTokenB, licenseC, tokenB;
 
 await test("switching to LIVE: test events are ignored, live events are honoured with real plan and full grace", async () => {
   // Baseline rather than a literal count: the v0.4.16 portal-session tests
@@ -424,6 +425,7 @@ await test("switching to LIVE: test events are ignored, live events are honoured
   assert.equal(inv.body.outcome, "applied", JSON.stringify(inv.body));
   licenseB = licenses().find((l) => l.name === "Bob Builder");
   assert.ok(licenseB);
+  tokenB = h.store.tokenFor(licenseB.id);
   assert.equal(licenseB.plan, "unleashed");
   assert.equal(licenseB.exp, clock + 37 * DAY, "30-day period + 7 grace, no test cap");
   assert.equal(emailCalls().length, 2, "the welcome went out on the first event that created the licence");
@@ -459,7 +461,7 @@ await test("a chargeback revokes the licence, the install page says so, and outs
   const r = await postEvent("live", event("charge.dispute.created", { id: "dp_1", object: "dispute", charge: "ch_B1", payment_intent: "pi_B1", reason: "fraudulent", status: "needs_response" }, true));
   assert.equal(r.body.outcome, "applied");
   assert.equal(licenses().find((l) => l.id === licenseB.id).revoked, true);
-  const checkin = await jsonReq(`${h.origin}/api/license/checkin`, { method: "POST", body: JSON.stringify({ licenseId: licenseB.id, installId: "inst-B", version: "0.90.6", ts: Date.now() }) });
+  const checkin = await jsonReq(`${h.origin}/api/license/checkin`, { method: "POST", body: JSON.stringify({ licenseId: licenseB.id, installId: "inst-B", version: "0.90.6", ts: Date.now(), token: tokenB }) });
   assert.equal(checkin.body.revoked, true, "the bot learns at its next check-in");
   const after = await (await fetch(`${h.origin}/welcome/${pageTokenB}`)).text();
   assert.match(after, /Revoked/);

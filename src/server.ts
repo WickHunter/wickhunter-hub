@@ -820,19 +820,20 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     ) {
       return sendJson(res, 400, { ok: false, error: "bad checkin body" });
     }
-    // Per-licence gate, BEFORE any state-changing call below (recordCheckin,
-    // seats.admit) — a refusal here must never write a check-in row, bind or
-    // evict a seat, or hand out a renewed token. A claimed licenceId is
-    // untrusted input (exactly like `recordCheckin` below already treats
-    // it), so this bounds one caller's own claimed identity, not a proven
-    // licence — which is enough: an attacker who wants a bigger budget just
-    // rotates the claimed id, and then the IP gate above is what catches
-    // them.
+    // Per-licence gate precedes all state changes; the IP gate bounds callers
+    // that rotate untrusted claimed IDs before the token check below.
     const licenseRate = checkinLicenseLimiter.take(body.licenseId.slice(0, 64), rateLimitNow());
     if (!licenseRate.ok) return sendRateLimited(res, licenseRate, "check-in");
-    // Record EVERYTHING, including revoked/unknown ids — the record is the
-    // point (who is still running what). Cap field lengths so a hostile client
-    // cannot balloon the roster.
+    // A licence id is public. Verify possession of its signed token before
+    // recording activity, binding a seat, or disclosing flags/billing state.
+    // decodeGenuine deliberately accepts an expired genuine token: a lapsed
+    // client may still receive a renewed lease when the registry was extended.
+    const presented = typeof body.token === "string" && body.token.length <= 4096
+      ? store.decodeGenuine(body.token) : null;
+    if (!presented || presented.id !== body.licenseId) {
+      return sendJson(res, 401, { ok: false, error: "signed licence token required; update the client" });
+    }
+    // Cap field lengths so a hostile client cannot balloon the roster.
     recordCheckin(
       cfg.dataDir,
       {
@@ -843,8 +844,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       },
       clientIp(req),
     );
-    // Unknown id => revoked:true. A licenseId this hub never issued has no
-    // business running; failing safe here is the whole kill switch.
+    // A genuinely signed but subsequently deleted or revoked id is exit-only.
     const registryRevoked = !store.isKnown(body.licenseId) || store.isRevoked(body.licenseId);
     // ── v0.4.1 — ONE INSTALL PER LICENCE, DECIDED HERE ─────────────────────
     // The first install id to check in holds the seat; another live install
@@ -878,10 +878,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // says none"), and only the second can turn a feature back off. A hub that
     // omitted the key when it had nothing to say could never darken anything.
     //
-    // Sent to REVOKED and unknown ids too, for the same reason `latest` is: the
-    // reply is about what this build would show, and a revoked install still
-    // deserves a truthful answer. Nothing here grants access to anything — the
-    // licence gate is a separate mechanism at the order-submit seam.
+    // The signed-token check above prevents a bare licence id reading flags.
     const flags = flagsFor(cfg.dataDir, body.licenseId);
     // v0.4.16 — the customer's billing state, for the app's Subscription
     // card (`recordSubscriptionInfo` / `SubscriptionInfo` in
@@ -891,7 +888,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // revoked licence, a beta tester who never bought anything, a customer
     // record deleted by hand); an older hub simply never sends the key,
     // which is what leaves a cached answer alone. Sent to revoked/unknown
-    // ids too, for the same reason `flags` is.
+    // ids with a genuine signed token too, for the same reason `flags` is.
     const subscription = billing.subscriptionInfoFor(body.licenseId);
     // ── v0.3.19 — A LONGER KEY RIDES THE REPLY, TO A CALLER WHO PROVED THE OLD ONE
     //
@@ -903,14 +900,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // key and the bot installs it after verifying it against the same public
     // key. Nothing is handed to a bare id: a licence id is not a secret, the
     // token is, and only a holder of the current token gets its successor.
-    // A revoked or unknown id gets nothing, and a registry date that is not
-    // later hands back nothing — the reply is byte-identical to before for
-    // every caller this branch does not admit.
+    // A revoked or deleted id gets nothing, and a registry date that is not
+    // later hands back nothing.
     let renewal: { token: string; exp: number } | null = null;
-    if (!revoked && typeof body.token === "string" && body.token.length <= 4096) {
-      const presented = store.decodeGenuine(body.token);
-      const current = presented && presented.id === body.licenseId ? store.get(body.licenseId) : null;
-      if (presented && current && current.exp > presented.exp) {
+    if (!revoked) {
+      const current = store.get(body.licenseId);
+      if (current && current.exp > presented.exp) {
         const token = store.tokenFor(body.licenseId);
         if (token) renewal = { token, exp: current.exp };
       }
@@ -930,7 +925,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // ── machine-bound lease surface ─────────────────────────────────────────
   // New clients use an x-license bootstrap bearer and prove possession of an
   // install-local Ed25519 key. These routes are additive; the historical
-  // unauthenticated check-in above is intentionally byte-for-byte unchanged.
+  // token-authenticated check-in above remains available for older clients.
   function leaseBearer(req: IncomingMessage): string | null {
     const value = req.headers["x-license"];
     return typeof value === "string" && value.length <= 16_384 ? value : null;

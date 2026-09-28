@@ -19,7 +19,7 @@ async function checkin(installId, ip, extra = {}) {
   return jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-forwarded-for": ip },
-    body: JSON.stringify({ licenseId: L, installId, version: "0.90.6", ts: Date.now(), ...extra }),
+    body: JSON.stringify({ licenseId: L, installId, version: "0.90.6", ts: Date.now(), token: issued.token, ...extra }),
   });
 }
 const seatOf = async () => (await admin("/admin/api/licenses")).body.licenses.find((l) => l.id === L).seat;
@@ -122,13 +122,13 @@ await test("a copied install id checking in from alternating IPs raises the clon
   assert.ok(holder.clone.switches >= 3);
 });
 
-await test("a revoked or unknown licence is still answered revoked regardless of seats", async () => {
+await test("an unknown bare licence is rejected without disclosing its state", async () => {
   const unknown = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ licenseId: "never-issued", installId: "x", version: "0.90.6", ts: Date.now() }),
   });
-  assert.equal(unknown.body.revoked, true);
-  assert.equal(unknown.body.reason, undefined, "no seat reason on a registry refusal");
+  assert.equal(unknown.status, 401);
+  assert.equal(unknown.body.revoked, undefined);
 });
 
 await test("the licences list carries the seat policy so the page can say whether it is enforcing", async () => {

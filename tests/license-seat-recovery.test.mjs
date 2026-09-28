@@ -30,7 +30,7 @@ async function activate(issued, install) {
 async function checkin(issued, install) {
   return jsonReq(h.origin + "/api/license/checkin", { method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ licenseId: issued.payload.id, installId: install.id, version: "0.90.127", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: issued.payload.id, installId: install.id, version: "0.90.127", ts: Date.now(), token: issued.token }),
   });
 }
 const old = machine("wrong-server");

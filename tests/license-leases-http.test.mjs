@@ -180,7 +180,7 @@ await test("revocation blocks renewal while preserving authenticated deactivatio
 await test("legacy LHK1 check-in remains unchanged after lease activation", async () => {
   const legacy = await jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ licenseId: issued.payload.id, installId: "legacy-install", version: "0.3.2", ts: Date.now() }),
+    body: JSON.stringify({ licenseId: issued.payload.id, installId: "legacy-install", version: "0.3.2", ts: Date.now(), token: issued.token }),
   });
   assert.equal(legacy.status, 200);
   assert.equal(legacy.body.ok, true);

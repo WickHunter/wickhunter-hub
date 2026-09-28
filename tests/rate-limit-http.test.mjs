@@ -39,7 +39,7 @@ function leaseSignature(challenge, privateKey) {
   const checkin = (installId, ts, ip = "203.0.113.9") => jsonReq(`${h.origin}/api/license/checkin`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-forwarded-for": ip },
-    body: JSON.stringify({ licenseId: L, installId, version: "1.0.0", ts }),
+    body: JSON.stringify({ licenseId: L, installId, version: "1.0.0", ts, token: issued.token }),
   });
   const lastSeen = async () => (await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH }))
     .body.licenses.find((r) => r.id === L).lastSeen;
@@ -83,14 +83,14 @@ function leaseSignature(challenge, privateKey) {
   await test("check-in: the per-IP bucket is a SEPARATE dimension — a flood of DIFFERENT claimed licence ids from one IP is still capped by IP", async () => {
     clock += 120_000; // fresh windows on both dimensions
     const otherIds = [h.store.issue("A", 30), h.store.issue("B", 30), h.store.issue("C", 30), h.store.issue("D", 30), h.store.issue("E", 30)]
-      .map((x) => x.payload.id);
+      .map((x) => ({ id: x.payload.id, token: x.token }));
     let admitted = 0;
     let refused = 0;
-    for (const id of otherIds) {
+    for (const { id, token } of otherIds) {
       const r = await jsonReq(`${h.origin}/api/license/checkin`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.9" },
-        body: JSON.stringify({ licenseId: id, installId: "x", version: "1.0.0", ts: 1 }),
+        body: JSON.stringify({ licenseId: id, installId: "x", version: "1.0.0", ts: 1, token }),
       });
       if (r.status === 200) admitted++;
       else { refused++; assert.equal(r.status, 429); }
