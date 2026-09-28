@@ -172,11 +172,13 @@ await test("diagnostics are bounded and secret-shaped values are redacted at the
     context: "bybit-main:futures",
     logWindow: { included: 2, oldestAt: 1, newestAt: 2 },
     apiKey: "must-never-land",
+    key: "x7",
     nested: { authorization: "Bearer must-never-land", note: "token=also-secret" },
   });
   assert.equal(diagnostics.page, "terminal");
   assert.equal(diagnostics.context, "bybit-main:futures");
   assert.equal(diagnostics.apiKey, "[redacted]");
+  assert.equal(diagnostics.key, "[redacted]");
   assert.equal(diagnostics.nested.authorization, "[redacted]");
   assert.ok(!JSON.stringify(diagnostics).includes("must-never-land"));
   assert.ok(!JSON.stringify(diagnostics).includes("also-secret"));
@@ -244,6 +246,7 @@ await test("v3 runtime evidence keeps server context, pair gaps and decisions th
     assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].missingClosedMinutes[0], 1_800_000_000_000);
     assert.equal(first.diagnostics.server.contexts[0].bots[0].pairs[0].decisions[0].action, "refused");
     assert.equal(first.diagnostics.server.apiKey, "[redacted]");
+    assert.equal(first.diagnostics.server.contexts[0].key, "[redacted]");
     assert.ok(!JSON.stringify(first.diagnostics).includes("must-not-persist"));
 
     await solo.close();

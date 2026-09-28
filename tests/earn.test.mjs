@@ -67,14 +67,21 @@ const h=await freshHub();try{
  const headers={'x-license':issued.token,'content-type':'application/json','x-wh-earn':'1'};
  assert.equal((await fetch(h.origin+'/api/hub/earn')).status,401);
  assert.equal((await fetch(h.origin+'/api/customer/earn')).status,401);
+ const unauthEarn=await fetch(h.origin+'/earn',{redirect:'manual'});assert.equal(unauthEarn.status,302);assert.equal(unauthEarn.headers.get('location'),'/customer');
  assert.equal((await fetch(h.origin+'/api/hub/earn',{headers})).status,404);
  setFlag(h.dataDir,issued.payload.id,'earn',true);
  const r=await fetch(h.origin+'/api/hub/earn',{headers});assert.equal(r.status,200);const member=(await r.json()).member;
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9001',accountType:'main'})})).status,200);
  const own=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(own.member.id,member.id);assert.equal(own.member.uids[0].uid,'9001');
+ assert.equal((await fetch(h.origin+'/api/hub/earn/onboard',{method:'POST',headers,body:JSON.stringify({country:'US',email:'attacker@example.com'})})).status,403);
  assert.equal((await fetch(h.origin+'/admin/api/earn',{headers})).status,401);
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers:{...headers,'sec-fetch-site':'cross-site'},body:'{}'})).status,403);
  });
 }finally{await h.close();}
+const checkoutHub=await freshHub({}, {rateLimitNow:()=>123456789});
+try {
+ const referralCodes=[];for(let i=0;i<4;i++)referralCodes.push((await fetch(checkoutHub.origin+'/buy?ref=BAD'+i,{redirect:'manual'})).status);
+ assert.deepEqual(referralCodes,[400,400,400,429]);
+} finally {await checkoutHub.close();}
 summary('earn');
 }finally{fs.rmSync(dir,{recursive:true,force:true});}

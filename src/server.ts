@@ -336,6 +336,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const generalIpLimiter = new SlidingWindowLimiter({
     max: rateLimitPolicy.generalIpMax, windowMs: rateLimitPolicy.generalIpWindowMs,
   });
+  // Referral checkout creates a remote Stripe Session on the Earn money
+  // queue. Admit it before that queue, independently of cheap /buy reads.
+  const referralCheckoutIpLimiter = new SlidingWindowLimiter({ max: 3, windowMs: 60_000, maxKeys: 4096 });
+  const referralCheckoutCodeLimiter = new SlidingWindowLimiter({ max: 20, windowMs: 60_000, maxKeys: 4096 });
   // Stripe webhooks are signature-verified before anything here trusts them;
   // this exists only to cap a runaway or hostile sender, deliberately
   // generous so a burst of Stripe's own retries (same event, several ids) is
@@ -743,7 +747,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
       if (plan?.checkout === "hosted-bundle") return sendText(res, 403, "hosted bundles require a reserved Checkout Session");
       const referral = url.searchParams.get("ref");
-      if (referral) { try { return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout"); } catch (e) { return sendText(res, 400, (e as Error).message); } }
+      if (referral) {
+        const ipRate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
+        if (!ipRate.ok) return sendRateLimited(res, ipRate, "referral checkout attempts");
+        const codeRate = referralCheckoutCodeLimiter.take(referral.slice(0, 128), rateLimitNow());
+        if (!codeRate.ok) return sendRateLimited(res, codeRate, "referral checkout attempts");
+        try { return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout"); }
+        catch (e) { return sendText(res, 400, (e as Error).message); }
+      }
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
     // The website reads prices from here, so a price change on the Hub shows
@@ -1360,6 +1371,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   async function earnCustomer(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    // Recipient creation and onboarding links are financial capabilities.
+    // The app license is useful for viewing earnings, not for minting them.
+    if (url.pathname.endsWith('/onboard') && !url.pathname.startsWith('/api/customer/'))
+      return sendJson(res, 403, { ok: false, error: 'Sign in at the customer portal to connect payouts' }, { 'cache-control': 'no-store' });
     let owner = "", name = "", allowed = false;
     if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
       const identity = authenticatedCustomer(req);
@@ -1376,6 +1391,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         name = record?.email || store.get(payload.id)?.name || "WH member";
       }
     }
+    if (!owner && url.pathname === '/earn') { res.writeHead(302, { location: '/customer', 'cache-control': 'no-store' }); res.end(); return; }
     if (!owner) return sendJson(res, 401, { ok: false, error: "Sign in with your WH account or an active app license" }, { "cache-control": "no-store" });
     if (!allowed) return sendJson(res, 404, { ok: false, error: "Not found" });
     if (url.pathname === "/earn") return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, "earn.html"), "utf8"));

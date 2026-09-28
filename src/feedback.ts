@@ -292,13 +292,9 @@ const DIAGNOSTIC_PRIORITY_KEYS = new Set([
 ]);
 
 function diagnosticValue(value: unknown, key: string, depth: number, budget: DiagnosticBudget): unknown {
-  // `key` is also a common diagnostic join field (`acct:market`). Treat the
-  // generic spelling as secret only when its value has a credential shape;
-  // explicit names such as apiKey/privateKey remain unconditional.
-  const genericKey = key.toLowerCase() === "key";
-  const genericSecret = typeof value === "string"
-    && (/^LHK1\./.test(value) || /^(?:sk|ghp|github_pat|AKIA)/.test(value) || value.length >= 32);
-  if (SECRET_FIELD.test(key) && (!genericKey || genericSecret)) return REDACTED;
+  // A short credential can be named exactly `key`; length and recognizable
+  // prefixes cannot prove it is a harmless diagnostic join value.
+  if (SECRET_FIELD.test(key)) return REDACTED;
   if (budget.bytes >= FEEDBACK_DIAGNOSTICS_BYTES_MAX || budget.nodes >= FEEDBACK_DIAGNOSTICS_NODES_MAX) {
     budget.truncated = true;
     return "[truncated]";

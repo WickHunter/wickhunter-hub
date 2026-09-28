@@ -47,6 +47,10 @@ assert.equal(inFlight.customer(identity,tid).threads[0].status,'human');
 const failedDir=tmpDir('support-timeout');const failed=new SupportChat(failedDir,{...cfg,aiEnabled:true,apiKey:'fake'},async()=>{throw new Error('timeout');});
 await failed.message(identity,{text:'Help',requestId:'failed-request'});
 assert.equal(new SupportChat(failedDir,cfg).allowance('owner').userRemainingMicros,992000);
+const refusedDir=tmpDir('support-refused');const refused=new SupportChat(refusedDir,{...cfg,aiEnabled:true,apiKey:'fake'},async()=>new Response('{}',{status:429}));
+await refused.message(identity,{text:'Help',requestId:'refused-request'});
+assert.equal(new SupportChat(refusedDir,cfg).allowance('owner').userRemainingMicros,1_000_000);
+assert.equal(new SupportChat(refusedDir,cfg).allowance('owner').monthlyRemaining,200);
 const h=await freshHub({support:cfg});
 try{
  assert.equal((await fetch(h.origin+'/admin/api/support')).status,401);
