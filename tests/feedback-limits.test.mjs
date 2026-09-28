@@ -28,6 +28,7 @@ import {
   FEEDBACK_RAW_RATE_WINDOW_MS,
   FEEDBACK_RECORDS_MAX,
   FEEDBACK_TRACKER_BYTES_MAX,
+  FEEDBACK_LICENSE_TRACKER_BYTES_MAX,
 } from "../dist/src/feedback.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -258,6 +259,25 @@ await test("the per-licence report quota refuses atomically and an explicit dele
     if (restarted) await restarted.close();
     else if (!firstClosed) await h.close();
   }
+});
+
+await test("one license cannot fill the shared feedback tracker", async () => {
+  const h = await freshHub();
+  try {
+    const owner = h.store.issue("Large diagnostics", 30).payload.id;
+    const other = h.store.issue("Other reporter", 30).payload.id;
+    let accepted = 0;
+    const bulky = { ...appendInput(owner, "large report"), diagnostics: { padding: "x".repeat(240_000) } };
+    for (;;) {
+      try { appendFeedback(h.dataDir, bulky, 1_800_000_000_000 + accepted); }
+      catch (e) { assert.equal(e.quota, "tracker-license"); break; }
+      accepted++;
+      if (accepted > 100) assert.fail("per-license tracker cap was not reached");
+    }
+    assert.ok(accepted > 0);
+    assert.ok(fs.statSync(path.join(h.dataDir, "feedback.jsonl")).size < FEEDBACK_LICENSE_TRACKER_BYTES_MAX);
+    assert.ok(appendFeedback(h.dataDir, appendInput(other, "other report")).id);
+  } finally { await h.close(); }
 });
 
 await test("global count and tracker-byte ceilings reject before mutating persistent state", async () => {

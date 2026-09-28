@@ -98,6 +98,7 @@ const FEEDBACK_RATE_KEYS_MAX = 4_096;
 export const FEEDBACK_RECORDS_MAX = 2_000;
 export const FEEDBACK_LICENSE_RECORDS_MAX = 100;
 export const FEEDBACK_TRACKER_BYTES_MAX = 32 * 1024 * 1024;
+export const FEEDBACK_LICENSE_TRACKER_BYTES_MAX = 8 * 1024 * 1024;
 export const FEEDBACK_ATTACHMENTS_BYTES_MAX = 256 * 1024 * 1024;
 export const FEEDBACK_LICENSE_ATTACHMENTS_BYTES_MAX = 32 * 1024 * 1024;
 export const FEEDBACK_STORAGE_BYTES_MAX = 320 * 1024 * 1024;
@@ -246,6 +247,7 @@ export type FeedbackQuotaCode =
   | "reports-total"
   | "reports-license"
   | "tracker-bytes"
+  | "tracker-license"
   | "attachments-total"
   | "attachments-license"
   | "storage-total"
@@ -710,7 +712,24 @@ function assertFeedbackCapacity(
   if (licenseAttachmentBytes + pendingAttachmentBytes > FEEDBACK_LICENSE_ATTACHMENTS_BYTES_MAX) {
     throw new FeedbackQuotaError("attachments-license", quotaMessage("this license's picture evidence", "32 MiB maximum"));
   }
-  const licenseTrackerBytes = licenseRows.reduce((sum, row) => sum + Buffer.byteLength(`${JSON.stringify(row)}\n`, "utf8"), 0);
+  // listFeedback normalizes/prunes legacy and oversized diagnostics. Counting
+  // its re-serialized rows undercharges the bytes actually occupying JSONL.
+  let licenseTrackerBytes = 0;
+  try {
+    const raw = fs.existsSync(tracker) ? fs.readFileSync(tracker, "utf8") : "";
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      let id: unknown;
+      try { id = (JSON.parse(line) as { licenseId?: unknown }).licenseId; }
+      catch { continue; } // Torn tail remains globally charged by trackerBytes.
+      if (id === pending.licenseId) licenseTrackerBytes += Buffer.byteLength(line, "utf8") + 1;
+    }
+  } catch {
+    throw new FeedbackQuotaError("tracker-license", "feedback tracker usage could not be verified; no report was written");
+  }
+  if (licenseTrackerBytes + pendingTrackerBytes > FEEDBACK_LICENSE_TRACKER_BYTES_MAX) {
+    throw new FeedbackQuotaError("tracker-license", quotaMessage("this license's report tracker", "8 MiB maximum"));
+  }
   if (licenseTrackerBytes + licenseAttachmentBytes + pendingTrackerBytes + pendingAttachmentBytes > limits.licenseStorageBytesMax) {
     throw new FeedbackQuotaError("storage-license", quotaMessage("this license", byteLimitLabel(limits.licenseStorageBytesMax, "combined maximum")));
   }
