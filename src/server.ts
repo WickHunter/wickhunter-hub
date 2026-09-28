@@ -111,6 +111,7 @@ import {
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
+import type { CustomerRecord } from "./billing/store.js";
 import { DEFAULT_SEAT_POLICY, SeatStore } from "./seats.js";
 import type { BillingMode } from "./billing/config.js";
 import {
@@ -1375,26 +1376,57 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return customerSessions.authenticate(sessionCookieFrom(req.headers.cookie));
   }
 
+  function earnBillingKeys(record: CustomerRecord): string[] {
+    return [`license:${record.licenseId}`,
+      ...(record.stripeCustomerId.startsWith('cus_') ? [`stripe:live:${record.stripeCustomerId}`] : [])];
+  }
+
+  function boundEarnOwner(records: CustomerRecord[], fallbackLicenseId?: string): string {
+    const sorted=records.slice().sort((a,b)=>a.key.localeCompare(b.key));
+    const keys=sorted.flatMap(earnBillingKeys);
+    if (fallbackLicenseId) keys.push(`license:${fallbackLicenseId}`);
+    const legacy=[...sorted.map(record=>earnOwner('email:'+normalizeCustomerEmail(record.email))),
+      ...sorted.map(record=>earnOwner('license:'+record.licenseId))];
+    if (!sorted.length && fallbackLicenseId) legacy.push(earnOwner('license:'+fallbackLicenseId));
+    const first=sorted.find(record=>record.stripeCustomerId.startsWith('cus_'));
+    const preferred=earnOwner(first ? `stripe:live:${first.stripeCustomerId}` : `license:${fallbackLicenseId ?? sorted[0]?.licenseId}`);
+    return earn.bindOwner(keys,legacy,preferred);
+  }
+
   async function earnCustomer(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     // Recipient creation and onboarding links are financial capabilities.
     // The app license is useful for viewing earnings, not for minting them.
     if (url.pathname.endsWith('/onboard') && !url.pathname.startsWith('/api/customer/'))
       return sendJson(res, 403, { ok: false, error: 'Sign in at the customer portal to connect payouts' }, { 'cache-control': 'no-store' });
     let owner = "", name = "", allowed = false;
-    if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
-      const identity = authenticatedCustomer(req);
-      if (identity) { owner = earnOwner("email:" + normalizeCustomerEmail(identity.email)); name = identity.email; allowed = Object.values(billing.store.customers()).some(c => c.livemode && normalizeCustomerEmail(c.email) === normalizeCustomerEmail(identity.email) && flagsFor(cfg.dataDir, c.licenseId).earn === true); }
-    } else {
-      // The app forwards its license only in a header. Never trust an owner id from its body.
-      const raw = req.headers["x-license"];
-      const verified = typeof raw === "string" ? store.verify(raw) : null;
-      if (verified?.ok) {
-        const payload = store.decodeGenuine(raw as string)!;
-        allowed = flagsFor(cfg.dataDir, payload.id).earn === true;
-        const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
-        owner = earnOwner(record?.email ? "email:" + normalizeCustomerEmail(record.email) : "license:" + payload.id);
-        name = record?.email || store.get(payload.id)?.name || "WH member";
+    try {
+      if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
+        const identity = authenticatedCustomer(req);
+        if (identity) {
+          name=identity.email;
+          owner=earnOwner('customer-session:'+identity.id);
+          const records=Object.values(billing.store.customers()).filter(c=>c.livemode
+            && normalizeCustomerEmail(c.email)===normalizeCustomerEmail(identity.email)
+            && flagsFor(cfg.dataDir,c.licenseId).earn===true);
+          allowed=records.length>0;
+          if (allowed) owner=boundEarnOwner(records);
+        }
+      } else {
+        // The app forwards its license only in a header. Never trust an owner id from its body.
+        const raw = req.headers["x-license"];
+        const verified = typeof raw === "string" ? store.verify(raw) : null;
+        if (verified?.ok) {
+          const payload = store.decodeGenuine(raw as string)!;
+          owner=earnOwner('license:'+payload.id);
+          allowed = flagsFor(cfg.dataDir, payload.id).earn === true;
+          const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
+          if (allowed) owner=boundEarnOwner(record?[record]:[],payload.id);
+          name = record?.email || store.get(payload.id)?.name || "WH member";
+        }
       }
+    } catch (error) {
+      console.warn(`[earn] owner binding needs review: ${(error as Error).message}`);
+      return sendJson(res,409,{ok:false,error:'Earn ownership needs account review'},{'cache-control':'no-store'});
     }
     if (!owner && url.pathname === '/earn') { res.writeHead(302, { location: '/customer', 'cache-control': 'no-store' }); res.end(); return; }
     if (!owner) return sendJson(res, 401, { ok: false, error: "Sign in with your WH account or an active app license" }, { "cache-control": "no-store" });

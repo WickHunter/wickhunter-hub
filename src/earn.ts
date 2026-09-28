@@ -18,7 +18,7 @@ type UID = { exchange: string; uid: string; verified: boolean; submittedAt: stri
 export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
-export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any> };
+export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
 export const tierPercent = (active: number) => active <= 20 ? 20 : active <= 40 ? 30 : 40;
 function text(v: unknown, max = 200): string { if (typeof v !== 'string' || !v.trim() || v.length > max || /[\x00-\x1f]/.test(v)) throw new Error('Invalid or missing text field'); return v.trim(); }
@@ -60,6 +60,42 @@ export class EarnService {
   /** Synchronous transaction: never retain state across an awaited network call. */
   transaction<T>(fn: (state: EarnState) => T): T { const state=this.read(); const result=fn(state);this.save(state);return result; }
   copyMember(member: Member) { this.transaction(s=>{const i=s.members.findIndex(m=>m.id===member.id);if(i<0)s.members.push(structuredClone(member));else s.members[i]=structuredClone(member);}); }
+
+  /** Bind verified billing identities to one immutable ledger owner. Email is
+   *  consulted only to preserve an existing legacy member, never as the new
+   *  owner of an unseen customer. Conflicting historical owners need review. */
+  bindOwner(keys: string[], legacyCandidates: string[], preferred: string): string {
+    const validOwner = (value: string) => /^[a-f0-9]{64}$/.test(value);
+    if (!keys.length || keys.length > 32 || !validOwner(preferred)
+      || keys.some(key => !key || key.length > 300 || /[\x00-\x1f]/.test(key))
+      || legacyCandidates.some(owner => !validOwner(owner))) throw new Error('Invalid Earn owner binding');
+    const hashed = [...new Set(keys.map(key => earnOwner('billing-binding:' + key)))];
+    const s=this.read(), bindings=s.ownerBindings ?? {};
+    const existing=[...new Set(hashed.map(key => bindings[key]).filter((owner): owner is string => owner !== undefined))];
+    if (existing.some(owner => !validOwner(owner)) || existing.length > 1) throw new Error('Conflicting Earn owner bindings require review');
+    const historical=[...new Set(legacyCandidates.filter(owner =>
+      s.members.some(member => member.id === owner) || s.entries.some(entry => entry.owner === owner)
+      || s.months.some(month => month.rows.some(row => row.owner === owner))))];
+    if (historical.length > 1 || (existing.length && historical.length && historical[0] !== existing[0]))
+      throw new Error('Conflicting historical Earn owners require review');
+    const owner=existing[0] ?? historical[0] ?? preferred;
+    if (hashed.every(key => bindings[key] === owner)) return owner;
+    this.transaction(state => {
+      const next=state.ownerBindings ??= {};
+      for (const key of hashed) if (next[key] && next[key] !== owner)
+        throw new Error('Conflicting Earn owner bindings require review');
+      for (const key of hashed) next[key]=owner;
+    });
+    return owner;
+  }
+
+  boundOwner(keys: string[]): string | null {
+    const bindings=this.read().ownerBindings ?? {};
+    const owners=[...new Set(keys.map(key => bindings[earnOwner('billing-binding:' + key)]).filter((owner): owner is string => owner !== undefined))];
+    if (owners.length > 1 || owners.some(owner => !/^[a-f0-9]{64}$/.test(owner)))
+      throw new Error('Conflicting Earn owner bindings require review');
+    return owners[0] ?? null;
+  }
 
   view(owner: string, name: string) {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);

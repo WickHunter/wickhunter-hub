@@ -165,7 +165,14 @@ export class EarnStripeService {
     if(!products.has(id(price.product))||price.currency!=='usd'||!['month','year'].includes(price.recurring?.interval))return;
    }
   }
-  const cust=await api.call('GET','/v1/customers/'+id(inv.customer));if(earnOwner('email:'+String(cust.email||'').trim().toLowerCase())===member.id)return;
+  const customerId=id(inv.customer);
+  const cust=await api.call('GET','/v1/customers/'+customerId);
+  // A changed customer email cannot turn the member's own subscription into
+  // a payable referral. The durable binding is the authority when present;
+  // the email check retains protection for older, unbound members.
+  const billedOwner=this.liveLedger.boundOwner([`stripe:${mode}:${customerId}`])
+    ?? earnOwner('email:'+String(cust.email||'').trim().toLowerCase());
+  if(billedOwner===member.id)return;
   const paid=money(inv.amount_paid),total=money(inv.total_excluding_tax);if(paid===null||total===null||paid===0)return;
   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
   const basis=Math.min(total,Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)));if(!basis)return;

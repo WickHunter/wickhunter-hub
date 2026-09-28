@@ -144,5 +144,13 @@ await test('Earn event dedupe stays bounded while financial invoice records rema
  assert.ok(saved.seen['new-untracked-event']);
  assert.ok(saved.invoices['in_1']);
 });
+await test('a bound Stripe customer remains a self referral after its email changes',async()=>{
+ ledger.bindOwner(['stripe:live:cus_friend'],[owner],owner);
+ const before=ledger.view(owner,'Referrer').balances.referral;
+ email='changed-referrer@example.com';
+ await svc.handleEvent(event('invoice.paid','evt_self_after_email_change',{id:'in_self_after_email_change'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
+ assert.equal(ledger.admin().stripe.invoices['in_self_after_email_change'],undefined);
+});
 }finally{svc.stop();fs.rmSync(dir,{recursive:true,force:true});}
 summary('earn-stripe');
