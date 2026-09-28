@@ -39,6 +39,7 @@ export const COMMUNITY_BOT_TYPES = ["grid", "bot1", "tv", "sb", "bot3"] as const
 export type CommunityBotType = (typeof COMMUNITY_BOT_TYPES)[number];
 
 export const STRAT_MAX = 500;
+export const STRAT_OWNER_MAX = 25;
 export const STRAT_BOTS_MAX = 10;
 export const STRAT_BYTES_MAX = 128 * 1024;
 
@@ -118,6 +119,8 @@ export class CommunityService {
     if ("error" in parsed) return { ok: false, error: parsed.error };
 
     const prior = [...this.items.values()].find((x) => x.licenseId === p.licenseId && x.name === name && !x.removed);
+    if (!prior && [...this.items.values()].filter((x) => x.licenseId === p.licenseId && !x.removed).length >= STRAT_OWNER_MAX)
+      return { ok: false, error: `a license may publish at most ${STRAT_OWNER_MAX} active strategies; replace or delete one first` };
     const id = prior?.id ?? "s" + randomBytes(5).toString("hex");
     this.items.set(id, {
       id, at: Date.now(), licenseId: p.licenseId,
@@ -127,11 +130,11 @@ export class CommunityService {
       votes: prior?.votes ?? {},
     });
     // Capacity: drop the lowest-scored, oldest entries past the cap.
-    if (this.items.size > STRAT_MAX) {
-      const surplus = [...this.items.values()]
-        .filter((x) => !x.removed)
+    const active = [...this.items.values()].filter((x) => !x.removed);
+    if (active.length > STRAT_MAX) {
+      const surplus = active
         .sort((a, b) => this.scoreOf(a) - this.scoreOf(b) || a.at - b.at)
-        .slice(0, this.items.size - STRAT_MAX);
+        .slice(0, active.length - STRAT_MAX);
       for (const x of surplus) this.items.delete(x.id);
     }
     this.persist();

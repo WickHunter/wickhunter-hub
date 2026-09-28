@@ -8,6 +8,8 @@
 // licence. So the tests that matter here are the ones where a caller LIES.
 import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
+import { CommunityService, STRAT_OWNER_MAX } from "../dist/src/community.js";
+import { tmpDir } from "./helpers.mjs";
 
 const h = await freshHub();
 const alice = h.store.issue("Alice", 30);
@@ -143,6 +145,17 @@ await test("republishing the same name REPLACES that licence's own row and keeps
   const after = (await list(alice)).body.strategies.find((s) => s.name === "Scalp + Hedge");
   assert.equal(after.bots.length, 1, "the new bot list took");
   assert.equal(after.up, 1, "votes survive a republish");
+});
+
+await test("one publisher cannot evict another publisher's gallery", () => {
+  const gallery = new CommunityService(tmpDir("gallery-fairness"));
+  const publish = (licenseId, name) => gallery.publish({ licenseId, name, bots: combo.bots });
+  const other = publish("other", "Other author's strategy");
+  assert.equal(other.ok, true);
+  for (let i = 0; i < STRAT_OWNER_MAX; i++) assert.equal(publish("prolific", `Strategy ${i}`).ok, true);
+  assert.match(publish("prolific", "One too many").error, /at most/);
+  assert.equal(gallery.list().some(s => s.id === other.id), true);
+  assert.equal(publish("prolific", "Strategy 0").ok, true, "replacement does not consume another slot");
 });
 
 // The hub holds an open listener; every suite here closes it before
