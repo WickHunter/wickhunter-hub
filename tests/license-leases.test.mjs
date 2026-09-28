@@ -382,6 +382,93 @@ await test("missing, zeroed, or suffix-rolled-back ledger state refuses against 
   }
 });
 
+await test("segmented ledger preserves leases, spent nonces, and seat policy across restart", () => {
+  const config = { ledgerRotateBytes: 5_000, ledgerMaxBytes: 8_000 };
+  const f = serviceFixture({ config });
+  const key = installKey();
+  const first = activate(f, key);
+  f.service.setSeatOverride(f.issued.payload.id, 2, "approved second machine", f.service.adminSnapshot().auditRevision);
+  let latest = first.result.activation;
+  for (let i = 0; i < 12; i++) {
+    f.now += 1_000;
+    const challenge = f.service.challenge(f.issued.token, {
+      purpose: "renew", activationId: latest.id, installId: latest.installId,
+      installPublicKey: key.publicKey,
+    });
+    latest = f.service.renew(f.issued.token, challenge.nonce, proof(challenge, key.privateKey)).activation;
+  }
+  const archives = fs.readdirSync(f.dataDir).filter((name) => name.startsWith(`${LEASE_LEDGER_FILE}.segment.`));
+  assert.ok(archives.length >= 2, "small test ceiling did not exercise multiple rotations");
+  assert.ok(fs.statSync(path.join(f.dataDir, LEASE_LEDGER_FILE)).size < config.ledgerMaxBytes);
+  const restarted = new LicenseLeaseService(f.dataDir, f.store, config, { now: () => f.now + 100 });
+  const snap = restarted.adminSnapshot(f.issued.payload.id);
+  assert.equal(snap.activations[0].lastSequence, latest.lastSequence);
+  assert.equal(snap.seatOverrides[f.issued.payload.id], 2);
+  assert.equal(restarted.activate(f.issued.token, first.challenge.nonce,
+    proof(first.challenge, key.privateKey)).replayed, true);
+  const next = restarted.challenge(f.issued.token, {
+    purpose: "renew", activationId: latest.id, installId: latest.installId,
+    installPublicKey: key.publicKey,
+  });
+  const renewed = restarted.renew(f.issued.token, next.nonce, proof(next, key.privateKey)).activation;
+  assert.equal(renewed.lastSequence, latest.lastSequence + 1);
+  restarted.adminDeactivate(f.issued.payload.id, renewed.id, renewed.revision, "lost machine key");
+  const again = new LicenseLeaseService(f.dataDir, f.store, config, { now: () => f.now + 200 });
+  assert.deepEqual(again.adminSnapshot(f.issued.payload.id).recoveryLockedLicenses, [f.issued.payload.id]);
+});
+
+await test("restart recovers a crash between archive rename and new active segment creation", () => {
+  const config = { ledgerRotateBytes: 1_024, ledgerMaxBytes: 3_000 };
+  const f = serviceFixture({ config });
+  const key = installKey();
+  const first = activate(f, key);
+  const activeFile = path.join(f.dataDir, LEASE_LEDGER_FILE);
+  const originalOpen = fs.openSync;
+  let injected = false;
+  fs.openSync = function (file, flags, ...args) {
+    if (!injected && file === activeFile && flags === "wx") {
+      injected = true;
+      throw new Error("simulated crash before active segment creation");
+    }
+    return originalOpen.call(this, file, flags, ...args);
+  };
+  try {
+    assert.throws(() => f.service.setSeatOverride(f.issued.payload.id, 2, "crash injection",
+      f.service.adminSnapshot().auditRevision), /simulated crash/);
+  } finally {
+    fs.openSync = originalOpen;
+  }
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(activeFile), false);
+  const restarted = new LicenseLeaseService(f.dataDir, f.store, config, { now: () => f.now + 100 });
+  assert.equal(fs.statSync(activeFile).size, 0);
+  assert.equal(restarted.adminSnapshot(f.issued.payload.id).activations[0].lastSequence,
+    first.result.activation.lastSequence);
+  assert.equal(restarted.adminSnapshot(f.issued.payload.id).seatOverrides[f.issued.payload.id], undefined);
+  restarted.setSeatOverride(f.issued.payload.id, 2, "recover after crash", restarted.adminSnapshot().auditRevision);
+  assert.equal(restarted.adminSnapshot(f.issued.payload.id).seatOverrides[f.issued.payload.id], 2);
+});
+
+await test("missing or edited archived ledger segment fails closed against the signed head", () => {
+  for (const mode of ["missing", "edited"]) {
+    const config = { ledgerRotateBytes: 1_024, ledgerMaxBytes: 3_000 };
+    const f = serviceFixture({ config });
+    activate(f, installKey());
+    const archive = path.join(f.dataDir, `${LEASE_LEDGER_FILE}.segment.00000001`);
+    assert.equal(fs.existsSync(archive), true);
+    if (mode === "missing") fs.unlinkSync(archive);
+    else {
+      const rows = fs.readFileSync(archive, "utf8").trimEnd().split("\n");
+      const line = JSON.parse(rows[0]);
+      line.event.atMs += 1;
+      rows[0] = JSON.stringify(line);
+      fs.writeFileSync(archive, rows.join("\n") + "\n");
+    }
+    assert.throws(() => new LicenseLeaseService(f.dataDir, f.store, config, { now: () => f.now + 100 }),
+      /archive sequence|signature is invalid|hash chain|does not match/, mode);
+  }
+});
+
 await test("admin lost-key deactivation is revision-bound and permanently blocks bearer-race re-enrolment", () => {
   const f = serviceFixture();
   const first = activate(f, installKey()).result.activation;

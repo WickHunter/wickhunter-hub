@@ -39,6 +39,7 @@ const LEASE_SIGNATURE_DOMAIN = Buffer.from("WICKHUNTER\0LICENSE_LEASE\0V1\0", "u
 const MAX_OUTSTANDING_CHALLENGES = 8;
 const MAX_CHALLENGES_PER_LICENSE_PER_HOUR = 120;
 const MAX_LEDGER_BYTES = 128 * 1024 * 1024;
+const ROTATE_LEDGER_BYTES = 64 * 1024 * 1024;
 const RAW_PUBLIC_KEY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -140,6 +141,9 @@ export interface LicenseLeaseConfig {
   readonly challengeTtlMs?: number;
   readonly maxClockSkewMs?: number;
   readonly defaultMaxMachines?: number;
+  /** Test seam: the active segment rotates before it reaches the hard cap. */
+  readonly ledgerRotateBytes?: number;
+  readonly ledgerMaxBytes?: number;
 }
 
 export interface LicenseLeaseDeps {
@@ -266,6 +270,7 @@ interface ReplayCache {
   readonly ledgerMtimeMs: number;
   readonly ledgerIno: number;
   readonly keyringHash: string;
+  readonly archiveIdentity: string;
 }
 
 export type LeaseVerifyResult =
@@ -788,6 +793,8 @@ export class LicenseLeaseService {
   private readonly challengeTtlMs: number;
   private readonly maxClockSkewMs: number;
   private readonly defaultMaxMachines: number;
+  private readonly ledgerRotateBytes: number;
+  private readonly ledgerMaxBytes: number;
   private replayCache: ReplayCache | null = null;
   private readonly wallClockAnchorMs: number;
   private readonly monotonicAnchorMs: number;
@@ -808,6 +815,9 @@ export class LicenseLeaseService {
     this.challengeTtlMs = finiteInt("challengeTtlMs", cfg.challengeTtlMs ?? DEFAULT_CHALLENGE_TTL_MS, 10_000, 60 * 60_000);
     this.maxClockSkewMs = finiteInt("maxClockSkewMs", cfg.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS, 0, 60 * 60_000);
     this.defaultMaxMachines = finiteInt("defaultMaxMachines", cfg.defaultMaxMachines ?? DEFAULT_MAX_MACHINES, 1, 64);
+    this.ledgerMaxBytes = finiteInt("ledgerMaxBytes", cfg.ledgerMaxBytes ?? MAX_LEDGER_BYTES, 2_048, MAX_LEDGER_BYTES);
+    this.ledgerRotateBytes = finiteInt("ledgerRotateBytes", cfg.ledgerRotateBytes ?? ROTATE_LEDGER_BYTES,
+      1_024, this.ledgerMaxBytes - 1);
     this.wallClockAnchorMs = finiteInt("server clock", this.now(), 0, Number.MAX_SAFE_INTEGER);
     this.monotonicAnchorMs = this.monotonicNow();
     if (!Number.isFinite(this.monotonicAnchorMs) || this.monotonicAnchorMs < 0) throw new Error("monotonic server clock is unavailable");
@@ -818,12 +828,14 @@ export class LicenseLeaseService {
     this.mutationLockFile = path.join(dataDir, "license-lease-write.v1.lock");
     const haveLedger = fs.existsSync(this.ledgerFile);
     const haveHead = fs.existsSync(this.ledgerHeadFile);
-    if (!haveLedger && !haveHead) {
+    const haveArchives = this.archiveFiles().length > 0;
+    if (!haveLedger && !haveHead && !haveArchives) {
       this.appendEvent({ schemaVersion: 1, eventId: this.randomId(), kind: "ledger_initialized", atMs: this.rawNow() }, null);
     } else {
-      if (!haveLedger || !haveHead) throw new Error("lease audit ledger/checkpoint pair is incomplete; restore both from the same backup");
+      if (!haveHead || (!haveLedger && !haveArchives)) throw new Error("lease audit ledger/checkpoint pair is incomplete; restore both from the same backup");
       const recovered = this.replay(); // fail closed on corruption, deletion, truncation, or rollback
       if (recovered.events.length === 0) throw new Error("lease audit ledger is empty after it was initialized");
+      if (!haveLedger) this.createEmptyActiveSegment(); // crash after durable archive rename, before empty-file creation
     }
   }
 
@@ -840,29 +852,95 @@ export class LicenseLeaseService {
     return raw;
   }
 
-  private readLines(): { readonly lines: LedgerLine[]; readonly malformedTailOffset: number | null } {
-    let text: string;
-    try { text = fs.readFileSync(this.ledgerFile, "utf8"); }
-    catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { lines: [], malformedTailOffset: null };
-      throw err;
-    }
-    if (!text) return { lines: [], malformedTailOffset: null };
-    const raw = text.split("\n");
-    if (raw.at(-1) === "") raw.pop();
-    const lines: LedgerLine[] = [];
-    let offset = 0;
-    for (const [index, line] of raw.entries()) {
-      if (!line) { offset += 1; continue; }
-      let parsed: unknown;
-      try { parsed = JSON.parse(line); }
-      catch {
-        if (index === raw.length - 1) return { lines, malformedTailOffset: offset };
-        throw new Error(`lease audit line ${index + 1} is not JSON`);
+  /** Immutable complete segments retain the entire signed history and every
+   * outstanding nonce/seat/recovery obligation. Numbered names are only an
+   * ordering aid: replay still verifies the continuous signatures and head. */
+  private archiveFiles(): string[] {
+    if (!fs.existsSync(this.dataDir)) return [];
+    const prefix = `${LEASE_LEDGER_FILE}.segment.`;
+    const names = fs.readdirSync(this.dataDir).filter((name) => name.startsWith(prefix)).sort();
+    for (const [index, name] of names.entries()) {
+      if (name !== `${prefix}${String(index + 1).padStart(8, "0")}`) {
+        throw new Error("lease audit archive sequence is missing, duplicated, or malformed");
       }
-      if (parsed === null || typeof parsed !== "object") throw new Error(`lease audit line ${index + 1} is not an object`);
-      lines.push(parsed as LedgerLine);
-      offset += Buffer.byteLength(line, "utf8") + 1;
+      if (!fs.lstatSync(path.join(this.dataDir, name)).isFile()) {
+        throw new Error("lease audit archive is not a regular file");
+      }
+    }
+    return names.map((name) => path.join(this.dataDir, name));
+  }
+
+  private archiveIdentity(files: readonly string[]): string {
+    return sha256(JSON.stringify(files.map((file) => {
+      const stat = fs.statSync(file);
+      return [path.basename(file), stat.size, stat.mtimeMs, stat.ino];
+    })));
+  }
+
+  private createEmptyActiveSegment(): void {
+    const fd = fs.openSync(this.ledgerFile, "wx", 0o600);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fsyncDirectory(path.dirname(this.ledgerFile));
+  }
+
+  private rotateActiveSegment(): void {
+    const files = this.archiveFiles();
+    const archive = path.join(this.dataDir,
+      `${LEASE_LEDGER_FILE}.segment.${String(files.length + 1).padStart(8, "0")}`);
+    if (fs.existsSync(archive)) throw new Error("lease audit archive target already exists");
+    const activeBytes = fs.statSync(this.ledgerFile).size;
+    if (activeBytes === 0) return;
+    const tail = Buffer.allocUnsafe(1);
+    const readFd = fs.openSync(this.ledgerFile, "r");
+    try {
+      if (fs.readSync(readFd, tail, 0, 1, activeBytes - 1) !== 1) {
+        throw new Error("lease audit active segment changed during rotation");
+      }
+    }
+    finally { fs.closeSync(readFd); }
+    if (tail[0] !== 0x0a) {
+      const fd = fs.openSync(this.ledgerFile, "a");
+      try { fs.writeSync(fd, "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+    fs.renameSync(this.ledgerFile, archive);
+    fsyncDirectory(this.dataDir);
+    // A crash here is recoverable: the signed head still names the complete
+    // chain in the newly archived segment. Constructor verifies it first,
+    // then creates this empty file if the process died before doing so.
+    this.createEmptyActiveSegment();
+    this.replayCache = null;
+  }
+
+  private readLines(files: readonly string[]): { readonly lines: LedgerLine[]; readonly malformedTailOffset: number | null } {
+    const lines: LedgerLine[] = [];
+    for (const file of [...files, this.ledgerFile]) {
+      const archived = file !== this.ledgerFile;
+      let text: string;
+      try { text = fs.readFileSync(file, "utf8"); }
+      catch (err) {
+        if (!archived && (err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      if (!text) {
+        if (archived) throw new Error("lease audit archive is empty");
+        continue;
+      }
+      if (archived && !text.endsWith("\n")) throw new Error("lease audit archive has an incomplete final line");
+      const raw = text.split("\n");
+      if (raw.at(-1) === "") raw.pop();
+      let offset = 0;
+      for (const [index, line] of raw.entries()) {
+        if (!line) { offset += 1; continue; }
+        let parsed: unknown;
+        try { parsed = JSON.parse(line); }
+        catch {
+          if (!archived && index === raw.length - 1) return { lines, malformedTailOffset: offset };
+          throw new Error(`lease audit ${archived ? "archive" : "active"} line ${index + 1} is not JSON`);
+        }
+        if (parsed === null || typeof parsed !== "object") throw new Error(`lease audit line ${index + 1} is not an object`);
+        lines.push(parsed as LedgerLine);
+        offset += Buffer.byteLength(line, "utf8") + 1;
+      }
     }
     return { lines, malformedTailOffset: null };
   }
@@ -896,6 +974,8 @@ export class LicenseLeaseService {
     const keyring = this.keyStore.publicKeyring();
     const head = this.readHead(keyring);
     const keyringHash = sha256(JSON.stringify(keyring));
+    const archives = this.archiveFiles();
+    const archiveIdentity = this.archiveIdentity(archives);
     let before: fs.Stats | null = null;
     try { before = fs.statSync(this.ledgerFile); } catch { /* full replay reports the exact state below */ }
     if (head && before && this.replayCache
@@ -904,11 +984,12 @@ export class LicenseLeaseService {
       && this.replayCache.ledgerSize === before.size
       && this.replayCache.ledgerMtimeMs === before.mtimeMs
       && this.replayCache.ledgerIno === before.ino
-      && this.replayCache.keyringHash === keyringHash) {
+      && this.replayCache.keyringHash === keyringHash
+      && this.replayCache.archiveIdentity === archiveIdentity) {
       return this.replayCache.state;
     }
     const state = emptyReplay();
-    const read = this.readLines();
+    const read = this.readLines(archives);
     for (const [index, line] of read.lines.entries()) {
       if (line.v !== 1 || typeof line.kid !== "string" || typeof line.sig !== "string"
         || !(line.previousHash === null || typeof line.previousHash === "string")
@@ -1070,6 +1151,7 @@ export class LicenseLeaseService {
       ledgerMtimeMs: finalStat.mtimeMs,
       ledgerIno: finalStat.ino,
       keyringHash,
+      archiveIdentity,
     } : null;
     return state;
   }
@@ -1115,6 +1197,7 @@ export class LicenseLeaseService {
       ledgerMtimeMs: stat.mtimeMs,
       ledgerIno: stat.ino,
       keyringHash: sha256(JSON.stringify(this.keyStore.publicKeyring())),
+      archiveIdentity: this.archiveIdentity(this.archiveFiles()),
     };
   }
 
@@ -1153,8 +1236,14 @@ export class LicenseLeaseService {
         event,
       };
       const line: LedgerLine = { ...unsigned, sig: this.keyStore.sign(lineUnsigned(unsigned)) };
-      if (fs.existsSync(this.ledgerFile) && fs.statSync(this.ledgerFile).size >= MAX_LEDGER_BYTES) {
-        throw new Error("lease audit ledger reached its configured safety ceiling; archive with a signed operator procedure before accepting more mutations");
+      const activeBytes = fs.existsSync(this.ledgerFile) ? fs.statSync(this.ledgerFile).size : 0;
+      const nextBytes = Buffer.byteLength(JSON.stringify(line) + "\n", "utf8");
+      if (nextBytes >= this.ledgerMaxBytes) {
+        throw new Error("lease audit event exceeds the active segment safety ceiling");
+      }
+      if (activeBytes > 0 && (activeBytes >= this.ledgerRotateBytes
+        || activeBytes + nextBytes >= this.ledgerMaxBytes)) {
+        this.rotateActiveSegment();
       }
       durableAppendLine(this.ledgerFile, line);
       const hash = lineHash(line);
