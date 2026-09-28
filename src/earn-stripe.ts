@@ -70,10 +70,15 @@ export class EarnStripeService {
   promo??=await api.call('POST','/v1/promotion_codes',{coupon:coupon.id,code,'metadata[wh_earn_owner]':owner,'metadata[managed_by]':'wh-earn'},{key:'promo_'+signature});
   if(!id(promo))throw Error('Stripe did not return a promotion code');
   if(p.promotion)await api.call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
-  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature});return this.view(owner);
+  const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'&&v!==code))];
+  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes});return this.view(owner);
  });}
  checkout(code:string,planKey?:string|null){return this.serial(async()=>{
-  const c=this.settings();if(!c.enabled)throw Error('Referrals are not available');const b=book(this.ledger(c.mode).admin());const found=Object.entries(b.profiles).find(([,p])=>(p as StripeObject).code===code) as [string,StripeObject]|undefined;if(!found)throw Error('Referral code not found');
+  const c=this.settings();if(!c.enabled)throw Error('Referrals are not available');const b=book(this.ledger(c.mode).admin()),members=this.liveLedger.admin().members;const found=Object.entries(b.profiles).find(([owner,p])=>{
+   const profile=p as StripeObject;
+   return profile.code===code || (Array.isArray(profile.legacyCodes)&&profile.legacyCodes.includes(code))
+     || members.some(m=>m.id===owner&&m.code===code);
+  }) as [string,StripeObject]|undefined;if(!found)throw Error('Referral code not found');
   const [owner,p]=found,m=this.syncMember(c.mode,owner),cfg=this.billing();const plan=cfg.plans.find(x=>x.key===(planKey||'monthly')&&x.role==='software'&&x.interval&&x.checkout==='payment-link'&&x.currency==='usd');const price=plan&&cfg.stripe[c.mode].priceIds[plan.key];if(!plan||!price)throw Error('This recurring subscription plan is unavailable');
   const r=await this.api(c.mode).call('POST','/v1/checkout/sessions',{mode:'subscription','line_items[0][price]':price,'line_items[0][quantity]':1,'discounts[0][promotion_code]':p.promotion,'metadata[plan]':plan.key,'metadata[managed_by]':'wickhunter-hub','metadata[wh_earn_code]':m.code,'subscription_data[metadata][plan]':plan.key,'subscription_data[metadata][wh_earn_code]':m.code,'subscription_data[metadata][managed_by]':'wickhunter-hub',success_url:this.origin+'/customer?checkout=complete',cancel_url:this.origin+'/customer'},{key:'earn_checkout_'+randomUUID()});
   if(typeof r.url!=='string'||new URL(r.url).hostname!=='checkout.stripe.com')throw Error('Invalid Stripe checkout URL');return r.url;
@@ -84,7 +89,20 @@ export class EarnStripeService {
    // Persist the exact creation request before the API call so retries reuse both key and body.
    if(!p.request){this.updateProfile(c.mode,owner,{request:{contact_email:email,identity:{country,entity_type:entity},configuration:{recipient:{capabilities:{bank_accounts:{[network]:{requested:true}}}}},metadata:{wh_earn_owner:owner},include:['configuration.recipient','requirements','identity']},requestAt:this.now()});p=this.profile(c.mode,owner);}
    if(this.now()-p.requestAt>23*3600000)throw Error('Recipient creation needs reconciliation before retrying; contact WH');
-   const a=await api.call('POST','/v2/core/accounts',p.request,{key:'earn_recipient_'+hash(c.mode+owner)});if(!id(a).startsWith('acct_'))throw Error('Invalid Stripe recipient');this.updateProfile(c.mode,owner,{recipient:a.id,status:'onboarding'});p=this.profile(c.mode,owner);
+   const attempt=Number.isSafeInteger(p.requestAttempt)&&p.requestAttempt>=0?p.requestAttempt:0;
+   const requestKey='earn_recipient_'+hash(c.mode+owner+(attempt?':'+attempt:''));
+   let a:StripeObject;
+   try { a=await api.call('POST','/v2/core/accounts',p.request,{key:requestKey}); }
+   catch(error) {
+    // A validation refusal has not created a recipient. Rotate the durable
+    // idempotency key before accepting corrected facts. Transport, 409, 429,
+    // and 5xx outcomes retain the exact original body/key for safe retry.
+    if(error instanceof EarnStripeError && [400,422].includes(error.status)
+      && !['idempotency_error','request_failed'].includes(error.code))
+      this.updateProfile(c.mode,owner,{request:null,requestAt:null,requestAttempt:attempt+1});
+    throw error;
+   }
+   if(!id(a).startsWith('acct_'))throw Error('Invalid Stripe recipient');this.updateProfile(c.mode,owner,{recipient:a.id,status:'onboarding'});p=this.profile(c.mode,owner);
   }
   const ret=this.origin+'/earn';const link=await api.call('POST','/v2/core/account_links',{account:p.recipient,use_case:{type:'account_onboarding',account_onboarding:{configurations:['recipient'],return_url:ret,refresh_url:ret}}},{key:'earn_link_'+randomUUID()});
   if(typeof link.url!=='string'||new URL(link.url).protocol!=='https:'||!['accounts.stripe.com','connect.stripe.com','onboarding.stripe.com'].includes(new URL(link.url).hostname))throw Error('Unexpected Stripe onboarding URL');return {url:link.url};

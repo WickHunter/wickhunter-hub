@@ -44,6 +44,15 @@ await test('forever software-only coupon; custom referrer code and safe Checkout
 await test('test recipient and referral money stay out of real earnings',async()=>{
  await svc.onboard(owner,{country:'US',email:'referrer@example.com'});await svc.handleEvent({...event('invoice.paid','evt_test',{id:'in_test'}),livemode:false});assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.ledger('test').view(owner,'Referrer').balances.referral,1800);
 });
+await test('older shared referral codes resolve to the current promotion after discount rotation',async()=>{
+ ledger.configure({owner,discountPercent:15});await svc.activate(owner);
+ const firstRotated=svc.view(owner).referralUrl.split('ref=')[1];
+ ledger.configure({owner,discountPercent:20});await svc.activate(owner);
+ assert.notEqual(firstRotated,svc.view(owner).referralUrl.split('ref=')[1]);
+ const count=calls.filter(c=>c.endpoint==='/v1/checkout/sessions').length;
+ await svc.checkout(member.code,'monthly');await svc.checkout(firstRotated,'monthly');
+ assert.equal(calls.filter(c=>c.endpoint==='/v1/checkout/sessions').length,count+2);
+});
 svc.configure({mode:'live'});assert.throws(()=>svc.configure({payoutKey:'sk_live_fixture'}),/restricted/);svc.configure({payoutKey:'rk_live_fixture'});assert.ok(!JSON.stringify(svc.admin()).includes('rk_live_fixture'));await svc.activate(owner);
 await test('renewals credit once per invoice, even with two event types and restarts',async()=>{
  await svc.handleEvent(event('invoice.paid','evt_paid',{id:'in_1'}));await svc.handleEvent(event('invoice.payment_succeeded','evt_other',{id:'in_1'}));
@@ -76,6 +85,36 @@ await test('accepted payout plus failed status read never releases money',async(
 await test('Stripe-managed entries cannot be manually reversed',()=>{const e=ledger.admin().entries.find(e=>e.actor==='stripe');assert.throws(()=>ledger.reverse({id:e.id,note:'double credit attempt'}),/not found/);});
 await test('future-month earnings are never auto-paid',async()=>{
  now=Date.parse('2026-11-17T12:00:00Z');ledger.record({owner,source:'exchange',kind:'earning',cents:5000,reference:'future',note:'future',period:'2026-12'});await svc.run();assert.equal(payouts.get('obp_3').amount.value,2700);assert.equal(ledger.view(owner,'Referrer').balances.exchange,5000);
+});
+await test('definite recipient validation refusal permits corrected facts with a new key; ambiguous submit retains exact attempt',async()=>{
+ const isolated=tmpDir('recipient-retry');
+ try {
+  const localLedger=new EarnService(isolated,()=>now),localOwner=earnOwner('email:recipient@example.com');
+  localLedger.member(localOwner,'Recipient');
+  let outcome='refuse';const posts=[];
+  const localFetch=async(url,init)=>{
+   const endpoint=new URL(url).pathname;
+   if(endpoint==='/v2/core/accounts'){
+    posts.push({body:JSON.parse(init.body),key:init.headers['Idempotency-Key']});
+    if(outcome==='refuse')return new Response(JSON.stringify({error:{code:'parameter_invalid'}}),{status:400});
+    if(outcome==='ambiguous')throw Error('connection lost');
+    return new Response(JSON.stringify({id:'acct_test_corrected'}));
+   }
+   if(endpoint==='/v2/core/account_links')return new Response(JSON.stringify({url:'https://accounts.stripe.com/setup/test'}));
+   throw Error('Unexpected request '+endpoint);
+  };
+  const local=new EarnStripeService(isolated,localLedger,()=>cfg,'https://hub.example',()=>now,localFetch);local.configure({enabled:true});
+  await assert.rejects(local.onboard(localOwner,{country:'US',email:'wrong@example.com'}),/400/);
+  assert.equal(local.admin().profiles[localOwner].request,null);
+  outcome='ambiguous';await assert.rejects(local.onboard(localOwner,{country:'CA',email:'correct@example.com'}),/connection lost/);
+  outcome='accept';await local.onboard(localOwner,{country:'GB',email:'ignored@example.com'});
+  assert.equal(posts[0].body.contact_email,'wrong@example.com');
+  assert.equal(posts[1].body.contact_email,'correct@example.com');
+  assert.equal(posts[2].body.contact_email,'correct@example.com');
+  assert.notEqual(posts[0].key,posts[1].key);
+  assert.equal(posts[1].key,posts[2].key);
+  local.stop();
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
 });
 }finally{svc.stop();fs.rmSync(dir,{recursive:true,force:true});}
 summary('earn-stripe');

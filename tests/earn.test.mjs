@@ -9,17 +9,19 @@ try {
 await test('tier boundaries include 20 and 40 in the lower tier',()=>{assert.deepEqual([0,19,20,21,40,41].map(tierPercent),[20,20,20,30,30,40]);});
 await test('only four approved exchanges; no Aster',()=>assert.deepEqual(EXCHANGES.map(e=>e.id),['bybit','bitget','bitunix','weex']));
 svc.member('alice','Alice');svc.member('bob','Bob');
-await test('main UID required; one per exchange; globally unique; verification pending',()=>{
+await test('main UID required; one pending claim per exchange and globally exclusive verification',()=>{
  assert.throws(()=>svc.addUid('alice',{exchange:'bybit',uid:'1001'}),/main account/);
  svc.addUid('alice',{exchange:'bybit',uid:'1001',accountType:'main'});
  assert.equal(svc.view('alice','Alice').member.uids[0].verified,false);
- assert.throws(()=>svc.addUid('bob',{exchange:'bybit',uid:'1001',accountType:'main'}),/already registered/);
+ svc.addUid('bob',{exchange:'bybit',uid:'1001',accountType:'main'});
+ assert.equal(svc.view('bob','Bob').member.uids[0].verified,false);
  assert.throws(()=>svc.addUid('alice',{exchange:'bybit',uid:'1002',accountType:'main'}),/already registered/);
  assert.throws(()=>svc.addUid('alice',{exchange:'aster',uid:'1002',accountType:'main'}),/valid exchange/);
 });
 await test('CSV refuses unverified UID, malformed currency and duplicate source rows',()=>{
  assert.throws(()=>svc.previewCsv({period:'2026-08',csv:'exchange,uid,commission_usd\nbybit,1001,30.00'}),/not verified/);
  svc.configure({owner:'alice',exchange:'bybit',uid:'1001',verified:true});
+ assert.throws(()=>svc.configure({owner:'bob',exchange:'bybit',uid:'1001',verified:true}),/already verified/);
  assert.throws(()=>usdCents('1e4'));
  assert.throws(()=>usdCents('-5'));
  assert.deepEqual(csvRows('a,b\r\n"x,y","z"\r\n'),[['a','b'],['x,y','z']]);

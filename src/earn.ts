@@ -75,7 +75,8 @@ export class EarnService {
     const exchange=text(input.exchange,20), uid=text(input.uid,80);
     if(!EXCHANGES.some(e=>e.id===exchange)||!/^[A-Za-z0-9_-]{2,80}$/.test(uid))throw new Error('Enter a valid exchange UID');
     const s=this.read(), m=s.members.find(m=>m.id===owner);if(!m)throw new Error('Member not found');
-    if(s.members.some(m=>m.uids.some(u=>u.exchange===exchange&&u.uid===uid)))throw new Error('That exchange UID is already registered; contact support if it is yours');
+    // Submission is a claim, not proof. Do not disclose another member's
+    // ownership or let an unverified claim block its actual owner.
     if(m.uids.some(u=>u.exchange===exchange))throw new Error('A main account UID is already registered for this exchange; contact support to correct it');
     m.uids.push({exchange,uid,verified:false,submittedAt:this.date()});this.save(s);
   }
@@ -85,7 +86,10 @@ export class EarnService {
     if(input.discountPercent!==undefined)m.discountPercent=percent(input.discountPercent);
     if(input.commissionPercent!==undefined)m.commissionPercent=input.commissionPercent===null?null:percent(input.commissionPercent);
     if(input.rebatePercent!==undefined)m.rebatePercent=percent(input.rebatePercent);
-    if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');u.verified=input.verified;}
+    if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');
+      if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
+        throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
+      u.verified=input.verified;}
     (s.audit??=[]).push({at:this.date(),actor:'hub-admin',owner:m.id,before,after:structuredClone(m)});
     this.save(s);
   }
