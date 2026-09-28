@@ -1,0 +1,252 @@
+{
+  "scope": "Hub source review only; no runtime deploy, live Stripe call, payout, customer message, or version bump",
+  "baseline": "55e8bdffde176400896ad9d9eb1bf7b4db1f7f21",
+  "reviewedHead": "009b245",
+  "validation": {
+    "build": "npm run build passed",
+    "focused": "server, seats, flags, rate-limit-http, admin, billing, license-seat-recovery, license-leases-http passed after MKT-M9",
+    "full": "69/69 suites passed with PATH=/opt/homebrew/bin:$PATH and LIQHUNTER_BOT_MODULE set to the built Alpha size-percentiles module; default macOS run fails in backup-script (Apple Bash lacks mapfile) and liq-percentiles (Linux default sibling path absent)."
+  },
+  "findings": [
+    {
+      "id": "R-3",
+      "disposition": "not_issue",
+      "evidence": "All named Hub side branches resolve as ancestors of the 55e8bdf baseline by git merge-base --is-ancestor; branch ancestry alone caused no serving defect.",
+      "source": "git merge-base --is-ancestor for support-messenger, hub-earn-with-wh, license-seat-recovery, report-runtime-evidence against 55e8bdf",
+      "tests": "none",
+      "commit": "none",
+      "riskOrNextAction": "Branch hygiene remains an operator task; no code or deployment change.",
+      "residualOpen": false
+    },
+    {
+      "id": "MKT-H3",
+      "disposition": "blocked_external",
+      "evidence": "Durable checkout-session markers and customer-pending recovery already prevent prospective duplicate credit after cache rotation or concurrent retry. Historical purchases whose pre-ledger marker was evicted cannot be distinguished from a first delivery from current local records.",
+      "source": "src/billing/store.ts checkout marker methods; src/billing/service.ts checkout claim/recovery",
+      "tests": "tests/billing-payment-replay.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "Historical Stripe Checkout Session reconciliation requires actual prior Stripe records and operator-controlled backfill; do not silently credit or suppress them.",
+      "residualOpen": true
+    },
+    {
+      "id": "MKT-M9",
+      "disposition": "fixed",
+      "evidence": "Signed token must match licenseId before recordCheckin, seats.admit, flagsFor or subscriptionInfoFor; bare/forged/other-license tokens get generic 401 with no mutation. A genuinely signed expired token can still renew after registry extension. Current Alpha check-in always sends its token.",
+      "source": "src/server.ts:825-841; src/server.ts:903-913; Alpha src/license.ts:628-633",
+      "tests": "tests/server.test.mjs; tests/seats.test.mjs; tests/flags.test.mjs; tests/admin.test.mjs; tests/billing.test.mjs; tests/rate-limit-http.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "009b245; clients older than Alpha v0.90.3 without token require update.",
+      "residualOpen": false
+    },
+    {
+      "id": "MKT-L5",
+      "disposition": "fixed",
+      "evidence": "The community gallery limits active strategies to 25 per license; a same-name replacement is allowed and moderated tombstones do not spend active quota.",
+      "source": "src/community.ts",
+      "tests": "tests/community.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "d7b640b; global retention can still evict old work across owners at scale, subject to global policy.",
+      "residualOpen": false
+    },
+    {
+      "id": "DM-17",
+      "disposition": "accepted_limitation",
+      "evidence": "Billing marks the core event seen before Earn work, preventing replayed license mutation, but still awaits Earn serial handling. A failed Earn hook produces 500 for an already-applied core event; Stripe retry repeats only the idempotent hook. Safe decoupling needs a durable Earn outbox/acknowledgment contract not present in this source pass.",
+      "source": "src/billing/service.ts:304-343; src/earn-stripe.ts:124-146",
+      "tests": "tests/billing-payment-replay.test.mjs; tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen: Stripe webhook latency and delayed Earn work remain; add a durable outbox with crash/retry tests before asynchronous acknowledgement.",
+      "residualOpen": true
+    },
+    {
+      "id": "DM-18",
+      "disposition": "blocked_external",
+      "evidence": "Earn owner is a hash of normalized billing email, falling back to license ID. The customer session uses email while the license route uses the current customer email; a past identity change could detach an existing money ledger. Migrating unknown existing owners requires verified customer-to-owner history, absent from this checkout.",
+      "source": "src/server.ts:1374-1391; src/earn.ts:22,57-66; src/billing/store.ts CustomerRecord",
+      "tests": "source review",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen: collect verified historical identity mapping and design a durable immutable owner binding/migration; do not merge balances by guessed email aliases.",
+      "residualOpen": true
+    },
+    {
+      "id": "DM-23",
+      "disposition": "accepted_limitation",
+      "evidence": "Posted payouts now reconcile every six hours rather than every minute; processing jobs remain on the one-minute cadence. Candidate scan and Earn ledger transaction still scale with accumulated jobs/entries; no production latency or size threshold demonstrates an urgent bounded schema rewrite.",
+      "source": "src/earn-stripe.ts:200-205,226-233; src/earn.ts:43-55",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "784bae5; residualOpen: measure live job/ledger growth and queue latency, then introduce a durable cursor or archival format.",
+      "residualOpen": true
+    },
+    {
+      "id": "DM-24",
+      "disposition": "fixed",
+      "evidence": "A definite Stripe 400/422 validation rejection clears the persisted recipient request and rotates its next idempotency attempt; ambiguous outcomes keep the exact request and key for reconciliation.",
+      "source": "src/earn-stripe.ts onboarding recipient path",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "b9ddf2d; other provider failures remain conservatively pending.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-3",
+      "disposition": "duplicate",
+      "evidence": "This overlaps DM-17 Earn queue and MKT-H3 checkout replay. Core billing markSeen precedes Earn, so the specific claimed license double-credit path is already prevented; Earn failure/latency remains DM-17.",
+      "source": "src/billing/service.ts:304-343; src/billing/store.ts checkout marker methods",
+      "tests": "tests/billing-payment-replay.test.mjs; tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen follows DM-17 and historical MKT-H3; no independent fix.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-4",
+      "disposition": "fixed",
+      "evidence": "A profile records Stripe-proved software product IDs at activation; grandfathered prices are admitted only after Stripe proves the same USD recurring product, bounded to four historical IDs. Paused new enrollment still honors renewals for previously activated referrals.",
+      "source": "src/earn-stripe.ts activate/invoice; src/earn.ts member profile",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "7ba4cd0; legacy profiles with no product proof fail closed until reactivated.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-5",
+      "disposition": "duplicate",
+      "evidence": "Same repeated settled-payout reconciliation and full-ledger fsync growth as DM-23. The posted cadence improvement applies here.",
+      "source": "src/earn-stripe.ts:200-205; src/earn.ts:43-55",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "784bae5; residualOpen follows DM-23.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-6",
+      "disposition": "fixed",
+      "evidence": "Anonymous referral checkout is admitted by independent pre-queue IP 3/min and referral-code 20/min gates before Stripe/session/ledger work. Ordinary /buy remains available.",
+      "source": "src/server.ts:341-342,749-755",
+      "tests": "tests/earn.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "5fecac1; shared IPs can consume a local three-attempt minute allowance.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-8",
+      "disposition": "blocked_external",
+      "evidence": "Hub guest-session IP limiter remains capped at 4096 keys. The claim that the external website widget opens a session on every page load needs current site instrumentation and supported traffic/unique-IP measurements; changing eviction/budgets without those would weaken abuse bounds.",
+      "source": "src/server.ts:548,683-700; public/support.html",
+      "tests": "source review",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen: capture website /session traffic and 4096-key overflow behavior under supported load; tune only with observed use and an abuse budget.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-9",
+      "disposition": "fixed",
+      "evidence": "Raw JSONL bytes are counted per license; a 8 MiB/license tracker ceiling sits under the existing 32 MiB global ceiling so another license can still submit after one reaches its cap.",
+      "source": "src/feedback.ts",
+      "tests": "tests/feedback-limits.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "81b8809; total global cap remains 32 MiB.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-10",
+      "disposition": "accepted_limitation",
+      "evidence": "Guests and licensed members share the same approved monthly $50 AI support spend ceiling; a guest can exhaust it. A separate guest share is a product spending policy, not inferable from code, and would change access without authorization. Per-identity reply limits remain.",
+      "source": "src/support-chat.ts:70-77,143-152",
+      "tests": "tests/support-chat.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen: choose a guest sub-budget only with explicit owner policy, preserving the $50 total cap.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-11",
+      "disposition": "fixed",
+      "evidence": "A definite non-2xx AI-provider refusal releases its unbilled support reservation and reply count; ambiguous timeout retains a conservative reservation until reconciliation to avoid overspending the approved budget.",
+      "source": "src/support-chat.ts provider response/catch",
+      "tests": "tests/support-chat.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "5fecac1; ambiguous network failures can still hold allowance.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-13",
+      "disposition": "fixed",
+      "evidence": "Diagnostics field named exactly key is redacted even when its value is a short credential; stored redacted output is asserted.",
+      "source": "src/feedback.ts diagnosticValue",
+      "tests": "tests/feedback.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "5fecac1; key-name redaction remains heuristic for other unrecognized names.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-16",
+      "disposition": "duplicate",
+      "evidence": "Same definitive recipient rejection/retry issue as DM-24; the changed recipient facts can be resubmitted after a confirmed 400/422 only.",
+      "source": "src/earn-stripe.ts onboard",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "b9ddf2d; ambiguous outcomes remain pinned.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-17",
+      "disposition": "fixed",
+      "evidence": "License-only payout-recipient onboarding now returns 403 before touching Stripe. Customer-session authenticated /api/customer/earn/onboard remains; unauthenticated GET /earn redirects to first-party /customer.",
+      "source": "src/server.ts:1371-1409; public/earn.html",
+      "tests": "tests/earn.test.mjs; tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "5fecac1; app-origin Earn iframe replacement is owned by Alpha integration, not this Hub source commit.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-18",
+      "disposition": "fixed",
+      "evidence": "Old referral codes remain aliases to the currently activated promotion after discount rotation. An inactive/retired promotion falls back to the normal checkout rather than failing the sale.",
+      "source": "src/earn-stripe.ts referral activation/checkout; src/server.ts:749-755",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "b9ddf2d and c1696d8; expired/unknown codes cannot confer a referral discount.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-19",
+      "disposition": "fixed",
+      "evidence": "Admin discount changes invoke Stripe activation; zero percent retires the promotion. Member UI displays Stripe-applied percent or unconfirmed; if activation fails, admin receives explicit partial-success error and UI retains prior applied figure.",
+      "source": "src/server.ts admin Earn configuration; src/earn-stripe.ts activate; public/earn.html",
+      "tests": "tests/earn.test.mjs; tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "c1696d8; configuration may remain desired-but-unsynced after Stripe failure and needs operator retry, but no silent advertised mismatch.",
+      "residualOpen": false
+    },
+    {
+      "id": "DH-20",
+      "disposition": "blocked_external",
+      "evidence": "The guard compares exact normalized emails. Alias and dot-equivalence vary by identity provider and domain; no supported customer identity contract proves two such strings are one person, so speculative canonicalization could merge unrelated payees.",
+      "source": "src/earn-stripe.ts:168; src/customer-sessions.ts normalizeCustomerEmail",
+      "tests": "source review",
+      "commit": "none",
+      "riskOrNextAction": "residualOpen: obtain provider/product alias semantics and verified customer-ID linkage before altering payout attribution.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-21",
+      "disposition": "accepted_limitation",
+      "evidence": "Earn seen-event map now retains the newest 10,000 IDs, stopping unbounded dedupe-map growth. An unrelated invoice still performs Stripe invoice/subscription reads and a full-ledger save when promotions exist; financial invoice records are intentionally retained.",
+      "source": "src/earn-stripe.ts:124-146,147-181; src/earn.ts:43-55",
+      "tests": "tests/earn-stripe.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "a6f0e9c; residualOpen: measure unrelated-event rate and ledger I/O before changing attribution prefilters or financial retention.",
+      "residualOpen": true
+    },
+    {
+      "id": "DH-22",
+      "disposition": "fixed",
+      "evidence": "An unverified UID claim no longer reveals whether another member has it or blocks the legitimate claimant. Admin verification refuses a duplicate verified UID across members; transfer still needs operator review.",
+      "source": "src/earn.ts:73-94",
+      "tests": "tests/earn.test.mjs",
+      "commit": "none",
+      "riskOrNextAction": "b9ddf2d; duplicate unverified claims can coexist pending ownership proof.",
+      "residualOpen": false
+    }
+  ]
+}
