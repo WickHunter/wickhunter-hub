@@ -118,5 +118,13 @@ await test('definite recipient validation refusal permits corrected facts with a
   local.stop();
  } finally {fs.rmSync(isolated,{recursive:true,force:true});}
 });
+await test('zero discount retires the Stripe promotion and refuses referral checkout',async()=>{
+ ledger.configure({owner,discountPercent:0});
+ const before=calls.length;await svc.activate(owner);
+ assert.ok(calls.slice(before).some(c=>c.endpoint.startsWith('/v1/promotion_codes/')&&c.body.active==='false'));
+ assert.equal(svc.view(owner).referralUrl,null);
+ assert.equal(svc.view(owner).appliedDiscountPercent,0);
+ await assert.rejects(svc.checkout(member.code,'monthly'),/discount is not active/);
+});
 }finally{svc.stop();fs.rmSync(dir,{recursive:true,force:true});}
 summary('earn-stripe');

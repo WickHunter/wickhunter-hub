@@ -51,15 +51,25 @@ export class EarnStripeService {
  private profile(mode:BillingMode,owner:string){return book(this.ledger(mode).admin()).profiles[owner]||{};}
  private updateProfile(mode:BillingMode,owner:string,patch:StripeObject){this.ledger(mode).transaction(s=>{const b=book(s);b.profiles[owner]={...b.profiles[owner],...patch};});}
  private syncMember(mode:BillingMode,owner:string){const m=this.liveLedger.admin().members.find(m=>m.id===owner);if(!m)throw Error('Member not found');if(mode==='test')this.testLedger.copyMember(m);return m;}
- view(owner:string){const c=this.settings(),p=this.profile(c.mode,owner);return {mode:c.mode,enabled:c.enabled,automatic:c.automatic,payoutDay:c.payoutDay,referralUrl:c.enabled&&p.promotion?`${this.origin}/buy?ref=${encodeURIComponent(p.code)}`:null,recipient:!!p.recipient,recipientStatus:p.status||'not_connected',jobs:(book(this.ledger(c.mode).admin()).jobs as Job[]).filter(j=>j.owner===owner).map(j=>({id:j.id,cycle:j.cycle,amount:j.amount,status:j.status,error:j.error})),test:c.mode==='test'?this.testLedger.view(owner,this.liveLedger.admin().members.find(m=>m.id===owner)?.name||'Test member'):undefined};}
+ view(owner:string){const c=this.settings(),p=this.profile(c.mode,owner);return {mode:c.mode,enabled:c.enabled,automatic:c.automatic,payoutDay:c.payoutDay,referralUrl:c.enabled&&p.promotion?`${this.origin}/buy?ref=${encodeURIComponent(p.code)}`:null,appliedDiscountPercent:Number.isInteger(p.appliedDiscountPercent)?p.appliedDiscountPercent:null,recipient:!!p.recipient,recipientStatus:p.status||'not_connected',jobs:(book(this.ledger(c.mode).admin()).jobs as Job[]).filter(j=>j.owner===owner).map(j=>({id:j.id,cycle:j.cycle,amount:j.amount,status:j.status,error:j.error})),test:c.mode==='test'?this.testLedger.view(owner,this.liveLedger.admin().members.find(m=>m.id===owner)?.name||'Test member'):undefined};}
  admin(){const c=this.settings();return {settings:c,payoutKeyConfigured:!!readJson<Partial<Record<BillingMode,string>>>(path.join(this.dir,'earn-stripe-secrets.v1.json'),{})[c.mode],lastError:this.lastError,...book(this.ledger(c.mode).admin())};}
  async readiness(){const c=this.settings();const accounts=await this.payoutApi(c.mode).call('GET','/v2/money_management/financial_accounts');return {mode:c.mode,accounts:(accounts.data||[]).map((a:StripeObject)=>({id:a.id,status:a.status,currencies:a.storage?.holds_currencies||[],availableUsd:a.balance?.available?.usd?.value??null}))};}
  activate(owner:string){return this.serial(async()=>{
-  const c=this.settings();if(!c.enabled)throw Error('Earnings are not enabled');const m=this.syncMember(c.mode,owner),api=this.api(c.mode);const p=this.profile(c.mode,owner);
+  const c=this.settings();if(!c.enabled)throw Error('Earnings are not enabled');const m=this.syncMember(c.mode,owner),p=this.profile(c.mode,owner);
+  if(m.discountPercent===0){
+   if(p.promotion)await this.api(c.mode).call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
+   const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'))];
+   this.updateProfile(c.mode,owner,{code:m.code,promotion:null,signature:null,legacyCodes,appliedDiscountPercent:0});
+   return this.view(owner);
+  }
+  const api=this.api(c.mode);
   const plans=this.billing().plans.filter(p=>p.role==='software'&&p.interval&&p.checkout==='payment-link'&&p.currency==='usd');
   const products:string[]=[];for(const plan of plans){const priceId=this.billing().stripe[c.mode].priceIds[plan.key];if(!priceId)continue;const price=await api.call('GET','/v1/prices/'+priceId);if(price.active===true&&price.recurring?.interval===plan.interval&&price.currency==='usd')products.push(id(price.product));}
   if(!products.length)throw Error('Create the recurring WH software plans in Stripe first');
-  const signature=hash(JSON.stringify([m.code,m.discountPercent,[...new Set(products)].sort()]));if(p.signature===signature&&p.promotion)return this.view(owner);
+  const signature=hash(JSON.stringify([m.code,m.discountPercent,[...new Set(products)].sort()]));if(p.signature===signature&&p.promotion){
+   if(!Number.isInteger(p.appliedDiscountPercent))this.updateProfile(c.mode,owner,{appliedDiscountPercent:m.discountPercent});
+   return this.view(owner);
+  }
   if(m.discountPercent<1)throw Error('Referral discounts must be at least 1% to create a promotion code');
   const couponId='wh_earn_'+signature;
   let coupon:StripeObject;try{coupon=await api.call('GET','/v1/coupons/'+couponId);}catch(e){if(!(e instanceof EarnStripeError)||e.status!==404)throw e;coupon=await api.call('POST','/v1/coupons',{id:couponId,duration:'forever',percent_off:m.discountPercent,'metadata[managed_by]':'wh-earn',...Object.fromEntries([...new Set(products)].map((v,i)=>[`applies_to[products][${i}]`,v]))},{key:couponId});}
@@ -72,7 +82,7 @@ export class EarnStripeService {
   if(!id(promo))throw Error('Stripe did not return a promotion code');
   if(p.promotion)await api.call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
   const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'&&v!==code))];
-  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes});return this.view(owner);
+  this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes,appliedDiscountPercent:m.discountPercent});return this.view(owner);
  });}
  checkout(code:string,planKey?:string|null){return this.serial(async()=>{
   const c=this.settings();if(!c.enabled)throw Error('Referrals are not available');const b=book(this.ledger(c.mode).admin()),members=this.liveLedger.admin().members;const found=Object.entries(b.profiles).find(([owner,p])=>{
@@ -80,7 +90,7 @@ export class EarnStripeService {
    return profile.code===code || (Array.isArray(profile.legacyCodes)&&profile.legacyCodes.includes(code))
      || members.some(m=>m.id===owner&&m.code===code);
   }) as [string,StripeObject]|undefined;if(!found)throw Error('Referral code not found');
-  const [owner,p]=found,m=this.syncMember(c.mode,owner),cfg=this.billing();const plan=cfg.plans.find(x=>x.key===(planKey||'monthly')&&x.role==='software'&&x.interval&&x.checkout==='payment-link'&&x.currency==='usd');const price=plan&&cfg.stripe[c.mode].priceIds[plan.key];if(!plan||!price)throw Error('This recurring subscription plan is unavailable');
+  const [owner,p]=found;if(!p.promotion)throw Error('Referral discount is not active');const m=this.syncMember(c.mode,owner),cfg=this.billing();const plan=cfg.plans.find(x=>x.key===(planKey||'monthly')&&x.role==='software'&&x.interval&&x.checkout==='payment-link'&&x.currency==='usd');const price=plan&&cfg.stripe[c.mode].priceIds[plan.key];if(!plan||!price)throw Error('This recurring subscription plan is unavailable');
   const r=await this.api(c.mode).call('POST','/v1/checkout/sessions',{mode:'subscription','line_items[0][price]':price,'line_items[0][quantity]':1,'discounts[0][promotion_code]':p.promotion,'metadata[plan]':plan.key,'metadata[managed_by]':'wickhunter-hub','metadata[wh_earn_code]':m.code,'subscription_data[metadata][plan]':plan.key,'subscription_data[metadata][wh_earn_code]':m.code,'subscription_data[metadata][managed_by]':'wickhunter-hub',success_url:this.origin+'/customer?checkout=complete',cancel_url:this.origin+'/customer'},{key:'earn_checkout_'+randomUUID()});
   if(typeof r.url!=='string'||new URL(r.url).hostname!=='checkout.stripe.com')throw Error('Invalid Stripe checkout URL');return r.url;
  });}

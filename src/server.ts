@@ -753,7 +753,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         const codeRate = referralCheckoutCodeLimiter.take(referral.slice(0, 128), rateLimitNow());
         if (!codeRate.ok) return sendRateLimited(res, codeRate, "referral checkout attempts");
         try { return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout"); }
-        catch (e) { return sendText(res, 400, (e as Error).message); }
+        catch (e) {
+          if ((e as Error).message === 'Referral discount is not active') return billingRedirect(res, billing.buyUrl(planKey), 'checkout');
+          return sendText(res, 400, (e as Error).message);
+        }
       }
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
@@ -2009,7 +2012,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
           case "/admin/api/earn/stripe-run": result = await earnStripe.run(); break;
           case "/admin/api/earn/stripe-activate": result = await earnStripe.activate(String(body.owner)); break;
-          case "/admin/api/earn/configure": result = earn.configure(body); break;
+          case "/admin/api/earn/configure": {
+            const prior = earn.admin().members.find(member => member.id === body.owner)?.discountPercent;
+            result = earn.configure(body);
+            if (body.discountPercent !== undefined && prior !== body.discountPercent && earnStripe.settings().enabled) {
+              try { await earnStripe.activate(String(body.owner)); }
+              catch (error) { throw new Error(`Rates saved, but Stripe discount was not changed: ${(error as Error).message}`); }
+            }
+            break;
+          }
           case "/admin/api/earn/record": result = earn.record(body); break;
           case "/admin/api/earn/reverse": result = earn.reverse(body); break;
           case "/admin/api/earn/preview": result = earn.previewCsv(body); break;

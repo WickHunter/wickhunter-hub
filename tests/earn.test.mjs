@@ -78,6 +78,12 @@ const h=await freshHub();try{
  assert.equal((await fetch(h.origin+'/api/hub/earn/onboard',{method:'POST',headers,body:JSON.stringify({country:'US',email:'attacker@example.com'})})).status,403);
  assert.equal((await fetch(h.origin+'/admin/api/earn',{headers})).status,401);
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers:{...headers,'sec-fetch-site':'cross-site'},body:'{}'})).status,403);
+ const adminHeaders={'x-hub-admin':'test-admin-token','x-wh-earn':'1','content-type':'application/json'};
+ assert.equal((await fetch(h.origin+'/admin/api/earn/stripe-configure',{method:'POST',headers:adminHeaders,body:JSON.stringify({enabled:true})})).status,200);
+ assert.equal((await fetch(h.origin+'/admin/api/earn/configure',{method:'POST',headers:adminHeaders,body:JSON.stringify({owner:member.id,discountPercent:0})})).status,200);
+ const paused=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();
+ assert.equal(paused.stripe.appliedDiscountPercent,0);
+ assert.equal(paused.stripe.referralUrl,null);
  });
 }finally{await h.close();}
 const checkoutHub=await freshHub({}, {rateLimitNow:()=>123456789});
