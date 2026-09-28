@@ -11,6 +11,7 @@ type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:
 type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean};
 const sources:EarnSource[]=['referral','exchange','marketplace'];
 const POSTED_RECHECK_MS=6*60*60_000;
+const SEEN_EVENT_MAX=10_000;
 const defaults:Settings={mode:'test',enabled:false,automatic:false,payoutDay:1,financialAccount:''};
 const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String((v as StripeObject).id||''):'';
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
@@ -135,7 +136,14 @@ export class EarnStripeService {
   } else if(['charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type)){
    const charge=ev.type==='charge.refunded'?id(o):id(o.charge);if(charge){const row=(Object.values(b.invoices) as Invoice[]).find(i=>i.charges.includes(charge));if(row)await this.adjustInvoice(mode,row.id);else{const ch=await api.call('GET','/v1/charges/'+charge);if(id(ch.invoice))await this.invoice(mode,id(ch.invoice));}}
   }
-  ledger.transaction(s=>{book(s).seen[ev.id]=this.now();});
+  ledger.transaction(s=>{
+   const seen=book(s).seen;seen[ev.id]=this.now();
+   const keys=Object.keys(seen);
+   if(keys.length>SEEN_EVENT_MAX){
+    keys.sort((a,b)=>(Number(seen[a])||0)-(Number(seen[b])||0));
+    for(const key of keys.slice(0,keys.length-SEEN_EVENT_MAX))delete seen[key];
+   }
+  });
  });}
  private async invoice(mode:BillingMode,invoiceId:string){
   const ledger=this.ledger(mode),api=this.api(mode);if(book(ledger.admin()).invoices[invoiceId]){await this.adjustInvoice(mode,invoiceId);return;}

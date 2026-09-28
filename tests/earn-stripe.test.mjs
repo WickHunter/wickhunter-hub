@@ -136,5 +136,13 @@ await test('zero discount retires the Stripe promotion and refuses referral chec
  await svc.handleEvent(event('invoice.paid','evt_existing_after_pause',{id:'in_existing_after_pause'}));
  assert.equal(ledger.view(owner,'Referrer').balances.referral,beforeBalance+1800,'an existing referred subscription still earns after enrollment pauses');
 });
+await test('Earn event dedupe stays bounded while financial invoice records remain durable',async()=>{
+ ledger.transaction(s=>{for(let i=0;i<10_001;i++)s.stripe.seen['old-event-'+i]=now-10_000-i;});
+ await svc.handleEvent(event('customer.subscription.updated','new-untracked-event',{id:'sub_untracked'}));
+ const saved=ledger.admin().stripe;
+ assert.ok(Object.keys(saved.seen).length<=10_000);
+ assert.ok(saved.seen['new-untracked-event']);
+ assert.ok(saved.invoices['in_1']);
+});
 }finally{svc.stop();fs.rmSync(dir,{recursive:true,force:true});}
 summary('earn-stripe');
