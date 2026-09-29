@@ -1,3 +1,4 @@
+import { SupportSessionLimiter } from "./support-session-limiter.js";
 import { SupportChat, SupportError } from "./support-chat.js";
 import { EarnStripeService } from "./earn-stripe.js";
 import { EarnService, earnOwner } from "./earn.js";
@@ -552,7 +553,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   });
 
   const support = new SupportChat(cfg.dataDir, cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000});
-  const supportGuestLimiter = new SlidingWindowLimiter({windowMs:24*60*60_000,max:3,maxKeys:4096});
+  const supportGuestLimiter = new SupportSessionLimiter();
   const supportSendLimiter = new SlidingWindowLimiter({windowMs:60_000,max:20,maxKeys:4096});
   let upgradeStartedAt = 0;
   let sourceProbeCache: { readonly atMs: number; readonly runtimeKey: string; readonly source: ReturnType<typeof probeSourceCheckout> } | null = null;

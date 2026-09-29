@@ -132,13 +132,13 @@
     },
     {
       "id": "DH-8",
-      "disposition": "partially_fixed",
-      "evidence": "Confirmed directly in the served website widget: page load minted a session before a question. It now reads any existing conversation without minting a cookie; first actual question creates the session. Anonymous idle pages do not poll. Existing chats and team reply polling are preserved.",
-      "source": "src/server.ts:548,683-700; public/support.html",
-      "tests": "support-lazy-session, support-website-ui and support-inbox suites passed.",
-      "commit": "completion lazy-session source batch",
-      "riskOrNextAction": "The 4096-key daily IP admission bound remains; supported concurrent distinct-question traffic and abuse budget are needed to change that cap without weakening its protection.",
-      "residualOpen": true
+      "disposition": "fixed",
+      "evidence": "Idle pages no longer mint support sessions. Replaced the 4096-key shared overflow allowance with a fixed 6 MiB four-way keyed sliding-window sketch. An address can never gain extra allowance from a collision; unrelated visitors no longer share one overflow bucket after 4095 distinct addresses.",
+      "source": "src/support-session-limiter.ts; src/server.ts; public/support.html",
+      "tests": "Four limiter regressions pass: 12000 distinct visitors, per-IP 3/24h bound, exact expiry and denied-call behavior, conservative forced collisions, cardinality churn, clock rollback and fixed memory. Support chat and lazy-session suites pass. Independent source review found no concrete defect.",
+      "commit": "Alpha completion Hub source batch",
+      "riskOrNextAction": "Source only under Alpha-only publication instruction. Heavy sketch saturation can conservatively refuse earlier; in-memory admission state resets on process restart, as before. Independent guest and total monetary caps remain enforced.",
+      "residualOpen": false
     },
     {
       "id": "DH-9",
