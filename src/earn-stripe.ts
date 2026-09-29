@@ -25,7 +25,7 @@ function entry(owner:string,source:EarnSource,kind:Entry['kind'],cents:number,re
  * BEFORE submission; unknown outcomes retain that reservation across restarts. */
 export class EarnStripeService {
  private tail:Promise<unknown>=Promise.resolve(); private timer:ReturnType<typeof setInterval>|undefined; private tickRunning=false; private lastError:string|null=null;
- private payoutScan:Partial<Record<BillingMode,{version:string;nextDue:number}>>={};
+ private payoutScan:Partial<Record<BillingMode,{version:string;nextDue:number;jobs:Job[]}>>={};
  private testLedger:EarnService;
  constructor(private dir:string,private liveLedger:EarnService,private billing:()=>BillingConfig,private origin:string,private now=Date.now,private fetcher:typeof fetch=fetch){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
  settings():Settings {return {...defaults,...readJson<Partial<Settings>>(path.join(this.dir,'earn-stripe-config.v1.json'),{})};}
@@ -226,13 +226,14 @@ export class EarnStripeService {
    // Otherwise a posted-only book needs only a stat until its next six-hour
    // check. On restart the memo is empty, so every durable obligation is read.
    if(memo&&memo.version===version&&at<memo.nextDue)continue;
-   const all=book(own.admin()).jobs as Job[];
+   const all=memo?.version===version?memo.jobs:book(own.admin()).jobs as Job[];
    const candidates=all.filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
     && (j.status!=='posted'||at-(j.checked||0)>=POSTED_RECHECK_MS)).sort((a,b)=>(a.checked||0)-(b.checked||0)).slice(0,100);
    const outcomes:{id:string;identity:string;status?:string;error?:unknown}[]=[];
    for(const job of candidates){const identity=payoutIdentity(job);try{outcomes.push({id:job.id,identity,status:await this.readPayoutStatus(rail,job)});}catch(error){outcomes.push({id:job.id,identity,error});}}
+   let latest=all;
    if(outcomes.length)own.transactionIfChanged(s=>{
-    const current=book(s).jobs as Job[];let changed=false;
+    const current=book(s).jobs as Job[];latest=current;let changed=false;
     for(const outcome of outcomes){const job=current.find(j=>j.id===outcome.id);if(!job)continue;
      if(payoutIdentity(job)!==outcome.identity){const message='Payout identity changed during reconciliation; manual review required';if(job.error!==message){job.error=message;changed=true;}continue;}
      if(outcome.error!==undefined){const message=outcome.error instanceof EarnStripeError?outcome.error.message:'Stripe could not be reached; reconciliation will retry';if(job.checked!==at||job.error!==message){job.checked=at;job.error=message;changed=true;}}
@@ -244,10 +245,9 @@ export class EarnStripeService {
    });
    // A 101st due job remains due on the next tick; non-posted jobs must also
    // continue to poll each tick. Only an all-posted/no-due book can sleep.
-   const latest=outcomes.length?book(own.admin()).jobs as Job[]:all;
    const nextDue=latest.reduce((due,j)=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
     ?Math.min(due,j.status==='posted'?(j.checked||0)+POSTED_RECHECK_MS:0):due,Number.POSITIVE_INFINITY);
-   this.payoutScan[rail]={version:own.fileVersion(),nextDue};
+   this.payoutScan[rail]={version:own.fileVersion(),nextDue,jobs:latest};
   }
   if(!c.enabled||!c.automatic)return;
   const date=new Date(this.now());if(date.getUTCDate()<c.payoutDay)return;const cycle=date.toISOString().slice(0,7);
