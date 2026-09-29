@@ -1,13 +1,13 @@
 {
   "scope": "Hub source review only; no runtime deploy, live Stripe call, payout, customer message, or version bump",
   "baseline": "55e8bdffde176400896ad9d9eb1bf7b4db1f7f21",
-  "reviewedHead": "120a50c (Hub source only; no runtime deploy)",
+  "reviewedHead": "94ebcfa (Hub source only; no runtime deploy)",
   "validation": {
     "build": "npm run build passed",
     "focused": "server, seats, flags, rate-limit-http, admin, billing, license-seat-recovery, license-leases-http passed after MKT-M9",
     "full": "71/71 suites passed with PATH=/opt/homebrew/bin:$PATH and LIQHUNTER_BOT_MODULE set to the built Alpha size-percentiles module; default macOS run fails in backup-script (Apple Bash lacks mapfile) and liq-percentiles (Linux default sibling path absent).",
     "latestRoute": "npm run build and tests/server.test.mjs 21/21 passed after header-first /api/latest and /download addition",
-    "earnOutboxAndOwner": "npm run build; billing-after-commit-outbox 5/5, earn-owner-binding 3/3, earn-stripe 18/18, earn 11/11; full Hub suite 71/71."
+    "earnOutboxAndOwner": "npm run build; billing-after-commit-outbox 5/5, earn-owner-binding 3/3, earn-stripe 18/18, earn 11/11; payout-cost 4/4; full Hub suite 74/74 with Homebrew Bash and LIQHUNTER_BOT_MODULE pointed at the built Alpha module."
   },
   "findings": [
     {
@@ -72,13 +72,13 @@
     },
     {
       "id": "DM-23",
-      "disposition": "accepted_limitation",
-      "evidence": "Posted payouts now reconcile every six hours rather than every minute; processing jobs remain on the one-minute cadence. Candidate scan and Earn ledger transaction still scale with accumulated jobs/entries; no production latency or size threshold demonstrates an urgent bounded schema rewrite.",
-      "source": "src/earn-stripe.ts:200-205,226-233; src/earn.ts:43-55",
-      "tests": "tests/earn-stripe.test.mjs",
-      "commit": "none",
-      "riskOrNextAction": "784bae5; residualOpen: measure live job/ledger growth and queue latency, then introduce a durable cursor or archival format.",
-      "residualOpen": true
+      "disposition": "fixed",
+      "evidence": "Posted-only books now stat the atomic ledger and defer parse/sort until their exact six-hour next due time; any file version change or process restart forces a fresh durable scan. Up to 100 provider outcomes per rail apply in one ledger transaction, with exact job identity rechecked after the awaited reads. A 120-job/~0.9 MB retained-history fixture made one ledger parse and no Stripe reads/writes over 60 idle ticks, then used one durable write for each 100/20 due batch; late returns after restart reversed each payout once.",
+      "source": "src/earn-stripe.ts payoutScan/run/readPayoutStatus/settleInState; src/earn.ts fileVersion/transactionIfChanged",
+      "tests": "tests/earn-payout-reconcile-cost.test.mjs 4/4; tests/earn-stripe.test.mjs 18/18; full Hub gate 74/74 with documented local tool-path env",
+      "commit": "fd4cfee,94ebcfa",
+      "riskOrNextAction": "Due batches still read and durably save the full ledger because job status, reservations and reversals are financial truth. Processing jobs retain each-tick provider polling; no status freshness was lengthened. No live Stripe or production-size sample was used.",
+      "residualOpen": false
     },
     {
       "id": "DM-24",
@@ -113,12 +113,12 @@
     {
       "id": "DH-5",
       "disposition": "duplicate",
-      "evidence": "Same repeated settled-payout reconciliation and full-ledger fsync growth as DM-23. The posted cadence improvement applies here.",
-      "source": "src/earn-stripe.ts:200-205; src/earn.ts:43-55",
-      "tests": "tests/earn-stripe.test.mjs",
-      "commit": "none",
-      "riskOrNextAction": "784bae5; residualOpen follows DM-23.",
-      "residualOpen": true
+      "evidence": "This is DM-23's repeated settled-payout scan and full-ledger rewrite. File-version-aware due scheduling and one durable transaction per 100 checked jobs remove the measured hot-path amplification.",
+      "source": "src/earn-stripe.ts payoutScan/run; src/earn.ts fileVersion/transactionIfChanged",
+      "tests": "tests/earn-payout-reconcile-cost.test.mjs 4/4; full Hub gate 74/74",
+      "commit": "fd4cfee,94ebcfa",
+      "riskOrNextAction": "Follows DM-23; due financial updates still require a durable ledger save.",
+      "residualOpen": false
     },
     {
       "id": "DH-6",
@@ -232,13 +232,13 @@
     },
     {
       "id": "DH-21",
-      "disposition": "accepted_limitation",
-      "evidence": "Earn seen-event map now retains the newest 10,000 IDs, stopping unbounded dedupe-map growth. An unrelated invoice still performs Stripe invoice/subscription reads and a full-ledger save when promotions exist; financial invoice records are intentionally retained.",
-      "source": "src/earn-stripe.ts:124-146,147-181; src/earn.ts:43-55",
-      "tests": "tests/earn-stripe.test.mjs",
-      "commit": "none",
-      "riskOrNextAction": "a6f0e9c; residualOpen: measure unrelated-event rate and ledger I/O before changing attribution prefilters or financial retention.",
-      "residualOpen": true
+      "disposition": "fixed",
+      "evidence": "The financial seen map remains capped at 10,000. A signed event proved unrelated after its necessary Stripe attribution reads now stores its bounded replay ID in a separate small sidecar, leaving the financial ledger inode and all retained invoice/entry evidence unchanged. Relevant events still record their seen marker with the money ledger; an older oversized seen map is pruned by its first normal ledger save.",
+      "source": "src/earn-stripe.ts ignoredEventFile/rememberIgnoredEvent/handleEvent; src/earn.ts fileVersion",
+      "tests": "tests/earn-stripe.test.mjs checks foreign/self/non-USD invoice events do not rewrite financial ledger and repeated foreign ID makes no Stripe call; full Hub gate 74/74",
+      "commit": "fd4cfee",
+      "riskOrNextAction": "A new unknown invoice still needs Stripe reads to prove whether it belongs to an activated referral; skipping on unverified webhook fields could lose earned money. Losing the sidecar only causes a safe re-read. No financial invoice record is deleted.",
+      "residualOpen": false
     },
     {
       "id": "DH-22",
