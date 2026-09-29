@@ -57,8 +57,23 @@ export class EarnService {
     return m;
   }
   admin() { return this.read(); }
+  /** Rename-on-save changes inode, including on filesystems with coarse mtimes.
+   * A missing file is a distinct version and is still read on first use. */
+  fileVersion(): string {
+    try {
+      const st=fs.statSync(this.file,{bigint:true});
+      return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code==='ENOENT') return 'missing';
+      throw error;
+    }
+  }
   /** Synchronous transaction: never retain state across an awaited network call. */
   transaction<T>(fn: (state: EarnState) => T): T { const state=this.read(); const result=fn(state);this.save(state);return result; }
+  /** Reconciliation may prove the provider has not changed any durable fact. */
+  transactionIfChanged(fn: (state: EarnState) => boolean): boolean {
+    const state=this.read();const changed=fn(state);if(changed)this.save(state);return changed;
+  }
   copyMember(member: Member) { this.transaction(s=>{const i=s.members.findIndex(m=>m.id===member.id);if(i<0)s.members.push(structuredClone(member));else s.members[i]=structuredClone(member);}); }
 
   /** Bind verified billing identities to one immutable ledger owner. Email is

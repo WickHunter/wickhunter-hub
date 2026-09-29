@@ -16,6 +16,7 @@ const defaults:Settings={mode:'test',enabled:false,automatic:false,payoutDay:1,f
 const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String((v as StripeObject).id||''):'';
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex').slice(0,40);
+const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j.financialAccount,j.amount,j.allocations,j.stripeId]);
 function book(s:EarnState):StripeObject { return s.stripe??=( {profiles:{},invoices:{},jobs:[],seen:{}} ); }
 function entry(owner:string,source:EarnSource,kind:Entry['kind'],cents:number,reference:string,period:string,note:string,now:number):Entry {
  return {id:randomUUID(),owner,source,kind,cents,currency:'USD',period,reference,note,method:kind==='payout'?'Stripe Global Payouts':'',createdAt:new Date(now).toISOString(),actor:'stripe',...(kind==='payout'?{paidAt:new Date(now).toISOString().slice(0,10)}:{})};
@@ -24,6 +25,7 @@ function entry(owner:string,source:EarnSource,kind:Entry['kind'],cents:number,re
  * BEFORE submission; unknown outcomes retain that reservation across restarts. */
 export class EarnStripeService {
  private tail:Promise<unknown>=Promise.resolve(); private timer:ReturnType<typeof setInterval>|undefined; private tickRunning=false; private lastError:string|null=null;
+ private payoutScan:Partial<Record<BillingMode,{version:string;nextDue:number}>>={};
  private testLedger:EarnService;
  constructor(private dir:string,private liveLedger:EarnService,private billing:()=>BillingConfig,private origin:string,private now=Date.now,private fetcher:typeof fetch=fetch){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
  settings():Settings {return {...defaults,...readJson<Partial<Settings>>(path.join(this.dir,'earn-stripe-config.v1.json'),{})};}
@@ -49,6 +51,14 @@ export class EarnStripeService {
   throw Error('Save a restricted live Global Payouts key in Earn settings; keep billing keys unchanged');
  }
  private serial<T>(fn:()=>Promise<T>):Promise<T>{const next=this.tail.then(fn,fn);this.tail=next.catch(()=>{});return next;}
+ private ignoredEventFile(mode:BillingMode){return path.join(this.dir,`earn-stripe-ignored-${mode}.v1.json`);}
+ private ignoredEvents(mode:BillingMode):Record<string,number>{return readJson<Record<string,number>>(this.ignoredEventFile(mode),{})||{};}
+ private rememberIgnoredEvent(mode:BillingMode,eventId:string){const seen=this.ignoredEvents(mode);seen[eventId]=this.now();const keys=Object.keys(seen);
+  if(keys.length>SEEN_EVENT_MAX){keys.sort((a,b)=>(Number(seen[a])||0)-(Number(seen[b])||0));for(const key of keys.slice(0,keys.length-SEEN_EVENT_MAX))delete seen[key];}
+  // This sidecar is only a replay filter for proved unrelated signed events.
+  // Losing it on a crash causes a harmless re-read, never lost money evidence.
+  writeJsonAtomic(this.ignoredEventFile(mode),seen);
+ }
  private profile(mode:BillingMode,owner:string){return book(this.ledger(mode).admin()).profiles[owner]||{};}
  private updateProfile(mode:BillingMode,owner:string,patch:StripeObject){this.ledger(mode).transaction(s=>{const b=book(s);b.profiles[owner]={...b.profiles[owner],...patch};});}
  private syncMember(mode:BillingMode,owner:string){const m=this.liveLedger.admin().members.find(m=>m.id===owner);if(!m)throw Error('Member not found');if(mode==='test')this.testLedger.copyMember(m);return m;}
@@ -126,16 +136,20 @@ export class EarnStripeService {
   // for already attributed subscriptions. Invoice admission still requires a known profile.
   const mode:BillingMode=ev.livemode?'live':'test';
   if(!['invoice.paid','invoice.payment_succeeded','customer.subscription.updated','customer.subscription.deleted','charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type))return;
-  const ledger=this.ledger(mode),b=book(ledger.admin());if(b.seen[ev.id])return;
+  const ledger=this.ledger(mode),b=book(ledger.admin());if(b.seen[ev.id]||this.ignoredEvents(mode)[ev.id])return;
   // An unconfigured private program must not add Stripe dependencies to ordinary billing.
   if(!Object.values(b.profiles).some((p:any)=>p.promotion)&&!Object.keys(b.invoices).length)return;
-  const api=this.api(mode),o=ev.object;
+  const before=ledger.fileVersion(),api=this.api(mode),o=ev.object;
   if(['invoice.paid','invoice.payment_succeeded'].includes(ev.type))await this.invoice(mode,id(o));
   else if(ev.type.startsWith('customer.subscription.')){
    const tracked=ledger.admin().referrals.find(r=>r.subscription===id(o));if(tracked){const sub=await api.call('GET','/v1/subscriptions/'+id(o));ledger.transaction(s=>{const r=s.referrals.find(r=>r.subscription===sub.id);if(r)r.active=sub.status==='active'&&(Object.values(book(s).invoices) as Invoice[]).some(i=>i.subscription===sub.id&&i.paidThrough>this.now()&&!i.disputed&&i.refunded<i.paid);});}
   } else if(['charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type)){
    const charge=ev.type==='charge.refunded'?id(o):id(o.charge);if(charge){const row=(Object.values(b.invoices) as Invoice[]).find(i=>i.charges.includes(charge));if(row)await this.adjustInvoice(mode,row.id);else{const ch=await api.call('GET','/v1/charges/'+charge);if(id(ch.invoice))await this.invoice(mode,id(ch.invoice));}}
   }
+  // Foreign/untracked events must remain deduped, but recording their IDs in
+  // the financial ledger would fsync its entire retained history for zero
+  // financial change. An unrelated event goes in a bounded sidecar instead.
+  if(ledger.fileVersion()===before&&Object.keys(b.seen).length<=SEEN_EVENT_MAX){this.rememberIgnoredEvent(mode,ev.id);return;}
   ledger.transaction(s=>{
    const seen=book(s).seen;seen[ev.id]=this.now();
    const keys=Object.keys(seen);
@@ -204,10 +218,37 @@ export class EarnStripeService {
  start(){if(this.timer)return;this.timer=setInterval(()=>{if(this.tickRunning)return;this.tickRunning=true;void this.run().then(()=>{this.lastError=null;},e=>{this.lastError=e instanceof EarnStripeError?e.message:'Payout reconciliation needs attention';}).finally(()=>{this.tickRunning=false;});},60_000);this.timer.unref();}
  stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
  run(){return this.serial(async()=>{
-  const c=this.settings();const mode=c.mode,ledger=this.ledger(mode);let jobs=book(ledger.admin()).jobs as Job[];
+  const c=this.settings();const mode=c.mode,ledger=this.ledger(mode);let jobs:Job[];
   // Reconcile even when automatic dispatch is paused. Submitted money still needs accounting.
-  for(const rail of ['test','live'] as const){const candidates=(book(this.ledger(rail).admin()).jobs as Job[]).filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
-    && (j.status!=='posted'||this.now()-(j.checked||0)>=POSTED_RECHECK_MS)).sort((a,b)=>(a.checked||0)-(b.checked||0));for(const job of candidates.slice(0,100))try{await this.reconcile(rail,job);}catch(e){this.jobError(rail,job.id,e);}}
+  for(const rail of ['test','live'] as const){
+   const own=this.ledger(rail),version=own.fileVersion(),memo=this.payoutScan[rail],at=this.now();
+   // A new file (including another writer's atomic rename) forces a full scan.
+   // Otherwise a posted-only book needs only a stat until its next six-hour
+   // check. On restart the memo is empty, so every durable obligation is read.
+   if(memo&&memo.version===version&&at<memo.nextDue)continue;
+   const all=book(own.admin()).jobs as Job[];
+   const candidates=all.filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
+    && (j.status!=='posted'||at-(j.checked||0)>=POSTED_RECHECK_MS)).sort((a,b)=>(a.checked||0)-(b.checked||0)).slice(0,100);
+   const outcomes:{id:string;identity:string;status?:string;error?:unknown}[]=[];
+   for(const job of candidates){const identity=payoutIdentity(job);try{outcomes.push({id:job.id,identity,status:await this.readPayoutStatus(rail,job)});}catch(error){outcomes.push({id:job.id,identity,error});}}
+   if(outcomes.length)own.transactionIfChanged(s=>{
+    const current=book(s).jobs as Job[];let changed=false;
+    for(const outcome of outcomes){const job=current.find(j=>j.id===outcome.id);if(!job)continue;
+     if(payoutIdentity(job)!==outcome.identity){const message='Payout identity changed during reconciliation; manual review required';if(job.error!==message){job.error=message;changed=true;}continue;}
+     if(outcome.error!==undefined){const message=outcome.error instanceof EarnStripeError?outcome.error.message:'Stripe could not be reached; reconciliation will retry';if(job.checked!==at||job.error!==message){job.checked=at;job.error=message;changed=true;}}
+     else if(outcome.status!==undefined)try{changed=this.settleInState(s,job,outcome.status,at)||changed;}catch{
+      const message='Payout ledger settlement needs review';if(job.checked!==at||job.error!==message){job.checked=at;job.error=message;changed=true;}
+     }
+    }
+    return changed;
+   });
+   // A 101st due job remains due on the next tick; non-posted jobs must also
+   // continue to poll each tick. Only an all-posted/no-due book can sleep.
+   const latest=outcomes.length?book(own.admin()).jobs as Job[]:all;
+   const nextDue=latest.reduce((due,j)=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
+    ?Math.min(due,j.status==='posted'?(j.checked||0)+POSTED_RECHECK_MS:0):due,Number.POSITIVE_INFINITY);
+   this.payoutScan[rail]={version:own.fileVersion(),nextDue};
+  }
   if(!c.enabled||!c.automatic)return;
   const date=new Date(this.now());if(date.getUTCDate()<c.payoutDay)return;const cycle=date.toISOString().slice(0,7);
   const fa=await this.payoutApi(mode).call('GET','/v2/money_management/financial_accounts/'+c.financialAccount);if(fa.status!=='open'||fa.livemode!==(mode==='live'))throw Error('The payout financial account is not open in this mode');
@@ -224,20 +265,29 @@ export class EarnStripeService {
    });if(job)await this.submit(mode,job,c);
   }
  });}
- private jobError(mode:BillingMode,jobId:string,error:unknown){this.ledger(mode).transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===jobId);if(j){j.checked=this.now();j.error=error instanceof EarnStripeError?error.message:'Stripe could not be reached; reconciliation will retry';}});}
+ private jobError(mode:BillingMode,jobId:string,error:unknown){this.ledger(mode).transactionIfChanged(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===jobId);if(!j)return false;const at=this.now(),message=error instanceof EarnStripeError?error.message:'Stripe could not be reached; reconciliation will retry';if(j.checked===at&&j.error===message)return false;j.checked=at;j.error=message;return true;});}
  private async submit(mode:BillingMode,job:Job,c:Settings){
   if(this.now()-job.created>23*3600000){this.ledger(mode).transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.status='needs_review';j.error='Unknown submission outcome; reconcile in Stripe before releasing this reservation';});return;}
   let accepted=false;try{const result=await this.payoutApi(mode).call('POST','/v2/money_management/outbound_payments',{from:{financial_account:job.financialAccount,currency:'usd'},to:{recipient:job.recipient},amount:{value:job.amount,currency:'usd'},description:`Wick Hunter earnings ${job.cycle}`,metadata:{wh_payout_id:job.id}},{key:'wh_payout_'+job.id});if(!id(result))throw Error('Missing outbound payment ID');accepted=true;this.ledger(mode).transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.stripeId=result.id;});await this.reconcile(mode,{...job,stripeId:result.id});}
   catch(e){this.jobError(mode,job.id,e);if(!accepted&&e instanceof EarnStripeError&&[400,402,403,404,422].includes(e.status))this.settle(mode,job.id,'failed');}
  }
- private async reconcile(mode:BillingMode,job:Job){const result=await this.payoutApi(mode).call('GET','/v2/money_management/outbound_payments/'+job.stripeId);if(result.amount?.value!==job.amount||result.amount?.currency!=='usd'||id(result.to?.recipient)!==job.recipient||result.livemode!==(mode==='live'))throw Error('Stripe payout identity mismatch');this.settle(mode,job.id,result.status);}
+ private async readPayoutStatus(mode:BillingMode,job:Job):Promise<string>{const result=await this.payoutApi(mode).call('GET','/v2/money_management/outbound_payments/'+job.stripeId);if(result.amount?.value!==job.amount||result.amount?.currency!=='usd'||id(result.to?.recipient)!==job.recipient||result.livemode!==(mode==='live'))throw Error('Stripe payout identity mismatch');return result.status;}
+ private async reconcile(mode:BillingMode,job:Job){this.settle(mode,job.id,await this.readPayoutStatus(mode,job));}
  private settle(mode:BillingMode,jobId:string,status:string){
   if(!['processing','posted','failed','canceled','returned'].includes(status))return;
-  this.ledger(mode).transaction(s=>{const job=(book(s).jobs as Job[]).find(j=>j.id===jobId)!;
-   if(job.returned||(['failed','canceled'].includes(job.status)))return;
+  const at=this.now();this.ledger(mode).transactionIfChanged(s=>{const job=(book(s).jobs as Job[]).find(j=>j.id===jobId);return job?this.settleInState(s,job,status,at):false;});
+ }
+ private settleInState(s:EarnState,job:Job,status:string,at:number):boolean{
+   if(!['processing','posted','failed','canceled','returned'].includes(status)
+     ||job.returned||(['failed','canceled'].includes(job.status)))return false;
+   const originals=new Map<EarnSource,Entry>();
+   if(['failed','canceled','returned'].includes(status)&&job.paid&&!job.returned)
+    for(const a of job.allocations){const orig=s.entries.find(e=>e.reference==='stripe:payout:'+job.id+':'+a.source);
+     if(!orig)throw Error('Payout reversal lacks its original paid entry');originals.set(a.source,orig);}
+   const was=JSON.stringify(job);
    if(status==='posted'&&!job.paid){for(const a of job.allocations){s.entries.push(entry(job.owner,a.source,'release',a.cents,'stripe:release:'+job.id+':'+a.source,job.cycle,'Reservation settled by Stripe',this.now()));s.entries.push(entry(job.owner,a.source,'payout',-a.cents,'stripe:payout:'+job.id+':'+a.source,job.cycle,'Stripe payout sent (bank arrival may follow)',this.now()));}job.paid=true;job.released=true;}
-   if(['failed','canceled','returned'].includes(status))for(const a of job.allocations){if(job.paid&&!job.returned){const orig=s.entries.find(e=>e.reference==='stripe:payout:'+job.id+':'+a.source)!;const reversal=entry(job.owner,a.source,'reversal',a.cents,'stripe:return:'+job.id+':'+a.source,job.cycle,'Stripe payout returned; earnings restored',this.now());reversal.reverses=orig.id;s.entries.push(reversal);}else if(!job.released)s.entries.push(entry(job.owner,a.source,'release',a.cents,'stripe:release:'+job.id+':'+a.source,job.cycle,'Stripe payout did not complete; earnings restored',this.now()));}
-   if(['failed','canceled','returned'].includes(status)){job.released=true;job.returned=job.paid||status==='returned';}job.status=status;job.checked=this.now();if(status==='posted')delete job.error;
-  });
+   if(['failed','canceled','returned'].includes(status))for(const a of job.allocations){if(job.paid&&!job.returned){const reversal=entry(job.owner,a.source,'reversal',a.cents,'stripe:return:'+job.id+':'+a.source,job.cycle,'Stripe payout returned; earnings restored',this.now());reversal.reverses=originals.get(a.source)!.id;s.entries.push(reversal);}else if(!job.released)s.entries.push(entry(job.owner,a.source,'release',a.cents,'stripe:release:'+job.id+':'+a.source,job.cycle,'Stripe payout did not complete; earnings restored',this.now()));}
+   if(['failed','canceled','returned'].includes(status)){job.released=true;job.returned=job.paid||status==='returned';}job.status=status;job.checked=at;if(status==='posted')delete job.error;
+   return was!==JSON.stringify(job);
  }
 }

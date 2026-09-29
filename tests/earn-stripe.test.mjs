@@ -68,7 +68,9 @@ await test('paused enrollment still reconciles refunds and disputes without doub
  await svc.handleEvent(event('charge.refunded','evt_refund_again',{id:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);assert.equal(ledger.view(owner,'Referrer').activeSubscribers,1);refund=0;dispute=false;svc.configure({enabled:true});
 });
 await test('self referrals, foreign prices and non-USD invoices do not earn',async()=>{
- const before=ledger.view(owner,'Referrer').balances.referral;email='referrer@example.com';await svc.handleEvent(event('invoice.paid','evt_self',{id:'in_self'}));email='friend@example.com';priceId='price_hosting';await svc.handleEvent(event('invoice.paid','evt_foreign',{id:'in_foreign'}));priceId='price_month';currency='eur';await svc.handleEvent(event('invoice.paid','evt_eur',{id:'in_eur'}));currency='usd';assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
+ const before=ledger.view(owner,'Referrer').balances.referral,version=ledger.fileVersion();email='referrer@example.com';await svc.handleEvent(event('invoice.paid','evt_self',{id:'in_self'}));email='friend@example.com';priceId='price_hosting';await svc.handleEvent(event('invoice.paid','evt_foreign',{id:'in_foreign'}));priceId='price_month';currency='eur';await svc.handleEvent(event('invoice.paid','evt_eur',{id:'in_eur'}));currency='usd';assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
+ assert.equal(ledger.fileVersion(),version,'proved unrelated events do not rewrite the financial ledger');
+ const callsBefore=calls.length;await svc.handleEvent(event('invoice.paid','evt_foreign',{id:'in_foreign'}));assert.equal(calls.length,callsBefore,'bounded sidecar dedupes foreign event replay');
 });
 await test('subscription cancellation removes active count',async()=>{subStatus='canceled';await svc.handleEvent(event('customer.subscription.deleted','evt_cancel',{id:'sub_friend'}));assert.equal(ledger.view(owner,'Referrer').activeSubscribers,0);});
 await svc.onboard(owner,{country:'US',email:'referrer@example.com'});svc.configure({financialAccount:'fa_test_fixture',automatic:true});
