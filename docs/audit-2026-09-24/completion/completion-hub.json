@@ -132,12 +132,12 @@
     },
     {
       "id": "DH-8",
-      "disposition": "blocked_external",
-      "evidence": "Hub guest-session IP limiter remains capped at 4096 keys. The claim that the external website widget opens a session on every page load needs current site instrumentation and supported traffic/unique-IP measurements; changing eviction/budgets without those would weaken abuse bounds.",
+      "disposition": "partially_fixed",
+      "evidence": "Confirmed directly in the served website widget: page load minted a session before a question. It now reads any existing conversation without minting a cookie; first actual question creates the session. Anonymous idle pages do not poll. Existing chats and team reply polling are preserved.",
       "source": "src/server.ts:548,683-700; public/support.html",
-      "tests": "source review",
-      "commit": "none",
-      "riskOrNextAction": "residualOpen: capture website /session traffic and 4096-key overflow behavior under supported load; tune only with observed use and an abuse budget.",
+      "tests": "support-lazy-session, support-website-ui and support-inbox suites passed.",
+      "commit": "completion lazy-session source batch",
+      "riskOrNextAction": "The 4096-key daily IP admission bound remains; supported concurrent distinct-question traffic and abuse budget are needed to change that cap without weakening its protection.",
       "residualOpen": true
     },
     {
@@ -152,13 +152,13 @@
     },
     {
       "id": "DH-10",
-      "disposition": "accepted_limitation",
-      "evidence": "Guests and licensed members share the same approved monthly $50 AI support spend ceiling; a guest can exhaust it. A separate guest share is a product spending policy, not inferable from code, and would change access without authorization. Per-identity reply limits remain.",
+      "disposition": "fixed",
+      "evidence": "Website guests now reserve against a separate configurable monthly sub-budget, default $5, inside the unchanged $50 total. Pending/uncertain reservations, usage and cap edits persist. Exhausted visitors retain their messages and route to human support, while licensed customers can use the remaining total. Hub shows and edits both caps.",
       "source": "src/support-chat.ts:70-77,143-152",
-      "tests": "tests/support-chat.test.mjs",
-      "commit": "none",
-      "riskOrNextAction": "residualOpen: choose a guest sub-budget only with explicit owner policy, preserving the $50 total cap.",
-      "residualOpen": true
+      "tests": "support-guest-budget, support-chat, support-inbox, admin suites passed; real Chrome desktop/mobile budget form checked.",
+      "commit": "completion guest-cap source batch",
+      "riskOrNextAction": "Source-only; no live spend configuration or Hub runtime changed.",
+      "residualOpen": false
     },
     {
       "id": "DH-11",
@@ -250,5 +250,13 @@
       "riskOrNextAction": "b9ddf2d; duplicate unverified claims can coexist pending ownership proof.",
       "residualOpen": false
     }
-  ]
+  ],
+  "dispositionCounts": {
+    "not_issue": 1,
+    "blocked_external": 2,
+    "fixed": 15,
+    "accepted_limitation": 2,
+    "duplicate": 3,
+    "partially_fixed": 1
+  }
 }

@@ -6,7 +6,7 @@
 <p id="status" role="status">Connecting…</p><form id="chat"><input id="question" aria-label="Your message" placeholder="Write a message…" maxlength="4000" required><button id="send">Send</button></form>
 <footer>Keep this browser session to receive replies. Never share passwords, API keys or payment details.</footer>
 <script>
-const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null;
+const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null,sessionReady=false;
 const el=id=>document.getElementById(id);
 const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function swFormat(text){
@@ -33,7 +33,7 @@ function swFormat(text){
   }
   flush();endList();return out;
 }
-async function call(path,body){const r=await fetch(root+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-wh-support':'1'},...(body?{body:JSON.stringify(body)}:{})});const d=await r.json();if(!d.ok)throw new Error(d.error||'Support unavailable');return d;}
+async function call(path,body){const r=await fetch(root+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-wh-support':'1'},...(body?{body:JSON.stringify(body)}:{})});const d=await r.json();if(!d.ok){const error=new Error(d.error||'Support unavailable');error.status=r.status;throw error;}return d;}
 function render(d){state=d;const list=d.threads||[];
  const visible=t=>!!t&&(t.status!=='resolved'||(['human','assistant'].includes(t.messages?.at(-1)?.role)&&t.messages.at(-1).feedback!=='helpful'));
  if(!visible(list.find(t=>t.id===current)))current='';
@@ -46,11 +46,11 @@ function render(d){state=d;const list=d.threads||[];
  const last=t?.messages.at(-1);feedback.hidden=!last||last.role==='customer'||!!last.feedback;box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
  el('status').textContent=t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled?'':'Send a message to our team.';
 }
-async function load(){if(busy)return;try{render(await call('/chat'));}catch(e){el('status').textContent=e.message;}}
+async function load(){if(busy)return;try{render(await call('/chat'));sessionReady=true;}catch(e){if(e.status===401){sessionReady=false;render({threads:[],aiEnabled:true});}else el('status').textContent=e.message;}}
 async function feedback(action){if(busy)return;const t=state?.threads.find(t=>t.id===current),last=t?.messages.at(-1);if(!last)return;busy=true;try{const d=await call('/chat',{id:t.id,replyId:last.id,action});if(action==='resolve'){current='';attempt=null;el('question').value='';}render(d);}catch(e){el('status').textContent=e.message;}finally{busy=false;}}
 el('resolved').onclick=()=>feedback('resolve');el('more').onclick=()=>feedback('human');
-el('chat').onsubmit=async e=>{e.preventDefault();if(busy)return;const text=el('question').value.trim();if(!text)return;if(!attempt||attempt.text!==text||attempt.id!==current)attempt={id:current,text,human:false,requestId:crypto.randomUUID()};busy=true;el('send').disabled=true;el('status').textContent='Sending…';try{const d=await call('/chat',attempt);current=d.threads[0].id;attempt=null;el('question').value='';render(d);}catch(e){el('status').textContent=e.message+' Your message is still in the box.';}finally{busy=false;el('send').disabled=false;}};
+el('chat').onsubmit=async e=>{e.preventDefault();if(busy)return;const text=el('question').value.trim();if(!text)return;if(!attempt||attempt.text!==text||attempt.id!==current)attempt={id:current,text,human:false,requestId:crypto.randomUUID()};busy=true;el('send').disabled=true;el('status').textContent='Sending…';try{if(!sessionReady){await call('/session',{});sessionReady=true;}const d=await call('/chat',attempt);current=d.threads[0].id;attempt=null;el('question').value='';render(d);}catch(e){el('status').textContent=e.message+' Your message is still in the box.';}finally{busy=false;el('send').disabled=false;}};
 function supportViewport(){document.body.style.setProperty('--support-viewport-height',(window.visualViewport?.height||window.innerHeight)+'px');}
 window.visualViewport?.addEventListener('resize',supportViewport);window.addEventListener('resize',supportViewport);supportViewport();
-call('/session',{}).then(load).catch(e=>{el('status').textContent=e.message;});setInterval(()=>{if(!document.hidden)load();},15000);
+load();setInterval(()=>{if(sessionReady&&!document.hidden)load();},15000);
 </script></body></html>

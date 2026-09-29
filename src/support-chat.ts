@@ -11,6 +11,7 @@ export interface SupportConfig {
   aiEnabled: boolean;
   apiKey: string;
   totalMonthlyMicros: number;
+  guestMonthlyMicros?: number;
   knowledgeFile?: string;
   legacyFile?: string;
 }
@@ -22,7 +23,7 @@ interface Thread {
 }
 interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
-interface State { monthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
+interface State { monthlyLimitMicros?: number; guestMonthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number;previousGuestMicros?:number;guestLimitMicros?:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
 const MAX_BYTES = 16 * 1024 * 1024;
 const GUEST_OWNER_BYTES = 256 * 1024;
 const OWNER_BYTES = 2 * 1024 * 1024;
@@ -67,11 +68,14 @@ export class SupportChat {
   private owned(identity: SupportIdentity,id:string) {const t=this.thread(id);if(t.owner!==identity.owner)throw new SupportError('Conversation not found',404);return t;}
   private period() { const iso=new Date(this.now()).toISOString();return {month:iso.slice(0,7),day:iso.slice(0,10)}; }
   private monthlyLimit() { return this.state.monthlyLimitMicros ?? this.config.totalMonthlyMicros; }
+  private configuredGuestLimit() { return this.state.guestMonthlyLimitMicros ?? this.config.guestMonthlyMicros ?? 5_000_000; }
+  private guestLimit() { return Math.min(this.monthlyLimit(),this.configuredGuestLimit()); }
   allowance(owner: string) {
     const p=this.period(), monthly=this.state.usage.filter(u=>u.month===p.month), mine=monthly.filter(u=>u.owner===owner);
     return {monthlyRemaining:Math.max(0,(owner.startsWith("guest:")?10:200)-mine.length),dailyRemaining:Math.max(0,(owner.startsWith("guest:")?5:20)-mine.filter(u=>u.day===p.day).length),
       userRemainingMicros:Math.max(0,1_000_000-mine.reduce((a,u)=>a+u.micros,0)),
       totalRemainingMicros:Math.max(0,this.monthlyLimit()-monthly.reduce((a,u)=>a+u.micros,0)),
+      guestRemainingMicros:Math.max(0,this.guestLimit()-monthly.filter(u=>u.owner.startsWith('guest:')).reduce((a,u)=>a+u.micros,0)),
       resetsAt:Date.UTC(Number(p.month.slice(0,4)),Number(p.month.slice(5,7)),1)};
   }
   customer(identity:SupportIdentity,id?:string) {
@@ -104,7 +108,8 @@ export class SupportChat {
       message:this.unavailable??(this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.'),
       items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
       knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},
-      budget:{limitMicros:this.monthlyLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0),reservedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.pending).reduce((a,u)=>a+u.micros,0),resetsAt:this.allowance('').resetsAt,month:this.period().month},
+      budget:{limitMicros:this.monthlyLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0),reservedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.pending).reduce((a,u)=>a+u.micros,0),resetsAt:this.allowance('').resetsAt,month:this.period().month,
+        guests:{limitMicros:this.guestLimit(),configuredLimitMicros:this.configuredGuestLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.owner.startsWith('guest:')).reduce((a,u)=>a+u.micros,0)}},
       spentMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0)};
   }
   async message(identity:SupportIdentity,body:Record<string,unknown>) {
@@ -141,7 +146,7 @@ export class SupportChat {
     });
     const threadId=thread!.id;
     const quota=this.allowance(identity.owner);
-    if(this.thread(threadId).status==='human'||human||!this.config.aiEnabled||!this.config.apiKey||!quota.dailyRemaining||!quota.monthlyRemaining||quota.userRemainingMicros<RESERVE_MICROS||quota.totalRemainingMicros<RESERVE_MICROS){
+    if(this.thread(threadId).status==='human'||human||!this.config.aiEnabled||!this.config.apiKey||!quota.dailyRemaining||!quota.monthlyRemaining||quota.userRemainingMicros<RESERVE_MICROS||quota.totalRemainingMicros<RESERVE_MICROS||(guest&&quota.guestRemainingMicros<RESERVE_MICROS)){
       this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;});return this.customer(identity,threadId);
     }
     const reservation=randomUUID();
@@ -201,8 +206,10 @@ export class SupportChat {
     if(body.action==='budget'){
       const dollars=body.monthlyLimitUsd;
       if(typeof dollars!=='number'||!Number.isFinite(dollars)||dollars<0||dollars>10000||Math.abs(dollars*100-Math.round(dollars*100))>0.000001)throw new SupportError('Enter a monthly limit from $0 to $10,000, in whole cents.');
-      const previousMicros=this.monthlyLimit(),limitMicros=Math.round(dollars*1_000_000);
-      this.edit(s=>{s.monthlyLimitMicros=limitMicros;s.budgetHistory=[...(s.budgetHistory||[]),{at:this.now(),previousMicros,limitMicros}].slice(-100);});return this.admin();
+      const guestDollars=body.guestMonthlyLimitUsd;
+      if(guestDollars!==undefined&&(typeof guestDollars!=='number'||!Number.isFinite(guestDollars)||guestDollars<0||guestDollars>10000||Math.abs(guestDollars*100-Math.round(guestDollars*100))>0.000001))throw new SupportError('Enter a website guest limit from $0 to $10,000, in whole cents.');
+      const previousMicros=this.monthlyLimit(),limitMicros=Math.round(dollars*1_000_000),previousGuestMicros=this.configuredGuestLimit(),guestLimitMicros=typeof guestDollars==='number'?Math.round(guestDollars*1_000_000):previousGuestMicros;
+      this.edit(s=>{s.monthlyLimitMicros=limitMicros;s.guestMonthlyLimitMicros=guestLimitMicros;s.budgetHistory=[...(s.budgetHistory||[]),{at:this.now(),previousMicros,limitMicros,previousGuestMicros,guestLimitMicros}].slice(-100);});return this.admin();
     }
     const id=clean(body.id,80),action=clean(body.action,30),thread=this.thread(id);
     if(action==='delete'){

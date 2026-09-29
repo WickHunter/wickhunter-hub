@@ -21,6 +21,12 @@ try {
  const errors=[],vc=new VirtualConsole();vc.on('jsdomError',e=>errors.push(e.message));
  dom=new JSDOM(fs.readFileSync('public/admin.html','utf8'),{url:h.origin+'/admin',runScripts:'dangerously',virtualConsole:vc,beforeParse(w){w.fetch=(url,opts)=>fetch(new URL(url,h.origin),opts);w.HTMLElement.prototype.scrollIntoView=()=>{};}});
  const w=dom.window,doc=w.document;await w.eval('token="test-admin-token";showHubPage("support",true);supportRefresh()');
+ doc.getElementById('supportBudgetLimit').value='50';doc.getElementById('supportGuestBudgetLimit').value='7.50';
+ doc.getElementById('supportBudgetForm').requestSubmit();
+ await until(()=>doc.getElementById('supportBudgetNotice').textContent.includes('Support limits saved'));
+ const budgetSaved=await(await fetch(h.origin+'/admin/api/support',{headers:{'x-hub-admin':'test-admin-token'}})).json();
+ assert.equal(budgetSaved.budget.limitMicros,50_000_000);assert.equal(budgetSaved.budget.guests.limitMicros,7_500_000);
+ assert.match(doc.getElementById('supportBudgetDetail').textContent,/Website guests/);
  const article=id=>doc.getElementById('support-'+id);
  const toggle=id=>doc.querySelector('[data-ticket-id="'+id+'"]').click();
  const act=(id,action)=>article(id).querySelector(`[data-support-action="${action}"]`).click();
