@@ -120,7 +120,8 @@ EOF
 }
 
 candidate=$(mktemp "$HUB_DIR/dist/src/.server.js.sec10-new.XXXXXXXX")
-install -o "$old_uid" -g "$old_gid" -m "$old_mode" "$ARTIFACT" "$candidate"
+install -m "$old_mode" "$ARTIFACT" "$candidate"
+node -e 'require("node:fs").chownSync(process.argv[1], Number(process.argv[2]), Number(process.argv[3]))' "$candidate" "$old_uid" "$old_gid"
 mv -f "$candidate" "$TARGET"
 candidate=''
 installed=true
