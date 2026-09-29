@@ -7,7 +7,8 @@
     "focused": "server, seats, flags, rate-limit-http, admin, billing, license-seat-recovery, license-leases-http passed after MKT-M9",
     "full": "Final gate: all 75 suites passed on 2026-09-29 UTC with PATH=/opt/homebrew/bin:$PATH and LIQHUNTER_BOT_MODULE set to the built Alpha dist/liq/size-percentiles.js. Initial parallel run hit the temporarily absent Alpha module during clean build; after build completed, the unchanged full Hub gate passed.",
     "latestRoute": "npm run build and tests/server.test.mjs 21/21 passed after header-first /api/latest and /download addition",
-    "earnOutboxAndOwner": "npm run build; billing-after-commit-outbox 5/5, earn-owner-binding 3/3, earn-stripe 18/18, earn 11/11; payout-cost 4/4; full Hub suite 74/74 with Homebrew Bash and LIQHUNTER_BOT_MODULE pointed at the built Alpha module."
+    "earnOutboxAndOwner": "npm run build; billing-after-commit-outbox 5/5, earn-owner-binding 3/3, earn-stripe 18/18, earn 11/11; payout-cost 4/4; full Hub suite 74/74 with Homebrew Bash and LIQHUNTER_BOT_MODULE pointed at the built Alpha module.",
+    "dh20": "Source-only build; earn-stripe 19/19 and earn-owner-binding 3/3; no live Stripe call, payout, or deployment."
   },
   "findings": [
     {
@@ -222,12 +223,12 @@
     },
     {
       "id": "DH-20",
-      "disposition": "blocked_external",
-      "evidence": "The guard compares exact normalized emails. Alias and dot-equivalence vary by identity provider and domain; no supported customer identity contract proves two such strings are one person, so speculative canonicalization could merge unrelated payees.",
-      "source": "src/earn-stripe.ts:168; src/customer-sessions.ts normalizeCustomerEmail",
-      "tests": "source review",
-      "commit": "none",
-      "riskOrNextAction": "residualOpen: obtain provider/product alias semantics and verified customer-ID linkage before altering payout attribution.",
+      "disposition": "partially_fixed",
+      "evidence": "At invoice commission admission, an independently billed Stripe Customer is now refused when its consumer @gmail.com or @googlemail.com dot/plus address maps to the same inbox as a referrer's live billing customer record already bound to that immutable Earn owner. The server derives candidate referrer emails only from durable Stripe-customer owner bindings; no customer account or financial owner is merged. Google's consumer Gmail dot and plus rules support this exact exclusion; Workspace/custom-domain dot rules differ. Stripe customer email alone does not establish person identity for unrelated domains or unbound historical members. Sources: https://support.google.com/mail/answer/7436150, https://support.google.com/mail/answer/10313 and https://support.google.com/a/users/answer/9282734.",
+      "source": "src/earn-stripe.ts:consumerGmailMailbox/invoice; src/server.ts:boundReferrerEmails callback",
+      "tests": "npm run build; tests/earn-stripe.test.mjs 19/19 (consumer Gmail alias withheld, Workspace dots and distinct Gmail paid); tests/earn-owner-binding.test.mjs 3/3",
+      "commit": "3d14a49 + 61cc357",
+      "riskOrNextAction": "residualOpen: obtain verified person/payment-owner linkage before withholding commissions across unrelated email providers or unbound legacy identities; do not canonicalize arbitrary domains or merge customer accounts.",
       "residualOpen": true
     },
     {
