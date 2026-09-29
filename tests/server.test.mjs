@@ -157,6 +157,26 @@ await test("api/latest returns the release metadata", async () => {
   assert.equal(r.body.signatures[0].kid, h.releaseSigner.kid);
 });
 
+await test("updater metadata and downloads accept a header token without a URL credential", async () => {
+  const headers = { "x-license": token };
+  const latest = await fetch(`${h.origin}/api/latest`, { headers });
+  assert.equal(latest.status, 200);
+  assert.equal((await latest.json()).file, relName);
+  for (const name of ["latest", relName]) {
+    const res = await fetch(`${h.origin}/download/${name}`, { headers });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), tarball);
+  }
+});
+
+await test("a present invalid header cannot fall back to a valid query token", async () => {
+  for (const name of ["/api/latest", `/download/${relName}`]) {
+    const res = await fetch(`${h.origin}${name}?key=${token}`, { headers: { "x-license": "LHK1.invalid.signature" } });
+    assert.equal(res.status, 403);
+  }
+});
+
 await test("download without / with a bad key is 403", async () => {
   for (const qs of ["", "?key=", "?key=LHK1.garbage.garbage"]) {
     const res = await fetch(`${h.origin}/download/${relName}${qs}`);

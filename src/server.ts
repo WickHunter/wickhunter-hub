@@ -9,8 +9,8 @@ import { EarnService, earnOwner } from "./earn.js";
 //   keyed    POST /api/license/checkin           bot phone-home; answers revoked (also for a 2nd install — see src/seats.ts)
 //   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
-//   keyed    GET  /api/latest?key=<token>        authenticated signed release manifest
-//   keyed    GET  /download/<file>?key=<token>   beta tarballs ("latest" resolves)
+//   keyed    GET  /api/latest                    authenticated signed release manifest (x-license; legacy ?key=)
+//   keyed    GET  /download/<file>               beta tarballs (x-license; legacy ?key=; "latest" resolves)
 //   public   GET  /buy[?plan=key]                302 -> the ACTIVE mode's Stripe Payment Link for that plan
 //   public   GET  /api/billing/plans             the plans + prices, for the website (CORS *)
 //   admin    POST /admin/api/billing/plans/provision {mode} -> product/prices/links created or reused in Stripe
@@ -720,7 +720,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
-    if (m === "GET" && p === "/api/latest") return latestMeta(url, res);
+    if (m === "GET" && p === "/api/latest") return latestMeta(req, url, res);
     if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
     if (m === "GET" && p === "/api/candles/snapshot") return candleSnapshot(req, url, res);
     if (m === "GET" && p === "/api/market-data/market-caps/v1") return marketCapSnapshot(req, url, res);
@@ -734,7 +734,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/hub/strategies/publish") return communityPublish(req, url, res);
     if (m === "POST" && p === "/api/hub/strategies/vote") return communityVote(req, url, res);
     if (m === "POST" && p === "/api/hub/strategies/delete") return communityDelete(req, url, res);
-    if (m === "GET" && p.startsWith("/download/")) return download(url, res);
+    if (m === "GET" && p.startsWith("/download/")) return download(req, url, res);
     // ── billing (public) ────────────────────────────────────────────────
     if (m === "GET" && p === "/buy") {
       const planKey = url.searchParams.get("plan");
@@ -1177,18 +1177,18 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
    *  did not, so the HEAVIER surface had the weaker handling. A second copy is
    *  how the next surface gets it wrong too.
    *
-   *  NOT used by `requireKey`: install.sh and /download are fetched by a bare
-   *  `curl` line a human pastes, which has no header to send — and install.sh
-   *  additionally SUBSTITUTES `?key=` into the script it returns, so the query
-   *  parameter is load-bearing there rather than incidental. */
+   *  install.sh still requires `?key=`: it substitutes that key into the
+   *  script it returns. Release metadata and downloads accept the header. */
   function licenseTokenOf(req: IncomingMessage, url: URL): string {
     const header = req.headers["x-license"];
     return String((Array.isArray(header) ? header[0] : header) ?? url.searchParams.get("key") ?? "").trim();
   }
 
-  /** Shared gate for install.sh / latest / download. Sends the 403 itself. */
-  function requireKey(url: URL, res: ServerResponse): LicensePayload | null {
-    const v = store.verify(url.searchParams.get("key") ?? "");
+  /** Shared gate for install.sh / latest / download. Sends the 403 itself.
+   *  The installer keeps its query-only contract; the updater's two read
+   *  routes prefer x-license and retain query compatibility for old clients. */
+  function requireKey(url: URL, res: ServerResponse, req?: IncomingMessage): LicensePayload | null {
+    const v = store.verify(req ? licenseTokenOf(req, url) : (url.searchParams.get("key") ?? ""));
     if (v.ok) return v.payload;
     // Plain-text 403 (these endpoints feed curl, not a JSON client). The
     // reason is safe to disclose: the caller already holds the token.
@@ -1600,8 +1600,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return null;
   }
 
-  async function latestMeta(url: URL, res: ServerResponse): Promise<void> {
-    if (!requireKey(url, res)) return;
+  async function latestMeta(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    if (!requireKey(url, res, req)) return;
     const latest = readLatest();
     if (!latest) return sendJson(res, 404, { ok: false, error: "no release published" });
     // Additive response: old clients keep reading version/file/sha256; new
@@ -1615,8 +1615,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     });
   }
 
-  async function download(url: URL, res: ServerResponse): Promise<void> {
-    if (!requireKey(url, res)) return;
+  async function download(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    if (!requireKey(url, res, req)) return;
     let name = decodeURIComponent(url.pathname.slice("/download/".length));
     if (name === "latest") {
       const latest = readLatest();
@@ -1640,6 +1640,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     res.writeHead(200, {
       "content-type": name.endsWith(".json") ? "application/json" : "application/gzip",
+      "cache-control": "no-store",
       "content-length": stat.size,
       "content-disposition": `attachment; filename="${name}"`,
     });
