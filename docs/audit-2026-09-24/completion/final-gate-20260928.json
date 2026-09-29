@@ -1,7 +1,8 @@
 {
-  "sourceCommit": "8058e5a",
+  "sourceCommit": "4a711860148962ffc77167dd9d026e597320386b",
   "suitesPassed": 75,
   "suitesFailed": 0,
-  "logSha256": "058377e28d387220be248504a96c1961c2d5209e33517ec22d49da54d43ee677",
-  "publication": "source only; Hub runtime unchanged under Alpha-only instruction"
+  "logSha256": "cb352a609622877d496b530d594e222535c59fa45873bc9fa5ecedfe44e55e9b",
+  "publication": "source only; Hub runtime unchanged under Alpha-only instruction",
+  "buildLogSha256": "5a7266e5b34911c2bca02f0623122e9e4bc5c6480563a0bbd3bba8a39ee0833d"
 }
