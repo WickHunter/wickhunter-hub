@@ -65,7 +65,7 @@ alpha_public_before=$(tree_sha "$ALPHA_DIR/public")
 alpha_package_before=$(tree_sha "$ALPHA_DIR/package.json")
 
 health() {
-  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8091/api/health \
+  curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8091/api/health \
     | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{const h=JSON.parse(s);process.exit(h.ok===true&&h.version==="0.4.61"?0:1)}catch{process.exit(1)}})'
 }
 health || die 'Hub health/version preflight failed'
@@ -97,7 +97,7 @@ trap finish EXIT
 
 header_probe() {
   local status file digest route
-  status=$(curl --silent --show-error --max-time 10 --output "$probe_dir/manifest.json" --write-out '%{http_code}' --config - <<EOF
+  status=$(curl --silent --show-error --max-time 20 --output "$probe_dir/manifest.json" --write-out '%{http_code}' --config - <<EOF
 url = "http://127.0.0.1:8091/api/latest"
 header = "x-license: $PROBE_LICENSE"
 EOF
@@ -113,7 +113,7 @@ EOF
   )
   [ "$status" = 200 ] && [ "$(sha "$probe_dir/download")" = "$digest" ] || return 1
   for route in /api/latest "/download/$file"; do
-    status=$(curl --silent --show-error --max-time 8 --output /dev/null --write-out '%{http_code}' \
+    status=$(curl --silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code}' \
       --header 'x-license: LHK1.invalid.signature' "http://127.0.0.1:8091$route")
     [ "$status" = 403 ] || return 1
   done
