@@ -20,6 +20,14 @@ export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earn
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
 export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
+/** Resolve exact verified keys against one already-read financial snapshot.
+ * This keeps invoice admission from parsing the whole ledger once per
+ * candidate customer while preserving the same conflict refusal as boundOwner. */
+export function boundOwnerFromBindings(bindings: Readonly<Record<string,string>>,keys:string[]):string|null {
+  const owners=[...new Set(keys.map(key=>bindings[earnOwner('billing-binding:'+key)]).filter((owner):owner is string=>owner!==undefined))];
+  if(owners.length>1||owners.some(owner=>!/^[a-f0-9]{64}$/.test(owner)))throw new Error('Conflicting Earn owner bindings require review');
+  return owners[0]??null;
+}
 export const tierPercent = (active: number) => active <= 20 ? 20 : active <= 40 ? 30 : 40;
 function text(v: unknown, max = 200): string { if (typeof v !== 'string' || !v.trim() || v.length > max || /[\x00-\x1f]/.test(v)) throw new Error('Invalid or missing text field'); return v.trim(); }
 function percent(v: unknown): number { if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 100) throw new Error('Percentage must be an integer from 0 to 100'); return v; }
@@ -105,11 +113,7 @@ export class EarnService {
   }
 
   boundOwner(keys: string[]): string | null {
-    const bindings=this.read().ownerBindings ?? {};
-    const owners=[...new Set(keys.map(key => bindings[earnOwner('billing-binding:' + key)]).filter((owner): owner is string => owner !== undefined))];
-    if (owners.length > 1 || owners.some(owner => !/^[a-f0-9]{64}$/.test(owner)))
-      throw new Error('Conflicting Earn owner bindings require review');
-    return owners[0] ?? null;
+    return boundOwnerFromBindings(this.read().ownerBindings ?? {},keys);
   }
 
   view(owner: string, name: string) {

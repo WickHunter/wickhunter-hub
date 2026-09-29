@@ -220,6 +220,9 @@ export interface Hub {
   /** Stripe -> licence -> install page. Always constructed; does nothing
    *  until the admin page is given keys (see src/billing/). */
   billing: BillingService;
+  /** Internal financial service; exposed to local integration tests beside
+   * billing so they can exercise the real server-bound identity callback. */
+  earnStripe: EarnStripeService;
   /** The central customer dashboard's identity/session state (H2): a
    *  magic-link sign-in scoped to a durable owner id, kept deliberately
    *  separate from admin auth and from BillingStore's per-Stripe-customer
@@ -411,11 +414,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // this deliberately keeps from admin auth and from BillingStore's own
   // per-Stripe-customer, per-mode records.
   earnStripe = new EarnStripeService(cfg.dataDir, earn, () => billing.config(), cfg.publicOrigin.replace(/\/+$/, ""), deps.billingNow ?? Date.now, deps.earnFetch,
-    (mode, owner) => {
+    (mode, owner, bindings) => {
       // Only a billing customer whose Stripe ID was already bound to this
       // immutable Earn owner can supply a referrer mailbox for commission
       // exclusion. A matching email alone never merges customer accounts.
-      const bindings=earn.admin().ownerBindings ?? {};
       return Object.values(billing.store.customers())
         .filter(record=>record.livemode===(mode==='live') && record.stripeCustomerId.startsWith('cus_')
           && bindings[earnOwner(`billing-binding:stripe:${mode}:${record.stripeCustomerId}`)]===owner)
@@ -2757,6 +2759,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     candleKey,
     licenseLeases,
     billing,
+    earnStripe,
     customerSessions,
     hosting,
     seats,

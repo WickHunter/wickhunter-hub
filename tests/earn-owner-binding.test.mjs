@@ -56,4 +56,60 @@ try {
   });
 } finally { await h.close(); }
 
+const payer={email:'j.a.n.e.d.o.e+own@googlemail.com'};
+const stripeFetch=async(url,init)=>{
+  const u=new URL(url),ep=u.pathname;
+  const ok=(body,status=200)=>new Response(JSON.stringify(body),{status});
+  if(ep==='/v1/prices/price_month')return ok({id:'price_month',active:true,recurring:{interval:'month'},currency:'usd',product:'prod_wh'});
+  if(ep.startsWith('/v1/coupons/')&&init.method==='GET')return ok({error:{code:'resource_missing'}},404);
+  if(ep==='/v1/coupons')return ok({id:'wh_coupon',percent_off:10,duration:'forever',metadata:{managed_by:'wh-earn'}});
+  if(ep==='/v1/promotion_codes')return init.method==='GET'?ok({data:[]}):ok({id:'promo_bound'});
+  if(ep.startsWith('/v1/invoices/')){
+    const id=ep.split('/').at(-1);
+    return ok({id,customer:'cus_payer',status:'paid',currency:'usd',livemode:true,amount_paid:9900,total_excluding_tax:9000,
+      total_taxes:[{amount:900}],parent:{subscription_details:{subscription:'sub_'+id}},
+      lines:{data:[{pricing:{price_details:{price:'price_month'}},period:{end:1790000000}}]},
+      status_transitions:{paid_at:1780000000}});
+  }
+  if(ep.startsWith('/v1/subscriptions/sub_'))return ok({id:ep.split('/').at(-1),status:'active',metadata:{wh_earn_code:refMember.code},items:{data:[{price:'price_month'}]}});
+  if(ep==='/v1/customers/cus_payer')return ok({email:payer.email});
+  if(ep==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}]});
+  if(ep.startsWith('/v1/charges/ch_'))return ok({amount_refunded:0,disputed:false,livemode:true});
+  throw new Error('Unexpected fake Stripe request '+init.method+' '+ep);
+};
+const boundHub=await freshHub({}, {earnFetch:stripeFetch});
+const refEarn=new EarnService(boundHub.dataDir),refOwner=earnOwner('email:jane.doe@gmail.com');
+const refMember=refEarn.member(refOwner,'Jane Doe');
+const refRecord={key:'cus_ref',stripeCustomerId:'cus_ref',email:'jane.doe@gmail.com',name:'Jane Doe',livemode:true,
+  licenseId:'lic_ref',planKey:null,subscriptionId:null,subscriptionStatus:'active',periodEndMs:null,chargeIds:[],
+  createdAtMs:Date.now(),updatedAtMs:Date.now(),welcomeSentAtMs:null,welcomeError:null,disputed:false,refunded:false,
+  lastEventType:null,lastEventAtMs:null};
+try {
+  await test('the server-bound referrer mailbox suppresses only its own Gmail alias payer',async()=>{
+    boundHub.hub.billing.updateConfig({stripe:{live:{secretKey:'sk_live_fixture',priceIds:{monthly:'price_month'}}}});
+    boundHub.hub.billing.store.putCustomer(refRecord);
+    refEarn.bindOwner(['stripe:live:cus_ref'],[refOwner],refOwner);
+    boundHub.hub.earnStripe.configure({mode:'live',enabled:true});
+    await boundHub.hub.earnStripe.activate(refOwner);
+    const invoice=async(id)=>boundHub.hub.earnStripe.handleEvent({id:'evt_'+id,type:'invoice.paid',object:{id},livemode:true,createdMs:Date.now()});
+    await invoice('in_alias');
+    assert.equal(refEarn.admin().stripe.invoices.in_alias,undefined);
+    assert.equal(refEarn.view(refOwner,'Jane Doe').balances.referral,0);
+
+    payer.email='different@gmail.com';
+    await invoice('in_other_mailbox');
+    assert.ok(refEarn.admin().stripe.invoices.in_other_mailbox);
+    assert.equal(refEarn.view(refOwner,'Jane Doe').balances.referral,1800);
+
+    // A customer row with the same email but no exact owner binding is not
+    // authority to identify that payer as the referrer.
+    boundHub.hub.billing.store.putCustomer({...refRecord,email:'elsewhere@gmail.com'});
+    boundHub.hub.billing.store.putCustomer({...refRecord,key:'cus_unbound',stripeCustomerId:'cus_unbound',email:'jane.doe@gmail.com',licenseId:'lic_unbound'});
+    payer.email='jane.doe+tag@gmail.com';
+    await invoice('in_unbound_mailbox');
+    assert.ok(refEarn.admin().stripe.invoices.in_unbound_mailbox);
+    assert.equal(refEarn.view(refOwner,'Jane Doe').balances.referral,3600);
+  });
+} finally { await boundHub.close(); }
+
 summary('earn-owner-binding');

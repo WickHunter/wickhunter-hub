@@ -1,6 +1,6 @@
 import {createHash,randomUUID} from 'node:crypto';
 import path from 'node:path';
-import {EarnService,earnOwner,tierPercent,type EarnState,type Entry,type EarnSource} from './earn.js';
+import {EarnService,earnOwner,boundOwnerFromBindings,tierPercent,type EarnState,type Entry,type EarnSource} from './earn.js';
 import {EarnStripeApi,EarnStripeError,type StripeObject} from './earn-stripe-api.js';
 import {readJson,writeJsonAtomic} from './jsonfile.js';
 import type {BillingConfig,BillingMode} from './billing/config.js';
@@ -40,7 +40,7 @@ export class EarnStripeService {
  private payoutScan:Partial<Record<BillingMode,{version:string;nextDue:number;jobs:Job[]}>>={};
  private testLedger:EarnService;
  constructor(private dir:string,private liveLedger:EarnService,private billing:()=>BillingConfig,private origin:string,private now=Date.now,private fetcher:typeof fetch=fetch,
-  private boundReferrerEmails?:(mode:BillingMode,owner:string)=>string[]){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
+  private boundReferrerEmails?:(mode:BillingMode,owner:string,bindings:Readonly<Record<string,string>>)=>string[]){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
  settings():Settings {return {...defaults,...readJson<Partial<Settings>>(path.join(this.dir,'earn-stripe-config.v1.json'),{})};}
  configure(input:Record<string,unknown>) {
   const c=this.settings(),wasAutomatic=c.automatic;for(const k of ['enabled','automatic'] as const)if(input[k]!==undefined){if(typeof input[k]!=='boolean')throw Error('Invalid switch');c[k]=input[k];}
@@ -197,7 +197,11 @@ export class EarnStripeService {
   // A changed customer email cannot turn the member's own subscription into
   // a payable referral. The durable binding is the authority when present;
   // the email check retains protection for older, unbound members.
-  const billedOwner=this.liveLedger.boundOwner([`stripe:${mode}:${customerId}`])
+  // One fresh read after remote customer truth covers both the payer binding
+  // and all candidate referrer bindings; do not parse the full money ledger
+  // again for every billing customer the server callback examines.
+  const bindings=this.liveLedger.admin().ownerBindings??{};
+  const billedOwner=boundOwnerFromBindings(bindings,[`stripe:${mode}:${customerId}`])
     ?? earnOwner('email:'+String(cust.email||'').trim().toLowerCase());
   if(billedOwner===member.id)return;
   // A second Stripe Customer can use a dotted/plus-tagged version of the
@@ -205,7 +209,7 @@ export class EarnStripeService {
   // bound to this immutable Earn owner; arbitrary customer emails, Workspace
   // domains and payment-method similarities are not identity evidence.
   const mailbox=consumerGmailMailbox(cust.email);
-  if(mailbox && this.boundReferrerEmails?.(mode,member.id).some(email=>consumerGmailMailbox(email)===mailbox))return;
+  if(mailbox && this.boundReferrerEmails?.(mode,member.id,bindings).some(email=>consumerGmailMailbox(email)===mailbox))return;
   const paid=money(inv.amount_paid),total=money(inv.total_excluding_tax);if(paid===null||total===null||paid===0)return;
   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
   const basis=Math.min(total,Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)));if(!basis)return;
