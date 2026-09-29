@@ -21,10 +21,11 @@ const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j
  * inbox. Workspace/custom domains do not share the dot rule. This key is ONLY
  * a commission exclusion; it never merges customers or Earn owners.
  * https://support.google.com/mail/answer/7436150
+ * https://support.google.com/mail/answer/10313
  * https://support.google.com/a/users/answer/9282734 */
 function consumerGmailMailbox(raw:unknown):string|null {
  if(typeof raw!=='string')return null;
- const match=/^([a-z0-9.]+)(?:\+[^@\s]+)?@gmail\.com$/.exec(raw.trim().toLowerCase());
+ const match=/^([a-z0-9.]+)(?:\+[^@\s]+)?@(?:gmail|googlemail)\.com$/.exec(raw.trim().toLowerCase());
  if(!match||match[1].startsWith('.')||match[1].endsWith('.')||match[1].includes('..'))return null;
  return match[1].replaceAll('.','');
 }

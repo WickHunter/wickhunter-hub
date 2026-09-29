@@ -155,6 +155,10 @@ await test('consumer Gmail dot and plus aliases cannot earn a self-referral comm
  await svc.handleEvent(event('invoice.paid','evt_gmail_alias',{id:'in_gmail_alias'}));
  assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
  assert.equal(ledger.admin().stripe.invoices['in_gmail_alias'],undefined);
+ email='janedoe+other@googlemail.com';
+ await svc.handleEvent(event('invoice.paid','evt_googlemail_alias',{id:'in_googlemail_alias'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
+ assert.equal(ledger.admin().stripe.invoices['in_googlemail_alias'],undefined);
  // Gmail's consumer dot rule does not apply to Workspace or arbitrary domains.
  boundEmails[0]='jane.doe@business.example';email='janedoe@business.example';
  await svc.handleEvent(event('invoice.paid','evt_workspace_distinct',{id:'in_workspace_distinct'}));
