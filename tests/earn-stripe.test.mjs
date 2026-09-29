@@ -146,6 +146,24 @@ await test('Earn event dedupe stays bounded while financial invoice records rema
  assert.ok(saved.seen['new-untracked-event']);
  assert.ok(saved.invoices['in_1']);
 });
+await test('consumer Gmail dot and plus aliases cannot earn a self-referral commission',async()=>{
+ const boundEmails=['jane.doe@gmail.com'];
+ svc=new EarnStripeService(dir,ledger,()=>cfg,'https://hub.example',()=>now,fake,
+  (_mode,candidate)=>candidate===owner?boundEmails:[]);
+ const before=ledger.view(owner,'Referrer').balances.referral;
+ email='j.a.n.e.d.o.e+own@gmail.com';
+ await svc.handleEvent(event('invoice.paid','evt_gmail_alias',{id:'in_gmail_alias'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
+ assert.equal(ledger.admin().stripe.invoices['in_gmail_alias'],undefined);
+ // Gmail's consumer dot rule does not apply to Workspace or arbitrary domains.
+ boundEmails[0]='jane.doe@business.example';email='janedoe@business.example';
+ await svc.handleEvent(event('invoice.paid','evt_workspace_distinct',{id:'in_workspace_distinct'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before+1800);
+ assert.ok(ledger.admin().stripe.invoices['in_workspace_distinct']);
+ boundEmails[0]='jane.doe@gmail.com';email='other@gmail.com';
+ await svc.handleEvent(event('invoice.paid','evt_different_gmail',{id:'in_different_gmail'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,before+3600);
+});
 await test('a bound Stripe customer remains a self referral after its email changes',async()=>{
  ledger.bindOwner(['stripe:live:cus_friend'],[owner],owner);
  const before=ledger.view(owner,'Referrer').balances.referral;

@@ -17,6 +17,17 @@ const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex').slice(0,40);
 const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j.financialAccount,j.amount,j.allocations,j.stripeId]);
+/** Consumer Gmail alone documents both dotted usernames and plus tags as one
+ * inbox. Workspace/custom domains do not share the dot rule. This key is ONLY
+ * a commission exclusion; it never merges customers or Earn owners.
+ * https://support.google.com/mail/answer/7436150
+ * https://support.google.com/a/users/answer/9282734 */
+function consumerGmailMailbox(raw:unknown):string|null {
+ if(typeof raw!=='string')return null;
+ const match=/^([a-z0-9.]+)(?:\+[^@\s]+)?@gmail\.com$/.exec(raw.trim().toLowerCase());
+ if(!match||match[1].startsWith('.')||match[1].endsWith('.')||match[1].includes('..'))return null;
+ return match[1].replaceAll('.','');
+}
 function book(s:EarnState):StripeObject { return s.stripe??=( {profiles:{},invoices:{},jobs:[],seen:{}} ); }
 function entry(owner:string,source:EarnSource,kind:Entry['kind'],cents:number,reference:string,period:string,note:string,now:number):Entry {
  return {id:randomUUID(),owner,source,kind,cents,currency:'USD',period,reference,note,method:kind==='payout'?'Stripe Global Payouts':'',createdAt:new Date(now).toISOString(),actor:'stripe',...(kind==='payout'?{paidAt:new Date(now).toISOString().slice(0,10)}:{})};
@@ -27,7 +38,8 @@ export class EarnStripeService {
  private tail:Promise<unknown>=Promise.resolve(); private timer:ReturnType<typeof setInterval>|undefined; private tickRunning=false; private lastError:string|null=null;
  private payoutScan:Partial<Record<BillingMode,{version:string;nextDue:number;jobs:Job[]}>>={};
  private testLedger:EarnService;
- constructor(private dir:string,private liveLedger:EarnService,private billing:()=>BillingConfig,private origin:string,private now=Date.now,private fetcher:typeof fetch=fetch){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
+ constructor(private dir:string,private liveLedger:EarnService,private billing:()=>BillingConfig,private origin:string,private now=Date.now,private fetcher:typeof fetch=fetch,
+  private boundReferrerEmails?:(mode:BillingMode,owner:string)=>string[]){this.testLedger=new EarnService(path.join(dir,'earn-test'),now);}
  settings():Settings {return {...defaults,...readJson<Partial<Settings>>(path.join(this.dir,'earn-stripe-config.v1.json'),{})};}
  configure(input:Record<string,unknown>) {
   const c=this.settings(),wasAutomatic=c.automatic;for(const k of ['enabled','automatic'] as const)if(input[k]!==undefined){if(typeof input[k]!=='boolean')throw Error('Invalid switch');c[k]=input[k];}
@@ -187,6 +199,12 @@ export class EarnStripeService {
   const billedOwner=this.liveLedger.boundOwner([`stripe:${mode}:${customerId}`])
     ?? earnOwner('email:'+String(cust.email||'').trim().toLowerCase());
   if(billedOwner===member.id)return;
+  // A second Stripe Customer can use a dotted/plus-tagged version of the
+  // referrer's consumer Gmail inbox. Compare only with billing records already
+  // bound to this immutable Earn owner; arbitrary customer emails, Workspace
+  // domains and payment-method similarities are not identity evidence.
+  const mailbox=consumerGmailMailbox(cust.email);
+  if(mailbox && this.boundReferrerEmails?.(mode,member.id).some(email=>consumerGmailMailbox(email)===mailbox))return;
   const paid=money(inv.amount_paid),total=money(inv.total_excluding_tax);if(paid===null||total===null||paid===0)return;
   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
   const basis=Math.min(total,Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)));if(!basis)return;

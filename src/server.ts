@@ -410,7 +410,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // customer (H2). See src/customer-sessions.ts's header for the boundary
   // this deliberately keeps from admin auth and from BillingStore's own
   // per-Stripe-customer, per-mode records.
-  earnStripe = new EarnStripeService(cfg.dataDir, earn, () => billing.config(), cfg.publicOrigin.replace(/\/+$/, ""), deps.billingNow ?? Date.now, deps.earnFetch);
+  earnStripe = new EarnStripeService(cfg.dataDir, earn, () => billing.config(), cfg.publicOrigin.replace(/\/+$/, ""), deps.billingNow ?? Date.now, deps.earnFetch,
+    (mode, owner) => {
+      // Only a billing customer whose Stripe ID was already bound to this
+      // immutable Earn owner can supply a referrer mailbox for commission
+      // exclusion. A matching email alone never merges customer accounts.
+      const bindings=earn.admin().ownerBindings ?? {};
+      return Object.values(billing.store.customers())
+        .filter(record=>record.livemode===(mode==='live') && record.stripeCustomerId.startsWith('cus_')
+          && bindings[earnOwner(`billing-binding:stripe:${mode}:${record.stripeCustomerId}`)]===owner)
+        .map(record=>record.email);
+    });
   const customerSessions = new CustomerSessionService(cfg.dataDir, billing, store, cfg.publicOrigin, {
     now: deps.customerSessionNow,
     fetchLike: deps.customerSessionFetch,
