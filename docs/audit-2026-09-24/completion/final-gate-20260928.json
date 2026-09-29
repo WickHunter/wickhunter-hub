@@ -1,0 +1,7 @@
+{
+  "sourceCommit": "8058e5a",
+  "suitesPassed": 75,
+  "suitesFailed": 0,
+  "logSha256": "058377e28d387220be248504a96c1961c2d5209e33517ec22d49da54d43ee677",
+  "publication": "source only; Hub runtime unchanged under Alpha-only instruction"
+}
