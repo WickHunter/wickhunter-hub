@@ -31,5 +31,16 @@ repair gap without constructing the entire candle window. In a local synthetic
 twenty early-gap lookups took 152 ms before and 1 ms after, with identical facts.
 These are local measurements, not a production throughput guarantee.
 
-The candidate still requires a complete test gate and the unchanged live
-freshness check before being recorded as deployed.
+Hub 0.4.64 is verified live from `b201ec55355d6446a7c2fbce6c4bb93b83525d95`.
+All 76 test suites passed. The unchanged live gate observed all three BTCUSDT
+samples advance to 03:46 UTC, within its ten-minute age bound. The admin
+status request returned in 0.24 seconds; header-based update metadata/download
+authentication passed and invalid credentials were rejected. Alpha services and
+Beta release artifacts remained unchanged during the Hub deployment. See
+[deployment](HUB-0464-DEPLOYMENT.json) and [verification](HUB-0464-VERIFICATION.json).
+
+A second 22-second CPU profile found the full admin scanner gone. Remaining
+activity was distributed across stream snapshot writes, seed requests and the
+startup liquidation percentile rebuild. Its diagnostic cleanup closed the
+inspector without restarting the process. Cold coverage still warms in bounded
+slices; unchecked symbols and known historical gaps remain explicitly reported.

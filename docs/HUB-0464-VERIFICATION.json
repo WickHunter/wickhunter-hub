@@ -1,0 +1,18 @@
+{
+  "sourceCommit": "b201ec55355d6446a7c2fbce6c4bb93b83525d95",
+  "sourceTree": "b74a125bcc252d638b8af686021ba0d22a10fddd",
+  "version": "0.4.64",
+  "buildExit": 0,
+  "gateExit": 0,
+  "gateSuites": 76,
+  "buildLogSha256": "982e9bc88ee3d9dcee65a748d7559d76fb0887735b4f80bb4866b8a493a93aa8",
+  "gateLogSha256": "205ba17ce8c61693516b2df9cc7b123537f29b17983ae803d525909ee4dd67a0",
+  "buildExitFileSha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "gateExitFileSha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "gateInputSha256": "9831379aea18af2498db062884c5362c7990331b4f794826de7f61b741a21b55",
+  "baselineHubReceiptSha256": "043dbeac6e1b94a80f2f626c7aa079c29a7afba7271511021fb6fc1d13b435b2",
+  "baselineHashesSha256": "c51660ad0e2db3f7f2b7acdf70ef5c4f0880c7c94e27a3e843617120e1261354",
+  "alphaReceiptSha256": "0fe2e0729f33c7bb963e2991f78fe2dc37e02f20bbaf67a136b2b31f3e03e4ff",
+  "failedHub463RollbackSha256": "0e1bb355dd2af6638bc77c980da18047c7da100acb62247a895e63aa63f13513",
+  "failedHub463ManifestSha256": "b520a5c28251d3049a6bfe6321eb5900a9708a71b6a980908bb920a8d0bc50bf"
+}

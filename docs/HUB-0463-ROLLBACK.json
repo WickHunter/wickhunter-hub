@@ -1,0 +1,10 @@
+{
+  "change": "Hub candle repair code rollback",
+  "verifiedAt": "2026-09-30T03:35:53Z",
+  "sourceCommit": "a1165eff6fa9970eba2a1bf06d0950bd76919f8e",
+  "deploymentFailure": "Selected durable candle samples did not advance to reviewed tail freshness",
+  "restoredVersion": "0.4.62",
+  "restoredPid": 2644918,
+  "backup": "/root/wh-hub0463-candles-20260929/audit-hub-backup-p07v9wwh",
+  "currentHubDataPreserved": true
+}

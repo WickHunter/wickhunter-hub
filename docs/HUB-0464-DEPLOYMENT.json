@@ -1,0 +1,95 @@
+{
+  "change": "Hub candle freshness repair",
+  "verifiedAt": "2026-09-30T03:48:14Z",
+  "sourceCommit": "b201ec55355d6446a7c2fbce6c4bb93b83525d95",
+  "expectedVersion": "0.4.64",
+  "sourceTree": "b74a125bcc252d638b8af686021ba0d22a10fddd",
+  "verificationSha256": "ee06cce3bdd6c34f5b28e33ec50f44e452c29251a339178bf043e8aa7ebe5476",
+  "gateSuites": 76,
+  "files": {
+    "dist/src/candles/collector.js": {
+      "before": "3eafeb6801116fb03b3cc1a88c263e8958646c79fcac1a9d961d9199fb64b59d",
+      "after": "e9b7e04e66295ab6003c321d01aa68bf587339d3260d7b0063e829da270f512c"
+    },
+    "dist/src/candles/service.js": {
+      "before": "119ef03aa91e53054f77520362f1533fb5d4e80bccbfcb58cd34e430beb30970",
+      "after": "5a8da3fc1e62ef34797e13d34c4a27581d1ac77eb529a3c905a54060d8b774c2"
+    },
+    "dist/src/candles/store.js": {
+      "before": "a09d4675e6e3b52f0f1fa02057f4be33443300904aef4e8efd30d67beeae2a1d",
+      "after": "6fb2a89e2e1e51d48adcc586c4b0ac730ce34382912eb8dfa4c03a71d6fbd02b"
+    },
+    "public/admin.html": {
+      "before": "1535c2cd92b0440e15e3bfa89ea6daa6cce3fe53be4c126ae35e812ea9bbd1c9",
+      "after": "593eaf2bbffc0b74562ffdf6778b54f2aba97dc0cbd19421ec3a01ee30e3b44b"
+    },
+    "dist/src/version.js": {
+      "before": "293ebee8731387f2794eacea40efa51791e53a40230a61d595e090eb0449512e",
+      "after": "54e7a6d78a472f6b28f5046d0065b295a47fee1be67bdae168068aefbd7c0494"
+    },
+    "package.json": {
+      "before": "15f0d74533bb75168c809fe0f0b0954d61ec203f7fec5cf4a6dd5966ba472e26",
+      "after": "75651df8de713c87b82f4da32b619811408f1067f97518f978c3980cda60caf6"
+    },
+    "package-lock.json": {
+      "before": "d815e8ac4d0f6c72fb5b6e3f4236d57a5a10010cd0e88d4b057bf1ad8d8b51a1",
+      "after": "5a50959f9adcfd7b21edb6078ffbb6d8f32f491bd08ea8b712ad3b9c6c9c652c"
+    }
+  },
+  "oldPid": 2644918,
+  "newPid": 2646820,
+  "backup": "/root/wh-hub0464-candles-20260929/audit-hub-backup-er1lt74d",
+  "beforeVersion": "0.4.62",
+  "healthVerified": true,
+  "headerMetadataAndDownloadVerified": true,
+  "invalidHeaderRejected": true,
+  "alphaServicesUnchanged": true,
+  "protectedFingerprints": {
+    "/opt/liqhunter/dist": "e1fa24da5b74f9228e728df2e7a59d5ede51a398e1199f4c1239654e83645324",
+    "/opt/liqhunter/src": "1d81c6da97ea0e5a1e78ef3833a83d628e5380c009bb070d69130d92c33c3189",
+    "/opt/liqhunter/public": "b3c60c02617e7b908f89bd946b543e6dea974af145dba16ae25e3b446301a1dc",
+    "/opt/liqhunter/scripts": "bc3c3e1c06fb5600b07ac1f78428eec97d69e16c881b1c0ca987bd8cf953438c",
+    "/opt/liqhunter/migrations": "82293ae7ff1b1c66ad140eb2a5f32d7717dd02efd831c51d342f81796bd9a3fd",
+    "/opt/liqhunter/package.json": "d28131389a85e05d8c214efd97c989a404d9f3447f47bdcd8bbb70956883ace3",
+    "/opt/liqhunter/package-lock.json": "a44e946302f3b00a8328f162d18a912e161c1e17d8e9fbe549de3b5b7d5df1b4",
+    "/opt/liqhunter/.deployed-commit": "68928227aa59b87475d7ed1f311a8840b7624384a9548a3d09d127fb064ea105",
+    "/opt/liqhunter/.deployed-at": null,
+    "/opt/liqhunter/bin": "369c6d67c75b78292f3c50df9843eeb201199e243b7cf54e25a68489e42200d4",
+    "/opt/liqhunter/native": null,
+    "/opt/liqhunter/.native": null,
+    "/opt/wickhunter-hub/dist": "26e7a12b69c9fe7b92b92fcccb7c73e18025de68298a109f358067b4824407c6",
+    "/opt/wickhunter-hub/src": "4eb141d566017f899bf34db58f8a828bc072fffc6ae1499be1b39ced0f94dddf",
+    "/opt/wickhunter-hub/public": "8810a6db8acbb582edd49b9e7e6a7e5b913a2d91f6cc731a21c1ec4ed084093e",
+    "/opt/wickhunter-hub/scripts": "59ef0cd2b58ee7a6345e1f0bb366b63dc1b6d26e8f74ed1699858abb2525a736",
+    "/opt/wickhunter-hub/migrations": null,
+    "/opt/wickhunter-hub/releases": "9bdb570f563a8bb61d1e40484369dc3f734bfa8b8aa31948ddc50d385cb82db0"
+  },
+  "betaArtifactSha256": "6c649a93a5371af3ae658512b9947cccd62442666c20d50c7dc1c88e40eb4b1e",
+  "alphaVersion": "0.90.145",
+  "alphaCommit": "1125c5cc2080c15788a076a4e2642a0808db4a89",
+  "failedHub463RollbackSha256": "0e1bb355dd2af6638bc77c980da18047c7da100acb62247a895e63aa63f13513",
+  "candleSamplesBefore": {
+    "bybit": 1790736780000,
+    "binance": 1790738520000,
+    "aster": 1790739300000
+  },
+  "candleSamplesAfter": {
+    "bybit": 1790739960000,
+    "binance": 1790739960000,
+    "aster": 1790739960000
+  },
+  "candleFreshnessBoundMs": 600000,
+  "adminCandleSnapshot": {
+    "status": "verified",
+    "venues": 6
+  },
+  "restFrontierProgress": {
+    "status": "verified",
+    "advancedSymbols": {
+      "bybit": 15,
+      "binance": 10,
+      "aster": 32
+    }
+  },
+  "financialDataRestoredOrRewrittenByDeployment": false
+}
