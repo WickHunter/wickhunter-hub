@@ -20,7 +20,7 @@
     "bundleExecuted": false
   },
   "initialGate": "Initial gate failed release changelog parity and a Unix-second-boundary-sensitive installer test. Changelog updated; deadline fixture uses controlled time and verifies bounded wait, preserved failure, and no second attempt. Complete rerun passed.",
-  "deployment": "pending",
+  "deployment": "Hub 0.4.62 deployed and verified; HUB-0462-DEPLOYMENT.json",
   "betaPublication": "forbidden; retain 0.90.135 unchanged",
   "alphaPublication": "unrelated UI work pending separately; Hub deployment preserves current Alpha0.90.145"
 }

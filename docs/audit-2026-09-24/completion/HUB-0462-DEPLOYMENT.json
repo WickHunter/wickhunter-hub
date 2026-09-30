@@ -1,0 +1,125 @@
+{
+  "change": "Hub audit release",
+  "verifiedAt": "2026-09-30T01:31:20Z",
+  "sourceCommit": "eded5b8c935ccdb41ab494589a2be13fb11454e1",
+  "expectedVersion": "0.4.62",
+  "files": {
+    "dist/src/billing/after-commit-outbox.js": {
+      "before": null,
+      "after": "09a03aef66a7313bd457eac600ce99e57b6c6b4666d4ace249c14402d3cc5b54"
+    },
+    "dist/src/billing/service.js": {
+      "before": "539e7145039561bc5fa0fbdd3db1c7e19278a7d7fa27918a688c60b7a6568293",
+      "after": "9b664fd1bdda5e5ec91e753cf725dea479349c02f7d60de90399c2d8d2e16390"
+    },
+    "dist/src/community.js": {
+      "before": "c21f0a97c2121362cbe415702114a2ebd5e0a9e7fced263f088c501f02b6b49b",
+      "after": "e506e51a7e6985d7175678b6da656ccd64776503d9df750a00e5e8f3f1345770"
+    },
+    "dist/src/config.js": {
+      "before": "08ee4d716a484238cb9f92e0602b40c1650486569dfc82bc1035de208f028a50",
+      "after": "a2299ad0f35d173e7d858ae339bb8db223e1538975aca39bce8e034afeb1d8d2"
+    },
+    "dist/src/earn-stripe.js": {
+      "before": "fb3e746f786bb1cfede8957797b5ad0ccd002b129804dd8b9f40749b315ee2dc",
+      "after": "ca19e9e76eceb1283d3f94929a943860511cf143189f696812a7402405bba87f"
+    },
+    "dist/src/earn.js": {
+      "before": "a001442c6d1f8e7fbae3eae9b55ee075e08eb9a681027e1fcf7680a6065ee401",
+      "after": "412cac26b3d0b9a324d9cf222f4941efc9385372703fc1f4faa457d677949de5"
+    },
+    "dist/src/feedback.js": {
+      "before": "de02ba0db88a275be5debe9b6b02970ab29f321960705c429fdf5c891fd6f803",
+      "after": "760761633b5497a1f1e677657f6f26dde958fce33f8357e06cee14a0303f99c1"
+    },
+    "dist/src/license-leases.js": {
+      "before": "893e946365f63903a456cc09571a39bff7cc3d95abf02c6ebf208afe70c76b3e",
+      "after": "018c6d672c2f737508ef97408db0dcf9d525d28402cd7704bcbaabac52f3bfa0"
+    },
+    "dist/src/server.js": {
+      "before": "797c82eb9a20a68dc1724c6f1dfc75a4dfed0666e485b4ab7ef9807cc4b52f7f",
+      "after": "e1d05c12ba93acf1c9a095c6d254764e61516c4b04dc42404cc93d4b44c205a0"
+    },
+    "dist/src/support-chat.js": {
+      "before": "9a6ff6687b751048ed852a94f84b4843a1e107297d107e75c61679bbb8613a87",
+      "after": "92753ef075f7ab15e178b7c19d1d0ff03bf83cc465f6a98430a29e79e1dd97fb"
+    },
+    "dist/src/support-session-limiter.js": {
+      "before": null,
+      "after": "9ba11c71c9ee4b77551728653656e2b95daebbae60b280152cd77024ead81427"
+    },
+    "dist/src/version.js": {
+      "before": "d2d0453f53860300ac50d3177af04be076fa9febe168b623b8cc42dd739467f9",
+      "after": "293ebee8731387f2794eacea40efa51791e53a40230a61d595e090eb0449512e"
+    },
+    "package-lock.json": {
+      "before": "97f87775e7d24edec10ce6418972600d3a7856f8707774715d61ea4114fadc2f",
+      "after": "d815e8ac4d0f6c72fb5b6e3f4236d57a5a10010cd0e88d4b057bf1ad8d8b51a1"
+    },
+    "package.json": {
+      "before": "c57796e511fbd4fbf9d134264995b73fa3268d572bb5ab84a2d30131e5ac2d3d",
+      "after": "15f0d74533bb75168c809fe0f0b0954d61ec203f7fec5cf4a6dd5966ba472e26"
+    },
+    "public/admin.html": {
+      "before": "cbc34f717c0e00e84f6d36b4b79ed063eafaffb833c127e70cd6067dea3ee0bb",
+      "after": "1535c2cd92b0440e15e3bfa89ea6daa6cce3fe53be4c126ae35e812ea9bbd1c9"
+    },
+    "public/earn.html": {
+      "before": "095325cd7c8b924e741f96e8a83b061d473bc6da458e3696469b6a2194799c2b",
+      "after": "5c2b107d339d47afacea2eb4b821f487781719533d97b59795e711595850e29e"
+    },
+    "public/support.html": {
+      "before": "b4b9980e24dc4268c70e779e7cb7fc142ea23c27fb3b8e072d6c89250892945f",
+      "after": "097da1bb898aa22bb2efb1939c9f625ba624a3ef77e73ff61219cff1b99dad8f"
+    }
+  },
+  "oldPid": 2599362,
+  "newPid": 2631084,
+  "backup": "/root/wh-hub0462-audit-20260929/audit-hub-backup-tfbdji0u",
+  "beforeVersion": "0.4.61",
+  "healthVerified": true,
+  "headerMetadataAndDownloadVerified": true,
+  "invalidHeaderRejected": true,
+  "alphaServicesUnchanged": true,
+  "protectedFingerprints": {
+    "/opt/liqhunter/dist": "e1fa24da5b74f9228e728df2e7a59d5ede51a398e1199f4c1239654e83645324",
+    "/opt/liqhunter/src": "1d81c6da97ea0e5a1e78ef3833a83d628e5380c009bb070d69130d92c33c3189",
+    "/opt/liqhunter/public": "b3c60c02617e7b908f89bd946b543e6dea974af145dba16ae25e3b446301a1dc",
+    "/opt/liqhunter/scripts": "bc3c3e1c06fb5600b07ac1f78428eec97d69e16c881b1c0ca987bd8cf953438c",
+    "/opt/liqhunter/migrations": "82293ae7ff1b1c66ad140eb2a5f32d7717dd02efd831c51d342f81796bd9a3fd",
+    "/opt/liqhunter/package.json": "d28131389a85e05d8c214efd97c989a404d9f3447f47bdcd8bbb70956883ace3",
+    "/opt/liqhunter/package-lock.json": "a44e946302f3b00a8328f162d18a912e161c1e17d8e9fbe549de3b5b7d5df1b4",
+    "/opt/liqhunter/.deployed-commit": "68928227aa59b87475d7ed1f311a8840b7624384a9548a3d09d127fb064ea105",
+    "/opt/liqhunter/.deployed-at": null,
+    "/opt/liqhunter/bin": "369c6d67c75b78292f3c50df9843eeb201199e243b7cf54e25a68489e42200d4",
+    "/opt/liqhunter/native": null,
+    "/opt/liqhunter/.native": null,
+    "/opt/wickhunter-hub/dist": "275eebef7515ead3fc8c66ba6df07463f99ae41fa4adb4c70e6d0b767154c456",
+    "/opt/wickhunter-hub/src": "4eb141d566017f899bf34db58f8a828bc072fffc6ae1499be1b39ced0f94dddf",
+    "/opt/wickhunter-hub/public": "10fe93d7422392fc7f56192fc941d493349e9f17d90411a1d25531e0a3040f79",
+    "/opt/wickhunter-hub/scripts": "59ef0cd2b58ee7a6345e1f0bb366b63dc1b6d26e8f74ed1699858abb2525a736",
+    "/opt/wickhunter-hub/migrations": null,
+    "/opt/wickhunter-hub/releases": "9bdb570f563a8bb61d1e40484369dc3f734bfa8b8aa31948ddc50d385cb82db0"
+  },
+  "betaArtifactSha256": "6c649a93a5371af3ae658512b9947cccd62442666c20d50c7dc1c88e40eb4b1e",
+  "financialDataRestoredOrRewrittenByDeployment": false,
+  "betaUnchanged": true,
+  "alphaUnchanged": true,
+  "buildMetadataUpdated": true,
+  "betaClientCompatibility": {
+    "artifact": "wickhunter-beta-0.90.135.tar.gz",
+    "serverSha256": "6ee4374b4946b90445928361045fd9f2fa8e7856acf357c70093cedd6d9eaadb",
+    "route": "/api/license/checkin",
+    "method": "POST",
+    "serialize": "stringify",
+    "signedTokenProperty": true,
+    "readerUsesStoredOrEnvironmentLicense": true,
+    "readOnlyInspection": true,
+    "bundleExecuted": false
+  },
+  "validation": {
+    "suitesPassed": 75,
+    "suitesFailed": 0,
+    "rollbackChecksPassed": 4
+  }
+}
