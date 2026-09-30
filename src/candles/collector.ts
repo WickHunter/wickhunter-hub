@@ -250,6 +250,8 @@ export class VenueCollector {
   private tracked = new Map<string, TrackedSymbol>();
   private coverageCache = new Map<string, SymbolCoverage>();
   private coveragePrime: Promise<void> | null = null;
+  private coveragePrimeCursor = 0;
+  private holeScanCursor = 0;
   private readonly symbolsFile: string;
   private readonly restFrontierFile: string;
 
@@ -433,6 +435,27 @@ export class VenueCollector {
     finally { this.coveragePrime = null; }
   }
 
+  /** A collector tick must never wait for an admin's full-roster prime. Scan a
+   *  rotating slice instead, leaving unknown rows absent until their exact disk
+   *  coverage is known. Both limits matter: one unusually large day file must
+   *  not turn a nominally small slice into another minute-long prepass. */
+  private async prepareRuntimeCoverageSlice(clock: () => number): Promise<void> {
+    const roster = [...this.tracked.keys()];
+    if (!roster.length) return;
+    const startedAt = clock();
+    let scanned = 0;
+    for (let visited = 0; visited < roster.length && scanned < 32; visited++) {
+      if (scanned > 0 && clock() - startedAt >= 4_000) break;
+      const index = this.coveragePrimeCursor % roster.length;
+      const symbol = roster[index]!;
+      this.coveragePrimeCursor = (index + 1) % roster.length;
+      if (this.coverageCache.has(symbol)) continue;
+      this.coverage(symbol);
+      scanned++;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+
   /** Called ONLY after a write this collector made from its OWN REST fetch
    *  (tail/backfill/repair/reconcile, inside `tick()`). `noteStoredCandles`
    *  below is the websocket's entry point and deliberately does not call this
@@ -450,6 +473,8 @@ export class VenueCollector {
    *  websocket callback. */
   noteStoredCandles(symbol: string, candles: readonly Candle[], written: number, newlyFilled: number): void {
     if (candles.length === 0 || written === 0) return;
+    const knownGap = this.holeCache.get(symbol)?.gap;
+    const touchesKnownGap = !!knownGap && candles.some((c) => c.openMs >= knownGap[0] && c.openMs <= knownGap[1]);
     // v0.4.31 — record BEFORE the partial-write early return below: even a
     // partially-rejected batch proves a websocket wrote SOMETHING for this
     // symbol just now, which is the only fact `workQueue`'s reconcile trigger
@@ -463,9 +488,21 @@ export class VenueCollector {
     // A store gate may reject an early/invalid subset. Without the accepted
     // rows themselves, updating first/last from the input would publish a
     // candle that is not on disk. Drop a primed row for the next yielding scan.
-    if (written !== candles.length) { this.coverageCache.delete(symbol); return; }
+    if (written !== candles.length) {
+      this.coverageCache.delete(symbol);
+      this.holeCache.delete(symbol);
+      return;
+    }
     const c = this.coverageCache.get(symbol);
-    if (c) this.updateCoverage(symbol, c, candles, newlyFilled);
+    if (c) {
+      this.updateCoverage(symbol, c, candles, newlyFilled);
+      // A normal websocket append does not change the oldest interior hole.
+      // Evict only if it fills that hole or creates a new one, else busy
+      // streams would force a 30-day rescan on every tick.
+      if (touchesKnownGap || this.coverageCache.get(symbol)!.interiorMissing > c.interiorMissing) {
+        this.holeCache.delete(symbol);
+      }
+    }
   }
 
   private updateCoverage(symbol: string, c: SymbolCoverage, candles: readonly Candle[], newlyFilled: number): void {
@@ -568,17 +605,27 @@ export class VenueCollector {
     return gap;
   }
 
-  /** Coverage identifies symbols with holes; locating each oldest hole is
-   *  another full-window synchronous scan. Prime those scans with the same
-   *  event-loop boundary so a damaged roster cannot recreate the boot stall. */
-  private async prepareWorkQueue(now: number): Promise<void> {
-    await this.prepareCoverage();
-    for (const rec of this.tracked.values()) {
+  /** Deep hole discovery is separate from queue assembly. Every tick visits a
+   *  bounded rotating slice, so thousands of gapped symbols cannot delay all
+   *  fresh REST tails while their 30-day windows are parsed. Cached gaps remain
+   *  usable for repair until this cursor revalidates them. */
+  private async prepareWorkQueue(now: number, clock: () => number): Promise<void> {
+    await this.prepareRuntimeCoverageSlice(clock);
+    const roster = [...this.tracked.values()];
+    if (!roster.length) return;
+    const startedAt = clock();
+    let scanned = 0;
+    for (let visited = 0; visited < roster.length && scanned < 16; visited++) {
+      if (scanned > 0 && clock() - startedAt >= 4_000) break;
+      const index = this.holeScanCursor % roster.length;
+      const rec = roster[index]!;
+      this.holeScanCursor = (index + 1) % roster.length;
       if (rec.delisted || !rec.tradable) continue;
       const cov = this.coverageCache.get(rec.symbol);
       const cached = this.holeCache.get(rec.symbol);
       if (cov && cov.interiorMissing > 0 && (!cached || now - cached.at >= 10 * 60_000)) {
         this.oldestHole(rec.symbol, now);
+        scanned++;
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
@@ -608,7 +655,10 @@ export class VenueCollector {
 
     for (const rec of this.tracked.values()) {
       if (rec.delisted || !rec.tradable) continue;
-      const cov = this.coverage(rec.symbol);
+      // Unknown cold coverage stays unknown. The runtime prime will reach it
+      // on a later turn; a queue-builder deep scan would undo the bound above.
+      const cov = this.coverageCache.get(rec.symbol);
+      if (!cov) continue;
       if (cov.lastClosedMs === null) {
         // Nothing at all yet: WEEX's native current page can safely establish a
         // contiguous recent suffix without claiming anything about older time.
@@ -691,7 +741,7 @@ export class VenueCollector {
         }
       }
       if (cov.interiorMissing > 0) {
-        const hole = this.oldestHole(rec.symbol, now);
+        const hole = this.holeCache.get(rec.symbol)?.gap;
         // A FULL PAGE FORWARD FROM THE HOLE, exactly the shape of a tail
         // request — NOT a window clamped to the hole's own end.
         //
@@ -945,7 +995,7 @@ export class VenueCollector {
     // Do the cold exact scan before starting the request deadline. Priming is
     // local disk work, not venue pacing; charging its wall time here would make
     // a responsive startup skip the very first candle requests it prepared.
-    await this.prepareWorkQueue(now);
+    await this.prepareWorkQueue(now, clock);
     const startedAt = clock();
     const queue = this.scheduledWork(now);
     // NOTHING DUE IS NOT NOTHING WORKING. Recorded before the loop so a venue

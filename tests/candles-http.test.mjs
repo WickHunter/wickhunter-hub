@@ -645,13 +645,95 @@ await test("coverage priming time is outside the collector request deadline", as
   const venue = stubVenue({ symbols: ["AAAUSDT"] });
   await collector.refreshSymbols(venue.fetchLike, NOW);
   let clock = 0;
-  collector.prepareCoverage = async () => { clock += 10_000; };
+  const diskCoverage = store.coverage.bind(store);
+  store.coverage = (...args) => { clock += 10_000; return diskCoverage(...args); };
   const result = await collector.tick(venue.fetchLike, 1, NOW, {
     clock: () => clock,
     sleep: async () => {},
     deadlineMs: 1,
   });
   assert.equal(result.requests, 1, "a long cold disk prime does not consume the venue request deadline");
+});
+
+await test("large gapped rosters cannot starve fresh REST while deep scans rotate fairly", async () => {
+  const dataDir = tmpDir("bounded-gap-discovery");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const symbols = Array.from({ length: 80 }, (_, i) => `GAP${String(i).padStart(3, "0")}USDT`);
+  const venue = stubVenue({ symbols });
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, {
+    ...DEFAULT_COLLECTOR_OPTIONS, tailFillMinutes: 1, symbolRefreshMs: 1000 * MINUTE_MS,
+  }, NOW);
+  await collector.refreshSymbols(venue.fetchLike, NOW);
+  const old = NEWEST_CLOSED - 300 * MINUTE_MS;
+  for (const symbol of symbols) store.write("bitget", symbol, [mk(old, 0), mk(old + 2 * MINUTE_MS, 2)]);
+
+  let fakeClock = 0;
+  const coverageScans = [];
+  const holeScans = [];
+  const diskCoverage = store.coverage.bind(store);
+  const diskWindow = store.readWindow.bind(store);
+  store.coverage = (...args) => { coverageScans.push(args[1]); fakeClock += 150; return diskCoverage(...args); };
+  store.readWindow = (...args) => { holeScans.push(args[1]); fakeClock += 600; return diskWindow(...args); };
+  const deps = { clock: () => fakeClock, sleep: async () => {}, deadlineMs: 1 };
+
+  const first = await collector.tick(venue.fetchLike, 1, NOW, deps);
+  assert.equal(first.requests, 1, "a fresh REST tail starts in the first pass despite old gaps");
+  assert.ok(coverageScans.length > 0 && coverageScans.length <= 32, "cold exact coverage is bounded per pass");
+  assert.ok(holeScans.length > 0 && holeScans.length <= 16, "full-window hole scans are bounded per pass");
+  assert.equal(venue.state.klineRequests, 1);
+
+  for (let i = 1; i < 25 && new Set(holeScans).size < symbols.length; i++) {
+    await collector.tick(venue.fetchLike, 0, NOW + i * MINUTE_MS, deps);
+  }
+  assert.equal(new Set(coverageScans).size, symbols.length, "all cold symbols eventually receive exact coverage");
+  assert.equal(new Set(holeScans).size, symbols.length,
+    "the hole cursor eventually visits every gapped symbol even as old cache entries expire");
+});
+
+await test("an in-flight full admin coverage prime cannot hold a collector tick", async () => {
+  const dataDir = tmpDir("admin-prime-independent");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, {
+    ...DEFAULT_COLLECTOR_OPTIONS, tailFillMinutes: 1,
+  }, NOW);
+  await collector.refreshSymbols(venue.fetchLike, NOW);
+  let releaseAdmin;
+  collector.prepareCoverage = () => new Promise((resolve) => { releaseAdmin = resolve; });
+  const pendingAdmin = collector.prepareCoverage();
+  const result = await collector.tick(venue.fetchLike, 1, NOW, {
+    clock: () => 0, sleep: async () => {}, deadlineMs: 1,
+  });
+  assert.equal(result.requests, 1, "runtime prime does not await the admin full-roster promise");
+  releaseAdmin();
+  await pendingAdmin;
+});
+
+await test("websocket tail appends retain discovered old repair work", async () => {
+  const dataDir = tmpDir("stream-append-keeps-hole");
+  const store = new CandleStore(`${dataDir}/candles`);
+  const venue = stubVenue({ symbols: ["AAAUSDT"] });
+  const collector = new VenueCollector("bitget", store, `${dataDir}/candles`, {
+    ...DEFAULT_COLLECTOR_OPTIONS, tailFillMinutes: 1_000_000,
+  }, NOW);
+  await collector.refreshSymbols(venue.fetchLike, NOW);
+  const old = NEWEST_CLOSED - 4 * MINUTE_MS;
+  store.write("bitget", "AAAUSDT", [mk(old, 0), mk(old + 2 * MINUTE_MS, 2)]);
+  let gapScans = 0;
+  const oldestHole = collector.oldestHole.bind(collector);
+  collector.oldestHole = (...args) => { gapScans++; return oldestHole(...args); };
+  const deps = { clock: () => NOW, sleep: async () => {} };
+  await collector.tick(venue.fetchLike, 0, NOW, deps);
+  assert.equal(gapScans, 1, "the old hole was discovered");
+
+  const append = [mk(old + 3 * MINUTE_MS, 3)];
+  const write = store.write("bitget", "AAAUSDT", append);
+  collector.noteStoredCandles("AAAUSDT", append, write.written, write.newlyFilled);
+  await collector.tick(venue.fetchLike, 2, NOW + MINUTE_MS, deps);
+  assert.equal(gapScans, 1, "a normal new websocket candle does not force a deep rescan");
+  assert.ok(venue.state.requests.some((url) => url.includes("history-candles")
+    && Number(new URL(url).searchParams.get("startTime")) === old + MINUTE_MS),
+  "the cached old gap remains eligible for REST repair");
 });
 
 await test("the status states oldest/newest held, gap totals and the worst offenders", async () => {
