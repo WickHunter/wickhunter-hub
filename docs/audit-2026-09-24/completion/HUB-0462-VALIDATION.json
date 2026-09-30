@@ -1,0 +1,26 @@
+{
+  "version": "0.4.62",
+  "testedRuntimeSourceCommit": "a6439d4cb75ea9e70691d04122094db7fdd00fe7",
+  "gate": {
+    "suitesPassed": 75,
+    "failed": 0,
+    "logSha256": "75473980b19c51b70d56a5afd003f14a829c41e773f0e87108e7999cf35884b5",
+    "buildLogSha256": "030e5fc834a600215bbfba746291adb7eaa3007fc12b0c3c4373365cfe785ecf"
+  },
+  "additionalRollbackTests": 4,
+  "betaCompatibility": {
+    "artifact": "wickhunter-beta-0.90.135.tar.gz",
+    "serverSha256": "6ee4374b4946b90445928361045fd9f2fa8e7856acf357c70093cedd6d9eaadb",
+    "route": "/api/license/checkin",
+    "method": "POST",
+    "serialize": "stringify",
+    "signedTokenProperty": true,
+    "readerUsesStoredOrEnvironmentLicense": true,
+    "readOnlyInspection": true,
+    "bundleExecuted": false
+  },
+  "initialGate": "Initial gate failed release changelog parity and a Unix-second-boundary-sensitive installer test. Changelog updated; deadline fixture uses controlled time and verifies bounded wait, preserved failure, and no second attempt. Complete rerun passed.",
+  "deployment": "pending",
+  "betaPublication": "forbidden; retain 0.90.135 unchanged",
+  "alphaPublication": "unrelated UI work pending separately; Hub deployment preserves current Alpha0.90.145"
+}
