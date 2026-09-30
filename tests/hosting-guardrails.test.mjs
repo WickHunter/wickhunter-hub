@@ -111,18 +111,26 @@ count=$((count + 1)); printf '%s' "$count" > "$COUNT_FILE"
 exit 100
 `, { mode: 0o755 });
     const countFile = path.join(dir, "count");
+    // Production measures whole Unix seconds. Crossing a second boundary can
+    // exhaust a one-second test deadline in far less than 900 ms, so wall time
+    // cannot establish this branch. Advance a controlled clock at its wait.
+    const clockFile = path.join(dir, "clock");
+    const sleepFile = path.join(dir, "sleep");
+    fs.writeFileSync(clockFile, "0");
+    fs.writeFileSync(path.join(dir, "date"), '#!/usr/bin/env bash\ncat "$CLOCK_FILE"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(dir, "sleep"), '#!/usr/bin/env bash\nprintf "%s" "$1" > "$SLEEP_FILE"\nprintf 1 > "$CLOCK_FILE"\n', { mode: 0o755 });
     const script = `set -Eeuo pipefail
 warn() { :; }
 ${helper}
 apt_retry update -qq
 `;
-    const started = Date.now();
     const result = spawnSync("bash", ["-c", script], {
       encoding: "utf8", timeout: 4_000,
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, COUNT_FILE: countFile },
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, COUNT_FILE: countFile,
+        CLOCK_FILE: clockFile, SLEEP_FILE: sleepFile },
     });
     assert.equal(result.status, 100, result.stderr);
-    assert.ok(Date.now() - started >= 900 && Date.now() - started < 3_000, "completed failures observe the shared retry deadline");
+    assert.equal(fs.readFileSync(sleepFile, "utf8"), "1", "wait is bounded to the one remaining second");
     assert.equal(fs.readFileSync(countFile, "utf8"), "1", "deadline prevents another lock attempt after the bounded wait");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

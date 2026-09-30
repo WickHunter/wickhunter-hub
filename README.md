@@ -1,3 +1,7 @@
+## v0.4.62 — Hub audit fixes
+
+Restrict payout onboarding to customer sign-in, keep Earn ownership stable across email changes, reject supported Gmail self-referrals, and durably deliver committed billing events to Earn. Bound guest support spending, session admission, diagnostics and gallery usage; preserve authenticated update compatibility. Alpha and Beta releases are managed separately.
+
 ## v0.4.61 — Hub audit follow-up
 
 Keep eligible Earn entry visible on the signed-in customer dashboard and show destination hosts for customer- or assistant-authored support links in the admin inbox.
@@ -1791,6 +1795,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.62 — Deploy Hub audit fixes for Earn access and identity, durable billing handoffs, bounded support and feedback, and signed check-ins.
 
 - v0.4.61 — Keep eligible Earn visible after sign-in and show destination hosts for untrusted support links.
 - v0.4.60 — Persist checkout receipts and recover interrupted purchases before later payments.
