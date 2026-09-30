@@ -564,8 +564,9 @@ await test("retention invalidates an expired cached repair gap only when that sy
     mk(retainedDay, 0), mk(retainedDay + 2 * MINUTE_MS, 2),
   ]);
   let gapScans = 0;
+  const diskGap = store.firstGap.bind(store);
   const diskWindow = store.readWindow.bind(store);
-  store.readWindow = (...args) => { gapScans++; return diskWindow(...args); };
+  store.firstGap = (...args) => { gapScans++; return diskGap(...args); };
   const deps = now => ({ clock: () => now, sleep: async () => {} });
   // A zero request budget still prepares the oldest gap used by real repair
   // work. Keep the following prune within that gap cache's ten-minute TTL.
@@ -671,9 +672,9 @@ await test("large gapped rosters cannot starve fresh REST while deep scans rotat
   const coverageScans = [];
   const holeScans = [];
   const diskCoverage = store.coverage.bind(store);
-  const diskWindow = store.readWindow.bind(store);
+  const diskGap = store.firstGap.bind(store);
   store.coverage = (...args) => { coverageScans.push(args[1]); fakeClock += 150; return diskCoverage(...args); };
-  store.readWindow = (...args) => { holeScans.push(args[1]); fakeClock += 600; return diskWindow(...args); };
+  store.firstGap = (...args) => { holeScans.push(args[1]); fakeClock += 600; return diskGap(...args); };
   const deps = { clock: () => fakeClock, sleep: async () => {}, deadlineMs: 1 };
 
   const first = await collector.tick(venue.fetchLike, 1, NOW, deps);
@@ -736,6 +737,32 @@ await test("websocket tail appends retain discovered old repair work", async () 
   "the cached old gap remains eligible for REST repair");
 });
 
+await test("admin candle status warms one exact row and reports the rest as unknown", async () => {
+  const symbols = Array.from({ length: 80 }, (_, i) => `ADMIN${String(i).padStart(3, "0")}USDT`);
+  const venue = stubVenue({ symbols });
+  const { svc, dataDir } = serviceWith("bitget", venue.fetchLike);
+  const collector = svc.collector("bitget");
+  await collector.refreshSymbols(venue.fetchLike, NOW);
+  const store = new CandleStore(`${dataDir}/candles`);
+  for (const symbol of symbols) store.write("bitget", symbol, [mk(DAY0, 0), mk(DAY0 + 2 * MINUTE_MS, 2)]);
+  const diskCoverage = collector.store.coverage.bind(collector.store);
+  let scans = 0;
+  collector.store.coverage = (...args) => { scans++; return diskCoverage(...args); };
+
+  await Promise.all(Array.from({ length: 20 }, () => svc.prepareStatus()));
+  const s = svc.status(NOW).find((v) => v.venue === "bitget");
+  assert.equal(scans, 1, "concurrent admin requests share one bounded exact scan");
+  assert.equal(s.counts.tracked, 80);
+  assert.equal(s.counts.active, 80);
+  assert.equal(s.counts.warming, 79, "unchecked symbols have an explicit unknown bucket");
+  assert.equal(s.counts.gapped, 1);
+  assert.equal(s.counts.seedable, 0);
+  assert.equal(s.counts.empty, 0, "unknown history is never displayed as empty");
+  assert.equal(s.totalMissingMinutes, 1, "gap totals cover only the checked row");
+  await svc.prepareStatus();
+  assert.equal(scans, 1, "repeated admin refreshes cannot amplify disk scanning");
+});
+
 await test("the status states oldest/newest held, gap totals and the worst offenders", async () => {
   const { svc, dataDir } = serviceWith("bitget", stubVenue().fetchLike);
   const store = new CandleStore(`${dataDir}/candles`);
@@ -755,7 +782,7 @@ await test("the status states oldest/newest held, gap totals and the worst offen
   for (let i = 0; i < 100; i++) if (![10, 11, 12].includes(i)) bbb.push(mk(DAY0 + i * MINUTE_MS, i));
   store.write("bitget", "BBBUSDT", bbb);
 
-  await svc.prepareStatus();
+  await svc.collector("bitget").prepareCoverage();
   const s = svc.status(NOW).find((v) => v.venue === "bitget");
   assert.equal(s.oldestClosedMs, DAY0, "oldest candle held is a fact on screen");
   assert.equal(s.newestClosedMs, DAY0 + 99 * MINUTE_MS, "newest likewise");
@@ -790,6 +817,7 @@ await test("symbols fall into exactly one bucket and the counts add up to tracke
   store.write("bitget", "HOLEUSDT", hole);
   // NONE: nothing at all -> empty
 
+  await c.prepareCoverage();
   const s = svc.status(NOW).find((v) => v.venue === "bitget");
   assert.equal(s.counts.tracked, 4);
   assert.equal(s.counts.seedable, 1, "FULLUSDT");
@@ -815,7 +843,7 @@ await test("inactive contracts are separated from active candle health without d
   await collector.refreshSymbols(list, NOW - 10 * 86_400_000);
   store.write("bitget", "ACTIVEUSDT", Array.from({length:2000},(_,i)=>mk(NEWEST_CLOSED-(1999-i)*MINUTE_MS,i)));
   store.write("bitget", "HALTEDUSDT", [mk(NEWEST_CLOSED-4*MINUTE_MS,1),mk(NEWEST_CLOSED,2)]);
-  await svc.prepareStatus();
+  await collector.prepareCoverage();
   let s=svc.status(NOW).find(v=>v.venue==="bitget");
   assert.equal(s.counts.tracked,3);assert.equal(s.counts.active,1);assert.equal(s.counts.inactive,2);
   assert.equal(s.counts.seedable,1);assert.equal(s.counts.gapped,0);assert.equal(s.counts.empty,0);
@@ -839,6 +867,7 @@ async function deepSymbolBehind(behindMin) {
   const end = NEWEST_CLOSED - behindMin * MINUTE_MS;
   for (let i = 0; i < 2000; i++) rows.push(mk(end - (1999 - i) * MINUTE_MS, i));
   store.write("bitget", "STALEUSDT", rows);
+  await svc.collector("bitget").prepareCoverage();
   return svc.status(NOW).find((v) => v.venue === "bitget");
 }
 
@@ -877,6 +906,7 @@ await test("newly listed pairs are counted and named, with the still-backfilling
   venue.state.symbols = ["OLDUSDT", "FRESHUSDT"];
   await c.refreshSymbols(venue.fetchLike, NOW - 3_600_000);
 
+  await c.prepareCoverage();
   const s = svc.status(NOW).find((v) => v.venue === "bitget");
   assert.equal(s.counts.newLast24h, 1, "only FRESHUSDT is new");
   assert.equal(s.counts.newLast24hBackfilling, 1, "and it is not seedable yet");
@@ -1319,6 +1349,9 @@ await test("the admin page carries the per-exchange panel and refreshes it with 
   assert.match(page, /NO COLLECTOR/, "an unconfigured venue says so rather than showing zeroes");
   assert.match(page, /sockets open/, "the venue card exposes socket coverage");
   assert.match(page, /REST reconciliation remains active/, "a live socket does not replace REST confirmation");
+  assert.match(page, /coverage warming/, "the venue card names unscanned symbols");
+  assert.match(page, /v\.counts\?\.warming > 0/, "the briefing cannot turn green while coverage is unknown");
+  assert.match(page, /pending coverage/, "the briefing explains its amber state");
   for (const field of ["seedable", "backfilling", "gapped", "Oldest candle", "Newest candle", "Missing minutes", "Worst gaps", "New in 24h"]) {
     assert.ok(page.includes(field), `panel states ${field}`);
   }

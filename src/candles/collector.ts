@@ -250,6 +250,8 @@ export class VenueCollector {
   private tracked = new Map<string, TrackedSymbol>();
   private coverageCache = new Map<string, SymbolCoverage>();
   private coveragePrime: Promise<void> | null = null;
+  private statusPrime: Promise<void> | null = null;
+  private nextStatusPrimeAt = 0;
   private coveragePrimeCursor = 0;
   private holeScanCursor = 0;
   private readonly symbolsFile: string;
@@ -412,6 +414,11 @@ export class VenueCollector {
     return c;
   }
 
+  /** Status may report only rows whose exact coverage is already known. */
+  cachedCoverage(symbol: string): SymbolCoverage | null {
+    return this.coverageCache.get(symbol) ?? null;
+  }
+
   /** Fill the exact coverage cache without monopolising Node's event loop.
    *  A cold 30-day roster is gigabytes of synchronous day-file reads; yielding
    *  after each symbol keeps health and other HTTP work responsive while the
@@ -439,13 +446,13 @@ export class VenueCollector {
    *  rotating slice instead, leaving unknown rows absent until their exact disk
    *  coverage is known. Both limits matter: one unusually large day file must
    *  not turn a nominally small slice into another minute-long prepass. */
-  private async prepareRuntimeCoverageSlice(clock: () => number): Promise<void> {
+  private async prepareRuntimeCoverageSlice(clock: () => number, maxSymbols = 32, maxMs = 4_000): Promise<void> {
     const roster = [...this.tracked.keys()];
     if (!roster.length) return;
     const startedAt = clock();
     let scanned = 0;
-    for (let visited = 0; visited < roster.length && scanned < 32; visited++) {
-      if (scanned > 0 && clock() - startedAt >= 4_000) break;
+    for (let visited = 0; visited < roster.length && scanned < maxSymbols; visited++) {
+      if (scanned > 0 && clock() - startedAt >= maxMs) break;
       const index = this.coveragePrimeCursor % roster.length;
       const symbol = roster[index]!;
       this.coveragePrimeCursor = (index + 1) % roster.length;
@@ -454,6 +461,20 @@ export class VenueCollector {
       scanned++;
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+  }
+
+  /** An admin refresh may advance one exact row, at most once per 15 seconds.
+   *  Concurrent requests share the same pass. A timed-out HTTP caller cannot
+   *  leave an unbounded full-roster scan running in the background. */
+  async prepareStatusCoverage(now = Date.now()): Promise<void> {
+    if (this.coveragePrime) return;
+    if (this.statusPrime) return this.statusPrime;
+    if (now < this.nextStatusPrimeAt) return;
+    this.nextStatusPrimeAt = now + 15_000;
+    const run = this.prepareRuntimeCoverageSlice(Date.now, 1, 1_000);
+    this.statusPrime = run;
+    try { await run; }
+    finally { if (this.statusPrime === run) this.statusPrime = null; }
   }
 
   /** Called ONLY after a write this collector made from its OWN REST fetch
@@ -598,8 +619,7 @@ export class VenueCollector {
     }
     let gap: [number, number] | null = null;
     try {
-      const w = this.store.readWindow(this.venue, symbol, cov.firstClosedMs, cov.lastClosedMs);
-      gap = w.gaps.length ? w.gaps[0]! : null;
+      gap = this.store.firstGap(this.venue, symbol, cov.firstClosedMs, cov.lastClosedMs);
     } catch { gap = null; }
     this.holeCache.set(symbol, { at: now, gap });
     return gap;

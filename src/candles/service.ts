@@ -38,11 +38,11 @@ export const NEW_SYMBOL_WINDOW_MS = 24 * 3_600_000;
 
 export interface SymbolStatus {
   symbol: string;
-  bucket: "seedable" | "backfilling" | "gapped" | "empty" | "inactive";
+  bucket: "seedable" | "backfilling" | "gapped" | "empty" | "inactive" | "warming";
   firstClosedMs: number | null;
   lastClosedMs: number | null;
-  heldMinutes: number;
-  missingMinutes: number;
+  heldMinutes: number | null;
+  missingMinutes: number | null;
   newlyListed: boolean;
   delisted: boolean;
   tradable: boolean;
@@ -64,6 +64,7 @@ export interface VenueStatus {
     backfilling: number;
     gapped: number;
     empty: number;
+    warming: number;
     delisted: number;
     newLast24h: number;
     newLast24hBackfilling: number;
@@ -71,13 +72,14 @@ export interface VenueStatus {
   /** Oldest and newest closed candle held for active symbols in this venue. */
   oldestClosedMs: number | null;
   newestClosedMs: number | null;
-  /** Total missing minutes inside held ranges, across active symbols only; inactive contract history is retained separately. */
+  /** Known missing minutes inside held ranges. `counts.warming` says whether
+   *  this is still a partial total; unknown symbols are never counted as zero. */
   totalMissingMinutes: number;
   /** Symbols with the most missing minutes — a venue quietly accumulating gaps
    *  is the failure that poisons seeds without ever throwing an error. */
   worstGaps: Array<{ symbol: string; missingMinutes: number }>;
   /** Symbols first listed inside the last 24h that are not seedable yet. */
-  newlyListed: Array<{ symbol: string; firstSeenAt: number; heldMinutes: number; bucket: SymbolStatus["bucket"] }>;
+  newlyListed: Array<{ symbol: string; firstSeenAt: number; heldMinutes: number | null; bucket: SymbolStatus["bucket"] }>;
 }
 
 /** What the snapshot route serves, or the refusal it answers with. The 404 for
@@ -279,11 +281,11 @@ export class CandleService {
     return [...this.streams.values()].map((r) => r.status());
   }
 
-  /** Prepare the exact data used by synchronous `status()`. The admin route
-   *  awaits this yielding pass; existing in-process callers retain the same
-   *  status signature once their normal collector tick has primed it. */
+  /** Advance a tightly bounded slice of exact status coverage. The response
+   *  labels all still-unscanned active symbols `warming`; it never waits for
+   *  the whole stored roster or invents complete gap totals. */
   async prepareStatus(): Promise<void> {
-    await Promise.all([...this.collectors.values()].map((collector) => collector.prepareCoverage()));
+    await Promise.all([...this.collectors.values()].map((collector) => collector.prepareStatusCoverage()));
   }
 
   /** Re-chunk every runner against the current tracked set. Called on the same
@@ -517,7 +519,7 @@ export class CandleService {
       return {
         venue, configured: false, health: null, klineEndpoint,
         counts: {
-          tracked: 0, active: 0, inactive: 0, seedable: 0, backfilling: 0, gapped: 0, empty: 0,
+          tracked: 0, active: 0, inactive: 0, seedable: 0, backfilling: 0, gapped: 0, empty: 0, warming: 0,
           delisted: 0, newLast24h: 0, newLast24hBackfilling: 0,
         },
         oldestClosedMs: null, newestClosedMs: null, totalMissingMinutes: 0,
@@ -528,7 +530,7 @@ export class CandleService {
     const per = this.symbolStatuses(collector, now);
     const counts = {
       tracked: per.length, active: 0, inactive: 0,
-      seedable: 0, backfilling: 0, gapped: 0, empty: 0, delisted: 0,
+      seedable: 0, backfilling: 0, gapped: 0, empty: 0, warming: 0, delisted: 0,
       newLast24h: 0, newLast24hBackfilling: 0,
     };
     let oldestClosedMs: number | null = null;
@@ -544,9 +546,9 @@ export class CandleService {
       counts.active++;
       if (s.newlyListed) {
         counts.newLast24h++;
-        if (s.bucket !== "seedable") counts.newLast24hBackfilling++;
+        if (s.bucket !== "seedable" && s.bucket !== "warming") counts.newLast24hBackfilling++;
       }
-      totalMissingMinutes += s.missingMinutes;
+      totalMissingMinutes += s.missingMinutes ?? 0;
       if (s.firstClosedMs !== null && (oldestClosedMs === null || s.firstClosedMs < oldestClosedMs)) {
         oldestClosedMs = s.firstClosedMs;
       }
@@ -556,10 +558,10 @@ export class CandleService {
     }
 
     const worstGaps = per
-      .filter((s) => s.bucket !== "inactive" && s.missingMinutes > 0)
-      .sort((a, b) => b.missingMinutes - a.missingMinutes)
+      .filter((s) => s.bucket !== "inactive" && s.missingMinutes !== null && s.missingMinutes > 0)
+      .sort((a, b) => (b.missingMinutes ?? 0) - (a.missingMinutes ?? 0))
       .slice(0, 8)
-      .map((s) => ({ symbol: s.symbol, missingMinutes: s.missingMinutes }));
+      .map((s) => ({ symbol: s.symbol, missingMinutes: s.missingMinutes! }));
 
     const newlyListed = per
       .filter((s) => s.bucket !== "inactive" && s.newlyListed)
@@ -586,9 +588,9 @@ export class CandleService {
   private symbolStatuses(collector: VenueCollector, now: number): SymbolStatus[] {
     const newestClosed = newestClosedOpenMs(now);
     return collector.symbols().map((t) => {
-      const cov = collector.coverage(t.symbol);
-      const heldMinutes = cov.count;
-      const missingMinutes = cov.interiorMissing;
+      const cov = collector.cachedCoverage(t.symbol);
+      const heldMinutes = cov?.count ?? null;
+      const missingMinutes = cov?.interiorMissing ?? null;
       // ── ONE BUCKET PER SYMBOL, IN PRIORITY ORDER ────────────────────────
       // The buckets are reported as plain counts and never rolled into a
       // health score: an operator needs to know WHICH of these is wrong, and a
@@ -596,14 +598,16 @@ export class CandleService {
       let bucket: SymbolStatus["bucket"];
       if (t.delisted || !t.tradable) {
         bucket = "inactive";
+      } else if (!cov) {
+        bucket = "warming";
       } else if (cov.lastClosedMs === null) {
         bucket = "empty";
-      } else if (missingMinutes > 0) {
+      } else if (missingMinutes !== null && missingMinutes > 0) {
         // Holes inside the range we hold. Said first because a gapped symbol
         // is the one that can poison a seed while looking deep and current.
         bucket = "gapped";
       } else if (
-        heldMinutes < SEEDABLE_MIN_MINUTES ||
+        heldMinutes === null || heldMinutes < SEEDABLE_MIN_MINUTES ||
         newestClosed - cov.lastClosedMs > seedableMaxTailAgeMs(this.cfg.options)
       ) {
         bucket = "backfilling";
@@ -613,8 +617,8 @@ export class CandleService {
       return {
         symbol: t.symbol,
         bucket,
-        firstClosedMs: cov.firstClosedMs,
-        lastClosedMs: cov.lastClosedMs,
+        firstClosedMs: cov?.firstClosedMs ?? null,
+        lastClosedMs: cov?.lastClosedMs ?? null,
         heldMinutes,
         missingMinutes,
         newlyListed: now - t.firstSeenAt < NEW_SYMBOL_WINDOW_MS,

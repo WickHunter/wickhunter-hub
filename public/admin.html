@@ -1640,19 +1640,22 @@ async function cdRefresh() {
       + '<span class="bkt b-backfilling"><b>' + v.counts.backfilling + "</b> backfilling</span>"
       + '<span class="bkt b-gapped"><b>' + v.counts.gapped + "</b> gapped</span>"
       + '<span class="bkt b-empty"><b>' + v.counts.empty + "</b> empty</span>"
+      + (v.counts.warming ? '<span class="bkt b-new"><b>' + v.counts.warming + "</b> coverage warming</span>" : "")
       + (v.counts.inactive ? '<span class="bkt b-empty"><b>' + v.counts.inactive + "</b> inactive</span>" : "")
       + (v.counts.newLast24h ? '<span class="bkt b-new"><b>' + v.counts.newLast24h + "</b> new in 24h</span>" : "")
       + "</div>";
 
-    html += '<p class="muted">Data health covers active markets. Inactive contracts keep their history but are excluded from gaps and empty counts.</p>';
+    html += '<p class="muted">Data health covers active markets. Inactive contracts keep their history but are excluded from gaps and empty counts.'
+      + (v.counts.warming ? ' Coverage and gap totals currently include only checked symbols; warming symbols are unknown.' : '')
+      + '</p>';
     html += "<dl>"
       + "<dt>Symbols tracked</dt><dd>" + v.counts.tracked
         + (v.counts.delisted ? ' <span class="muted">(' + v.counts.delisted + " delisted)</span>" : "") + "</dd>"
       + "<dt>Last success</dt><dd>" + when(h.lastSuccessAt) + "</dd>"
       + "<dt>Symbol list</dt><dd>" + when(h.lastSymbolRefreshAt) + "</dd>"
-      + "<dt>Oldest candle</dt><dd>" + (v.oldestClosedMs ? fmt(v.oldestClosedMs) + " UTC" : "—") + "</dd>"
-      + "<dt>Newest candle</dt><dd>" + (v.newestClosedMs ? fmt(v.newestClosedMs) + " UTC (" + ago(v.newestClosedMs) + ")" : "—") + "</dd>"
-      + "<dt>Missing minutes</dt><dd>" + v.totalMissingMinutes.toLocaleString() + "</dd>"
+      + "<dt>" + (v.counts.warming ? "Oldest known candle" : "Oldest candle") + "</dt><dd>" + (v.oldestClosedMs ? fmt(v.oldestClosedMs) + " UTC" : "—") + "</dd>"
+      + "<dt>" + (v.counts.warming ? "Newest known candle" : "Newest candle") + "</dt><dd>" + (v.newestClosedMs ? fmt(v.newestClosedMs) + " UTC (" + ago(v.newestClosedMs) + ")" : "—") + "</dd>"
+      + "<dt>" + (v.counts.warming ? "Known missing minutes" : "Missing minutes") + "</dt><dd>" + v.totalMissingMinutes.toLocaleString() + "</dd>"
       + "<dt>Requests</dt><dd>" + h.requestsMade.toLocaleString() + " · " + h.candlesWritten.toLocaleString() + " candles</dd>"
       // The rate is stated whenever the collector is not at full speed, because
       // "slow" and "broken" look identical from the bucket counts alone.
@@ -1671,7 +1674,7 @@ async function cdRefresh() {
     // "Why is this new coin not trading?" should be answerable on sight.
     if (v.newlyListed.length) {
       html += '<div class="worst"><span class="muted">New in 24h:</span> '
-        + v.newlyListed.map((n) => esc(n.symbol) + " (" + n.bucket + ", " + dur(n.heldMinutes) + " held)").join(", ") + "</div>";
+        + v.newlyListed.map((n) => esc(n.symbol) + " (" + n.bucket + ", " + (n.heldMinutes === null ? "coverage pending" : dur(n.heldMinutes) + " held") + ")").join(", ") + "</div>";
     }
     if (h.lastError) {
       html += '<div class="verr">Last error ' + ago(h.lastError.at) + ": " + esc(h.lastError.message) + "</div>";
@@ -2912,17 +2915,17 @@ async function openReport(r) {
 }
 function renderBriefCandles(data) {
   const venues = (data.venues || []).filter(v => v.configured);
-  const problems = venues.filter(v => v.health?.state !== 'running' || v.counts?.gapped > 0 || v.counts?.empty > 0 || !v.health?.lastSuccessAt || Date.now()-v.health.lastSuccessAt > 10*60*1000);
+  const problems = venues.filter(v => v.health?.state !== 'running' || v.counts?.gapped > 0 || v.counts?.empty > 0 || v.counts?.warming > 0 || !v.health?.lastSuccessAt || Date.now()-v.health.lastSuccessAt > 10*60*1000);
   const failing = problems.some(v => ['failing','stalled'].includes(v.health?.state) || (v.health?.lastSuccessAt && Date.now()-v.health.lastSuccessAt>10*60*1000));
   const state = !data.enabled || !venues.length ? 'unknown' : failing ? 'red' : problems.length ? 'amber' : 'green';
   setBrief('Candles', state, state[0].toUpperCase()+state.slice(1), !venues.length ? 'No collectors configured' : (venues.length-problems.length)+'/'+venues.length+' exchanges healthy');
   const box = document.getElementById('briefDataList'); box.textContent = '';
   if (!venues.length) box.textContent = 'Candle collection is not configured.';
-  else if (!problems.length) box.textContent = 'All configured collectors are running with no gapped or empty symbols reported.';
+  else if (!problems.length) box.textContent = 'All configured collectors are running with complete coverage and no gapped or empty symbols reported.';
   for (const v of problems) {
     const item=document.createElement('div'); item.className='inbox-item';
     const name=document.createElement('strong'); name.textContent=v.venue.toUpperCase()+' · '+(v.health?.state || 'unknown');
-    const detail=document.createElement('p'); detail.textContent=(v.health?.detail || 'Collector status unavailable')+' · '+(v.counts?.gapped || 0)+' gapped · '+(v.counts?.empty || 0)+' empty';
+    const detail=document.createElement('p'); detail.textContent=(v.health?.detail || 'Collector status unavailable')+' · '+(v.counts?.gapped || 0)+' gapped · '+(v.counts?.empty || 0)+' empty · '+(v.counts?.warming || 0)+' pending coverage';
     item.append(name,detail); box.appendChild(item);
   }
 }
