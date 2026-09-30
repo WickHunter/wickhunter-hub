@@ -329,6 +329,7 @@ await test("demanded native depth and background 1m depth alternate first histor
   await collector.refreshSymbols(async () => ({ ok: true, status: 200,
     json: async () => ({ code: "00000", data: [{ symbol: "BTCUSDT", symbolStatus: "normal" }] }) }), NOW);
   h.value.request("bitget", "BTCUSDT", 60, DAY0, DAY0 + HOUR, NOW, current, "seed-1", sign);
+  await collector.prepareCoverage();
   const a = collector.scheduledWork(NOW).map((w) => w.kind);
   const b = collector.scheduledWork(NOW).map((w) => w.kind);
   assert.ok(a.includes("backfill") && a.includes("timeframe"));
@@ -390,6 +391,7 @@ await test("WEEX mixed cold work gives native and legacy history equal request-w
     })) },
   }), NOW);
   for (const symbol of symbols) h.value.request("weex", symbol, 60, DAY0, DAY0, NOW, current, "seed-1", sign);
+  await collector.prepareCoverage();
   const scheduled = collector.scheduledWork(NOW).slice(0, 12).map((w) => w.kind);
   assert.deepEqual(scheduled.slice(0, 6), ["backfill", "timeframe", "timeframe", "timeframe", "timeframe", "timeframe"]);
   assert.deepEqual(scheduled.slice(6, 12), ["backfill", "timeframe", "timeframe", "timeframe", "timeframe", "timeframe"]);

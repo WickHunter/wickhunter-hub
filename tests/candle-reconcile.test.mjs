@@ -346,6 +346,10 @@ for (const [venue, count, budget] of [["bitget", 783, 100], ["weex", 239, 5]]) {
     for (const symbol of f.symbols) {
       for (let t = NOW - 6 * MINUTE_MS; t <= settledOpenMs(NOW); t += MINUTE_MS) f.put(symbol, t);
     }
+    // This is the warm-collector scheduling contract. Runtime startup now
+    // primes cold coverage in bounded slices, while the admin/full prime still
+    // establishes exact coverage for the entire roster before this sweep.
+    await f.collector.prepareCoverage();
     assert.equal(f.collector.restConfirmedMs(f.symbols[0]), null, "WS history is not REST evidence");
     const ticks = Math.ceil(count / budget) + 1;
     for (let i = 0; i < ticks; i++) {
@@ -363,6 +367,23 @@ for (const [venue, count, budget] of [["bitget", 783, 100], ["weex", 239, 5]]) {
     assert.equal(Object.keys(persisted.restConfirmed).length, count, "frontiers are persisted only after each successful response");
   });
 }
+
+await test("cold reconciliation reaches a large roster as bounded coverage becomes known", async () => {
+  const f = fairnessFixture("bitget", 80);
+  await f.collector.refreshSymbols(f.fetchLike, NOW);
+  for (const symbol of f.symbols) f.put(symbol, settledOpenMs(NOW));
+  for (let i = 0; i < 4; i++) {
+    const now = NOW + i * MINUTE_MS;
+    if (i > 0) for (const symbol of f.symbols) f.put(symbol, settledOpenMs(now));
+    await f.tick(100, now);
+    const confirmed = f.symbols.filter((symbol) => f.collector.restConfirmedMs(symbol) !== null).length;
+    assert.equal(confirmed, Math.min(f.symbols.length, (i + 1) * 32),
+      "each tick confirms the next bounded cold slice without leaving eligible peers behind");
+  }
+  assert.deepEqual(f.state.calls.slice(0, 32), f.symbols.slice(0, 32),
+    "the first cold slice follows roster order");
+  for (const symbol of f.symbols) assert.notEqual(f.collector.restConfirmedMs(symbol), null);
+});
 
 await test("reconciliation resumes after the last attempted symbol through roster changes and zero-work ticks", async () => {
   const f = fairnessFixture("bitget", 5, { reconcileWsGapMinutes: 1 });
