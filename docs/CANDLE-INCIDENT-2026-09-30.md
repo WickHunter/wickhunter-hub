@@ -44,3 +44,12 @@ activity was distributed across stream snapshot writes, seed requests and the
 startup liquidation percentile rebuild. Its diagnostic cleanup closed the
 inspector without restarting the process. Cold coverage still warms in bounded
 slices; unchecked symbols and known historical gaps remain explicitly reported.
+
+At the final observation after Alpha146 passed readiness, stored BTCUSDT
+candles on all six configured venues were 2.6–5.6 minutes old. Bybit, Binance
+and Aster REST-confirmed BTC history was 3.6–5.6 minutes old; WEEX confirmation
+was still 21.6 minutes old within its slower reconciliation lane. The admin
+request completed in 2.0 seconds under load. Historical gaps and unchecked
+coverage are still present and explicitly reported; this is a freshness
+recovery, not a claim that every historical gap has been repaired.
+[Final observation](HUB-0464-FRESHNESS-OBSERVATION.json).

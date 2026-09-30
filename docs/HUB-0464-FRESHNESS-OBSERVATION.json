@@ -1,0 +1,141 @@
+{
+  "at": 1790740594581,
+  "pid": 2646820,
+  "samples": {
+    "bybit": {
+      "latest": 1790740380000,
+      "ageMinutes": 3.6,
+      "confirmedAgeMinutes": 5.6
+    },
+    "binance": {
+      "latest": 1790740440000,
+      "ageMinutes": 2.6,
+      "confirmedAgeMinutes": 3.6
+    },
+    "aster": {
+      "latest": 1790740440000,
+      "ageMinutes": 2.6,
+      "confirmedAgeMinutes": 4.6
+    },
+    "bitget": {
+      "latest": 1790740440000,
+      "ageMinutes": 2.6,
+      "confirmedAgeMinutes": 4.6
+    },
+    "bitunix": {
+      "latest": 1790740440000,
+      "ageMinutes": 2.6,
+      "confirmedAgeMinutes": 6.6
+    },
+    "weex": {
+      "latest": 1790740260000,
+      "ageMinutes": 5.6,
+      "confirmedAgeMinutes": 21.6
+    }
+  },
+  "adminSeconds": 2.0,
+  "venues": [
+    {
+      "venue": "bybit",
+      "counts": {
+        "tracked": 789,
+        "active": 782,
+        "inactive": 7,
+        "seedable": 112,
+        "backfilling": 0,
+        "gapped": 100,
+        "empty": 0,
+        "warming": 570,
+        "delisted": 7,
+        "newLast24h": 4,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 7571
+    },
+    {
+      "venue": "bitunix",
+      "counts": {
+        "tracked": 770,
+        "active": 763,
+        "inactive": 7,
+        "seedable": 179,
+        "backfilling": 0,
+        "gapped": 32,
+        "empty": 0,
+        "warming": 552,
+        "delisted": 3,
+        "newLast24h": 0,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 166
+    },
+    {
+      "venue": "bitget",
+      "counts": {
+        "tracked": 815,
+        "active": 801,
+        "inactive": 14,
+        "seedable": 180,
+        "backfilling": 0,
+        "gapped": 0,
+        "empty": 0,
+        "warming": 621,
+        "delisted": 14,
+        "newLast24h": 0,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 0
+    },
+    {
+      "venue": "binance",
+      "counts": {
+        "tracked": 653,
+        "active": 522,
+        "inactive": 131,
+        "seedable": 61,
+        "backfilling": 0,
+        "gapped": 95,
+        "empty": 0,
+        "warming": 366,
+        "delisted": 0,
+        "newLast24h": 0,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 8512
+    },
+    {
+      "venue": "aster",
+      "counts": {
+        "tracked": 584,
+        "active": 565,
+        "inactive": 19,
+        "seedable": 112,
+        "backfilling": 0,
+        "gapped": 100,
+        "empty": 0,
+        "warming": 353,
+        "delisted": 0,
+        "newLast24h": 0,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 7504
+    },
+    {
+      "venue": "weex",
+      "counts": {
+        "tracked": 246,
+        "active": 246,
+        "inactive": 0,
+        "seedable": 214,
+        "backfilling": 0,
+        "gapped": 0,
+        "empty": 0,
+        "warming": 32,
+        "delisted": 0,
+        "newLast24h": 7,
+        "newLast24hBackfilling": 0
+      },
+      "missingMinutes": 0
+    }
+  ]
+}
