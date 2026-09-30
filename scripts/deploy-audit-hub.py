@@ -31,6 +31,8 @@ SHA_RE = re.compile(r'[0-9a-f]{64}\Z')
 JS_RE = re.compile(r'dist/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(?:[.-][A-Za-z0-9_-]+)*\.js\Z')
 PUBLIC_FILES = {'public/admin.html', 'public/earn.html', 'public/support.html'}
 PACKAGE_FILES = {'package.json', 'package-lock.json'}
+ROLLBACK_GUARD = 'prepare-hub-audit-rollback.mjs'
+DATA_DIR = Path('/opt/wickhunter-hub/data')
 ALPHA_PROTECTED = ('dist', 'src', 'public', 'scripts', 'migrations', 'package.json',
                    'package-lock.json', '.deployed-commit', '.deployed-at', 'bin', 'native', '.native')
 HUB_PROTECTED = ('dist', 'src', 'public', 'scripts', 'migrations', 'package.json',
@@ -188,6 +190,13 @@ def pid(service):
     return value
 
 
+def require_hub_stopped():
+    active = subprocess.run(['systemctl', 'is-active', '--quiet', 'wickhunter-hub'],
+                            capture_output=True, timeout=30)
+    main_pid = int(run(['systemctl', 'show', '-p', 'MainPID', '--value', 'wickhunter-hub']))
+    require(active.returncode != 0 and main_pid == 0, 'Hub writer is not fully stopped')
+
+
 def request(route, destination, token=None, timeout=20):
     config = 'url = "http://127.0.0.1:8091' + route + '"\n'
     if token:
@@ -247,6 +256,30 @@ def remove_new(target):
     sync_dir(target.parent)
 
 
+def guard_rollback(script, stage, stopped_pid):
+    """Only permit old code if current signed data is readable without merge.
+
+    The guard writes a private export under the stage. A nonzero result or any
+    archive means old code must not boot: the old reader cannot discover the
+    segmented lease chain, and we do not rename live data in this helper.
+    """
+    output = stage / 'rollback-lease-export.jsonl'
+    require(path_kind(output) is None, 'Rollback guard output already exists')
+    result = subprocess.run(['node', str(script), '--data-dir', str(DATA_DIR),
+                             '--output', str(output), '--stopped-pid', str(stopped_pid)],
+                            text=True, capture_output=True, timeout=300)
+    require(result.returncode == 0, 'Rollback data guard refused: ' + result.stderr.strip())
+    proof = json.loads(result.stdout)
+    require(proof.get('ok') is True and proof.get('output') == str(output)
+            and SHA_RE.fullmatch(proof.get('sha256', ''))
+            and sha(output) == proof['sha256'], 'Rollback guard export proof is invalid')
+    require(proof.get('archives') == 0, 'Rollback refused: current lease history has archived segments')
+    require(sha(DATA_DIR / 'license-lease-audit.v1.jsonl') == proof['sha256'],
+            'Rollback guard export differs from current active lease ledger')
+    sync_dir(stage)
+    return proof
+
+
 def private_copy_tree_entry(directory, relative, data):
     destination = directory / relative
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -275,6 +308,9 @@ def main():
             'Missing or invalid source commit')
     files = manifest.get('files')
     require(isinstance(files, dict) and files, 'Manifest has no files')
+    guard_sha = manifest.get('rollbackGuardSha256')
+    require(isinstance(guard_sha, str) and SHA_RE.fullmatch(guard_sha),
+            'Missing trusted rollback guard hash')
     require(path_kind(stage / 'receipt.json') is None, 'Stage already has a deployment receipt')
     for relative, evidence in files.items():
         safe_target(relative)
@@ -324,13 +360,22 @@ def main():
                 metadata[relative] = {'existed': True, 'mode': stat.S_IMODE(existing.st_mode),
                                       'uid': existing.st_uid, 'gid': existing.st_gid}
                 private_copy_tree_entry(backup, relative, original)
+                require(sha(backup / relative) == evidence['before'],
+                        'Durable backup verification failed: ' + relative)
             artifact = read_regular(stage_file(stage, relative), require_stage=True)
             require(hashlib.sha256(artifact).hexdigest() == evidence['after'],
                     'Staged artifact mismatch: ' + relative)
             private_copy_tree_entry(verified, relative, artifact)
+            require(sha(verified / relative) == evidence['after'],
+                    'Private artifact verification failed: ' + relative)
+        guard_bytes = read_regular(stage_file(stage, ROLLBACK_GUARD), require_stage=True)
+        require(hashlib.sha256(guard_bytes).hexdigest() == guard_sha,
+                'Staged rollback guard does not match manifest hash')
+        private_copy_tree_entry(verified, ROLLBACK_GUARD, guard_bytes)
         write_private(backup / 'recovery.json', (json.dumps({
             'sourceCommit': manifest['sourceCommit'], 'expectedVersion': EXPECTED_VERSION,
             'beforeVersion': before_version, 'files': files, 'metadata': metadata,
+            'rollbackGuardSha256': guard_sha,
         }, indent=2) + '\n').encode())
         sync_tree_directories(backup)
         sync_tree_directories(verified)
@@ -345,6 +390,7 @@ def main():
         try:
             # Do not let a running process observe a partially replaced import graph.
             run(['systemctl', 'stop', 'wickhunter-hub'])
+            require_hub_stopped()
             for relative in sorted(files):
                 replace(verified / relative, safe_target(relative), metadata[relative])
             run(['systemctl', 'start', 'wickhunter-hub'])
@@ -383,8 +429,41 @@ def main():
             write_private(stage / 'receipt.json', (json.dumps(receipt, indent=2) + '\n').encode())
             sync_dir(stage)
             print(json.dumps(receipt))
-        except BaseException:
+        except BaseException as deployment_error:
+            # A failed receipt fsync or stdout write must not leave a success
+            # marker beside an automatic rollback.
+            (stage / 'receipt.json').unlink(missing_ok=True)
+            sync_dir(stage)
             run(['systemctl', 'stop', 'wickhunter-hub'])
+            require_hub_stopped()
+            try:
+                guard_rollback(verified / ROLLBACK_GUARD, stage, old_pid)
+            except BaseException as guard_error:
+                # Current data may contain signed lease segments or a pending
+                # billing-to-Earn handoff that 0.4.61 cannot read. Never put
+                # old code over that data. Finish installing verified new code
+                # even if the first batch failed partway through.
+                for relative, evidence in sorted(files.items()):
+                    target = safe_target(relative)
+                    replace(verified / relative, target, metadata[relative])
+                    require(sha(target) == evidence['after'],
+                            'Could not retain the verified current Hub runtime')
+                run(['systemctl', 'start', 'wickhunter-hub'])
+                retained_pid = wait_ready(scratch, EXPECTED_VERSION)
+                require(protected_fingerprints(files) == protected,
+                        'Protected code changed while retaining current Hub')
+                refusal = {'change': 'Hub audit rollback refused',
+                           'verifiedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                           'sourceCommit': manifest['sourceCommit'], 'versionRetained': EXPECTED_VERSION,
+                           'retainedPid': retained_pid, 'backup': str(backup),
+                           'rollbackGuardReason': str(guard_error),
+                           'deploymentFailure': str(deployment_error),
+                           'currentFinancialDataPreserved': True}
+                write_private(stage / 'rollback-refused.json',
+                              (json.dumps(refusal, indent=2) + '\n').encode())
+                sync_dir(stage)
+                raise RuntimeError('Rollback refused by current-data guard; verified new Hub code restarted. '
+                                   'See private rollback-refused.json.') from deployment_error
             for relative in sorted(files):
                 target = safe_target(relative)
                 if metadata[relative]['existed']:
