@@ -1804,6 +1804,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.64 — Keep candle status responsive while coverage warms; reduce coverage and first-gap scanning costs.
+
 - v0.4.63 — Bound candle repair discovery so large historical gaps cannot starve fresh collection.
 - v0.4.62 — Deploy Hub audit fixes for Earn access and identity, durable billing handoffs, bounded support and feedback, and signed check-ins.
 
