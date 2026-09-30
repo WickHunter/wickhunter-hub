@@ -1,3 +1,7 @@
+## v0.4.64 — Responsive candle status and collection
+
+Return bounded candle-status snapshots while exact coverage warms, with unchecked symbols reported separately. Count occupied slots without decoding price objects and stop gap discovery at the first missing run. Preserve REST confirmation and historical gap reporting. The first 0.4.63 deployment failed its live freshness check and was rolled back to 0.4.62.
+
 ## v0.4.63 — Candle collector freshness
 
 Bound and rotate historical coverage and gap discovery so current-candle collection does not wait for a full damaged roster scan. Tail collection and REST confirmation retain priority; missing history remains reported until it is repaired.

@@ -793,4 +793,43 @@ await test("a built snapshot verifies under Ed25519 over exactly the canonical b
   }
 });
 
+await test("coverage and first-gap scans preserve sparse, corrupt and cross-day occupancy", () => {
+  const root = tmpDir("candles-fast-presence");
+  const store = new CandleStore(root);
+  const from = DAY0 + 1437 * MINUTE_MS;
+  const keep = [0, 1, 4, 5, 8];
+  store.write("bybit", "BTCUSDT", keep.map((i) => mkCandle(from + i * MINUTE_MS, i)));
+  const file = `${root}/bybit/BTCUSDT/${dayKey(DAY0 + 86_400_000)}.c1m`;
+  const bytes = fs.readFileSync(file);
+  // Corrupt one occupied timestamp's upper half while leaving prices intact.
+  bytes.writeBigInt64LE(BigInt(from + 5 * MINUTE_MS) + (1n << 32n), 2 * 48);
+  fs.writeFileSync(file, bytes);
+  const to = from + 8 * MINUTE_MS;
+  const held = store.readWindow("bybit", "BTCUSDT", from, to);
+  assert.deepEqual(store.coverage("bybit", "BTCUSDT", true), {
+    firstClosedMs: from, lastClosedMs: to, count: held.rows.length,
+    interiorMissing: 9 - held.rows.length,
+  });
+  assert.deepEqual(store.firstGap("bybit", "BTCUSDT", from, to), held.gaps[0]);
+  assert.deepEqual(store.firstGap("bybit", "MISSING", from, to), [from, to]);
+  assert.equal(store.firstGap("bybit", "BTCUSDT", from, from + MINUTE_MS), null);
+  assert.equal(store.firstGap("bybit", "BTCUSDT", to, from), null);
+  assert.equal(store.firstGap("bybit", "BTCUSDT", NaN, to), null);
+});
+
+await test("finding an early repair gap does not read the rest of a month of history", () => {
+  const root = tmpDir("candles-first-gap");
+  const store = new CandleStore(root);
+  store.write("bybit", "BTCUSDT", [mkCandle(DAY0, 0), mkCandle(DAY0 + 2 * MINUTE_MS, 2),
+    mkCandle(DAY0 + 29 * 86_400_000, 3)]);
+  const read = fs.readFileSync;
+  const files = [];
+  fs.readFileSync = function(file, ...args) { files.push(String(file)); return read.call(this, file, ...args); };
+  try {
+    assert.deepEqual(store.firstGap("bybit", "BTCUSDT", DAY0, DAY0 + 29 * 86_400_000),
+      [DAY0 + MINUTE_MS, DAY0 + MINUTE_MS]);
+  } finally { fs.readFileSync = read; }
+  assert.equal(files.length, 1, "stop after the first run ends instead of scanning every later day");
+});
+
 summary("candles");

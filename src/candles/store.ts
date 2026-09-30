@@ -250,6 +250,16 @@ export class CandleStore {
     };
   }
 
+  /** Occupancy needs only the exact timestamp self-check, not five prices and
+   *  a newly allocated Candle. Compare both 32-bit halves so malformed 64-bit
+   *  timestamps cannot pass through a lossy Number conversion. */
+  private hasSlot(buf: Buffer, i: number, dayStartMs: number): boolean {
+    const expected = dayStartMs + i * MINUTE_MS;
+    const off = i * RECORD_BYTES;
+    return expected !== 0 && buf.readUInt32LE(off) === (expected >>> 0)
+      && buf.readUInt32LE(off + 4) === (Math.floor(expected / 0x1_0000_0000) >>> 0);
+  }
+
   /** Write candles into their slots. Grouped per day so each file is read,
    *  patched and rewritten once. Writes go tmp-then-rename like the rest of the
    *  hub's durable state, so a crash mid-write leaves the old day intact rather
@@ -335,6 +345,27 @@ export class CandleStore {
     return { rows, gaps };
   }
 
+  /** Find the first missing run without allocating every candle in the held
+   *  window. Repair scheduling needs one gap, never the full price history. */
+  firstGap(venue: string, symbol: string, fromMs: number, toMs: number): Gap | null {
+    const from = Math.ceil(fromMs / MINUTE_MS) * MINUTE_MS;
+    const to = floorMinute(toMs);
+    if (!(Number.isFinite(from) && Number.isFinite(to)) || to < from) return null;
+    let start: number | null = null;
+    for (let day = dayStartOf(from); day <= to; day += DAY_MS) {
+      const buf = this.readDay(venue, symbol, day);
+      const lo = Math.max(0, (from - day) / MINUTE_MS);
+      const hi = Math.min(SLOTS_PER_DAY - 1, (to - day) / MINUTE_MS);
+      for (let i = lo; i <= hi; i++) {
+        const at = day + i * MINUTE_MS;
+        if (buf && this.hasSlot(buf, i, day)) {
+          if (start !== null) return [start, at - MINUTE_MS];
+        } else if (start === null) start = at;
+      }
+    }
+    return start === null ? null : [start, to];
+  }
+
   /** What we hold for one symbol. Scans day files from each end, so a healthy
    *  symbol costs two file reads; `count`/`interiorMissing` need the full scan
    *  and are only asked for by the admin status panel. */
@@ -348,7 +379,7 @@ export class CandleStore {
       const buf = this.readDay(venue, symbol, d);
       if (!buf) continue;
       for (let i = 0; i < SLOTS_PER_DAY; i++) {
-        if (this.decodeSlot(buf, i, d)) { firstClosedMs = d + i * MINUTE_MS; break; }
+        if (this.hasSlot(buf, i, d)) { firstClosedMs = d + i * MINUTE_MS; break; }
       }
       if (firstClosedMs !== null) break;
     }
@@ -357,7 +388,7 @@ export class CandleStore {
       const buf = this.readDay(venue, symbol, d);
       if (!buf) continue;
       for (let i = SLOTS_PER_DAY - 1; i >= 0; i--) {
-        if (this.decodeSlot(buf, i, d)) { lastClosedMs = d + i * MINUTE_MS; break; }
+        if (this.hasSlot(buf, i, d)) { lastClosedMs = d + i * MINUTE_MS; break; }
       }
       if (lastClosedMs !== null) break;
     }
@@ -373,7 +404,7 @@ export class CandleStore {
       for (let i = 0; i < SLOTS_PER_DAY; i++) {
         const openMs = d + i * MINUTE_MS;
         if (openMs < firstClosedMs || openMs > lastClosedMs) continue;
-        if (this.decodeSlot(buf, i, d)) count++;
+        if (this.hasSlot(buf, i, d)) count++;
       }
     }
     const span = (lastClosedMs - firstClosedMs) / MINUTE_MS + 1;
