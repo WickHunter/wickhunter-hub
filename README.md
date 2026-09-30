@@ -1,3 +1,7 @@
+## v0.4.63 — Candle collector freshness
+
+Bound and rotate historical coverage and gap discovery so current-candle collection does not wait for a full damaged roster scan. Tail collection and REST confirmation retain priority; missing history remains reported until it is repaired.
+
 ## v0.4.62 — Hub audit fixes
 
 Restrict payout onboarding to customer sign-in, keep Earn ownership stable across email changes, reject supported Gmail self-referrals, and durably deliver committed billing events to Earn. Bound guest support spending, session admission, diagnostics and gallery usage; preserve authenticated update compatibility. Alpha and Beta releases are managed separately.
@@ -1796,6 +1800,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.63 — Bound candle repair discovery so large historical gaps cannot starve fresh collection.
 - v0.4.62 — Deploy Hub audit fixes for Earn access and identity, durable billing handoffs, bounded support and feedback, and signed check-ins.
 
 - v0.4.61 — Keep eligible Earn visible after sign-in and show destination hosts for untrusted support links.
