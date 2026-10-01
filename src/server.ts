@@ -450,6 +450,21 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     provider: deps.hostingProvider,
     publicHealthFetch: deps.hostingPublicHealthFetch,
   });
+  function publicHostingOptions() {
+    const policy = hosting.policy();
+    return {
+      monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
+      priceIsProposed: !policy.provisioningEnabled,
+      regions: policy.regions,
+      planId: policy.planId,
+      planLabel: policy.planLabel,
+      maximumConnectedAccounts: policy.maximumConnectedAccounts,
+      managedBackupsIncluded: policy.managedBackupsIncluded,
+      purchasable: hosting.hostingOfferIssue() === null,
+      bundleEnabled: hosting.bundleOfferIssue() === null,
+      bundles: hosting.bundlePlans(),
+    };
+  }
   hostingRef = hosting;
   // ── customer sessions: one central sign-in, downstream of a real billing
   // customer (H2). See src/customer-sessions.ts's header for the boundary
@@ -606,7 +621,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     log: (msg) => console.log(msg),
   });
 
-  const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans()}, undefined, undefined, event => {
+  const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans(), publicHostingOptions: () => {
+    const options=publicHostingOptions();
+    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
+  }}, undefined, undefined, event => {
     if (!notifications) throw Error('Notifications need repair');
     const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };
     notifications.enqueue({ key: `support:${event.key ?? `${event.kind}:${event.ticketId}:${event.at}`}`, kind: event.kind, title: titles[event.kind],
@@ -1627,21 +1645,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // read shape; these are the actions on top of it.
 
   function hostingOptions(res: ServerResponse): void {
-    const policy = hosting.policy();
-    const offerIssue = hosting.hostingOfferIssue();
-    sendJson(res, 200, {
-      ok: true,
-      monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
-      priceIsProposed: !policy.provisioningEnabled,
-      regions: policy.regions,
-      planId: policy.planId,
-      planLabel: policy.planLabel,
-      maximumConnectedAccounts: policy.maximumConnectedAccounts,
-      managedBackupsIncluded: policy.managedBackupsIncluded,
-      purchasable: offerIssue === null,
-      bundleEnabled: hosting.bundleOfferIssue() === null,
-      bundles: hosting.bundlePlans(),
-    }, { "access-control-allow-origin": "*", "cache-control": "no-store" });
+    sendJson(res, 200, {ok:true,...publicHostingOptions()}, { "access-control-allow-origin": "*", "cache-control": "no-store" });
   }
 
   function hostingState(req: IncomingMessage, res: ServerResponse): void {

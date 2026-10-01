@@ -94,7 +94,7 @@ for(const prompt of groundedPrompts.slice(0,4)){
 }
 assert.match(groundedPrompts[3],/TV Signal bot opens a deal/);
 assert.match(groundedPrompts[3],/Manual Bot adopts and manages/);
-assert.match(groundedPrompts[4],/Ask for a human when the answer is not supported, concerns account-specific money/);
+assert.match(groundedPrompts[4],/Ask for a human when the answer is not supported, concerns an actual account-specific charge or refund decision/);
 assert.equal(grounded.customer({...identity,owner:'grounded-account',licenseId:'grounded-account'}).threads[0].status,'human');
 assert.equal(grounded.customer(identity).threads[0].status,'assistant');
 console.log('Support: durable delivery, ownership, idempotency, takeover, quotas, reservations and HTTP auth passed');

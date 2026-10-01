@@ -18,6 +18,7 @@ function readGuide(file:string): SupportGuide | null {
 function guidesFor(file:string,version:string): {base:SupportGuide;current:SupportGuide} | null {
   const base=readGuide(file);if(!base)return null;
   if(version==='website'||base.version===version)return {base,current:base};
+  if(!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version))return {base,current:base};
   const exact=readGuide(path.join(path.dirname(file),'support-knowledge-'+version+'.json'));
   return {base,current:exact?.version===version?exact:base};
 }
@@ -59,8 +60,8 @@ export function selectSupportGuide(file: string | undefined, version: string, cu
   const candidates = sections
     .filter(s => typeof s?.text === 'string' && typeof s?.title === 'string')
     .filter(s => version !== 'website' || s.audience === 'website' || s.versionIndependent === true)
-    .map(s => ({ section: s, rank: score(s, current) * 2 + score(s, prior) + (/\b(what is|what does|mean|is there|types? of)\b/i.test(currentQuestion) && s.id === 'support-core-definitions' ? 30 : 0) }))
-    .filter(x => x.rank > 0)
+    .map(s => ({ section: s, rank: score(s, current) * 2 + score(s, prior) + (s.id === 'support-core-definitions' && (/\b(what is|what does|mean|is there|types? of|which bots?)\b/i.test(currentQuestion) || (current.includes('dca') && current.length===1)) ? 30 : 0) + (s.id === 'gd-number-input' && (/\b\d+[.,]\d+\b/.test(currentQuestion)||/\b(decimal|comma|numeric|number)\b/i.test(currentQuestion)) ? 60 : 0) }))
+    .filter(x => x.rank >= 8)
     .sort((a, b) => b.rank - a.rank || String(a.section.id).localeCompare(String(b.section.id)));
   const selected: string[] = [];
   let remaining = 9000;
@@ -91,7 +92,11 @@ export function selectSupportAnswers(guideFile: string | undefined, version: str
     const rows = Array.isArray(bank) ? bank : (bank.questions || bank.items || []);
     const bankVersion = Array.isArray(bank) ? base.version : bank.version || base.version;
     if (!Array.isArray(rows)) return '';
-    const approvedSources = new Map(base.sections!.filter(s=>s.id).map(s=>[s.id!,s]));
+    const bankGuide=bankVersion?guidesFor(guideFile,bankVersion)?.current:base;
+    // The bank is reviewed against its own guide snapshot. Older primary-guide
+    // app sections cannot silently stand in for missing bank-version sections.
+    const approvedSources = new Map(base.sections!.filter(s=>s.id && (s.versionIndependent === true || s.audience === 'website')).map(s=>[s.id!,s]));
+    if(bankGuide && bankGuide.version===bankVersion)for(const section of bankGuide.sections!){if(section.id)approvedSources.set(section.id,section);}
     const currentSources = new Map(currentGuide.sections!.filter(s=>s.id).map(s=>[s.id!,s]));
     const manifestSources = Array.isArray(bank) ? new Set<string>() : new Set(Array.isArray(bank.sources) ? bank.sources.map(s=>s.id).filter((id):id is string=>typeof id==='string') : Object.keys(bank.sources || {}));
     const current = supportTerms(currentQuestion);
@@ -105,6 +110,7 @@ export function selectSupportAnswers(guideFile: string | undefined, version: str
       if (source.audience === 'website') return source.versionIndependent === true && row.versionIndependent === true;
       if (bankVersion === version) return true;
       const exactSource=currentGuide.version===version?currentSources.get(id):undefined;
+      if (exactSource && (exactSource.text!==source.text || exactSource.title!==source.title)) return false;
       return (exactSource?.text===source.text && exactSource?.title===source.title) || (source.versionIndependent === true && row.versionIndependent === true);
     };
     return rows.filter(row => row && typeof row.question === 'string' && typeof row.answer === 'string' && Array.isArray(row.sourceIds) && row.sourceIds.length > 0 && row.sourceIds.every(id => sourceEligible(row,id)))
@@ -112,7 +118,7 @@ export function selectSupportAnswers(guideFile: string | undefined, version: str
       .filter(row => row.resolutionType === 'direct' || row.resolutionType === 'dynamic' || row.resolutionType === 'clarify_human')
       .filter(row => row.resolutionType !== 'clarify_human' || normalizedQuestion(row.question || '') === normalizedQuestion(currentQuestion))
       .filter(row => row.resolutionType === 'clarify_human' || !row.dynamicFacts?.some(tag => !allowedDynamic.has(tag)))
-      .map(row => ({row, rank: score({title:row.question, keywords:row.topic ? [row.topic] : [], text:''},current)*2 + score({title:row.question,text:''},prior)}))
+      .map(row => ({row, rank: score({title:row.question, keywords:row.topic ? [row.topic] : [], text:''},current)*2 + score({title:row.question,text:''},prior) + (normalizedQuestion(row.question || '')===normalizedQuestion(currentQuestion)?1000:0)}))
       .filter(x => x.rank >= 8)
       .sort((a,b) => b.rank-a.rank || String(a.row.id).localeCompare(String(b.row.id)))
       .slice(0,3)
@@ -124,12 +130,25 @@ export function selectSupportAnswers(guideFile: string | undefined, version: str
 interface PublicPlan { key?: unknown; name?: unknown; amountCents?: unknown; currency?: unknown; interval?: unknown; licenseDays?: unknown; lifetime?: unknown; description?: unknown; checkout?: unknown; buyUrl?: unknown; available?: unknown; discountedAmountCents?: unknown; cryptoAvailable?: unknown }
 interface PublicCatalog { mode?: unknown; plans?: unknown; launch?: unknown }
 /** The only pricing input is the public catalog already served to the site. */
-export function supportPricingFacts(catalog: PublicCatalog | undefined, question: string): string {
-  if (!/\b(pric\w*|cost\w*|fees?|plans?|subscriptions?|monthly|yearly|annual|lifetime|buy|purchase|discount|coupon|promo)\b/i.test(question)) return '';
+export function supportPricingFacts(catalog: PublicCatalog | undefined, question: string, nowMs = Date.now()): string {
+  const commerce=/\b(plans?|subscriptions?|monthly|yearly|annual|lifetime|discount|coupon|promo|cards?|payments?|checkout|charg\w*|renew\w*|billing|crypto|stablecoin|trial|free access|free period|free until)\b/i.test(question);
+  const trading=/\b(dca|pairs?|entry|orders?|markets?|trades?|hedge|vwma|leverage|stops?|exchange|funding|candles?)\b/i.test(question);
+  const price=/\b(pric\w*|cost\w*)\b/i.test(question);
+  const fee=/\bfees?\b/i.test(question)&&/\b(software|plans?|subscriptions?|hosting)\b/i.test(question);
+  if (!commerce && !fee && !(price&&!trading)) return '';
   if (!catalog || catalog.mode !== 'live' || !Array.isArray(catalog.plans)) return 'Current paid plan prices and availability could not be verified. Refer to the public pricing page or a human; do not quote a price.';
-  const plans = catalog.plans.filter((p: PublicPlan) => p && typeof p.key === 'string' && typeof p.name === 'string' && Number.isSafeInteger(p.amountCents) && Number(p.amountCents) >= 0 && typeof p.currency === 'string').map((p: PublicPlan) => ({
-    key: p.key, name: p.name, amountCents: p.amountCents, currency: p.currency, interval: p.interval, licenseDays: p.licenseDays, lifetime: p.lifetime === true, description: p.description, checkout: p.checkout, buyUrl: p.buyUrl, available: p.available === true, discountedAmountCents: Number.isSafeInteger(p.discountedAmountCents) ? p.discountedAmountCents : undefined, cryptoAvailable: p.cryptoAvailable === true,
+  const plans = catalog.plans.filter((p: PublicPlan) => p && typeof p.key === 'string' && !/host(?:ing|ed)/i.test(p.key) && typeof p.name === 'string' && Number.isSafeInteger(p.amountCents) && Number(p.amountCents) >= 0 && typeof p.currency === 'string').map((p: PublicPlan) => ({
+    key: p.key, name: p.name, amountCents: p.amountCents, currency: p.currency, interval: p.interval, lifetime: p.lifetime === true, entitlement: p.lifetime === true ? 'Life of the product; valid technical license tokens renew automatically. The token duration is not a ten-year purchase term.' : undefined, description: p.description, checkout: p.checkout, buyUrl: p.buyUrl, available: p.available === true, discountedAmountCents: Number.isSafeInteger(p.discountedAmountCents) ? p.discountedAmountCents : undefined, cryptoAvailable: p.cryptoAvailable === true,
   }));
   const launch = catalog.launch && typeof catalog.launch === 'object' ? catalog.launch as Record<string, unknown> : {};
-  return 'Current public billing catalog (amounts are minor currency units; availability refers to the public checkout link): '+JSON.stringify({plans,launch:{active:launch.active === true,code:launch.active === true ? launch.code : undefined,discountPercent:launch.active === true ? launch.discountPercent : undefined,firstPaymentAtMs:launch.active === true ? launch.firstPaymentAtMs : undefined,redeemUntilMs:launch.active === true ? launch.redeemUntilMs : undefined,cryptoEnabled:launch.cryptoEnabled === true}})+'. Quote only these public values, convert cents accurately, and distinguish available checkout from listed price. A displayed launch discount is conditional; do not promise individual eligibility or a successful checkout. Do not disclose an account-specific entitlement.';
+  const eastern=(ms:unknown)=>typeof ms==='number'&&Number.isFinite(ms)?new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'long',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(ms):undefined;
+  return 'Current public billing catalog (amounts are minor currency units; availability refers to software Payment Links only): '+JSON.stringify({asOfEastern:eastern(nowMs),plans,launch:{active:launch.active === true,code:launch.active === true ? launch.code : undefined,discountPercent:launch.active === true ? launch.discountPercent : undefined,firstPaymentEastern:launch.active === true ? eastern(launch.firstPaymentAtMs) : undefined,redeemUntilEastern:launch.active === true ? eastern(launch.redeemUntilMs) : undefined,cryptoEnabled:launch.cryptoEnabled === true},recurringDiscountTerms:launch.active===true?'Eligible launch software subscriptions keep their approved discount on eligible active recurring renewals; optional hosting and VPS charges are excluded unless checkout says otherwise. Lifetime and eligible crypto purchases are one-time, not recurring.':undefined})+'. Quote public values accurately and distinguish checkout display from an actual individual charge. The first-payment date describes the active launch offer, not proof that this customer will be charged then. Do not promise personal eligibility or a successful checkout. Do not disclose account-specific billing status.';
+}
+
+interface HostingOptions { monthlyPriceLabel?: unknown; priceIsProposed?: unknown; maximumConnectedAccounts?: unknown; managedBackupsIncluded?: unknown; purchasable?: unknown; bundleEnabled?: unknown; bundles?: unknown }
+export function supportHostingFacts(options: HostingOptions | undefined, question: string): string {
+  if(!/\b(hosting|hosted|vps|managed server)\b/i.test(question))return '';
+  if(!options)return 'Current hosting availability could not be verified; refer to the hosting checkout or a human.';
+  const bundles=Array.isArray(options.bundles)?options.bundles.filter((b:any)=>b&&typeof b.key==='string'&&Number.isSafeInteger(b.amountCents)&&b.amountCents>=0&&typeof b.currency==='string').map((b:any)=>({key:b.key,interval:b.interval,amountCents:b.amountCents,currency:b.currency})):[];
+  return 'Current public hosting options (authority for hosting purchase availability; plan Payment Link availability does not control this checkout): '+JSON.stringify({monthlyPriceLabel:typeof options.monthlyPriceLabel==='string'?options.monthlyPriceLabel:undefined,priceIsProposed:options.priceIsProposed===true,maximumConnectedAccounts:Number.isSafeInteger(options.maximumConnectedAccounts)?options.maximumConnectedAccounts:undefined,managedBackupsIncluded:options.managedBackupsIncluded===true,purchasable:options.purchasable===true,bundleEnabled:options.bundleEnabled===true,bundles})+'. Do not say hosting is unavailable when purchasable or bundleEnabled is true; do not imply backups are included when false. Bundles combine software and hosting; check current checkout before promising an individual purchase.';
 }
