@@ -180,7 +180,7 @@ export class LaunchBilling {
     let promotion = existing.data[0];
     if (promotion) {
       const couponId = typeof promotion.coupon === 'string' ? promotion.coupon : promotion.coupon?.id;
-      if (!/^coupon_[A-Za-z0-9]+$/.test(couponId ?? '')) throw Error('Existing UNLEASHED25 coupon is invalid');
+      if (!/^[A-Za-z0-9_-]{1,255}$/.test(couponId ?? '')) throw Error('Existing UNLEASHED25 coupon is invalid');
       // Stripe's pinned API version may omit applies_to from the promotion-code
       // expansion and from a plain coupon retrieve. Fetch the coupon by ID and
       // explicitly expand the product restriction before validating reuse.
