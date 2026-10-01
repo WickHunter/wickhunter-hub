@@ -146,11 +146,14 @@ export class BrevoMarketing {
     });
 
     if (existing.ok) {
-      const contact = await existing.json() as { emailBlacklisted?: unknown; listIds?: unknown };
+      const contact = await existing.json() as { emailBlacklisted?: unknown; listIds?: unknown; listUnsubscribed?: unknown };
       // Never resubscribe a suppressed contact. In particular, do not send an email address
       // or emailBlacklisted:false in the update request: Brevo documents that changing the
       // email address of a blocklisted contact can remove its blocklisting.
       if (contact.emailBlacklisted === true) return { status: "suppressed", listId };
+      if (Array.isArray(contact.listUnsubscribed) && contact.listUnsubscribed.some((id) => id === listId)) {
+        return { status: "suppressed", listId };
+      }
       if (contact.emailBlacklisted !== false || !Array.isArray(contact.listIds)) {
         throw new Error("Brevo returned an incomplete contact record; no import was made.");
       }

@@ -50,6 +50,9 @@ assert.deepEqual(created,{email:'new.customer@example.com',listIds:[17],emailBla
 responses.push(ok({emailBlacklisted:true,listIds:[]}));
 assert.deepEqual(await service.importContact({email:'blocked@example.com',consent:valid.consent},17),{status:'suppressed',listId:17});
 assert.equal(requests.at(-1).init.method,'GET','a globally suppressed contact is not updated or subscribed');
+responses.push(ok({emailBlacklisted:false,listIds:[29],listUnsubscribed:[17]}));
+assert.deepEqual(await service.importContact({email:'list-optout@example.com',consent:valid.consent},17),{status:'suppressed',listId:17});
+assert.equal(requests.at(-1).init.method,'GET','a list-specific unsubscribe is not reversed by a later import');
 const recordsBefore=consentRecords.length;
 responses.push(ok({emailBlacklisted:false,listIds:[17]}));
 assert.deepEqual(await service.importContact({email:'already@example.com',consent:valid.consent},17),{status:'already_in_list',listId:17});
