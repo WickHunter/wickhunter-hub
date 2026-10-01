@@ -425,6 +425,7 @@
 <section class="hubpage" data-hub-page-panel="support" hidden>
   <h2>Support inbox</h2>
   <div class="actions"><button id="supportRefresh">Refresh inbox</button><label>Status <select id="supportFilter"><option value="active">Open chats</option><option value="open">Needs a human reply</option><option value="resolved">Closed</option><option value="all">All chats</option></select></label><span id="supportMeta" class="muted" role="status"></span></div>
+  <details id="supportGapReview"><summary>Questions needing better answers <span id="supportGapCount"></span></summary><p class="muted">Counts come from conversations needing help. Review the linked chat, remove customer details, then use Save a reusable answer to approve a response.</p><div id="supportGapItems" class="actions"></div></details>
   <p id="supportReplyNotice" role="status"></p><div id="supportInbox"></div><details id="supportLegacy"><summary>Earlier one-way questions <span id="supportLegacyCount"></span></summary><p class="muted">These older questions have no reply channel. Customers can start a new chat in the app or on the website.</p><div id="supportLegacyItems"></div></details>
 </section>
 
@@ -3365,12 +3366,22 @@ function renderSupportInbox() {
     const field=document.getElementById('supportBudgetLimit');if(document.activeElement!==field)field.value=budget.limitMicros/1000000;
   }
   const items=(d.items || []).filter(x=>Array.isArray(x.messages)), legacy=(d.items || []).filter(x=>!Array.isArray(x.messages));
-  const pending=items.filter(x=>x.status!=='resolved'&&(x.status==='open'||(x.status==='human'&&(x.waitingForHuman||x.messages.at(-1)?.role!=='human'))));
+  const pending=items.filter(x=>x.status!=='resolved'&&(x.status==='open'||x.waitingForHuman===true||(x.status==='human'&&x.messages.at(-1)?.role!=='human')));
   const active=items.filter(x=>x.status!=='resolved'),closed=items.filter(x=>x.status==='resolved');
   setBrief('Support',d.connected ? (pending.length?'red':'green'):'unknown', d.connected ? (pending.length?'Red · '+pending.length+' waiting':'Green · no waiting replies'):'Not connected', d.connected ? 'Questions received by the support inbox':'Customer chat connection is pending');
   const filter=document.getElementById('supportFilter').value;
   const filtered=[...(filter==='open'?pending:filter==='active'?active:filter==='resolved'?closed:items)]
     .sort((a,b)=>Number(pending.includes(b))-Number(pending.includes(a))||(b.updatedAt||b.ts)-(a.updatedAt||a.ts));
+  const gaps=Array.isArray(d.questionGaps)?d.questionGaps:[];
+  document.getElementById('supportGapCount').textContent='('+gaps.reduce((n,g)=>n+(Number(g.count)||0),0)+')';
+  const gapItems=document.getElementById('supportGapItems');gapItems.textContent='';
+  if(!gaps.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='No answer gaps recorded yet.';gapItems.appendChild(empty);}
+  for(const gap of gaps){
+    if(!items.some(r=>r.id===gap.threadId))continue;
+    const button=document.createElement('button');button.type='button';button.textContent=gap.topic+' · '+gap.count;
+    button.onclick=()=>{document.getElementById('supportFilter').value='all';supportExpandedId=gap.threadId;supportMobileList=false;renderSupportInbox();document.getElementById('support-'+gap.threadId)?.scrollIntoView({block:'center'});};
+    gapItems.appendChild(button);
+  }
   for(const [value,label,count] of [['active','Open chats',active.length],['open','Needs a human reply',pending.length],['resolved','Closed',closed.length],['all','All chats',items.length]])
     document.querySelector('#supportFilter option[value="'+value+'"]').textContent=label+' ('+count+')';
   document.getElementById('supportLegacyCount').textContent='('+legacy.length+')';

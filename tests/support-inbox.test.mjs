@@ -34,6 +34,12 @@ try {
  assert.equal(doc.querySelectorAll('#supportInbox .support-ticket').length,1,'closed chats and legacy questions stay out of default inbox');
  assert.match(doc.getElementById('supportLegacyItems').textContent,/An earlier one-way question/);
  assert.match(doc.getElementById('briefSupport').textContent,/1 waiting/);
+ assert.match(doc.getElementById('supportGapCount').textContent,/\(1\)/);
+ const gapButton=doc.querySelector('#supportGapItems button');assert.ok(gapButton);gapButton.click();
+ assert.equal(doc.querySelector('[data-ticket-id="'+id+'"]').getAttribute('aria-current'),'true');
+ assert.ok(doc.getElementById('support-'+id).querySelector('.support-learning'),'gap review opens the existing staff approval flow');
+ doc.getElementById('support-'+id).querySelector('.support-back').click();
+ doc.getElementById('supportFilter').value='active';await w.eval('renderSupportInbox()');
  assert.ok(article(id).querySelector('form'),'first open ticket is ready to reply');
  toggle(id);assert.equal(doc.getElementById('supportInbox').classList.contains('support-mobile-list'),false);article(id).querySelector('.support-back').click();assert.equal(doc.getElementById('supportInbox').classList.contains('support-mobile-list'),true);toggle(id);
  let input=article(id).querySelector('form textarea');assert.equal(input.closest('details'),null,'reply is visible when chat opens');
