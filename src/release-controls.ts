@@ -126,15 +126,211 @@ export function validateReleaseControlState(raw: unknown): ReleaseControlState {
 
 export function writeReleaseControlState(file: string, raw: unknown): ReleaseControlState {
   const state = validateReleaseControlState(raw);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  atomicWrite(file, Buffer.from(JSON.stringify(state) + "\n"), 0o600);
+  return state;
+}
+
+export interface ReleasePublicationTransaction {
+  latestFile: string;
+  latestBytes: Buffer;
+  controlStateFile: string;
+  nextControlState: ReleaseControlState;
+}
+
+const PENDING_PUBLICATION_SCHEMA = "wickhunter.release-publication-pending.v1";
+interface FileSnapshot { base64: string; mode: number }
+interface PendingPublication {
+  schema: typeof PENDING_PUBLICATION_SCHEMA;
+  latestFile: string;
+  priorLatest: FileSnapshot | null;
+  priorControl: FileSnapshot | null;
+  targetLatest: FileSnapshot;
+  targetControl: FileSnapshot;
+}
+
+/** Persist a recoverable intent, write control state first, then move latest
+ * last. A crash before latest leaves customers on the old release; the next
+ * publisher deterministically restores the prior control state. A crash after
+ * latest leaves a fully signed target and matching control head; recovery
+ * verifies both before clearing the intent. */
+export function commitReleasePublication(
+  transaction: ReleasePublicationTransaction,
+  io: {
+    replaceLatest?: (file: string, bytes: Buffer) => void;
+    writeControlState?: (file: string, state: ReleaseControlState) => void;
+    verifyLatest?: (file: string) => void;
+  } = {},
+): void {
+  const latestFile = path.resolve(transaction.latestFile);
+  const stateFile = path.resolve(transaction.controlStateFile);
+  if (latestFile === stateFile) throw new ReleaseControlError("release pointer and control state must use separate files");
+  const pendingFile = `${stateFile}.pending.v1.json`;
+  if (fs.existsSync(pendingFile)) throw new ReleaseControlError("an unresolved release publication marker needs recovery first");
+  const beforeLatest = snapshotFile(latestFile);
+  const beforeState = snapshotFile(stateFile);
+  const replaceLatest = io.replaceLatest ?? ((file, bytes) => atomicWrite(file, bytes, 0o644));
+  const writeState = io.writeControlState ?? writeReleaseControlState;
+  const verifyLatest = io.verifyLatest ?? (() => {});
+  const nextState = validateReleaseControlState(transaction.nextControlState);
+  const targetControlBytes = Buffer.from(JSON.stringify(nextState) + "\n");
+  const marker: PendingPublication = {
+    schema: PENDING_PUBLICATION_SCHEMA,
+    latestFile,
+    priorLatest: beforeLatest && snapshotToMarker(beforeLatest),
+    priorControl: beforeState && snapshotToMarker(beforeState),
+    targetLatest: { base64: transaction.latestBytes.toString("base64"), mode: 0o644 },
+    targetControl: { base64: targetControlBytes.toString("base64"), mode: 0o600 },
+  };
+  atomicWrite(pendingFile, Buffer.from(JSON.stringify(marker) + "\n"), 0o600, true);
   try {
-    fs.writeFileSync(temp, JSON.stringify(state) + "\n", { mode: 0o600, flag: "wx" });
-    fs.renameSync(temp, file);
+    writeState(stateFile, nextState);
+    replaceLatest(latestFile, transaction.latestBytes);
+    verifyLatest(latestFile);
+    removeFile(pendingFile);
+  } catch (error) {
+    const restoreErrors: unknown[] = [];
+    try { restoreSnapshot(latestFile, beforeLatest); } catch (restoreError) { restoreErrors.push(restoreError); }
+    try { restoreSnapshot(stateFile, beforeState); } catch (restoreError) { restoreErrors.push(restoreError); }
+    if (!restoreErrors.length) {
+      try { removeFile(pendingFile); } catch (restoreError) { restoreErrors.push(restoreError); }
+    }
+    if (restoreErrors.length) {
+      throw new AggregateError([error, ...restoreErrors], "release publication failed; pending marker retained because rollback/recovery is incomplete");
+    }
+    throw error;
+  }
+}
+
+/** Resolve a stale marker only when the live files are exactly in a known
+ * transaction state. Unknown mixtures fail closed for operator recovery. */
+export function recoverPendingReleasePublication(controlStateFile: string, latestFile: string, publicKeys: Record<string, string>): "none" | "completed" | "rolled-back" {
+  const stateFile = path.resolve(controlStateFile);
+  const pointerFile = path.resolve(latestFile);
+  const pendingFile = `${stateFile}.pending.v1.json`;
+  let raw: unknown;
+  try {
+    const bytes = fs.readFileSync(pendingFile);
+    if (bytes.length > 2 * 1024 * 1024) throw new ReleaseControlError("pending release publication marker exceeds its size bound");
+    raw = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "none";
+    if (error instanceof ReleaseControlError) throw error;
+    throw new ReleaseControlError("pending release publication marker is unreadable");
+  }
+  const marker = validatePendingPublication(raw, pointerFile);
+  const liveLatest = snapshotFile(pointerFile);
+  const liveControl = snapshotFile(stateFile);
+  const priorLatest = markerToSnapshot(marker.priorLatest);
+  const priorControl = markerToSnapshot(marker.priorControl);
+  const targetLatest = markerToSnapshot(marker.targetLatest)!;
+  const targetControl = markerToSnapshot(marker.targetControl)!;
+  if (sameSnapshot(liveLatest, targetLatest) && sameSnapshot(liveControl, targetControl)) {
+    verifyPublishedTarget(pointerFile, marker.targetLatest, marker.targetControl, publicKeys);
+    removeFile(pendingFile);
+    return "completed";
+  }
+  if (sameSnapshot(liveLatest, priorLatest)
+      && (sameSnapshot(liveControl, priorControl) || sameSnapshot(liveControl, targetControl))) {
+    if (!sameSnapshot(liveControl, priorControl)) restoreSnapshot(stateFile, priorControl);
+    removeFile(pendingFile);
+    return "rolled-back";
+  }
+  throw new ReleaseControlError("pending release publication has an unknown pointer/control combination; refusing automatic recovery");
+}
+
+function validatePendingPublication(raw: unknown, expectedLatest: string): PendingPublication {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ReleaseControlError("pending release publication marker is invalid");
+  const value = raw as Partial<PendingPublication>;
+  if (value.schema !== PENDING_PUBLICATION_SCHEMA || value.latestFile !== expectedLatest) {
+    throw new ReleaseControlError("pending release publication marker does not match this shelf");
+  }
+  const check = (snapshot: unknown, nullable: boolean): snapshot is FileSnapshot | null => {
+    if (nullable && snapshot === null) return true;
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return false;
+    const candidate = snapshot as FileSnapshot;
+    if (typeof candidate.base64 !== "string" || !Number.isInteger(candidate.mode) || candidate.mode < 0 || candidate.mode > 0o777) return false;
+    const bytes = Buffer.from(candidate.base64, "base64");
+    return bytes.toString("base64") === candidate.base64;
+  };
+  if (!check(value.priorLatest, true) || !check(value.priorControl, true)
+      || !check(value.targetLatest, false) || !check(value.targetControl, false)) {
+    throw new ReleaseControlError("pending release publication marker has invalid snapshots");
+  }
+  validateReleaseControlState(JSON.parse(Buffer.from(value.targetControl!.base64, "base64").toString("utf8")));
+  if (value.priorControl) validateReleaseControlState(JSON.parse(Buffer.from(value.priorControl.base64, "base64").toString("utf8")));
+  return value as PendingPublication;
+}
+
+function verifyPublishedTarget(file: string, snapshot: FileSnapshot, controlSnapshot: FileSnapshot, publicKeys: Record<string, string>): void {
+  const bytes = Buffer.from(snapshot.base64, "base64");
+  const raw = JSON.parse(bytes.toString("utf8")) as SignedReleaseManifest;
+  const manifest = verifyReleaseManifest(raw, {
+    publicKeys, now: Date.now(), maxAgeMs: Number.MAX_SAFE_INTEGER,
+    channel: raw.channel, platform: raw.platform, arch: raw.arch,
+  });
+  const targetState = validateReleaseControlState(JSON.parse(Buffer.from(controlSnapshot.base64, "base64").toString("utf8")));
+  const head = manifest.channel === "beta" ? targetState.beta : manifest.channel === "production" ? targetState.production : null;
+  if (!head || head.buildId !== manifest.buildId || head.sha256 !== manifest.sha256 || head.version !== manifest.version || head.file !== manifest.file) {
+    throw new ReleaseControlError("pending publication target does not match its control head");
+  }
+  const artifact = fs.readFileSync(path.join(path.dirname(file), manifest.file));
+  verifyReleaseArtifact(manifest, artifact);
+}
+
+function snapshotToMarker(snapshot: { bytes: Buffer; mode: number }): FileSnapshot {
+  return { base64: snapshot.bytes.toString("base64"), mode: snapshot.mode };
+}
+function markerToSnapshot(snapshot: FileSnapshot | null): { bytes: Buffer; mode: number } | null {
+  return snapshot === null ? null : { bytes: Buffer.from(snapshot.base64, "base64"), mode: snapshot.mode };
+}
+function snapshotFile(file: string): { bytes: Buffer; mode: number } | null {
+  try {
+    const stat = fs.statSync(file);
+    return { bytes: fs.readFileSync(file), mode: stat.mode & 0o777 };
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+}
+function sameSnapshot(left: { bytes: Buffer; mode: number } | null, right: { bytes: Buffer; mode: number } | null): boolean {
+  return left === null ? right === null : right !== null && left.mode === right.mode && left.bytes.equals(right.bytes);
+}
+
+function atomicWrite(file: string, bytes: Buffer, mode: number, noReplace = false): void {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const temp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(temp, "wx", mode);
+    fs.fchmodSync(fd, mode);
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    if (noReplace) fs.linkSync(temp, file);
+    else fs.renameSync(temp, file);
+    syncDirectory(dir);
   } finally {
+    if (fd !== undefined) fs.closeSync(fd);
     try { fs.unlinkSync(temp); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
-  return state;
+}
+
+function syncDirectory(dir: string): void {
+  const fd = fs.openSync(dir, "r");
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function restoreSnapshot(file: string, snapshot: { bytes: Buffer; mode: number } | null): void {
+  if (snapshot === null) {
+    try { fs.unlinkSync(file); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    syncDirectory(path.dirname(file));
+  } else {
+    atomicWrite(file, snapshot.bytes, snapshot.mode);
+  }
+}
+
+function removeFile(file: string): void {
+  fs.unlinkSync(file);
+  syncDirectory(path.dirname(file));
 }
 
 /** Called only after the Beta latest pointer has been verified and advanced by
@@ -188,6 +384,10 @@ export function evaluateProductionPromotion(policy: PromotionPolicy): PromotionE
   if (policy.beta.channel !== "beta") reasons.push("candidate manifest is not signed for Beta");
   if (policy.production.channel !== "production") reasons.push("target manifest is not signed for Production");
   if (policy.beta.product !== RELEASE_PRODUCT || policy.production.product !== RELEASE_PRODUCT) reasons.push("release product does not match Wick Hunter");
+  if (policy.beta.version !== policy.production.version
+      || policy.beta.minUpdateProtocol !== policy.production.minUpdateProtocol) {
+    reasons.push("Production version and minimum update protocol must match the exact Beta build");
+  }
   if (policy.beta.buildId !== policy.production.buildId || policy.beta.sha256 !== policy.production.sha256) {
     reasons.push("Production archive bytes and build identity must exactly match the Beta candidate");
   }

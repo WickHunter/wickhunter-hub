@@ -14,6 +14,8 @@ import {
 } from "../src/release-manifest.js";
 import {
   assertProductionPromotionEligible,
+  commitReleasePublication,
+  recoverPendingReleasePublication,
   readReleaseControlState,
   recordBetaPublication,
   verifyPromotionAttestation,
@@ -36,16 +38,22 @@ const { values } = parseArgs({
 });
 
 function fail(message: string): never {
-  console.error(`publish release failed: ${message}`);
-  process.exit(1);
+  throw new Error(message);
 }
 
 if (!values.manifest || !values.artifact || !values["releases-dir"]) {
-  fail("usage: npm run publish-release -- --manifest <signed.json> --artifact <package.tar.gz> --releases-dir <directory>");
+  console.error("publish release failed: usage: npm run publish-release -- --manifest <signed.json> --artifact <package.tar.gz> --releases-dir <directory>");
+  process.exit(1);
 }
 
 const publicKeysRaw = process.env.HUB_RELEASE_PUBLIC_KEYS_JSON;
-if (!publicKeysRaw) fail("HUB_RELEASE_PUBLIC_KEYS_JSON is required (public keys only; never place a signing key on the Hub)");
+if (!publicKeysRaw) {
+  console.error("publish release failed: HUB_RELEASE_PUBLIC_KEYS_JSON is required (public keys only; never place a signing key on the Hub)");
+  process.exit(1);
+}
+
+let publisherLock: string | null = null;
+let ownsPublisherLock = false;
 
 try {
   const channel = (values.channel ?? process.env.HUB_RELEASE_CHANNEL ?? "beta").trim() as ReleaseChannel;
@@ -72,7 +80,21 @@ try {
   const releasesDir = path.resolve(values["releases-dir"]);
   const now = Date.now();
   let promotionAttestation: ReturnType<typeof verifyPromotionAttestation> | undefined;
-  let controlStatePath = values["control-state"] ? path.resolve(values["control-state"]) : path.join(releasesDir, ".release-control.v1.json");
+  const controlStatePath = values["control-state"] ? path.resolve(values["control-state"]) : path.join(releasesDir, ".release-control.v1.json");
+  fs.mkdirSync(path.dirname(controlStatePath), { recursive: true, mode: 0o700 });
+  publisherLock = `${controlStatePath}.publish.lock`;
+  let lockFd: number;
+  try { lockFd = fs.openSync(publisherLock, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") fail("another publisher is active or a stale publisher lock needs manual inspection");
+    throw error;
+  }
+  ownsPublisherLock = true;
+  fs.writeFileSync(lockFd, `${process.pid}\n`);
+  fs.fsyncSync(lockFd);
+  fs.closeSync(lockFd);
+  const recovered = recoverPendingReleasePublication(controlStatePath, path.join(releasesDir, "latest.json"), publicKeys);
+  if (recovered !== "none") console.error(`release publisher recovered pending transaction: ${recovered}`);
   let controlState = readReleaseControlState(controlStatePath);
   if (channel === "production") {
     if (process.env.HUB_RELEASE_AUTO_PROMOTION_ENABLED !== "true") fail("automatic Production promotion is disabled; set HUB_RELEASE_AUTO_PROMOTION_ENABLED=true only for the controlled promotion job");
@@ -120,36 +142,53 @@ try {
 
   installImmutable(artifactTarget, artifactBytes, "artifact");
   installImmutable(archivedManifestTarget, manifestBytes, "archived manifest");
-  replaceAtomic(latestTarget, manifestBytes);
-
-  // Verify the exact shelf bytes after all renames. This also catches a
-  // surprising filesystem/operator race before reporting success.
-  const publishedManifestBytes = fs.readFileSync(latestTarget);
-  const published = verifyReleaseManifest(JSON.parse(publishedManifestBytes.toString("utf8")), {
-    publicKeys: parseReleasePublicKeys(publicKeysRaw),
-    now: Date.now(),
-    maxAgeMs,
-    channel: manifest.channel,
-    platform: manifest.platform,
-    arch: manifest.arch,
-  });
-  const publishedArtifact = fs.readFileSync(artifactTarget);
-  verifyReleaseArtifact(published, publishedArtifact);
-  if (!publishedManifestBytes.equals(fs.readFileSync(archivedManifestTarget))) {
-    fail("latest.json does not exactly match its immutable archived manifest");
-  }
-  if (channel === "beta") {
-    controlState = recordBetaPublication(controlState, published, Date.now());
-    writeReleaseControlState(controlStatePath, controlState);
-  } else if (promotionAttestation) {
+  if (channel === "production" && promotionAttestation) {
     const attestationBytes = fs.readFileSync(path.resolve(values["promotion-attestation"]!));
     installImmutable(path.join(releasesDir, `promotion-${promotionAttestation.betaSha256}.json`), attestationBytes, "promotion attestation");
-    controlState = { ...controlState, production: { buildId: published.buildId, file: published.file, publishedAt: new Date().toISOString(), sha256: published.sha256, version: published.version } };
-    writeReleaseControlState(controlStatePath, controlState);
   }
+
+  const publishedAt = new Date().toISOString();
+  const nextControlState = channel === "beta"
+    ? recordBetaPublication(controlState, manifest, Date.parse(publishedAt))
+    : { ...controlState, production: { buildId: manifest.buildId, file: manifest.file, publishedAt, sha256: manifest.sha256, version: manifest.version } };
+  let published = manifest;
+  commitReleasePublication({
+    latestFile: latestTarget,
+    latestBytes: manifestBytes,
+    controlStateFile: controlStatePath,
+    nextControlState,
+  }, {
+    replaceLatest(file, bytes) {
+      replaceAtomic(file, bytes);
+      // Verify the exact shelf bytes after the rename. Any refusal here causes
+      // commitReleasePublication to restore the former pointer and state.
+      const publishedManifestBytes = fs.readFileSync(file);
+      published = verifyReleaseManifest(JSON.parse(publishedManifestBytes.toString("utf8")), {
+        publicKeys: parseReleasePublicKeys(publicKeysRaw),
+        now: Date.now(), maxAgeMs, channel: manifest.channel,
+        platform: manifest.platform, arch: manifest.arch,
+      });
+      verifyReleaseArtifact(published, fs.readFileSync(artifactTarget));
+      if (!publishedManifestBytes.equals(fs.readFileSync(archivedManifestTarget))) {
+        throw new Error("latest.json does not exactly match its immutable archived manifest");
+      }
+    },
+  });
   console.log(`Published authenticated release ${published.version} (${published.buildId}) sha256=${published.sha256}`);
 } catch (error) {
-  fail((error as Error).message);
+  console.error(`publish release failed: ${(error as Error).message}`);
+  process.exitCode = 1;
+} finally {
+  if (ownsPublisherLock && publisherLock) {
+    try {
+      fs.unlinkSync(publisherLock);
+      const dirFd = fs.openSync(path.dirname(publisherLock), "r");
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch (error) {
+      console.error(`publish release cleanup failed: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  }
 }
 
 function installImmutable(target: string, bytes: Buffer, label: string): void {
@@ -169,6 +208,7 @@ function replaceAtomic(target: string, bytes: Buffer, noReplace = false): void {
   let fd: number | undefined;
   try {
     fd = fs.openSync(temp, "wx", 0o644);
+    fs.fchmodSync(fd, 0o644);
     fs.writeFileSync(fd, bytes);
     fs.fsyncSync(fd);
     fs.closeSync(fd);

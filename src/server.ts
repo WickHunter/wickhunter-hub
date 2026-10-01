@@ -2936,7 +2936,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === 'GET' && p === '/admin/api/releases/status') {
       try {
         const latest = readLatest();
-        const control = readReleaseControlState(path.join(cfg.releasesDir, '.release-control.v1.json'));
+        const controlFile = path.join(cfg.releasesDir, '.release-control.v1.json');
+        const pendingPublication = fs.existsSync(`${controlFile}.pending.v1.json`);
+        const control = readReleaseControlState(controlFile);
         const recorded = latest && control.beta?.sha256 === latest.sha256 && control.beta?.buildId === latest.buildId ? control.beta : null;
         const ageMs = recorded ? Math.max(0, Date.now() - Date.parse(recorded.publishedAt)) : null;
         return sendJson(res, 200, { ok: true, alpha: { private: true },
@@ -2944,7 +2946,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             soakDays: ageMs === null ? null : Math.min(7, Math.floor(ageMs / 86400000)),
             soakComplete: ageMs !== null && ageMs >= DEFAULT_PRODUCTION_SOAK_MS,
             unresolvedBugs: latest ? countUnresolvedHubBugs(path.join(cfg.dataDir, 'feedback.jsonl'), latest.version) : null },
-          production: { version: control.production?.version ?? null, automaticPromotionEnabled: false,
+          production: { version: pendingPublication ? null : control.production?.version ?? null,
+            publicationPending: pendingPublication,
+            recovery: pendingPublication ? 'required' : 'not-needed',
+            automaticPromotionEnabled: false,
             hold: control.productionHold?.reason ?? 'Publishing is disabled for this rollout',
             checks: ['7 days on the same Beta build', 'No unresolved bugs for that build', 'Passing tests and fresh health checks', 'Verified compatible rollback'] },
         }, { 'cache-control': 'no-store' });

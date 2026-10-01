@@ -1142,8 +1142,9 @@ async function releaseStatusRefresh() {
       '<div class="opscard"><h2>Beta</h2><p>' + esc(d.beta.version ? vlabel(d.beta.version) : 'No release') + ' · Manual publication</p><small class="muted">' +
       esc(d.beta.soakDays === null ? 'Soak period has not been recorded for this build.' : d.beta.soakDays + ' of 7 days completed.') + ' ' +
       esc(d.beta.unresolvedBugs === null ? '' : d.beta.unresolvedBugs + ' unresolved build reports.') + '</small></div>' +
-      '<div class="opscard"><h2>Production</h2><p>' + esc(d.production.version ? vlabel(d.production.version) : 'No release') + ' · Promotion off</p><small class="muted">' +
-      esc(d.production.hold) + '</small><ul>' + d.production.checks.map(check => '<li>' + esc(check) + '</li>').join('') + '</ul></div>';
+      '<div class="opscard"><h2>Production</h2><p>' +
+      esc(d.production.publicationPending ? 'Publication pending recovery' : (d.production.version ? vlabel(d.production.version) : 'No release')) + ' · Promotion off</p><small class="muted">' +
+      esc(d.production.publicationPending ? 'A publication transaction is unresolved. This staged version is not reported as current; publishing remains blocked until the operator recovers it.' : d.production.hold) + '</small><ul>' + d.production.checks.map(check => '<li>' + esc(check) + '</li>').join('') + '</ul></div>';
   } catch (e) { target.textContent = e.message || "Release status unavailable; publication remains disabled."; }
 }
 document.getElementById("upgradeHub").onclick = async () => {

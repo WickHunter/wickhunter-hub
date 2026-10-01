@@ -5,6 +5,12 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { releaseSigningBytes } from "../dist/src/release-manifest.js";
+import {
+  defaultReleaseControlState,
+  promotionSigningBytes,
+  recordBetaPublication,
+  writeReleaseControlState,
+} from "../dist/src/release-controls.js";
 import { test, summary, tmpDir } from "./helpers.mjs";
 
 const pair = generateKeyPairSync("ed25519");
@@ -36,6 +42,44 @@ function fixture(dir, overrides = {}) {
   fs.writeFileSync(manifestPath, JSON.stringify(manifest));
   fs.writeFileSync(artifactPath, artifact);
   return { artifact, manifest, manifestPath, artifactPath };
+}
+
+function productionEvidence({ betaManifest, rollbackManifest, now, betaPublishedAt }) {
+  const unsigned = {
+    schema: "wickhunter.production-promotion.v1",
+    betaBuildId: betaManifest.buildId,
+    betaSha256: betaManifest.sha256,
+    sourceCommit: betaManifest.sourceCommit,
+    tests: { passed: true, commit: betaManifest.sourceCommit,
+      completedAt: new Date(betaPublishedAt + 60_000).toISOString(), runId: "test-run-150" },
+    health: { passed: true, checkedAt: new Date(now - 30_000).toISOString(), probeId: "health-check-1" },
+    bugs: { unresolved: 0, checkedAt: new Date(now - 30_000).toISOString(), reportSet: "feedback-set-1" },
+    rollback: {
+      fromBuildId: betaManifest.buildId, fromSha256: betaManifest.sha256,
+      targetBuildId: rollbackManifest.buildId, targetSha256: rollbackManifest.sha256,
+      stateCompatible: true, settingsVersion: 8, restartHealthProtocol: "restart-health-v1",
+      nativeCoreProtocol: "native-core-v1", coreSha256: "d".repeat(64),
+      certifiedAt: new Date(now - 30_000).toISOString(), expiresAt: new Date(now + 86_400_000).toISOString(),
+    },
+  };
+  return { ...unsigned, signatures: [{ kid, alg: "Ed25519",
+    sig: edSign(null, promotionSigningBytes(unsigned), pair.privateKey).toString("base64url") }] };
+}
+
+function signedRelease(dir, channel, artifact, overrides = {}) {
+  const sha256 = createHash("sha256").update(artifact).digest("hex");
+  const unsigned = {
+    schema: "wickhunter.release.v1", product: "wickhunter", channel, platform: "linux", arch: "x64",
+    version: "0.89.91", buildId: `release-${channel}-0.89.91`,
+    file: `wickhunter-${channel}-0.89.91.tar.gz`, sha256,
+    issuedAt: new Date().toISOString(), minUpdateProtocol: 1, sourceCommit: "c".repeat(40), ...overrides,
+  };
+  const manifest = { ...unsigned, signatures: [{ kid, alg: "Ed25519",
+    sig: edSign(null, releaseSigningBytes(unsigned), pair.privateKey).toString("base64url") }] };
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `manifest-${sha256}.json`), JSON.stringify(manifest));
+  fs.writeFileSync(path.join(dir, manifest.file), artifact);
+  return manifest;
 }
 
 function publish(releasesDir, item, env = {}, extraArgs = []) {
@@ -135,6 +179,80 @@ await test("publisher never replaces a conflicting SHA-addressed manifest", () =
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /archived manifest already exists with different bytes/);
   assert.deepEqual(fs.readFileSync(path.join(releases, "latest.json")), oldLatest, "failed conflict cannot move latest");
+});
+
+await test("publisher refuses a concurrent or stale single-instance lock before touching the shelf", () => {
+  const input = tmpDir("publish-lock-input");
+  const releases = tmpDir("publish-lock-shelf");
+  const item = fixture(input);
+  const lock = path.join(releases, ".release-control.v1.json.publish.lock");
+  fs.writeFileSync(lock, "another publisher\n", { mode: 0o600 });
+  const result = publish(releases, item);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /publisher is active|stale publisher lock/);
+  assert.deepEqual(fs.readdirSync(releases), [path.basename(lock)]);
+});
+
+await test("first Production publication requires and accepts an offline-signed rollback baseline", () => {
+  const now = Date.now();
+  const betaPublishedAt = now - 8 * 86400_000;
+  const betaArtifact = Buffer.from("authenticated customer package");
+  const sourceCommit = "b".repeat(40);
+  const betaInput = tmpDir("publish-first-production-beta-input");
+  const betaItem = fixture(betaInput, { issuedAt: new Date(betaPublishedAt).toISOString(), sourceCommit });
+  const betaShelf = tmpDir("publish-first-production-beta-shelf");
+  const betaResult = publish(betaShelf, betaItem);
+  assert.equal(betaResult.status, 0, betaResult.stderr);
+
+  const controlStateFile = path.join(betaShelf, ".release-control.v1.json");
+  const initialState = recordBetaPublication(defaultReleaseControlState(), betaItem.manifest, betaPublishedAt);
+  writeReleaseControlState(controlStateFile, initialState);
+  assert.equal(initialState.production, null, "this exercises an empty first-production head");
+
+  const productionInput = tmpDir("publish-first-production-input");
+  const productionItem = fixture(productionInput, {
+    channel: "production", file: "wickhunter-production-0.89.92.tar.gz", sourceCommit,
+  });
+  assert.equal(productionItem.manifest.sha256, betaItem.manifest.sha256);
+  const rollbackDir = tmpDir("publish-first-production-rollback");
+  const rollbackManifest = signedRelease(rollbackDir, "production", Buffer.from("previous tested production package"));
+  const evidenceFile = path.join(tmpDir("publish-first-production-evidence"), "attestation.json");
+  const evidence = productionEvidence({ betaManifest: betaItem.manifest, rollbackManifest, now, betaPublishedAt });
+  fs.writeFileSync(evidenceFile, JSON.stringify(evidence));
+  const feedbackFile = path.join(tmpDir("publish-first-production-feedback"), "feedback.jsonl");
+  fs.writeFileSync(feedbackFile, "");
+  const productionArgs = [
+    "--channel", "production", "--beta-releases-dir", betaShelf,
+    "--control-state", controlStateFile, "--promotion-attestation", evidenceFile,
+    "--feedback-file", feedbackFile, "--rollback-releases-dir", rollbackDir,
+  ];
+  const noRollbackShelf = tmpDir("publish-first-production-no-rollback-shelf");
+  const noRollback = publish(noRollbackShelf, productionItem, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "true" }, [
+    ...productionArgs.slice(0, -2), "--rollback-releases-dir", tmpDir("publish-first-production-missing-rollback"),
+  ]);
+  assert.notEqual(noRollback.status, 0);
+  assert.deepEqual(fs.readdirSync(noRollbackShelf), [], "a missing signed Production rollback cannot create a head");
+
+  const mismatchedVersion = fixture(tmpDir("publish-first-production-bad-version"), {
+    channel: "production", file: "wickhunter-production-wrong-version.tar.gz", version: "0.89.93", sourceCommit,
+  });
+  const refusedShelf = tmpDir("publish-first-production-bad-version-shelf");
+  const refused = publish(refusedShelf, mismatchedVersion, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "true" }, productionArgs);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /version and minimum update protocol must match/);
+  assert.deepEqual(fs.readdirSync(refusedShelf), [], "mismatched release metadata never reaches Production latest");
+
+  const productionShelf = tmpDir("publish-first-production-shelf");
+  const result = publish(productionShelf, productionItem, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "true" }, productionArgs);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(fs.readFileSync(path.join(productionShelf, productionItem.manifest.file)), betaArtifact);
+  const published = fs.readFileSync(path.join(productionShelf, "latest.json"));
+  assert.deepEqual(published, fs.readFileSync(path.join(productionShelf, `manifest-${productionItem.manifest.sha256}.json`)));
+  assert.deepEqual(fs.readFileSync(path.join(productionShelf, `promotion-${betaItem.manifest.sha256}.json`)), fs.readFileSync(evidenceFile));
+  const after = JSON.parse(fs.readFileSync(controlStateFile, "utf8"));
+  assert.equal(after.beta.sha256, betaItem.manifest.sha256);
+  assert.equal(after.production.sha256, productionItem.manifest.sha256);
+  assert.equal(after.production.version, productionItem.manifest.version);
 });
 
 summary("publish-release");

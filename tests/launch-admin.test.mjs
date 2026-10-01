@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { freshHub, test, summary } from './helpers.mjs';
 const outbound = [];
 const hub = await freshHub({}, { marketingFetch: async (url, init) => {
@@ -23,9 +24,26 @@ try {
     assert.equal(status.beta.manualPublish, true);
     assert.equal(status.production.automaticPromotionEnabled, false);
     assert.equal(status.production.version, null);
+    assert.equal(status.production.publicationPending, false);
+    assert.equal(status.production.recovery, 'not-needed');
     assert.equal(status.production.checks.length, 4);
     const write = await fetch(hub.origin + '/admin/api/releases/status', { method: 'POST', headers, body: '{}' });
     assert.notEqual(write.status, 200);
+  });
+  await test('release overview hides staged Production head and flags pending recovery', async () => {
+    const stateFile = hub.releasesDir + '/.release-control.v1.json';
+    fs.writeFileSync(stateFile, JSON.stringify({
+      schema: 'wickhunter.release-control.v1', beta: null,
+      production: { buildId: 'staged', file: 'staged.tgz', publishedAt: new Date().toISOString(), sha256: 'a'.repeat(64), version: '9.9.9' },
+      productionHold: null,
+    }));
+    fs.writeFileSync(stateFile + '.pending.v1.json', '{"schema":"pending"}');
+    const response = await fetch(hub.origin + '/admin/api/releases/status', { headers });
+    assert.equal(response.status, 200);
+    const status = await response.json();
+    assert.equal(status.production.version, null);
+    assert.equal(status.production.publicationPending, true);
+    assert.equal(status.production.recovery, 'required');
   });
   await test('marketing credentials are write-only; connection check cannot send emails', async () => {
     const secret = 'fixture-brevo-secret-key-only';
