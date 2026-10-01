@@ -623,7 +623,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans(), publicHostingOptions: () => {
     const options=publicHostingOptions();
-    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
+    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,regions:options.regions,planLabel:options.planLabel,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
   }}, undefined, undefined, event => {
     if (!notifications) throw Error('Notifications need repair');
     const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };

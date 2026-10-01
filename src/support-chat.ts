@@ -231,7 +231,8 @@ export class SupportChat {
       const approvedAnswers=selectSupportAnswers(this.config.knowledgeFile,t.version,text,previous);
       let catalog: Record<string, unknown> | undefined;
       try { catalog=this.config.publicCatalog?.(); } catch { /* Billing remains authoritative; unavailable facts must not be guessed. */ }
-      const billingFacts=supportPricingFacts(catalog,text+(queryWords.length===0?' '+previous:''));
+      const commerceFollowup=queryWords.length<=3&&/\b(it|that|those|them|same|what about)\b/i.test(text);
+      const billingFacts=supportPricingFacts(catalog,text+(commerceFollowup?' '+previous:''));
       let hostingOptions: Record<string, unknown> | undefined;
       try { hostingOptions=this.config.publicHostingOptions?.(); } catch { /* Hosting availability is live and may be unavailable. */ }
       const hostingFacts=supportHostingFacts(hostingOptions,text);

@@ -28,12 +28,18 @@ assert.match(facts,/9900/);assert.match(facts,/UNLEASHED25/);assert.doesNotMatch
 assert.doesNotMatch(facts,/licenseDays|3650/);
 assert.match(supportPricingFacts(live,'When will my card first be charged?'),/firstPaymentEastern/);
 assert.match(supportPricingFacts(live,'When does free access end?'),/firstPaymentEastern/);
+assert.match(supportPricingFacts(live,'How much is it?'),/9900/);
+assert.match(supportPricingFacts(live,'Does an offer code have to be typed manually?'),/UNLEASHED25/);
 assert.equal(supportPricingFacts(live,'How do trading fees work?'),'');
+assert.equal(supportPricingFacts(live,'How much DCA should I use?'),'');
+assert.equal(supportPricingFacts(live,'Can I buy an exchange order?'),'');
 assert.match(supportPricingFacts({...live,mode:'test'},'How much is a plan?'),/could not be verified/);
 assert.equal(supportPricingFacts(live,'What is DCA?'),'');
-const hosting={monthlyPriceLabel:'$20.00',priceIsProposed:false,maximumConnectedAccounts:5,managedBackupsIncluded:false,purchasable:true,bundleEnabled:true,bundles:[{key:'monthly-hosted',interval:'month',amountCents:11900,currency:'usd'}]};
+const hosting={monthlyPriceLabel:'$20.00',priceIsProposed:false,regions:[{id:'nrt',label:'Tokyo'}],planLabel:'1 vCPU / 2 GB',maximumConnectedAccounts:5,managedBackupsIncluded:false,purchasable:true,bundleEnabled:true,bundles:[{key:'monthly-hosted',interval:'month',amountCents:11900,currency:'usd'}]};
 assert.match(supportHostingFacts(hosting,'Can I buy managed hosting?'),/"purchasable":true/);
 assert.match(supportHostingFacts(hosting,'How much is the hosted bundle?'),/11900/);
+assert.match(supportHostingFacts(hosting,'Which hosting region can I choose?'),/Tokyo/);
+assert.doesNotMatch(supportHostingFacts(hosting,'Which hosting region can I choose?'),/"nrt"/);
 const prompts=[];
 const provider=async (_url,init)=>{
   const input=JSON.parse(init.body);prompts.push(input.instructions);
