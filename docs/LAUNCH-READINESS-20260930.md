@@ -4,8 +4,8 @@ Scope: **Alpha, Hub, Stripe configuration, and website only.** Beta and Producti
 
 | Area | Verified result | Remaining boundary |
 | --- | --- | --- |
-| Hub | 0.4.68, runtime commit `ff7b2126c6395cd3a29b8ae9c465c8c3f7e51a04`; 86 suites passed. Deployed runtime matches the sealed manifest. Candle samples advanced after restart. | Central Discord webhook and Brevo credentials are not configured. |
-| Alpha | 0.90.150, commit `f75e9f9eafd88d2cc36164e3ca74218b36c16a7c`; 74,847 checks passed, zero failures. All four contexts ready; native lease pair and Marketplace API/worker/storage verified. | A follow-up shutdown review is recorded below. |
+| Hub | 0.4.70, runtime commit `199a51150c35b28dcd8f6529cbc5b7a459969e6d`; 86 suites passed. Deployed runtime matches the sealed manifest. Candle samples advanced after restart. | Central Discord webhook and Brevo credentials are not configured. |
+| Alpha | 0.90.152, commit `43d2b88997e71f9cfe678d832563d84be6ad79e7`; 74,881 checks passed, zero failures. All four contexts ready; native lease pair and Marketplace API/worker/storage verified. | Controlled API restart passed with paused WebSocket and incomplete ingress; accepted work drains before store cleanup. |
 | Website | Commit `8a64886` is live; 20 tests pass. Mobile 390px and desktop 1440px reviews verified actual Hub pricing, inline support, and intercepted checkout requests. | Browser checkout POSTs were intercepted; the separate Stripe probes exercised the real backend. |
 | Launch discount | `UNLEASHED25`: 25% off base software through October 15, 2026, 11:59 p.m. Eastern; ongoing discount on eligible recurring subscriptions. | Hosting and add-ons are excluded. |
 | Card subscriptions | Card required; prelaunch Monthly/Yearly signup costs $0 now, first discounted charge October 15 at midnight Eastern, no proration. Signups on October 15 are charged immediately. | No live customer was charged as a test. |
@@ -25,11 +25,17 @@ Approved company: Wick Hunter Software, LLC, a Delaware LLC, 131 Continental Dr 
 
 ## Deployment evidence
 
-Hub receipt: `/root/wh-hub0468-launch-20261001/receipt.json`.
-Alpha receipt: `/root/wh-alpha0150-launch-retry-20261001/receipt.json`.
+Hub receipt: `/root/wh-hub0470-launch-reviewed-20261001/receipt.json`.
+Alpha receipt: `/root/wh-alpha0152-launch-20261001/receipt.json`.
 Full local evidence: `/Users/zloren/Documents/Wick Hunter Launch 2026/verification/`.
 
-Alpha's first deployment attempt rolled back when the installer observation timeout matched the unit's 90-second stop limit. The original application had refused to finish one WEEX timer drain after 30 seconds. Recovery restored 0.90.149 with all four contexts ready. The retry used identical tested application bytes with a 120-second installer observation limit; the application then shut down cleanly in about four seconds and 0.90.150 deployed successfully. Existing service stop policies and trading settings were not changed. A separate read-only review is checking Marketplace API shutdown resource ordering; no drain/persistence guard has been weakened.
+Alpha 0.90.152, commit 43d2b88997e71f9cfe678d832563d84be6ad79e7, is deployed after 74,881 checks passed with zero failures. The final build, source tree, and all 1,207 runtime artifacts were captured before the full gate and verified during deployment. All four trading contexts, the native lease pair, and Marketplace API/worker/storage are ready.
+
+The follow-up fixes incomplete HTTP ingress and unsupported upgrades, tracks accepted HTTP/dispatch/WebSocket replay and grant work until it settles, and adds PostgreSQL client/idle-pool error listeners. Independent review found and corrected both HTTP pipelining and WebSocket work-drain gaps before the final gate. No main trading drain, order behavior, or service stop deadline was changed.
+
+A live API-only restart passed with a paused unauthenticated WebSocket, unsupported upgrade, incomplete body, and incomplete headers. The stop/start transition took 2,321 ms, the journal recorded a clean stop and no forced kill, and the main trading and Hub PIDs stayed unchanged. PostgreSQL error handling was verified by focused regressions; the database was not deliberately restarted as a test. The earlier failed restart on 0.90.151 and the external host-maintenance/database-restart observations remain preserved. The exact connection responsible for the original timeout has not been identified.
+
+Deployment receipts, exact test proofs, protected release hashes, restart receipt, and final health report are in the local verification folder listed above. Earlier failed/superseded checks are retained and are not counted as passes. The final gate used a 4 GiB local test-runner heap after the default 2 GiB run exhausted memory; production memory settings were not changed.
 
 Hub source-based Upgrade is unavailable on this manually deployed host because its configured source checkout is absent. Reviewed package deployment, code backups, and rollback receipts are available.
 
