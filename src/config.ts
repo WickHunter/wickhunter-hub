@@ -242,6 +242,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
       enabled: env.HUB_SUPPORT_ENABLED === "true",
       aiEnabled: env.LIQHUNTER_SUPPORT_OPENAI_ENABLED === "true",
       apiKey: env.LIQHUNTER_SUPPORT_OPENAI_API_KEY ?? "",
+      model: env.LIQHUNTER_SUPPORT_OPENAI_MODEL === "gpt-5.6-luna" ? "gpt-5.6-luna" : "gpt-6-luna",
       totalMonthlyMicros: Math.max(0, Math.min(50_000_000, Number(env.HUB_SUPPORT_MONTHLY_USD || 50) * 1_000_000 || 0)),
       guestMonthlyMicros: Math.max(0, Math.min(50_000_000, Number(env.HUB_SUPPORT_GUEST_MONTHLY_USD ?? 5) * 1_000_000 || 0)),
       knowledgeFile: env.HUB_SUPPORT_KNOWLEDGE_FILE,

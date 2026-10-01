@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import { SupportChat,SupportError } from '../dist/src/support-chat.js';
+import { configFromEnv } from '../dist/src/config.js';
 import { tmpDir,freshHub } from './helpers.mjs';
 const cfg={enabled:true,aiEnabled:false,apiKey:'',totalMonthlyMicros:50_000_000};
 const identity={owner:'owner',licenseId:'licensed',name:'Alice'};
@@ -32,6 +33,17 @@ chat.action({action:'budget',monthlyLimitUsd:0});assert.equal(chat.allowance('ow
 
 let calls=0;
 const provider=async()=>{calls++;return new Response(JSON.stringify({status:'completed',usage:{input_tokens:100,output_tokens:20},output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({answer:'Read the guide.',human:false})}]}]}));};
+assert.equal(configFromEnv({}).support.model,'gpt-6-luna');
+assert.equal(configFromEnv({LIQHUNTER_SUPPORT_OPENAI_MODEL:'gpt-5.6-luna'}).support.model,'gpt-5.6-luna');
+assert.equal(configFromEnv({LIQHUNTER_SUPPORT_OPENAI_MODEL:'unknown'}).support.model,'gpt-6-luna');
+for(const [configured,expectedModel,expectedMicros] of [[undefined,'gpt-6-luna',20],['gpt-5.6-luna','gpt-5.6-luna',44],['invalid','gpt-6-luna',20]]){
+ let requestedModel;
+ const metered=new SupportChat(tmpDir('support-meter'),{...cfg,aiEnabled:true,apiKey:'fake',model:configured},async(_url,init)=>{requestedModel=JSON.parse(init.body).model;return provider();});
+ await metered.message(identity,{text:'How do I install?',requestId:'model-meter-001',version:'website'});
+ assert.equal(requestedModel,expectedModel);
+ assert.equal(metered.allowance('owner').userRemainingMicros,1_000_000-expectedMicros);
+}
+calls=0;
 const ai=new SupportChat(tmpDir('support-ai'),{...cfg,aiEnabled:true,apiKey:'fake'},provider);
 let aiThread;
 for(let i=0;i<22;i++){const r=await ai.message(identity,{id:aiThread,text:'Question',requestId:'request-'+i});aiThread=r.threads[0].id;}
