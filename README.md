@@ -1,3 +1,7 @@
+## v0.4.71 — Grounded, natural customer support
+
+Support uses 1,000 reviewed questions, effective version-specific guides, and current public billing and hosting facts. GPT-6 Luna replaces GPT-5.6 Luna, with a configuration rollback and model-specific metering. Customer messages appear immediately with reliable retries and writing status. Hub groups unanswered questions for staff review; reusable answers require approval.
+
 ## v0.4.70 — Correct Brevo unsubscribe status copy
 
 Label configured and missing Brevo webhook status as the unsubscribe callback. No backend behavior changes.
