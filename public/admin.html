@@ -2837,7 +2837,7 @@ function renderBrevoSettings(data) {
   }
   document.getElementById("marketingBrevoStatus").textContent =
     (data.configured ? "API key configured" : "API key missing") + " · " +
-    (data.webhookConfigured ? "signup webhook configured" : "signup webhook missing") +
+    (data.webhookConfigured ? "unsubscribe webhook configured" : "unsubscribe webhook missing") +
     " · " + data.listIds.length + " list ID(s)" +
     (typeof data.lastTestAt === "string" && Number.isFinite(Date.parse(data.lastTestAt)) ? " · last check " + easternDate(Date.parse(data.lastTestAt)) + (data.lastTestOk === true ? " passed" : data.lastTestOk === false ? " failed" : "") : "");
   if (typeof data.lastTestMessage === "string" && data.lastTestMessage) document.getElementById("marketingBrevoStatus").textContent += " · " + data.lastTestMessage;

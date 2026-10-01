@@ -1,3 +1,7 @@
+## v0.4.70 — Correct Brevo unsubscribe status copy
+
+Label configured and missing Brevo webhook status as the unsubscribe callback. No backend behavior changes.
+
 ## v0.4.69 — Clarify Marketplace and Brevo webhook settings
 
 Describe the Marketplace page as private API service health, and identify the Brevo webhook secret as the unsubscribe callback credential. No backend behavior changes.
@@ -1823,6 +1827,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.70 — Label the Brevo opt-out callback accurately in the admin status summary.
 
 - v0.4.69 — Clarify Marketplace service-health scope and identify the Brevo webhook secret as the unsubscribe callback credential.
 
