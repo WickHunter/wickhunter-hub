@@ -59,3 +59,30 @@ Hub, atomically publish the signed manifest, deploy the Hub, then publish the
 first signed-aware app. Old clients ignore the additive fields; a new client
 talking to an old/unsigned Hub refuses only the update and keeps its current
 version running.
+
+## Explicit customer-channel installer (feature-gated)
+
+The generic `/install.sh` and `/welcome` flows remain legacy Beta. When
+`HUB_RELEASE_CHANNEL_ROUTING_ENABLED=true`, a customer can request
+`GET /install/channels/production.sh` with `x-license` and
+`x-release-channel: production`. A Beta-channel request uses
+`/install/channels/beta.sh`, `x-release-channel: beta`, and
+`x-early-access-opt-in: true`; the Hub additionally requires the individual
+license's Early Access eligibility flag. Alpha is never a customer channel.
+
+The Production endpoint requires a **separate** Production shelf configured
+by `HUB_PRODUCTION_RELEASES_DIR`. Its `latest.json`, matching
+`manifest-<sha256>.json`, and archive must all exist and verify against the
+offline public release keyring with `channel: production`. It embeds the exact
+signed manifest and identity in the installer; neither route falls back to
+the Beta shelf. No installer is issued when the feature switch is off or the
+Production shelf is absent or invalid.
+
+The channel installer runs only on a host without an existing app directory,
+environment file, or systemd unit. After verifying the channel-bound
+signature and archive bytes, it writes `data/release-state.json` with that
+signed identity and `data/release-channel-preference.v1.json` with the selected
+channel before the first app start. A failed install stops the new service and
+removes those newly seeded records. Existing installs are never inferred to be
+Production merely because their preference file is absent; they continue to
+use the legacy Beta flow unless the app explicitly changes its preference.

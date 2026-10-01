@@ -12,6 +12,7 @@ import { EarnService, earnOwner } from "./earn.js";
 //   keyed    POST /api/license/checkin           bot phone-home; answers revoked (also for a 2nd install — see src/seats.ts)
 //   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
+//   keyed    GET  /install/channels/{beta,production}.sh explicit fresh-install channel bootstrap (feature-gated)
 //   keyed    GET  /api/latest                    authenticated signed release manifest (x-license; legacy ?key=)
 //   keyed    GET  /download/<file>               beta tarballs (x-license; legacy ?key=; "latest" resolves)
 //   public   GET  /buy[?plan=key]                302 -> the ACTIVE mode's Stripe Payment Link for that plan
@@ -788,6 +789,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
+    const channelInstaller = /^\/install\/channels\/([^/]+)\.sh$/.exec(p);
+    if (m === "GET" && channelInstaller) return channelInstallScript(req, res, channelInstaller[1]!);
     const channelLatest = /^\/api\/releases\/([^/]+)\/latest$/.exec(p);
     if (m === "GET" && channelLatest) return channelLatestMeta(req, url, res, channelLatest[1]!);
     const channelDownload = /^\/api\/releases\/([^/]+)\/download\/([^/]+)$/.exec(p);
@@ -1330,6 +1333,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     res: ServerResponse,
     licenseToken: string,
     pinnedRelease?: SignedReleaseManifest,
+    channelAware = false,
   ): void {
     const template = fs.readFileSync(path.join(cfg.templatesDir, "install.sh"), "utf8");
     const script = template
@@ -1342,6 +1346,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       .replaceAll("__PINNED_MANIFEST_B64U__", pinnedRelease
         ? Buffer.from(JSON.stringify(pinnedRelease), "utf8").toString("base64url")
         : "")
+      .replaceAll("__INSTALL_CHANNEL__", channelAware ? pinnedRelease!.channel : "beta")
+      .replaceAll("__CHANNEL_AWARE__", channelAware ? "1" : "0")
       .replaceAll("__RELEASE_MAX_AGE_MS__", String(cfg.releaseMaxAgeMs));
     res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "no-store" });
     res.end(script);
@@ -1759,6 +1765,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!shelf || !/^[0-9a-f]{64}$/.test(sha256)) return null;
     const manifest = readChannelReleaseFile(shelf, channel, `manifest-${sha256}.json`, Number.MAX_SAFE_INTEGER);
     return manifest?.sha256 === sha256 ? manifest : null;
+  }
+
+  /** Explicit customer installer: the pinned manifest and archive must be
+   * present on the selected shelf. Legacy /install.sh remains Beta. The
+   * channel-specific script itself refuses every non-fresh target host. */
+  function channelInstallScript(req: IncomingMessage, res: ServerResponse, channelText: string): void {
+    const access = channelLicense(req, res, channelText);
+    if (!access) return;
+    const token = req.headers["x-license"];
+    if (typeof token !== "string" || !/^[A-Za-z0-9._-]+$/.test(token)) {
+      return sendJson(res, 403, { ok: false, error: "active license required in x-license" }, { "cache-control": "no-store" });
+    }
+    const shelf = customerReleaseShelf(access.channel);
+    if (!shelf) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no release is available for this channel" }, { "cache-control": "no-store" });
+    const latest = readChannelReleaseFile(shelf, access.channel, "latest.json");
+    if (!latest) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no verified release is available for this channel" }, { "cache-control": "no-store" });
+    const archived = readArchivedChannelRelease(access.channel, latest.sha256);
+    if (!archived || JSON.stringify(archived) !== JSON.stringify(latest)) {
+      return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "verified archived release is unavailable" }, { "cache-control": "no-store" });
+    }
+    sendInstaller(res, token, latest, true);
   }
 
   function channelLicense(req: IncomingMessage, res: ServerResponse, channelText: string): { channel: CustomerReleaseChannel; id: string } | null {

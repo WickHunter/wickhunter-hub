@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Wick Hunter beta installer — served personalised by the hub; the two
-# placeholders below are substituted per-tester at download time.
+# Wick Hunter customer installer. The legacy /install.sh renderer remains
+# Beta; gated channel routes pin one separately signed customer shelf.
 #
 # One command on a fresh Ubuntu VPS:
 #   curl -q -fsS "<hub>/install.sh?key=<your key>" | sudo bash
@@ -17,6 +17,8 @@ RELEASE_KEYS_B64U="__RELEASE_KEYS_B64U__"
 RELEASE_MAX_AGE_MS="__RELEASE_MAX_AGE_MS__"
 PINNED_RELEASE_B64U="__PINNED_RELEASE_B64U__"
 PINNED_MANIFEST_B64U="__PINNED_MANIFEST_B64U__"
+INSTALL_CHANNEL="__INSTALL_CHANNEL__"
+CHANNEL_AWARE="__CHANNEL_AWARE__"
 
 APP_DIR=/opt/wickhunter
 ENV_FILE=/etc/wickhunter/env
@@ -112,6 +114,15 @@ ask() { # ask VAR "prompt" [--secret]
 [ "$(id -u)" -eq 0 ] || die "run as root: curl -q -fsS \"...\" | sudo bash"
 command -v systemctl >/dev/null || die "systemd is required (Ubuntu 22.04+ VPS)"
 case "$HUB" in https://*) ;; *) die "the WickHunter Hub must use HTTPS" ;; esac
+if [ "$CHANNEL_AWARE" = "1" ]; then
+  case "$INSTALL_CHANNEL" in beta|production) ;; *) die "invalid customer release channel" ;; esac
+  [ -n "$PINNED_MANIFEST_B64U" ] && [ -n "$PINNED_RELEASE_B64U" ] || die "channel installer must pin a signed release"
+  # The channel route is for genuinely new hosts. Missing preference on an
+  # existing install means legacy Beta, never implicit Production migration.
+  [ ! -e "$APP_DIR" ] && [ ! -L "$APP_DIR" ] && [ ! -e "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
+    && [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] \
+    || die "channel installer requires a fresh host; existing installs keep their release channel"
+fi
 
 say "Installing prerequisites"
 export DEBIAN_FRONTEND=noninteractive
@@ -137,15 +148,35 @@ fi
 [ "$(node_major)" -ge "$NODE_MAJOR_WANTED" ] || die "Node ${NODE_MAJOR_WANTED}+ required, found $(node -v)"
 ok "node $(node -v)"
 
-# ── Fetch + verify the latest beta build ────────────────────────────────────
-say "Fetching the latest Wick Hunter beta"
+# ── Fetch + verify the selected signed build ────────────────────────────────
+say "Fetching the latest Wick Hunter $INSTALL_CHANNEL"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+CHANNEL_STATE_SEEDED=0
+CHANNEL_INSTALL_COMPLETE=0
+cleanup() {
+  if [ "$CHANNEL_AWARE" = "1" ] && [ "$CHANNEL_STATE_SEEDED" = "1" ] && [ "$CHANNEL_INSTALL_COMPLETE" != "1" ]; then
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$APP_DIR/data/release-channel-preference.v1.json" "$APP_DIR/data/release-state.json"
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+if [ "$CHANNEL_AWARE" = "1" ]; then
+  # Curl reads private headers from a 0600 config file; the license is never
+  # put in a URL or process argv for the channel-specific metadata/download.
+  case "$KEY" in *[!A-Za-z0-9._-]*|'') die "invalid license token" ;; esac
+  printf 'header = "x-license: %s"\nheader = "x-release-channel: %s"\n' "$KEY" "$INSTALL_CHANNEL" > "$work/channel-headers.curl"
+  if [ "$INSTALL_CHANNEL" = "beta" ]; then
+    printf 'header = "x-early-access-opt-in: true"\n' >> "$work/channel-headers.curl"
+  fi
+  chmod 600 "$work/channel-headers.curl"
+fi
 # Ignore a machine-local curlrc and request an identity response. Never ask
 # curl to decompress: Ubuntu 22.04's curl can expand a tiny response past its
 # size limit before the caller gets control. The bounded verifier below handles
 # the one safe compatibility exception (a gzip response) itself.
 curl_hub() {
+  if [ "${CHANNEL_AWARE:-0}" = "1" ]; then set -- --config "$work/channel-headers.curl" "$@"; fi
   curl -q --fail --silent --show-error \
     --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \
     --retry 2 --retry-delay 1 \
@@ -176,7 +207,9 @@ if (!bytes.length || bytes.length > 1024 * 1024 || bytes.toString("base64url") !
 fs.writeFileSync(out, bytes, { mode: 0o600 });
 DECODE_PINNED_MANIFEST
 else
-  if fetch_bounded "$HUB/api/latest?key=$KEY" "$work/latest.json" 1048576 'application/json'; then
+  latest_url="$HUB/api/latest?key=$KEY"
+  [ "$CHANNEL_AWARE" != "1" ] || latest_url="$HUB/api/releases/$INSTALL_CHANNEL/latest"
+  if fetch_bounded "$latest_url" "$work/latest.json" 1048576 'application/json'; then
     :
   else
     fetch_code=$?
@@ -191,12 +224,12 @@ fi
 # name. The Hub has only this public keyring; it cannot mint a release. `ok` is
 # an unsigned compatibility envelope and is deliberately excluded from the
 # canonical manifest bytes.
-if ! node - "$work/latest.json" "$work/verified.json" "$RELEASE_KEYS_B64U" "$RELEASE_MAX_AGE_MS" "$APP_DIR" <<'VERIFY_RELEASE'
+if ! node - "$work/latest.json" "$work/verified.json" "$RELEASE_KEYS_B64U" "$RELEASE_MAX_AGE_MS" "$APP_DIR" "$INSTALL_CHANNEL" <<'VERIFY_RELEASE'
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 const { TextDecoder } = require("node:util");
-const [manifestPath, verifiedPath, keysB64u, maxAgeRaw, appDir] = process.argv.slice(2);
+const [manifestPath, verifiedPath, keysB64u, maxAgeRaw, appDir, expectedChannel = "beta"] = process.argv.slice(2);
 const fail = (message) => { throw new Error(message); };
 const write = (value, out, depth = 0) => {
   if (depth > 64) fail("manifest nests too deeply");
@@ -245,7 +278,7 @@ if (!manifest || manifest.schema !== "wickhunter.release.v1") fail("unsupported 
 for (const field of ["product","channel","platform","arch","version","buildId","file","sha256","issuedAt"]) {
   if (typeof manifest[field] !== "string" || !manifest[field]) fail(`missing ${field}`);
 }
-if (manifest.product !== "wickhunter" || manifest.channel !== "beta" || manifest.platform !== "linux" || manifest.arch !== process.arch) fail("release target mismatch");
+if (manifest.product !== "wickhunter" || manifest.channel !== expectedChannel || manifest.platform !== "linux" || manifest.arch !== process.arch) fail("release target mismatch");
 if (!/^\d+\.\d+\.\d+$/.test(manifest.version) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(manifest.file) || !/^[0-9a-f]{64}$/.test(manifest.sha256)) fail("malformed release identity");
 if (!Number.isInteger(manifest.minUpdateProtocol) || manifest.minUpdateProtocol < 1 || manifest.minUpdateProtocol > 1) fail("unsupported update protocol");
 const issued = Date.parse(manifest.issuedAt), now = Date.now(), maxAge = Number(maxAgeRaw);
@@ -311,7 +344,9 @@ REL_FILE=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8
 REL_SHA=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).sha256' "$work/verified.json")
 ok "latest is v$REL_VERSION"
 
-if fetch_bounded "$HUB/download/$REL_FILE?key=$KEY" "$work/$REL_FILE" 268435456 'application/gzip'; then
+download_url="$HUB/download/$REL_FILE?key=$KEY"
+[ "$CHANNEL_AWARE" != "1" ] || download_url="$HUB/api/releases/$INSTALL_CHANNEL/download/$REL_FILE"
+if fetch_bounded "$download_url" "$work/$REL_FILE" 268435456 'application/gzip'; then
   :
 else
   fetch_code=$?
@@ -323,7 +358,12 @@ ok "signature and artifact hash verified for $REL_FILE"
 
 # ── Unpack: tarball root is the app dir; data/ always survives ──────────────
 say "Installing to $APP_DIR"
-mkdir -p "$work/unpack" "$APP_DIR"
+mkdir -p "$work/unpack"
+if [ "$CHANNEL_AWARE" = "1" ]; then
+  mkdir "$APP_DIR" || die "another install created $APP_DIR; refusing to overwrite its channel"
+else
+  mkdir -p "$APP_DIR"
+fi
 tar -xzf "$work/$REL_FILE" -C "$work/unpack"
 # Tolerate both layouts: files at archive root, or a single top-level dir.
 src="$work/unpack"
@@ -341,6 +381,42 @@ if [ -n "${LIQHUNTER_BOOTSTRAP_PASSWORD:-}" ]; then
 fi
 rsync -a --checksum --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
+if [ "$CHANNEL_AWARE" = "1" ]; then
+  # These new records exist only on a fresh host and only for an archive whose
+  # channel-bound signature and bytes were verified above. Seed before first
+  # boot so the app never briefly routes a Production artifact as legacy Beta.
+  # A failed installation stops the service and removes both records in EXIT.
+  CHANNEL_STATE_SEEDED=1
+  if ! node - "$work/verified.json" "$APP_DIR/data" "$INSTALL_CHANNEL" <<'SEED_CHANNEL_STATE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [manifestFile, dataDir, expectedChannel] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+if (manifest.schema !== "wickhunter.release.v1" || manifest.channel !== expectedChannel ||
+    !["beta", "production"].includes(expectedChannel)) process.exit(1);
+const now = new Date().toISOString();
+const preference = { schema: 1, channel: expectedChannel,
+  betaOptIn: expectedChannel === "beta", updatedAt: now };
+const state = { schema: manifest.schema, channel: manifest.channel,
+  version: manifest.version, buildId: manifest.buildId,
+  sha256: manifest.sha256, issuedAt: manifest.issuedAt, installedAt: now };
+const records = [
+  ["release-channel-preference.v1.json", preference],
+  ["release-state.json", state],
+];
+for (const [name, value] of records) {
+  const file = path.join(dataDir, name);
+  const fd = fs.openSync(file, "wx", 0o600);
+  try { fs.writeFileSync(fd, JSON.stringify(value) + "\n"); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+}
+const dir = fs.openSync(dataDir, "r");
+try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+SEED_CHANNEL_STATE
+  then
+    die "could not seed verified channel and installed identity"
+  fi
+fi
 
 # The beta artifact runs on Node builtins + what is bundled into server.js;
 # its only declared deps are ws's OPTIONAL native accelerators, and it ships
@@ -445,7 +521,7 @@ ENTRY="server.js"
 unit_tmp=$(mktemp)
 printf '%s\n' \
   '[Unit]' \
-  'Description=Wick Hunter beta bot' \
+  "Description=Wick Hunter $INSTALL_CHANNEL bot" \
   'After=network-online.target' \
   'Wants=network-online.target' \
   '' \
@@ -525,7 +601,8 @@ fi
 PUBLIC_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 [ -n "$PUBLIC_IP" ] || die "could not determine the VPS address for HTTPS verification"
 verify_public_https "$PUBLIC_IP" "$work/public-health.json" || die "trusted public HTTPS did not serve the signed app version — setup is incomplete"
-say "Done — Wick Hunter beta v$REL_VERSION is installed"
+CHANNEL_INSTALL_COMPLETE=1
+say "Done — Wick Hunter $INSTALL_CHANNEL v$REL_VERSION is installed"
 ok "URL:      https://${PUBLIC_IP}/"
 ok "Login:    use your configured dashboard password or hosted access details"
 ok "Upgrade:  re-run this same install command any time"
