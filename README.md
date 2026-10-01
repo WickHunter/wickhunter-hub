@@ -1,3 +1,7 @@
+## v0.4.68 — Correct annual revenue reporting
+
+Show fractional monthly revenue from annual subscriptions at currency precision, label reminder worker activity accurately, and state that separately billed VPS subscriptions are outside this software revenue report.
+
 ## v0.4.67 — Clarify yearly plan copy
 
 Describe the $699 yearly software plan as billed yearly and cancellable at any time. Pricing and billing terms are unchanged.
@@ -1815,6 +1819,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.68 — Accept valid fractional minor-unit MRR values, clarify reminder worker state, and document the report's software-only scope.
 
 - v0.4.67 — Correct yearly plan description without changing price or billing terms.
 

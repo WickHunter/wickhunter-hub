@@ -510,6 +510,7 @@
 <section class="launch-card" id="billingReportPanel" aria-labelledby="billingReportTitle" style="margin-top:.8rem">
   <div class="actions" style="justify-content:space-between;margin-top:0"><h2 id="billingReportTitle">Revenue and subscription report</h2><button type="button" id="billingReportRefresh">Refresh Stripe facts</button></div>
   <p id="billingReportMeta" class="muted" role="status">Loading report…</p>
+  <p class="muted">This report covers software subscriptions only. Separately billed VPS subscriptions are excluded.</p>
   <div id="billingReportModes" class="launch-grid"></div>
   <div id="billingSubscriptions" class="launch-table"></div>
   <h3 style="margin:.9rem 0 .35rem">Payment reminders</h3><div id="billingReminderHealth" class="launch-metrics"></div>
@@ -2661,8 +2662,11 @@ function easternDate(ms) {
 function metric(label, value) {
   return '<div class="launch-metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>';
 }
+function validMinorAmount(minor) {
+  return typeof minor === "number" && Number.isFinite(minor) && minor >= 0 && minor <= Number.MAX_SAFE_INTEGER;
+}
 function minorCurrency(minor, currency) {
-  if (!Number.isFinite(minor) || !Number.isSafeInteger(minor) || typeof currency !== "string" || !/^[a-z]{3}$/i.test(currency)) return "Unknown";
+  if (!validMinorAmount(minor) || typeof currency !== "string" || !/^[a-z]{3}$/i.test(currency)) return "Unknown";
   try {
     const code = currency.toUpperCase();
     const digits = new Intl.NumberFormat("en-US", { style:"currency", currency:code }).resolvedOptions().maximumFractionDigits;
@@ -2675,7 +2679,7 @@ function renderBillingOverview(report) {
   if (!total || !Number.isSafeInteger(total.activeRecurring) || !total.mrrMinorByCurrency || typeof total.mrrMinorByCurrency !== "object") {
     status.textContent = "Unknown"; status.className = "brief-status unknown"; note.textContent = "Could not verify subscription revenue"; return;
   }
-  const currencies = Object.entries(total.mrrMinorByCurrency).filter(([c, n]) => /^[a-z]{3}$/i.test(c) && Number.isSafeInteger(n));
+  const currencies = Object.entries(total.mrrMinorByCurrency).filter(([c, n]) => /^[a-z]{3}$/i.test(c) && validMinorAmount(n));
   status.textContent = total.activeRecurring + " active";
   status.className = "brief-status " + (total.unknownAmountCount > 0 ? "amber" : "green");
   note.textContent = currencies.length ? currencies.map(([c, n]) => minorCurrency(n, c) + " / month").join(" · ") : "No verified recurring revenue";
@@ -2760,13 +2764,13 @@ function renderBillingReport(data) {
   if (!subs.length) rows.innerHTML = '<p class="muted">No subscription records in the active mode.</p>';
   else rows.innerHTML = '<table><thead><tr><th>Plan</th><th>Status</th><th>Monthly revenue</th><th>Discount</th><th>Renews / ends</th></tr></thead><tbody>' +
     subs.map(s => '<tr><td>' + esc(s.plan || "Unknown") + '</td><td>' + esc(s.status || "Unknown") + (s.cancelAtPeriodEnd === true ? " · cancels" : "") + '</td><td>' +
-      (s.linesKnown === true && Number.isSafeInteger(s.netMrrMinor) && typeof s.currency === "string" ? esc(minorCurrency(s.netMrrMinor,s.currency)) : "Unknown") + '</td><td>' +
+      (s.linesKnown === true && validMinorAmount(s.netMrrMinor) && typeof s.currency === "string" ? esc(minorCurrency(s.netMrrMinor,s.currency)) : "Unknown") + '</td><td>' +
       (Number.isFinite(s.discountPercent) ? esc(s.discountPercent + "%") : "Unknown") + '</td><td>' +
       (Number.isSafeInteger(s.currentPeriodEndMs) && s.currentPeriodEndMs > 0 ? esc(easternDate(s.currentPeriodEndMs)) : "Unknown") + '</td></tr>').join("") + '</tbody></table>';
   const generated = Number.isSafeInteger(data.generatedAtMs) && data.generatedAtMs > 0 ? easternDate(data.generatedAtMs) : "unknown time";
   document.getElementById("billingReportMeta").textContent = "Active mode: " + data.activeMode.toUpperCase() + " · snapshot " + generated + (data.refreshing ? " · Stripe refresh in progress" : "");
   const r = data.reminders || {}, counts = r.counts || {};
-  document.getElementById("billingReminderHealth").innerHTML = metric("Scheduler", r.running === true ? "Running" : r.running === false ? "Stopped" : "Unknown") +
+  document.getElementById("billingReminderHealth").innerHTML = metric("Worker", r.running === true ? "Processing" : r.running === false ? "Idle" : "Unknown") +
     ["pending","sent","canceled","needs_attention"].map(k => metric(k.replace("_"," "), Number.isSafeInteger(counts[k]) ? counts[k] : "Unknown")).join("");
   const attention = Array.isArray(r.needsAttention) ? r.needsAttention : [];
   document.getElementById("billingReportNote").textContent = attention.length ? attention.length + " reminder(s) need attention. Review the reminder service status before relying on automatic first-payment reminders." : "";

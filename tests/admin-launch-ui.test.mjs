@@ -27,8 +27,12 @@ const kinds = { signup:true, renewal:true, discount:true, paymentFailed:true, su
 const report = {
   ok:true, activeMode:'test', generatedAtMs:Date.UTC(2026,8,30,16), refreshing:false,
   byMode:{
-    test:{ activeRecurring:2, scheduledPrelaunchStarts:1, oneTimePurchases:{yearly:3,lifetime:1}, mrrMinorByCurrency:{usd:4998}, scheduledMrrMinorByCurrency:{usd:2499}, unknownAmountCount:0, refreshedAtMs:Date.UTC(2026,8,30,15), refreshError:null,
-      subscriptions:[{plan:'monthly',status:'active',cancelAtPeriodEnd:false,currentPeriodEndMs:Date.UTC(2026,9,15),discountPercent:25,currency:'usd',netMrrMinor:2499,linesKnown:true}] },
+    test:{ activeRecurring:2, scheduledPrelaunchStarts:1, oneTimePurchases:{yearly:3,lifetime:1}, mrrMinorByCurrency:{usd:4368.75}, scheduledMrrMinorByCurrency:{usd:2499}, unknownAmountCount:0, refreshedAtMs:Date.UTC(2026,8,30,15), refreshError:null,
+      subscriptions:[
+        {plan:'yearly',status:'active',cancelAtPeriodEnd:false,currentPeriodEndMs:Date.UTC(2026,9,15),discountPercent:25,currency:'usd',netMrrMinor:4368.75,linesKnown:true},
+        {plan:'invalid-null',status:'active',currentPeriodEndMs:Date.UTC(2026,9,15),discountPercent:0,currency:'usd',netMrrMinor:null,linesKnown:true},
+        {plan:'invalid-string',status:'active',currentPeriodEndMs:Date.UTC(2026,9,15),discountPercent:0,currency:'usd',netMrrMinor:'4368.75',linesKnown:true},
+      ] },
     live:{ activeRecurring:0, scheduledPrelaunchStarts:0, oneTimePurchases:{yearly:0,lifetime:0}, mrrMinorByCurrency:{}, scheduledMrrMinorByCurrency:{}, unknownAmountCount:0, refreshedAtMs:null, refreshError:null, subscriptions:[] },
   }, reminders:{running:true,counts:{pending:1,sent:4,canceled:0,needs_attention:0},needsAttention:[]},
 };
@@ -74,9 +78,16 @@ try {
   await page.locator('#launchOfferFacts').waitFor();
   assert.match(await page.locator('#launchOfferFacts').innerText(), /UNLEASHED25/);
   assert.match(await page.locator('#launchOfferFacts').innerText(), /Oct 15/);
-  assert.match(await page.locator('#billingReportModes').innerText(), /\$49\.98/);
-  assert.match(await page.locator('#billingSubscriptions').innerText(), /monthly/);
-  assert.match(await page.locator('#billingReminderHealth').innerText(), /Running/);
+  assert.match(await page.locator('#billingReportModes').innerText(), /\$43\.69/);
+  assert.match(await page.locator('#briefRevenueNote').innerText(), /\$43\.69 \/ month/);
+  const subscriptionRows = await page.locator('#billingSubscriptions tbody tr').allInnerTexts();
+  assert.match(subscriptionRows[0], /yearly.*\$43\.69/);
+  assert.match(subscriptionRows[1], /invalid-null.*Unknown/);
+  assert.match(subscriptionRows[2], /invalid-string.*Unknown/);
+  assert.deepEqual(await page.evaluate(() => [NaN, Infinity, -1, Number.MAX_SAFE_INTEGER + 1].map(n => minorCurrency(n, 'usd'))),
+    ['Unknown','Unknown','Unknown','Unknown']);
+  assert.match(await page.locator('#billingReminderHealth').innerText(), /Worker\s+Processing/);
+  assert.match(await page.locator('#billingReportPanel').innerText(), /Separately billed VPS subscriptions are excluded/);
   assert.equal(await page.locator('#notificationWebhook').inputValue(), '', 'saved webhook URL is never returned to the UI');
   assert.equal(await page.locator('#notificationSettingsPanel button').filter({hasText:/test message/i}).count(), 0, 'there is no arbitrary notification test sender');
   assert.equal(await page.getByRole('button', {name:/publish/i}).count(), 0, 'no release publishing action is exposed');
