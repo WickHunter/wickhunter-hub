@@ -462,7 +462,7 @@
   <button type="button" id="mktRefresh">Refresh</button>
   <span id="mktMeta" class="muted"></span>
 </div>
-<p class="muted">This public Hub contains no trading or payment code. It reads a sanitized status contract from the private Marketplace API over a dedicated loopback credential. Secret values are never returned to this page.</p>
+<p class="muted">Marketplace controls connect to the private API. This view shows service health without exposing credentials.</p>
 <div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
 
 <h2 style="margin:1.2rem 0 .2rem">Provider approvals</h2>
@@ -539,7 +539,8 @@
     <label for="marketingBrevoLists">Brevo list IDs</label>
     <input id="marketingBrevoLists" inputmode="numeric" placeholder="e.g. 4, 12" style="width:min(100%,24rem);margin:.35rem 0">
     <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearLists"> Clear configured list IDs</label>
-    <label for="marketingBrevoWebhookSecret">Website signup webhook bearer secret</label>
+    <label for="marketingBrevoWebhookSecret">Brevo unsubscribe webhook bearer secret</label>
+    <p class="muted">Bearer secret used by the Brevo opt-out callback at <code>/api/marketing/brevo/webhook</code>.</p>
     <input id="marketingBrevoWebhookSecret" type="password" autocomplete="new-password" placeholder="Paste a new secret; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
     <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearWebhook"> Clear the saved webhook secret</label>
     <div class="actions"><button type="submit">Save Brevo settings</button><button type="button" id="marketingBrevoTest">Check Brevo connection</button><span id="marketingBrevoNote" class="muted" role="status"></span></div>

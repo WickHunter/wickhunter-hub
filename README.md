@@ -1,3 +1,7 @@
+## v0.4.69 — Clarify Marketplace and Brevo webhook settings
+
+Describe the Marketplace page as private API service health, and identify the Brevo webhook secret as the unsubscribe callback credential. No backend behavior changes.
+
 ## v0.4.68 — Correct annual revenue reporting
 
 Show fractional monthly revenue from annual subscriptions at currency precision, label reminder worker activity accurately, and state that separately billed VPS subscriptions are outside this software revenue report.
@@ -1819,6 +1823,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.69 — Clarify Marketplace service-health scope and identify the Brevo webhook secret as the unsubscribe callback credential.
 
 - v0.4.68 — Accept valid fractional minor-unit MRR values, clarify reminder worker state, and document the report's software-only scope.
 
