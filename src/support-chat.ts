@@ -23,6 +23,8 @@ interface Thread {
 }
 interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
+export type SupportNotificationKind = 'supportNew' | 'supportHuman' | 'supportReply' | 'supportResolved';
+export interface SupportNotificationEvent { kind: SupportNotificationKind; ticketId: string; openTickets: number; resolvedTickets: number; at: number }
 interface State { monthlyLimitMicros?: number; guestMonthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number;previousGuestMicros?:number;guestLimitMicros?:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
 const MAX_BYTES = 16 * 1024 * 1024;
 const GUEST_OWNER_BYTES = 256 * 1024;
@@ -39,7 +41,8 @@ export class SupportChat {
    * services from booting. Keep the old file untouched and expose a read-only
    * support view until an operator repairs it. */
   unavailable: string | null = null;
-  constructor(dataDir: string, readonly config: SupportConfig, private request: typeof fetch = fetch, private now = Date.now) {
+  constructor(dataDir: string, readonly config: SupportConfig, private request: typeof fetch = fetch, private now = Date.now,
+    private notify?: (event: SupportNotificationEvent) => void) {
     this.file = path.join(dataDir, 'support-chat.v1.json');
     const empty: State = {schema:1, threads:[], usage:[], knowledge:[]};
     try {
@@ -64,6 +67,13 @@ export class SupportChat {
     let n=0;for(const t of this.state.threads)if(match(t))for(const m of t.messages)n+=Buffer.byteLength(m.text);return n;
   }
   private edit(fn: (s: State)=>void) { const next=structuredClone(this.state); fn(next); this.commit(next); }
+  private notification(kind: SupportNotificationKind, ticketId: string) {
+    if (!this.notify) return;
+    try {
+      this.notify({ kind, ticketId, openTickets: this.state.threads.filter(t => t.status !== 'resolved').length,
+        resolvedTickets: this.state.threads.filter(t => t.status === 'resolved').length, at: this.now() });
+    } catch { /* Notifications must never change support availability. */ }
+  }
   private thread(id: string) { const t=this.state.threads.find(t=>t.id===id); if(!t)throw new SupportError('Conversation not found',404); return t; }
   private owned(identity: SupportIdentity,id:string) {const t=this.thread(id);if(t.owner!==identity.owner)throw new SupportError('Conversation not found',404);return t;}
   private period() { const iso=new Date(this.now()).toISOString();return {month:iso.slice(0,7),day:iso.slice(0,10)}; }
@@ -118,6 +128,8 @@ export class SupportChat {
       const id=clean(body.id,80);const t=this.owned(identity,id);const replyId=clean(body.replyId,80);
       const reply=t.messages.find(m=>m.id===replyId&&m.role!=='customer');if(!reply)throw new SupportError('Choose a support reply first');
       this.edit(s=>{const current=s.threads.find(t=>t.id===id)!;current.messages.find(m=>m.id===replyId)!.feedback=body.action==='resolve'?'helpful':'needs_help';current.status=body.action==='resolve'?'resolved':'human';current.waitingForHuman=body.action==='human';current.updatedAt=this.now();});
+      if (body.action === 'resolve' && t.status !== 'resolved') this.notification('supportResolved', id);
+      if (body.action === 'human' && t.status !== 'human') this.notification('supportHuman', id);
       return this.customer(identity,id);
     }
     const text=clean(body.text,4000), requestId=clean(body.requestId,80), id=clean(body.id,80);
@@ -130,6 +142,7 @@ export class SupportChat {
       ||(guest&&this.storedBytes(t=>t.owner.startsWith('guest:'))+add>GUEST_TOTAL_BYTES))
       throw new SupportError('Support storage for this conversation history is full. Please use Report a bug.',507);
     let thread=id?this.owned(identity,id):null;
+    const existingThread=!!thread;
     if(thread&&thread.messages.length>=100)throw new SupportError('This conversation is full. Start a new conversation.',409);
     const human=body.human===true || thread?.status==='human';
     this.edit(s=>{
@@ -145,9 +158,15 @@ export class SupportChat {
       const t=s.threads.find(t=>t.id===thread!.id)!;t.messages.push({id:requestId,role:'customer',text,at:this.now()});t.updatedAt=this.now();if(t.status==='resolved')t.status='human';if(t.status==='human')t.waitingForHuman=true;
     });
     const threadId=thread!.id;
+    if (!existingThread) this.notification('supportNew', threadId);
+    else this.notification('supportReply', threadId);
+    if (!existingThread && human) this.notification('supportHuman', threadId);
     const quota=this.allowance(identity.owner);
     if(this.thread(threadId).status==='human'||human||!this.config.aiEnabled||!this.config.apiKey||!quota.dailyRemaining||!quota.monthlyRemaining||quota.userRemainingMicros<RESERVE_MICROS||quota.totalRemainingMicros<RESERVE_MICROS||(guest&&quota.guestRemainingMicros<RESERVE_MICROS)){
-      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;});return this.customer(identity,threadId);
+      const wasHuman=this.thread(threadId).status==='human';
+      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;});
+      if (!wasHuman) this.notification('supportHuman', threadId);
+      return this.customer(identity,threadId);
     }
     const reservation=randomUUID();
     this.edit(s=>{s.usage=s.usage.filter(u=>u.month===this.period().month);s.usage.push({id:reservation,owner:identity.owner,...this.period(),micros:RESERVE_MICROS,pending:true});});
@@ -192,6 +211,7 @@ export class SupportChat {
         target.messages.push({id:randomUUID(),role:'assistant',text:clean(answer.answer,6000),at:this.now()});target.updatedAt=this.now();
         if(answer.human){target.status='human';target.waitingForHuman=true;}
       });
+      if (answer.human) this.notification('supportHuman', threadId);
     } catch (error) {
       const known=['Support context bound reached','Support provider unavailable','Empty provider response','Provider response exceeds bound','Incomplete provider response','Invalid provider answer','Missing usage'];
       console.warn('[support] '+(error instanceof Error&&known.includes(error.message)?error.message:'Response unavailable or invalid'));
@@ -216,6 +236,7 @@ export class SupportChat {
       if(this.busy.has(thread.owner))throw new SupportError('A reply is in progress. Try again shortly.',409);
       this.edit(s=>{s.threads=s.threads.filter(t=>t.id!==id);});return this.admin();
     }
+    let emitted: SupportNotificationKind | null = null;
     this.edit(s=>{
       const t=s.threads.find(t=>t.id===id)!;
       let touch=true;
@@ -225,7 +246,7 @@ export class SupportChat {
         if(t.messages.some(m=>m.id===requestId&&m.role==='human'))return;
         if(t.messages.length>=100)throw new SupportError('Conversation message limit reached',409);
         t.messages.push({id:requestId,role:'human',text:answer,at:this.now()});t.status='human';t.waitingForHuman=false;
-      }else if(action==='resolve'){t.status='resolved';t.waitingForHuman=false;}
+      }else if(action==='resolve'){if(t.status!=='resolved')emitted='supportResolved';t.status='resolved';t.waitingForHuman=false;}
       else if(action==='takeover')t.status='human';
       else if(action==='reopen'){t.status='human';t.waitingForHuman=true;}
       else if(action==='knowledge'){
@@ -240,6 +261,6 @@ export class SupportChat {
         s.knowledge.push({id:randomUUID(),question,answer,sourceId:id,version:t.version,at:this.now()});
       }else throw new SupportError('Unknown support action');
       if(touch)t.updatedAt=this.now();
-    });return this.admin();
+    });if(emitted)this.notification(emitted,id);return this.admin();
   }
 }
