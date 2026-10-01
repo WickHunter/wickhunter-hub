@@ -1,12 +1,12 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wick Hunter Support</title><style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a0c12;color:#e9ecf5}*{box-sizing:border-box}body{margin:0 auto;padding:20px;max-width:760px;height:var(--support-viewport-height,100dvh);min-height:0;display:flex;flex-direction:column;gap:14px}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:20px;margin:0}p,small{color:#aeb8cc;line-height:1.5}button,input{font:inherit;min-height:42px;border:1px solid #343d52;border-radius:10px;background:#151b27;color:inherit;padding:10px 14px;max-width:100%}button{cursor:pointer}button:disabled{opacity:.5}#messages{flex:1;min-height:0;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px;border:1px solid #252d40;border-radius:14px}.message{flex-shrink:0;border-radius:14px;background:#171e2d;padding:14px 16px;overflow-wrap:anywhere;font-size:14px;line-height:1.6;max-width:92%;width:fit-content}.message p{margin:0 0 10px;color:inherit}.message p:last-child{margin-bottom:0}.message li{margin:6px 0}.message ol,.message ul{padding-left:22px}.message small{display:block;font-size:11px;margin-bottom:6px}.customer{background:#5145af;margin-left:auto}form{display:flex;gap:10px}input{flex:1;min-width:0}#send{background:#7061ed}#status{margin:0;font-size:12px}#status:empty{display:none}a{color:#b5acff}#feedback{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;flex-shrink:0}#feedback[hidden]{display:none}#feedback button{font-size:12px;min-height:30px;padding:5px 9px}#feedback span{color:#aeb8cc}footer{font-size:11px;color:#aeb8cc}header a{font-size:12px}@media(max-width:700px){body{padding:max(12px,env(safe-area-inset-top,0px)) 12px max(12px,env(safe-area-inset-bottom,0px));gap:10px}.message{max-width:96%;font-size:15px}#messages{padding:12px}button,input{min-height:44px}input{font-size:16px}#feedback button{min-height:44px;padding:8px 10px}footer{font-size:11px}}
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a0c12;color:#e9ecf5}*{box-sizing:border-box}body{margin:0 auto;padding:20px;max-width:760px;height:var(--support-viewport-height,100dvh);min-height:0;display:flex;flex-direction:column;gap:14px}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:20px;margin:0}p,small{color:#aeb8cc;line-height:1.5}button,input{font:inherit;min-height:42px;border:1px solid #343d52;border-radius:10px;background:#151b27;color:inherit;padding:10px 14px;max-width:100%}button{cursor:pointer}button:disabled{opacity:.5}#messages{flex:1;min-height:0;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px;border:1px solid #252d40;border-radius:14px}.message{flex-shrink:0;border-radius:14px;background:#171e2d;padding:14px 16px;overflow-wrap:anywhere;font-size:14px;line-height:1.6;max-width:92%;width:fit-content}.message p{margin:0 0 10px;color:inherit}.message p:last-child{margin-bottom:0}.message li{margin:6px 0}.message ol,.message ul{padding-left:22px}.message small{display:block;font-size:11px;margin-bottom:6px}.customer{background:#5145af;margin-left:auto}.message.pending{opacity:.78}.message.failed{opacity:1}.delivery{display:block;margin-top:5px;color:#f7d6d6}.retry{display:flex;gap:8px;margin-top:6px}.retry button{min-height:0;border:0;background:none;padding:0;font-size:11px;text-decoration:underline}.writing{align-self:flex-start;width:max-content;max-width:100%;padding:5px 9px;border-radius:9px;background:#171e2d;color:#aeb8cc;font-size:11px}form{display:flex;gap:10px}input{flex:1;min-width:0}#send{background:#7061ed}#status{margin:0;font-size:12px}#status:empty{display:none}a{color:#b5acff}#feedback{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;flex-shrink:0}#feedback[hidden]{display:none}#feedback button{font-size:12px;min-height:30px;padding:5px 9px}#feedback span{color:#aeb8cc}footer{font-size:11px;color:#aeb8cc}header a{font-size:12px}@media(max-width:700px){body{padding:max(12px,env(safe-area-inset-top,0px)) 12px max(12px,env(safe-area-inset-bottom,0px));gap:10px}.message{max-width:96%;font-size:15px}#messages{padding:12px}button,input{min-height:44px}input{font-size:16px}#feedback button{min-height:44px;padding:8px 10px}.retry button{min-height:32px}footer{font-size:11px}}
 </style></head><body>
-<header><h1>Support</h1><a href="https://www.youtube.com/@wickhunter9006/videos" target="_blank" rel="noopener">Video tutorials</a></header>
+<header><h1>Wick Hunter Support</h1><a href="https://www.youtube.com/@wickhunter9006/videos" target="_blank" rel="noopener">Video tutorials</a></header>
 <div id="messages" role="log" aria-live="polite"></div><div id="feedback" hidden><span>Did that help?</span><button id="resolved">Yes, resolved</button><button id="more">Need more help</button></div>
 <p id="status" role="status">Connecting…</p><form id="chat"><input id="question" aria-label="Your message" placeholder="Write a message…" maxlength="4000" required><button id="send">Send</button></form>
 <footer>Keep this browser session to receive replies. Never share passwords, API keys or payment details.</footer>
 <script>
-const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null,sessionReady=false;
+const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null,sessionReady=false,epoch=0,loadSeq=0;
 const el=id=>document.getElementById(id);
 const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function swFormat(text){
@@ -34,7 +34,22 @@ function swFormat(text){
   flush();endList();return out;
 }
 async function call(path,body){const r=await fetch(root+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-wh-support':'1'},...(body?{body:JSON.stringify(body)}:{})});const d=await r.json();if(!d.ok){const error=new Error(d.error||'Support unavailable');error.status=r.status;throw error;}return d;}
+function autoReply(d,t){
+ if(typeof t?.canAutoReply==='boolean')return t.canAutoReply;
+ if(!t&&typeof d?.canAutoReply==='boolean')return d.canAutoReply;
+ return d?.aiEnabled===true&&t?.status!=='human'&&t?.status!=='resolved'; // Older Hub responses.
+}
+function attemptThread(list){
+ if(!attempt)return null;
+ return list.find(t=>(!attempt.id||t.id===attempt.id)&&t.messages?.some(m=>m.role==='customer'&&(
+  typeof m.clientRequestId==='string'?m.clientRequestId===attempt.requestId:
+  m.text===attempt.text&&m.id&&!attempt.knownIds.has(m.id)
+ )))||null;
+}
+function sendState(){el('send').disabled=busy||!!attempt;}
 function render(d){state=d;const list=d.threads||[];
+ const match=attemptThread(list);
+ if(attempt&&match){current=match.id;attempt.visibleServer=true;if(attempt.state==='failed')attempt=null;}
  const visible=t=>!!t&&(t.status!=='resolved'||(['human','assistant'].includes(t.messages?.at(-1)?.role)&&t.messages.at(-1).feedback!=='helpful'));
  if(!visible(list.find(t=>t.id===current)))current='';
  if(!current)current=(list.find(t=>t.status!=='resolved')||list.find(visible))?.id||'';
@@ -42,14 +57,58 @@ function render(d){state=d;const list=d.threads||[];
  const scroll=box.scrollTop,follow=box.scrollHeight-scroll-box.clientHeight<48;
  feedback.remove();box.textContent='';
  for(const m of t?.messages||[]){const p=document.createElement('div');p.className='message '+m.role;if(m.role!=='customer'){const who=document.createElement('small');who.textContent=m.role==='human'?'WH team':'Support';p.appendChild(who);}const body=document.createElement('div');body.innerHTML=swFormat(m.text);p.appendChild(body);box.appendChild(p);}
- if(!t){const hello=document.createElement('div');hello.className='message';hello.textContent='How can we help?';box.appendChild(hello);}
- const last=t?.messages.at(-1);feedback.hidden=!last||last.role==='customer'||!!last.feedback;box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
- el('status').textContent=t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled?'':'Send a message to our team.';
+ if(!t&&!attempt){const hello=document.createElement('div');hello.className='message';hello.textContent='How can we help?';box.appendChild(hello);}
+ if(attempt&&!attempt.visibleServer){
+  const p=document.createElement('div');p.className='message customer '+(attempt.state==='failed'?'failed':'pending');
+  const body=document.createElement('div');body.innerHTML=swFormat(attempt.text);p.appendChild(body);
+  if(attempt.state==='failed'){
+   const note=document.createElement('small');note.className='delivery';note.textContent='Could not confirm delivery.';p.appendChild(note);
+   const actions=document.createElement('div');actions.className='retry';
+   for(const [label,action] of [['Retry','retry'],['Remove','remove']]){const button=document.createElement('button');button.type='button';button.dataset.action=action;button.textContent=label;actions.appendChild(button);}p.appendChild(actions);
+  }
+  box.appendChild(p);
+ }
+ const last=t?.messages.at(-1);
+ if((attempt?.state==='sending'&&attempt.autoReply)||(!attempt&&last?.role==='customer'&&autoReply(d,t))){const writing=document.createElement('div');writing.className='writing';writing.textContent='Support is writing…';box.appendChild(writing);}
+ feedback.hidden=!!attempt||!last||last.role==='customer'||!!last.feedback;box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
+ el('status').textContent=attempt?.state==='failed'?'Message not confirmed. Retry or remove it to continue.':t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled===false?'Send a message to our team.':'';
+ sendState();
 }
-async function load(){if(busy)return;try{render(await call('/chat'));sessionReady=true;}catch(e){if(e.status===401){sessionReady=false;render({threads:[],aiEnabled:true});}else el('status').textContent=e.message;}}
-async function feedback(action){if(busy)return;const t=state?.threads.find(t=>t.id===current),last=t?.messages.at(-1);if(!last)return;busy=true;try{const d=await call('/chat',{id:t.id,replyId:last.id,action});if(action==='resolve'){current='';attempt=null;el('question').value='';}render(d);}catch(e){el('status').textContent=e.message;}finally{busy=false;}}
+async function load(){if(busy)return;const startEpoch=epoch,seq=++loadSeq;try{const d=await call('/chat');if(startEpoch===epoch&&seq===loadSeq){render(d);sessionReady=true;}}catch(e){if(startEpoch!==epoch||seq!==loadSeq)return;if(e.status===401){sessionReady=false;render({threads:[]});}else el('status').textContent=e.message;}}
+async function feedback(action){if(busy||attempt)return;const t=state?.threads.find(t=>t.id===current),last=t?.messages.at(-1);if(!last)return;busy=true;epoch++;try{const d=await call('/chat',{id:t.id,replyId:last.id,action});if(action==='resolve'){current='';attempt=null;el('question').value='';}render(d);}catch(e){el('status').textContent=e.message;}finally{busy=false;sendState();}}
 el('resolved').onclick=()=>feedback('resolve');el('more').onclick=()=>feedback('human');
-el('chat').onsubmit=async e=>{e.preventDefault();if(busy)return;const text=el('question').value.trim();if(!text)return;if(!attempt||attempt.text!==text||attempt.id!==current)attempt={id:current,text,human:false,requestId:crypto.randomUUID()};busy=true;el('send').disabled=true;el('status').textContent='Sending…';try{if(!sessionReady){await call('/session',{});sessionReady=true;}const d=await call('/chat',attempt);current=d.threads[0].id;attempt=null;el('question').value='';render(d);}catch(e){el('status').textContent=e.message+' Your message is still in the box.';}finally{busy=false;el('send').disabled=false;}};
+async function submitAttempt(){
+ if(busy||!attempt)return;
+ const sent=attempt;sent.state='sending';busy=true;epoch++;render(state||{threads:[]});
+ try{
+  if(!sessionReady){
+   await call('/session',{});sessionReady=true;
+   const fresh=await call('/chat');render(fresh);
+   if(sent.visibleServer){attempt=null;render(fresh);return;}
+   if(attempt!==sent)return;
+   sent.autoReply=autoReply(fresh,fresh.threads?.find(t=>t.id===sent.id));render(fresh);
+  }
+  const d=await call('/chat',{id:sent.id,text:sent.text,human:false,requestId:sent.requestId});
+  if(attempt===sent){current=(attemptThread(d.threads||[])||d.threads?.find(t=>t.id===sent.id)||d.threads?.[0])?.id||current;attempt=null;}
+  render(d);
+ }catch(e){
+  if(e.status===401)sessionReady=false;
+  if(attempt===sent){if(sent.visibleServer)attempt=null;else sent.state='failed';render(state||{threads:[]});}
+  if(attempt===sent)el('status').textContent=e.message+' Retry this message or remove it.';
+ }finally{busy=false;sendState();}
+}
+el('chat').onsubmit=e=>{
+ e.preventDefault();if(busy||attempt)return;
+ const text=el('question').value.trim();if(!text)return;
+ const knownIds=new Set((state?.threads||[]).flatMap(t=>(t.messages||[]).map(m=>m.id)));
+ const t=state?.threads?.find(t=>t.id===current);
+ attempt={id:current,text,requestId:crypto.randomUUID(),knownIds,state:'sending',visibleServer:false,autoReply:sessionReady&&autoReply(state,t)};
+ el('question').value='';submitAttempt();
+};
+el('messages').addEventListener('click',e=>{
+ if(e.target.closest('[data-action="retry"]'))submitAttempt();
+ else if(e.target.closest('[data-action="remove"]')&&!busy){attempt=null;render(state||{threads:[]});}
+});
 function supportViewport(){document.body.style.setProperty('--support-viewport-height',(window.visualViewport?.height||window.innerHeight)+'px');}
 window.visualViewport?.addEventListener('resize',supportViewport);window.addEventListener('resize',supportViewport);supportViewport();
 load();setInterval(()=>{if(sessionReady&&!document.hidden)load();},15000);
