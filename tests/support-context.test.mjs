@@ -22,6 +22,12 @@ assert.match(selectSupportGuide(guide,'0.90.155','How does the Optimized Liquida
 assert.match(selectSupportGuide(guide,'0.90.154','How does the Optimized Liquidation Bot set its leverage?'),/\[gd-liq-leverage\]/);
 assert.match(selectSupportGuide(guide,'0.90.135','How does the Optimized Liquidation Bot set its leverage?'),/\[gd-liq-leverage\]/);
 assert.match(selectSupportGuide(guide,'0.90.155','Can I enter 1,5 instead of 1.5?'),/\[gd-number-input\]/);
+for(const version of ['0.90.135','0.90.154','0.90.155']){
+ const replay=selectSupportGuide(guide,version,'Can I use Deal Replay on a closed trade?');
+ assert.match(replay,/\[support-feature-availability\]/);
+ assert.doesNotMatch(replay,/\[gd-replay\]/);
+ assert.match(replay,/unavailable in this released app build/);
+}
 const live={mode:'live',plans:[{key:'monthly',name:'Monthly',amountCents:9900,currency:'usd',interval:'month',available:true,buyUrl:'https://hub.test/buy?plan=monthly'},{key:'lifetime',name:'Lifetime',amountCents:99900,currency:'usd',interval:null,lifetime:true,licenseDays:3650,available:true}],launch:{active:true,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:1792036800000,redeemUntilMs:Date.now()+1e7}};
 const facts=supportPricingFacts(live,'How much is a plan?');
 assert.match(facts,/9900/);assert.match(facts,/UNLEASHED25/);assert.doesNotMatch(facts,/secretKey/);
