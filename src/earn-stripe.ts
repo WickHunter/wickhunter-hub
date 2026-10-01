@@ -108,6 +108,19 @@ export class EarnStripeService {
   const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'&&v!==code))];
   this.updateProfile(c.mode,owner,{code,promotion:promo.id,signature,legacyCodes,appliedDiscountPercent:m.discountPercent,products:[...new Set(products)],everActivated:true});return this.view(owner);
  });}
+ launchReferral(code:string,mode:BillingMode){
+  const c=this.settings();if(!c.enabled||c.mode!==mode)throw Error('Referrals are not available for this payment mode');
+  const members=this.liveLedger.admin().members;
+  const found=Object.entries(book(this.ledger(mode).admin()).profiles).find(([owner,value])=>{
+   const p=value as StripeObject;return p.code===code||(Array.isArray(p.legacyCodes)&&p.legacyCodes.includes(code))||members.some(m=>m.id===owner&&m.code===code);
+  }) as [string,StripeObject]|undefined;
+  if(!found)throw Error('Referral code not found');
+  const [owner,profile]=found,member=members.find(m=>m.id===owner);
+  if(!member)throw Error('Referral code not found');
+  const discount=profile.appliedDiscountPercent;
+  if(!profile.promotion||!Number.isFinite(discount)||discount<=0||discount>100)throw Error('Referral discount is not active');
+  return {code:member.code,promotionId:String(profile.promotion),discountPercent:Number(discount)};
+ }
  checkout(code:string,planKey?:string|null){return this.serial(async()=>{
   const c=this.settings();if(!c.enabled)throw Error('Referrals are not available');const b=book(this.ledger(c.mode).admin()),members=this.liveLedger.admin().members;const found=Object.entries(b.profiles).find(([owner,p])=>{
    const profile=p as StripeObject;

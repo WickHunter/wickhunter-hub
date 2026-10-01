@@ -10,7 +10,7 @@
 <title>Wick Hunter Hub</title>
 <style>
   :root {
-    color-scheme: dark;
+    color-scheme: light dark;
     --ground:#0a0c12; --raised:#11141d; --inset:#0d1017; --line:#212736; --line-soft:#1a1f2c;
     --ink:#e9ecf5; --muted:#96a0b8; --dim:#5c6579;
     --accent:#6f68f2; --accent-dim:rgba(111,104,242,.14); --accent-line:rgba(111,104,242,.38);
@@ -18,6 +18,9 @@
     --r:14px; --r-sm:10px;
     --sans:-apple-system,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --ground:#f5f6fa; --raised:#fff; --inset:#f0f2f7; --line:#d8dce7; --line-soft:#e7e9ef; --ink:#1e2432; --muted:#596276; --dim:#778096; --accent:#5b54db; --accent-dim:rgba(91,84,219,.1); --accent-line:rgba(91,84,219,.38); }
   }
   * { box-sizing: border-box; }
   html { background: var(--ground); }
@@ -157,6 +160,20 @@
   .custbadge.revoked, .custbadge.disputed, .custbadge.refunded { color:var(--short); }
   .eventrow { display:flex; gap:.6rem; align-items:baseline; padding:.5rem 0; border-top:1px solid var(--line-soft); font-size:.85rem; flex-wrap:wrap; }
   .eventrow:first-child { border-top:0; }
+  details.admin-advanced { margin:.8rem 0; border:1px solid var(--line); border-radius:var(--r); background:var(--raised); padding:.15rem .9rem .9rem; }
+  details.admin-advanced > summary { cursor:pointer; color:var(--ink); font-weight:700; padding:.8rem 0; }
+  .launch-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,19rem),1fr)); gap:.75rem; margin:.7rem 0; }
+  .launch-card { border:1px solid var(--line); border-radius:var(--r); background:var(--raised); padding:.9rem 1rem; min-width:0; }
+  .launch-card h2 { font-size:1rem; margin:0 0 .55rem; }
+  .launch-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr)); gap:.55rem; }
+  .launch-metric { background:var(--inset); border:1px solid var(--line-soft); border-radius:var(--r-sm); padding:.55rem .65rem; min-width:0; }
+  .launch-metric span { display:block; color:var(--muted); font-size:.75rem; }
+  .launch-metric strong { display:block; margin-top:.15rem; overflow-wrap:anywhere; }
+  .launch-table { overflow:auto; }
+  .launch-table td { white-space:normal; }
+  .kind-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr)); gap:.35rem .7rem; margin:.7rem 0; }
+  .kind-grid label, .launch-toggle { display:flex; gap:.5rem; align-items:center; min-height:2.5rem; }
+  .safe-note { border-left:3px solid var(--warn); padding:.55rem .7rem; background:var(--inset); color:var(--muted); }
   .custcards { display:none; }
   .custcard { border:1px solid var(--line); background:var(--raised); border-radius:var(--r-sm); padding:.7rem .8rem; }
   .custcard dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .5rem; margin:.4rem 0; font-size:.85rem; }
@@ -381,8 +398,8 @@
     </div>
   </div>
   <nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
-<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Support inbox</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Billing</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">System</button></div></nav>
-<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Support inbox</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Billing</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">System</option></optgroup></select></label>
+<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Support inbox</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Revenue &amp; subscriptions</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">Settings &amp; releases</button></div></nav>
+<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Support inbox</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Revenue &amp; subscriptions</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">Settings &amp; releases</option></optgroup></select></label>
 <div id="pageNotice" class="hub-error" role="status"></div>
 </header>
 
@@ -393,6 +410,8 @@
     <button class="brief-card" data-open-page="bugs"><span>Bug Reports</span><strong id="briefBugs" class="brief-status unknown">Checking…</strong><small id="briefBugsNote">Unresolved customer reports</small></button>
     <button class="brief-card" data-open-page="features"><span>Feature Requests</span><strong id="briefFeatures" class="brief-status unknown">Checking…</strong><small id="briefFeaturesNote">Requests awaiting review</small></button>
     <button class="brief-card" data-open-page="support"><span>Human Replies</span><strong id="briefSupport" class="brief-status unknown">Checking…</strong><small id="briefSupportNote">In-app support conversations</small></button>
+    <button class="brief-card" data-open-page="billing"><span>Subscription revenue</span><strong id="briefRevenue" class="brief-status unknown">Checking…</strong><small id="briefRevenueNote">Recurring customers and monthly revenue</small></button>
+    <button class="brief-card" data-open-page="system"><span>Release readiness</span><strong id="briefRelease" class="brief-status unknown">Checking…</strong><small id="briefReleaseNote">Build, source and upgrade status</small></button>
   </div>
   <p class="muted">Red: needs attention · Amber: review or recovery in progress · Green: clear · Unknown: could not verify. Status reflects all open work, not just today.</p>
   <section class="brief-section" style="margin-top:1rem" aria-labelledby="supportBudgetTitle"><h3 id="supportBudgetTitle">AI support budget</h3><p id="supportBudgetSummary" role="status">Checking this month’s usage…</p><progress id="supportBudgetProgress" max="100" value="0" aria-label="Monthly AI support budget used" style="width:100%;accent-color:var(--accent)"></progress><p id="supportBudgetDetail" class="muted"></p><form id="supportBudgetForm" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end"><label style="display:grid;gap:6px">Monthly limit ($) <input id="supportBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><label style="display:grid;gap:6px">Website guests ($) <input id="supportGuestBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><button type="submit">Save limits</button></form><p class="muted">Changes apply immediately without resetting usage. $0 pauses AI replies; human support stays available. The website guest cap is part of the total, not extra spending. Per-user limits remain $1/month, 200 replies/month and 20/day.</p><p id="supportBudgetNotice" role="status"></p></section>
@@ -423,7 +442,9 @@
 </section>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
-<h2>System</h2><div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
+<h1 style="margin-top:2.2rem">Settings &amp; releases <small>— system health and operational controls</small></h1><div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
+<p class="safe-note" id="releaseHoldNotice">Beta publication and Production promotion are disabled for this rollout.</p>
+<div class="opsgrid" id="releaseChannelSummary" aria-live="polite"><div class="opscard muted">Loading release status…</div></div>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
 
 <h1 style="margin-top:2.2rem">Machine leases <small>— staged licensing rollout; public verifier only</small></h1>
@@ -471,10 +492,61 @@
 </section>
 
 <section class="hubpage" data-hub-page-panel="billing" hidden>
-<h1 style="margin-top:2.2rem">Billing <small>— Stripe checkout, licences and receipts</small></h1>
+<h1 style="margin-top:2.2rem">Revenue &amp; subscriptions <small>— launch offer, recurring revenue and customer billing</small></h1>
 <div id="billingUnavailable" class="opscard muted" hidden>This Hub build has no billing yet.</div>
+<section class="launch-card" id="launchOfferPanel" aria-labelledby="launchOfferTitle">
+  <h2 id="launchOfferTitle">Launch offer</h2>
+  <p id="launchOfferSummary" class="muted" role="status">Checking offer status…</p>
+  <div id="launchOfferFacts" class="launch-metrics"></div>
+  <div class="actions">
+    <label class="launch-toggle"><input type="checkbox" id="launchEnabled"> Enable launch offer</label>
+    <label class="launch-toggle"><input type="checkbox" id="launchCryptoEnabled"> Enable crypto checkout</label>
+    <button type="button" id="launchOfferSave">Save offer settings</button>
+    <button type="button" id="launchOfferPrepare">Prepare Stripe offer</button>
+  </div>
+  <p id="launchOfferNote" class="muted" role="status"></p>
+  <p class="muted">Preparation creates the configured Stripe coupon and prices. Checkout activation is a separate setting. This does not publish a release.</p>
+</section>
+<section class="launch-card" id="billingReportPanel" aria-labelledby="billingReportTitle" style="margin-top:.8rem">
+  <div class="actions" style="justify-content:space-between;margin-top:0"><h2 id="billingReportTitle">Revenue and subscription report</h2><button type="button" id="billingReportRefresh">Refresh Stripe facts</button></div>
+  <p id="billingReportMeta" class="muted" role="status">Loading report…</p>
+  <div id="billingReportModes" class="launch-grid"></div>
+  <div id="billingSubscriptions" class="launch-table"></div>
+  <h3 style="margin:.9rem 0 .35rem">Payment reminders</h3><div id="billingReminderHealth" class="launch-metrics"></div>
+  <div id="billingReportNote" class="muted" role="status"></div>
+</section>
+<section class="launch-card" id="notificationSettingsPanel" aria-labelledby="notificationSettingsTitle" style="margin-top:.8rem">
+  <h2 id="notificationSettingsTitle">Notifications</h2>
+  <p id="notificationStatus" class="muted" role="status">Loading notification health…</p>
+  <form id="notificationSettingsForm" style="display:block">
+    <label for="notificationWebhook">Discord webhook URL</label>
+    <input id="notificationWebhook" type="password" autocomplete="new-password" placeholder="Paste a new URL; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="notificationClearWebhook"> Clear the saved webhook</label>
+    <div id="notificationKinds" class="kind-grid"></div>
+    <button type="submit">Save notification settings</button>
+    <span id="notificationSaveNote" class="muted" role="status"></span>
+  </form>
+</section>
+<details class="admin-advanced" id="marketingSettingsPanel">
+  <summary>Marketing email integration · Brevo</summary>
+  <p class="muted">Connection and consent-based audience setup. Keys are write-only. Connection check reads account status; it does not send a message.</p>
+  <p id="marketingBrevoStatus" class="muted" role="status">Checking Brevo configuration…</p>
+  <form id="marketingBrevoForm" style="display:block">
+    <label for="marketingBrevoKey">Brevo API key</label>
+    <input id="marketingBrevoKey" type="password" autocomplete="new-password" placeholder="Paste a new key; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearKey"> Clear the saved API key</label>
+    <label for="marketingBrevoLists">Brevo list IDs</label>
+    <input id="marketingBrevoLists" inputmode="numeric" placeholder="e.g. 4, 12" style="width:min(100%,24rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearLists"> Clear configured list IDs</label>
+    <label for="marketingBrevoWebhookSecret">Website signup webhook bearer secret</label>
+    <input id="marketingBrevoWebhookSecret" type="password" autocomplete="new-password" placeholder="Paste a new secret; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearWebhook"> Clear the saved webhook secret</label>
+    <div class="actions"><button type="submit">Save Brevo settings</button><button type="button" id="marketingBrevoTest">Check Brevo connection</button><span id="marketingBrevoNote" class="muted" role="status"></span></div>
+  </form>
+</details>
 <div id="billingBody" hidden>
 
+<details class="admin-advanced"><summary>Advanced billing setup, payment links and policy</summary>
 <div class="billinghead">
   <span class="muted">Mode</span>
   <div class="modeswitch" id="billingModeSwitch" role="group" aria-label="Billing mode">
@@ -541,6 +613,10 @@
   <span class="muted" id="billingPolicyNote" style="margin-left:.5rem"></span>
 </section>
 
+<span class="muted">Advanced billing controls retain the same test/live separation and existing write-only secret fields.</span>
+</details>
+
+<details class="admin-advanced"><summary>Customer records and billing events</summary>
 <h2 style="margin:1.2rem 0 .2rem">Customers</h2>
 <div class="actions">
   <button type="button" id="billingCustomersRefresh">Refresh</button>
@@ -557,6 +633,8 @@
   <button type="button" id="billingEventsRefresh">Refresh</button>
 </div>
 <div id="billingEvents"><div class="muted">loading&hellip;</div></div>
+
+</details>
 
 </div>
 </section>
@@ -711,11 +789,11 @@ async function loadHubPage(page, force = false) {
   if (loadingPages.has(key)) return loadingPages.get(key);
   if (!force && loadedPages.has(key)) return;
   const loaders = {
-    overview: [briefingRefresh], reports: [fbRefresh], support: [supportRefresh],
+    overview: [briefingRefresh, opsRefresh], reports: [fbRefresh], support: [supportRefresh],
     licenses: [refresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
     marketplace: [mktRefresh, mktConfigRefresh, mktProvidersRefresh],
-    billing: [billingConfigRefresh, billingCustomersRefresh, billingEventsRefresh],
-    earn: [earnRefresh], hosting: [hostingRefresh], system: [opsRefresh, leaseRefresh],
+    billing: [billingConfigRefresh, billingCustomersRefresh, billingEventsRefresh, billingLaunchRefresh, billingReportRefresh, notificationSettingsRefresh, marketingBrevoRefresh],
+    earn: [earnRefresh], hosting: [hostingRefresh], system: [opsRefresh, leaseRefresh, releaseStatusRefresh],
   };
   const pending = Promise.all((loaders[key] || []).map(fn => fn())).then(() => loadedPages.add(key)).catch(e => {
     if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
@@ -1027,6 +1105,19 @@ async function health() {
   try { return await (await fetch(base + "/api/health")).json(); }
   catch { return null; }
 }
+async function releaseStatusRefresh() {
+  const target = document.getElementById("releaseChannelSummary");
+  try {
+    const d = await api("/admin/api/releases/status");
+    if (!d.ok || !d.beta || !d.production) throw new Error(d.error || "Release status unavailable");
+    target.innerHTML = '<div class="opscard"><h2>Alpha</h2><p>Private testing</p><small class="muted">Operator installs only. Marketplace access is controlled separately.</small></div>' +
+      '<div class="opscard"><h2>Beta</h2><p>' + esc(d.beta.version ? vlabel(d.beta.version) : 'No release') + ' · Manual publication</p><small class="muted">' +
+      esc(d.beta.soakDays === null ? 'Soak period has not been recorded for this build.' : d.beta.soakDays + ' of 7 days completed.') + ' ' +
+      esc(d.beta.unresolvedBugs === null ? '' : d.beta.unresolvedBugs + ' unresolved build reports.') + '</small></div>' +
+      '<div class="opscard"><h2>Production</h2><p>' + esc(d.production.version ? vlabel(d.production.version) : 'No release') + ' · Promotion off</p><small class="muted">' +
+      esc(d.production.hold) + '</small><ul>' + d.production.checks.map(check => '<li>' + esc(check) + '</li>').join('') + '</ul></div>';
+  } catch (e) { target.textContent = e.message || "Release status unavailable; publication remains disabled."; }
+}
 document.getElementById("upgradeHub").onclick = async () => {
   if (!confirm("Upgrade the hub from the exact verified origin/main commit? A dirty checkout, wrong branch, divergence, or failed build is refused and shown here.")) return;
   const note = document.getElementById("note");
@@ -1067,7 +1158,15 @@ async function opsRefresh() {
   const box = document.getElementById("hubOps");
   let d;
   try { d = await api("/admin/api/operations"); }
-  catch (e) { if (e.message !== "unauthorized") box.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>'; return; }
+  catch (e) {
+    if (e.message !== "unauthorized") {
+      box.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>';
+      document.getElementById("briefRelease").textContent = "Unknown";
+      document.getElementById("briefRelease").className = "brief-status unknown";
+      document.getElementById("briefReleaseNote").textContent = "Could not verify build or source status";
+    }
+    return;
+  }
   const b = d.build || {}, s = d.source || {}, u = d.upgrade || {};
   document.getElementById("hubVer").textContent = "hub v" + (d.packageVersion || "?") + " · " + shortSha(b.commit);
   box.innerHTML =
@@ -1089,6 +1188,9 @@ async function opsRefresh() {
       '<dt>Finished</dt><dd>' + esc(u.completedAtMs ? fmt(u.completedAtMs) + " UTC" : "—") + '</dd>' +
       '<dt>Target</dt><dd>' + esc(u.targetCommit || "—") + '</dd></dl><p>' + esc(u.message || "") + '</p></div>' +
     '<div class="opscard"><h2>Upgrade log tail</h2><div class="logtail">' + esc(d.upgradeLogTail || "No upgrade log has been written.") + '</div></div>';
+  document.getElementById("briefRelease").textContent = "Publishing held";
+  document.getElementById("briefRelease").className = "brief-status amber";
+  document.getElementById("briefReleaseNote").textContent = "Build " + shortSha(b.commit) + " · source " + (s.relationToOriginMain || "unknown") + " · no channel control";
 }
 
 function renderStatusCard(title, value) {
@@ -2512,6 +2614,245 @@ async function billingProvisionPlans(mode) {
 document.getElementById("billingSavePlans").addEventListener("click", billingSavePlans);
 document.getElementById("billingProvisionTest").onclick = () => billingProvisionPlans("test");
 document.getElementById("billingProvisionLive").onclick = () => billingProvisionPlans("live");
+
+const NOTIFICATION_KINDS = [
+  ["signup", "New subscription or purchase"], ["renewal", "Successful renewal"],
+  ["discount", "Launch discount"], ["paymentFailed", "Failed payment"],
+  ["supportNew", "New support request"], ["supportHuman", "Human reply needed"],
+  ["supportReply", "Customer reply"], ["supportResolved", "Support resolved"],
+];
+let launchOfferStatus = null;
+let notificationConfigured = false;
+let notificationKinds = {};
+function easternDate(ms) {
+  if (!Number.isSafeInteger(ms) || ms <= 0) return "Not available";
+  try { return new Intl.DateTimeFormat("en-US", { timeZone:"America/New_York", year:"numeric", month:"short", day:"numeric", hour:"numeric", minute:"2-digit", timeZoneName:"short" }).format(new Date(ms)); }
+  catch { return "Not available"; }
+}
+function metric(label, value) {
+  return '<div class="launch-metric"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>';
+}
+function minorCurrency(minor, currency) {
+  if (!Number.isFinite(minor) || !Number.isSafeInteger(minor) || typeof currency !== "string" || !/^[a-z]{3}$/i.test(currency)) return "Unknown";
+  try {
+    const code = currency.toUpperCase();
+    const digits = new Intl.NumberFormat("en-US", { style:"currency", currency:code }).resolvedOptions().maximumFractionDigits;
+    return new Intl.NumberFormat("en-US", { style:"currency", currency:code, maximumFractionDigits:digits }).format(minor / (10 ** digits));
+  } catch { return "Unknown"; }
+}
+function renderBillingOverview(report) {
+  const total = report && report.byMode && report.byMode[report.activeMode];
+  const status = document.getElementById("briefRevenue"), note = document.getElementById("briefRevenueNote");
+  if (!total || !Number.isSafeInteger(total.activeRecurring) || !total.mrrMinorByCurrency || typeof total.mrrMinorByCurrency !== "object") {
+    status.textContent = "Unknown"; status.className = "brief-status unknown"; note.textContent = "Could not verify subscription revenue"; return;
+  }
+  const currencies = Object.entries(total.mrrMinorByCurrency).filter(([c, n]) => /^[a-z]{3}$/i.test(c) && Number.isSafeInteger(n));
+  status.textContent = total.activeRecurring + " active";
+  status.className = "brief-status " + (total.unknownAmountCount > 0 ? "amber" : "green");
+  note.textContent = currencies.length ? currencies.map(([c, n]) => minorCurrency(n, c) + " / month").join(" · ") : "No verified recurring revenue";
+}
+function renderLaunchOffer(data) {
+  const summary = document.getElementById("launchOfferSummary"), facts = document.getElementById("launchOfferFacts");
+  const enabled = document.getElementById("launchEnabled"), crypto = document.getElementById("launchCryptoEnabled");
+  launchOfferStatus = data && data.ok === true && ["test","live"].includes(data.mode) &&
+    typeof data.enabled === "boolean" && typeof data.prepared === "boolean" &&
+    typeof data.cryptoEnabled === "boolean" && typeof data.active === "boolean" &&
+    typeof data.code === "string" && Number.isFinite(data.discountPercent) &&
+    Number.isSafeInteger(data.firstPaymentAtMs) && Number.isSafeInteger(data.redeemUntilMs) ? data : null;
+  if (!launchOfferStatus) {
+    summary.textContent = "Offer status unavailable. Controls are disabled until Hub data is valid.";
+    facts.innerHTML = metric("Offer status", "Unknown");
+    enabled.disabled = crypto.disabled = document.getElementById("launchOfferSave").disabled = document.getElementById("launchOfferPrepare").disabled = true;
+    return;
+  }
+  const s = launchOfferStatus;
+  summary.textContent = (s.active ? "Active" : "Inactive") + " · " + s.mode.toUpperCase() + (s.prepared ? " · Stripe offer prepared" : " · Stripe setup needed");
+  facts.innerHTML = metric("Offer code", s.code) + metric("Discount", s.discountPercent + "%") +
+    metric("First payment", easternDate(s.firstPaymentAtMs)) + metric("Redeem through", easternDate(s.redeemUntilMs - 1)) +
+    metric("Offer", s.enabled ? "Enabled" : "Disabled") + metric("Crypto", s.cryptoEnabled ? "Enabled" : "Disabled");
+  enabled.checked = s.enabled; crypto.checked = s.cryptoEnabled;
+  enabled.disabled = crypto.disabled = false;
+  document.getElementById("launchOfferSave").disabled = !s.prepared;
+  document.getElementById("launchOfferPrepare").disabled = s.prepared;
+}
+async function billingLaunchRefresh() {
+  const note = document.getElementById("launchOfferNote");
+  try { renderLaunchOffer(await api("/admin/api/billing/launch")); }
+  catch (e) {
+    if (e.message === "unauthorized") return;
+    launchOfferStatus = null;
+    renderLaunchOffer(null);
+    note.textContent = e.message;
+  }
+}
+document.getElementById("launchOfferSave").onclick = async () => {
+  const note = document.getElementById("launchOfferNote"), button = document.getElementById("launchOfferSave");
+  if (!launchOfferStatus) { note.textContent = "Offer status is unavailable."; return; }
+  const enabled = document.getElementById("launchEnabled").checked, cryptoEnabled = document.getElementById("launchCryptoEnabled").checked;
+  if (enabled && !launchOfferStatus.prepared) { note.textContent = "Prepare the Stripe offer before enabling checkout."; return; }
+  button.disabled = true; note.textContent = "Saving…";
+  try { renderLaunchOffer(await api("/admin/api/billing/launch", { method:"POST", body:JSON.stringify({ enabled, cryptoEnabled }) })); note.textContent = "Offer settings saved."; }
+  catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = !launchOfferStatus || !launchOfferStatus.prepared; }
+};
+document.getElementById("launchOfferPrepare").onclick = async () => {
+  const note = document.getElementById("launchOfferNote"), button = document.getElementById("launchOfferPrepare");
+  if (!launchOfferStatus || launchOfferStatus.prepared) return;
+  if (!window.confirm("Prepare the launch coupon and prices in Stripe " + launchOfferStatus.mode.toUpperCase() + "?")) return;
+  button.disabled = true; note.textContent = "Preparing Stripe offer…";
+  try { renderLaunchOffer(await api("/admin/api/billing/launch", { method:"POST", body:JSON.stringify({ action:"prepare" }) })); note.textContent = "Stripe offer prepared."; }
+  catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = !!(launchOfferStatus && launchOfferStatus.prepared); }
+};
+function renderBillingReport(data) {
+  const modes = document.getElementById("billingReportModes"), rows = document.getElementById("billingSubscriptions");
+  if (!data || data.ok !== true || !data.byMode || !data.byMode.test || !data.byMode.live || !["test","live"].includes(data.activeMode)) {
+    modes.innerHTML = metric("Report", "Unavailable"); rows.textContent = "";
+    document.getElementById("billingReportMeta").textContent = "Billing report data is unavailable or incomplete.";
+    renderBillingOverview(null); return;
+  }
+  const makeMode = (mode) => {
+    const d = data.byMode[mode] || {}, mrr = d.mrrMinorByCurrency && typeof d.mrrMinorByCurrency === "object" ? Object.entries(d.mrrMinorByCurrency).map(([c,n]) => minorCurrency(n,c)).join(", ") : "";
+    const scheduled = d.scheduledMrrMinorByCurrency && typeof d.scheduledMrrMinorByCurrency === "object" ? Object.entries(d.scheduledMrrMinorByCurrency).map(([c,n]) => minorCurrency(n,c)).join(", ") : "";
+    return '<section class="launch-card"><h2>' + mode.toUpperCase() + (mode === data.activeMode ? " · active mode" : "") + '</h2><div class="launch-metrics">' +
+      metric("Active subscriptions", Number.isSafeInteger(d.activeRecurring) ? d.activeRecurring : "Unknown") +
+      metric("Monthly revenue", mrr || "No verified total") +
+      metric("Scheduled prelaunch", Number.isSafeInteger(d.scheduledPrelaunchStarts) ? d.scheduledPrelaunchStarts : "Unknown") +
+      metric("Scheduled MRR", scheduled || "No verified total") +
+      metric("Yearly purchases", d.oneTimePurchases && Number.isSafeInteger(d.oneTimePurchases.yearly) ? d.oneTimePurchases.yearly : "Unknown") +
+      metric("Lifetime purchases", d.oneTimePurchases && Number.isSafeInteger(d.oneTimePurchases.lifetime) ? d.oneTimePurchases.lifetime : "Unknown") +
+      metric("Unknown revenue", Number.isSafeInteger(d.unknownAmountCount) ? d.unknownAmountCount : "Unknown") +
+      metric("Last Stripe refresh", Number.isSafeInteger(d.refreshedAtMs) && d.refreshedAtMs > 0 ? easternDate(d.refreshedAtMs) : "Not refreshed") +
+      '</div>' + (d.refreshError ? '<p class="ops-warn">' + esc(d.refreshError) + '</p>' : "") + '</section>';
+  };
+  modes.innerHTML = makeMode("test") + makeMode("live");
+  const current = data.byMode[data.activeMode];
+  const subs = Array.isArray(current.subscriptions) ? current.subscriptions : [];
+  if (!subs.length) rows.innerHTML = '<p class="muted">No subscription records in the active mode.</p>';
+  else rows.innerHTML = '<table><thead><tr><th>Plan</th><th>Status</th><th>Monthly revenue</th><th>Discount</th><th>Renews / ends</th></tr></thead><tbody>' +
+    subs.map(s => '<tr><td>' + esc(s.plan || "Unknown") + '</td><td>' + esc(s.status || "Unknown") + (s.cancelAtPeriodEnd === true ? " · cancels" : "") + '</td><td>' +
+      (s.linesKnown === true && Number.isSafeInteger(s.netMrrMinor) && typeof s.currency === "string" ? esc(minorCurrency(s.netMrrMinor,s.currency)) : "Unknown") + '</td><td>' +
+      (Number.isFinite(s.discountPercent) ? esc(s.discountPercent + "%") : "Unknown") + '</td><td>' +
+      (Number.isSafeInteger(s.currentPeriodEndMs) && s.currentPeriodEndMs > 0 ? esc(easternDate(s.currentPeriodEndMs)) : "Unknown") + '</td></tr>').join("") + '</tbody></table>';
+  const generated = Number.isSafeInteger(data.generatedAtMs) && data.generatedAtMs > 0 ? easternDate(data.generatedAtMs) : "unknown time";
+  document.getElementById("billingReportMeta").textContent = "Active mode: " + data.activeMode.toUpperCase() + " · snapshot " + generated + (data.refreshing ? " · Stripe refresh in progress" : "");
+  const r = data.reminders || {}, counts = r.counts || {};
+  document.getElementById("billingReminderHealth").innerHTML = metric("Scheduler", r.running === true ? "Running" : r.running === false ? "Stopped" : "Unknown") +
+    ["pending","sent","canceled","needs_attention"].map(k => metric(k.replace("_"," "), Number.isSafeInteger(counts[k]) ? counts[k] : "Unknown")).join("");
+  const attention = Array.isArray(r.needsAttention) ? r.needsAttention : [];
+  document.getElementById("billingReportNote").textContent = attention.length ? attention.length + " reminder(s) need attention. Review the reminder service status before relying on automatic first-payment reminders." : "";
+  renderBillingOverview(data);
+}
+async function billingReportRefresh() {
+  try { renderBillingReport(await api("/admin/api/billing/report")); }
+  catch (e) { if (e.message !== "unauthorized") { document.getElementById("billingReportMeta").textContent = e.message; renderBillingOverview(null); } }
+}
+document.getElementById("billingReportRefresh").onclick = async () => {
+  const button = document.getElementById("billingReportRefresh"), note = document.getElementById("billingReportMeta");
+  button.disabled = true; note.textContent = "Requesting Stripe refresh…";
+  try {
+    await api("/admin/api/billing/report/refresh", { method:"POST", body:"{}" });
+    note.textContent = "Refresh requested. Checking the latest report…";
+    await new Promise(resolve => setTimeout(resolve, 900));
+    await billingReportRefresh();
+  } catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = false; }
+};
+function renderNotificationSettings(data) {
+  if (!data || data.ok !== true || typeof data.configured !== "boolean" || !data.enabledKinds || !data.counts) {
+    document.getElementById("notificationStatus").textContent = "Notification settings unavailable.";
+    document.getElementById("notificationSettingsForm").querySelectorAll("input,button").forEach(el => el.disabled = true);
+    return;
+  }
+  notificationConfigured = data.configured;
+  notificationKinds = data.enabledKinds;
+  document.getElementById("notificationStatus").textContent = (data.configured ? "Webhook configured" : "Webhook not configured") +
+    " · " + ["queued","sending","delivered","failed","ambiguous"].map(k => k + ": " + (Number.isSafeInteger(data.counts[k]) ? data.counts[k] : "?")).join(" · ");
+  document.getElementById("notificationKinds").innerHTML = NOTIFICATION_KINDS.map(([key,label]) =>
+    '<label><input type="checkbox" data-notification-kind="' + esc(key) + '"' + (data.enabledKinds[key] === true ? " checked" : "") + '> ' + esc(label) + '</label>').join("");
+  document.getElementById("notificationClearWebhook").checked = false;
+  document.getElementById("notificationWebhook").value = "";
+  document.getElementById("notificationSettingsForm").querySelectorAll("input,button").forEach(el => el.disabled = false);
+}
+async function notificationSettingsRefresh() {
+  try { renderNotificationSettings(await api("/admin/api/notifications")); }
+  catch (e) { if (e.message !== "unauthorized") document.getElementById("notificationStatus").textContent = e.message; }
+}
+document.getElementById("notificationSettingsForm").onsubmit = async event => {
+  event.preventDefault();
+  const note = document.getElementById("notificationSaveNote"), button = event.target.querySelector("button[type=submit]");
+  const input = document.getElementById("notificationWebhook"), clear = document.getElementById("notificationClearWebhook");
+  const body = { enabledKinds:Object.fromEntries(NOTIFICATION_KINDS.map(([key]) => [key, !!document.querySelector('[data-notification-kind="' + key + '"]')?.checked])) };
+  if (clear.checked) body.webhookUrl = "";
+  else if (input.value.trim()) body.webhookUrl = input.value.trim();
+  button.disabled = true; note.textContent = "Saving…";
+  try {
+    renderNotificationSettings(await api("/admin/api/notifications", { method:"POST", body:JSON.stringify(body) }));
+    input.value = "";
+    note.textContent = "Notification settings saved.";
+  }
+  catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = false; }
+};
+function renderBrevoSettings(data) {
+  if (!data || data.ok !== true || typeof data.configured !== "boolean" || typeof data.webhookConfigured !== "boolean" || !Array.isArray(data.listIds) ||
+      !data.listIds.every(id => Number.isSafeInteger(id) && id > 0)) {
+    document.getElementById("marketingBrevoStatus").textContent = "Brevo settings unavailable.";
+    document.getElementById("marketingBrevoForm").querySelectorAll("input,button").forEach(el => el.disabled = true);
+    return;
+  }
+  document.getElementById("marketingBrevoStatus").textContent =
+    (data.configured ? "API key configured" : "API key missing") + " · " +
+    (data.webhookConfigured ? "signup webhook configured" : "signup webhook missing") +
+    " · " + data.listIds.length + " list ID(s)" +
+    (typeof data.lastTestAt === "string" && Number.isFinite(Date.parse(data.lastTestAt)) ? " · last check " + easternDate(Date.parse(data.lastTestAt)) + (data.lastTestOk === true ? " passed" : data.lastTestOk === false ? " failed" : "") : "");
+  if (typeof data.lastTestMessage === "string" && data.lastTestMessage) document.getElementById("marketingBrevoStatus").textContent += " · " + data.lastTestMessage;
+  document.getElementById("marketingBrevoLists").value = data.listIds.join(", ");
+  document.getElementById("marketingBrevoClearKey").checked = false;
+  document.getElementById("marketingBrevoClearWebhook").checked = false;
+  document.getElementById("marketingBrevoClearLists").checked = false;
+  document.getElementById("marketingBrevoKey").value = "";
+  document.getElementById("marketingBrevoWebhookSecret").value = "";
+  document.getElementById("marketingBrevoForm").querySelectorAll("input,button").forEach(el => el.disabled = false);
+}
+async function marketingBrevoRefresh() {
+  try { renderBrevoSettings(await api("/admin/api/marketing/brevo")); }
+  catch (e) { if (e.message !== "unauthorized") document.getElementById("marketingBrevoStatus").textContent = e.message; }
+}
+document.getElementById("marketingBrevoForm").onsubmit = async event => {
+  event.preventDefault();
+  const note = document.getElementById("marketingBrevoNote"), button = event.target.querySelector('button[type="submit"]');
+  const key = document.getElementById("marketingBrevoKey").value.trim();
+  const secret = document.getElementById("marketingBrevoWebhookSecret").value.trim();
+  const rawLists = document.getElementById("marketingBrevoLists").value.trim();
+  const body = {};
+  if (document.getElementById("marketingBrevoClearKey").checked) body.apiKey = null;
+  else if (key) body.apiKey = key;
+  if (document.getElementById("marketingBrevoClearWebhook").checked) body.webhookBearerSecret = null;
+  else if (secret) body.webhookBearerSecret = secret;
+  if (document.getElementById("marketingBrevoClearLists").checked) body.listIds = [];
+  else if (rawLists) {
+    const ids = rawLists.split(",").map(value => value.trim());
+    if (ids.some(value => !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value)))) {
+      note.textContent = "Enter positive numeric list IDs separated by commas."; return;
+    }
+    body.listIds = [...new Set(ids.map(Number))];
+  }
+  button.disabled = true; note.textContent = "Saving…";
+  try { renderBrevoSettings(await api("/admin/api/marketing/brevo", { method:"POST", body:JSON.stringify(body) })); note.textContent = "Brevo settings saved."; }
+  catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = false; }
+};
+document.getElementById("marketingBrevoTest").onclick = async () => {
+  const button = document.getElementById("marketingBrevoTest"), note = document.getElementById("marketingBrevoNote");
+  button.disabled = true; note.textContent = "Checking account connection…";
+  try {
+    const result = await api("/admin/api/marketing/brevo/test", { method:"POST", body:"{}" });
+    renderBrevoSettings(result);
+    note.textContent = "Brevo account connection checked; no message was sent.";
+  } catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
+  finally { button.disabled = false; }
+};
 
 function billingRenderAll(data) {
   billingRenderMode(data.mode);

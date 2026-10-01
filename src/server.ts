@@ -1,5 +1,7 @@
 import { SupportSessionLimiter } from "./support-session-limiter.js";
 import { SupportChat, SupportError } from "./support-chat.js";
+import { readReleaseControlState, countUnresolvedHubBugs, DEFAULT_PRODUCTION_SOAK_MS } from "./release-controls.js";
+import { MarketingSettings } from './marketing-settings.js';
 import { EarnStripeService } from "./earn-stripe.js";
 import { EarnService, earnOwner } from "./earn.js";
 // src/server.ts
@@ -72,7 +74,7 @@ import { EarnService, earnOwner } from "./earn.js";
 // pathname only. The nginx snippet the installer emits does not add an access
 // log for /hub/ either; if the operator turns one on, that is on them.
 import fs from "node:fs";
-import { createHash, createHmac, randomBytes, timingSafeEqual, createPublicKey } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual, createPublicKey } from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { isIP, type AddressInfo } from "node:net";
@@ -112,6 +114,10 @@ import {
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
+import { LaunchBilling } from "./billing/launch.js";
+import { LaunchBillingReporting } from "./billing/reporting.js";
+import { FirstPaymentReminders } from "./billing/reminders.js";
+import { Notifications } from "./notifications.js";
 import type { CustomerRecord } from "./billing/store.js";
 import { DEFAULT_SEAT_POLICY, SeatStore } from "./seats.js";
 import type { BillingMode } from "./billing/config.js";
@@ -280,6 +286,9 @@ export interface HubDeps {
   feedbackStorageLimits?: Partial<FeedbackStorageLimits>;
   /** Injectable so billing tests never reach Stripe or an email provider. */
   billingFetch?: BillingServiceDeps["fetchLike"];
+  launchFetch?: typeof fetch;
+  notificationFetch?: typeof fetch;
+  marketingFetch?: typeof fetch;
   billingNow?: BillingServiceDeps["now"];
   billingRandomBytes?: BillingServiceDeps["randomBytes"];
   /** Injectable so customer sign-in tests never reach an email provider and
@@ -388,18 +397,49 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   let earnOutboxRunning = false;
   const earn = new EarnService(cfg.dataDir);
   let earnStripe: EarnStripeService;
+  const launchFetch: typeof fetch = deps.launchFetch ?? (deps.billingFetch ? async (input, init) => {
+    const response = await deps.billingFetch!(String(input), { method: init?.method || 'GET', headers: Object.fromEntries(new Headers(init?.headers)),
+      ...(typeof init?.body === 'string' ? { body: init.body } : {}), ...(init?.signal ? { signal: init.signal } : {}) });
+    return new Response(await response.text(), { status: response.status });
+  } : fetch);
+  let reporting: LaunchBillingReporting | null = null;
+  let notifications: Notifications | null = null;
+  let marketing: MarketingSettings | null = null;
+  try { marketing = new MarketingSettings(cfg.dataDir, deps.marketingFetch); }
+  catch { console.warn('[marketing] Saved marketing settings need repair; imports remain unavailable.'); }
+  try { notifications = new Notifications(cfg.dataDir, deps.notificationFetch, deps.billingNow); }
+  catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
   const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
+    launchFetch,
     randomBytes: deps.billingRandomBytes,
     onRevoke: (licenseId, reason) => {
       try { licenseLeases?.observeRevocation(licenseId, `license revoked by billing: ${reason}`); }
       catch (err) { console.warn(`[license-lease] could not audit billing revocation ${licenseId}: ${(err as Error).message}`); }
     },
-    onVerifiedEvent: ev => earnStripe.handleEvent(ev),
+    onVerifiedEvent: async ev => {
+      void reminders.tick().catch(() => console.warn('[billing] First-payment reminder remains pending.'));
+      await earnStripe.handleEvent(ev);
+      if (!reporting) throw Error('Billing reporting is unavailable; committed event remains pending');
+      await reporting.handleVerifiedEvent(ev);
+    },
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
     onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode, input.terminal) ?? false,
   });
+  const launchBilling = new LaunchBilling(cfg.dataDir, billing, store, cfg.publicOrigin.replace(/\/+$/, ''), launchFetch, deps.billingNow,
+    (code, mode) => earnStripe.launchReferral(code, mode));
+  try { reporting = new LaunchBillingReporting(billing.store, () => billing.config(), launchFetch, deps.billingNow, {
+    enqueue: input => { if (!notifications) throw Error('Notifications need repair'); return notifications.enqueue(input); },
+  }); } catch { console.warn('[billing] Saved reporting state needs repair; core billing remains available.'); }
+  // Existing scheduled charges still need reminders after new signup closes.
+  const reminders = new FirstPaymentReminders(billing, () => true, launchFetch, deps.billingNow);
+  let reportRefreshRunning = false, lastReportRefresh = 0;
+  const refreshReport = () => {
+    if (reportRefreshRunning || !reporting) return;
+    reportRefreshRunning = true;
+    void reporting.refresh().catch(() => console.warn('[billing] Report refresh remains pending.')).finally(() => { reportRefreshRunning = false; lastReportRefresh = Date.now(); });
+  };
   // ── Unleashed VPS Hosting (H4/H5/H6) ──────────────────────────────────────
   const hosting = new HostingService(cfg.dataDir, billing, store, cfg.publicOrigin, {
     now: deps.hostingNow,
@@ -564,7 +604,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     log: (msg) => console.log(msg),
   });
 
-  const support = new SupportChat(cfg.dataDir, cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000});
+  const support = new SupportChat(cfg.dataDir, cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}, undefined, undefined, event => {
+    if (!notifications) throw Error('Notifications need repair');
+    const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };
+    notifications.enqueue({ key: `support:${event.key ?? `${event.kind}:${event.ticketId}:${event.at}`}`, kind: event.kind, title: titles[event.kind],
+      fields: [{ name: 'Ticket', value: event.ticketId }, { name: 'Open tickets', value: String(event.openTickets), inline: true }, { name: 'Resolved tickets', value: String(event.resolvedTickets), inline: true }],
+      url: `${cfg.publicOrigin.replace(/\/+$/, '')}/admin#support` });
+  });
   const supportGuestLimiter = new SupportSessionLimiter();
   const supportSendLimiter = new SlidingWindowLimiter({windowMs:60_000,max:20,maxKeys:4096});
   let upgradeStartedAt = 0;
@@ -610,8 +656,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return false;
     }
     if (m === "POST") {
+      if (p === '/api/marketing/brevo/webhook') return true;
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
-      if (p === "/api/billing/portal-session") return true;
+      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout") return true;
       // /api/customer/signin also spends the dedicated per-email bucket
       // (`customerSigninEmailLimiter`) inside its own handler — this is the
       // per-IP half, the same "everything else public" bucket every other
@@ -768,20 +815,58 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         if (!ipRate.ok) return sendRateLimited(res, ipRate, "referral checkout attempts");
         const codeRate = referralCheckoutCodeLimiter.take(referral.slice(0, 128), rateLimitNow());
         if (!codeRate.ok) return sendRateLimited(res, codeRate, "referral checkout attempts");
-        try { return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout"); }
+        try {
+          if (launchBilling.status().enabled) {
+            const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), referral });
+            return billingRedirect(res, checkout.url, 'checkout');
+          }
+          return billingRedirect(res, await earnStripe.checkout(referral, planKey), "checkout");
+        }
         catch (e) {
-          if ((e as Error).message === 'Referral discount is not active') return billingRedirect(res, billing.buyUrl(planKey), 'checkout');
+          if ((e as Error).message === 'Referral discount is not active') {
+            if (launchBilling.status().enabled) {
+              const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID() });
+              return billingRedirect(res, checkout.url, 'checkout');
+            }
+            return billingRedirect(res, billing.buyUrl(planKey), 'checkout');
+          }
           return sendText(res, 400, (e as Error).message);
         }
+      }
+      if (launchBilling.status().enabled) {
+        const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
+        if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
+        try {
+          const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID() });
+          return billingRedirect(res, checkout.url, 'checkout');
+        } catch (e) { return sendText(res, 400, (e as Error).message); }
       }
       return billingRedirect(res, billing.buyUrl(planKey), "checkout");
     }
     // The website reads prices from here, so a price change on the Hub shows
     // on the site without a deploy. Public facts only, cached a minute.
     if (m === "GET" && p === "/api/billing/plans") {
-      return sendJson(res, 200, { ok: true, ...billing.publicPlans() }, { "access-control-allow-origin": "*", "cache-control": "public, max-age=60" });
+      return sendJson(res, 200, { ok: true, ...launchBilling.publicPlans() }, { "access-control-allow-origin": "*", "cache-control": "public, max-age=60" });
+    }
+    if (m === 'POST' && p === '/api/billing/checkout') {
+      const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
+      const body = await readJsonBody(req, 8 * 1024);
+      if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a checkout request' });
+      try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
+      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
     }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
+    if (m === 'POST' && p === '/api/marketing/brevo/webhook') {
+      if (!marketing) return sendJson(res, 503, { ok: false, error: 'Marketing is unavailable' });
+      const body = await readJsonBody(req, 16 * 1024);
+      try {
+        const result = await marketing.brevo.handleOptOutWebhook(req.headers.authorization, body);
+        return sendJson(res, 200, { ok: true, result });
+      } catch (error) {
+        return sendJson(res, (error as Error).message === 'Unauthorized Brevo webhook.' ? 401 : 503, { ok: false, error: 'Webhook could not be processed' });
+      }
+    }
     if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
       return stripeWebhook(req, res, p.endsWith("/live") ? "live" : "test");
     }
@@ -881,6 +966,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
     }
     const revoked = registryRevoked || seatRefused !== null;
+    if (!revoked) billing.refreshLifetimeLicense(body.licenseId);
     // The reply also carries the latest published beta version (when one
     // exists) so the bot can show "update available" — informational only;
     // a bot that ignores it loses nothing.
@@ -2611,10 +2697,60 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, configured: true, health: marketCaps.health() });
     }
     // ── billing ─────────────────────────────────────────────────────────
+    if (p.startsWith('/admin/api/marketing/brevo')) {
+      if (!marketing) return sendJson(res, 503, { ok: false, error: 'Marketing settings need repair' });
+      if (m === 'GET' && p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.status() }, { 'cache-control': 'no-store' });
+      if (m === 'POST') {
+        try {
+          if (p === '/admin/api/marketing/brevo/test') return sendJson(res, 200, { ok: true, ...await marketing.brevo.testConnection() }, { 'cache-control': 'no-store' });
+          const body = await readJsonBody(req, 64 * 1024);
+          if (!body) return sendJson(res, 400, { ok: false, error: 'Expected marketing settings' });
+          if (p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.configure(body) }, { 'cache-control': 'no-store' });
+          if (p === '/admin/api/marketing/brevo/import') return sendJson(res, 200, { ok: true, results: await marketing.import(body) }, { 'cache-control': 'no-store' });
+        } catch { return sendJson(res, 400, { ok: false, error: 'Check marketing settings, list IDs, and consent evidence; completed imports can be retried safely' }); }
+      }
+    }
     // Keys are WRITE-ONLY here: the page gets `configured` + last4. See
     // src/billing/config.ts for the patch semantics ("" keeps, null clears).
+    if (m === 'GET' && p === '/admin/api/releases/status') {
+      try {
+        const latest = readLatest();
+        const control = readReleaseControlState(path.join(cfg.releasesDir, '.release-control.v1.json'));
+        const recorded = latest && control.beta?.sha256 === latest.sha256 && control.beta?.buildId === latest.buildId ? control.beta : null;
+        const ageMs = recorded ? Math.max(0, Date.now() - Date.parse(recorded.publishedAt)) : null;
+        return sendJson(res, 200, { ok: true, alpha: { private: true },
+          beta: { version: latest?.version ?? null, manualPublish: true, publishedAt: recorded?.publishedAt ?? null,
+            soakDays: ageMs === null ? null : Math.min(7, Math.floor(ageMs / 86400000)),
+            soakComplete: ageMs !== null && ageMs >= DEFAULT_PRODUCTION_SOAK_MS,
+            unresolvedBugs: latest ? countUnresolvedHubBugs(path.join(cfg.dataDir, 'feedback.jsonl'), latest.version) : null },
+          production: { version: control.production?.version ?? null, automaticPromotionEnabled: false,
+            hold: control.productionHold?.reason ?? 'Publishing is disabled for this rollout',
+            checks: ['7 days on the same Beta build', 'No unresolved bugs for that build', 'Passing tests and fresh health checks', 'Verified compatible rollback'] },
+        }, { 'cache-control': 'no-store' });
+      } catch { return sendJson(res, 503, { ok: false, error: 'Release evidence needs review; publishing remains disabled' }, { 'cache-control': 'no-store' }); }
+    }
     if (m === "GET" && p === "/admin/api/billing/config") {
       return sendJson(res, 200, { ok: true, ...billing.adminConfigView(readLatest() !== null) }, { "cache-control": "no-store" });
+    }
+    if (m === 'GET' && p === '/admin/api/billing/launch') return sendJson(res, 200, { ok: true, ...launchBilling.status() }, { 'cache-control': 'no-store' });
+    if (m === 'GET' && p === '/admin/api/billing/report') return sendJson(res, 200, { ...(reporting?.snapshot() ?? { ok: false, error: 'Reporting state needs repair' }), refreshing: reportRefreshRunning, reminders: reminders.status() }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/billing/report/refresh') { refreshReport(); return sendJson(res, 202, { ok: true, refreshing: reportRefreshRunning }, { 'cache-control': 'no-store' }); }
+    if (m === 'GET' && p === '/admin/api/notifications') return sendJson(res, 200, notifications ? { ok: true, ...notifications.status() } : { ok: false, error: 'Notification state needs repair' }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/notifications') {
+      if (!notifications) return sendJson(res, 503, { ok: false, error: 'Notification state needs repair' });
+      const body = await readJsonBody(req, 4096);
+      if (!body) return sendJson(res, 400, { ok: false, error: 'Expected notification settings' });
+      try { return sendJson(res, 200, { ok: true, ...notifications.configure(body) }, { 'cache-control': 'no-store' }); }
+      catch { return sendJson(res, 400, { ok: false, error: 'Check the Discord webhook URL and notification settings' }); }
+    }
+    if (m === 'POST' && p === '/admin/api/billing/launch') {
+      const body = await readJsonBody(req, 4096);
+      try {
+        if (body?.action === 'prepare') return sendJson(res, 200, { ok: true, ...await launchBilling.prepare() }, { 'cache-control': 'no-store' });
+        if (typeof body?.enabled !== 'boolean' || typeof body?.cryptoEnabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'Expected launch settings' });
+        launchBilling.setEnabled(body.enabled, body.cryptoEnabled);
+        return sendJson(res, 200, { ok: true, ...launchBilling.status() }, { 'cache-control': 'no-store' });
+      } catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
     }
     if (m === "POST" && p === "/admin/api/billing/config") {
       const body = await readJsonBody(req);
@@ -2791,6 +2927,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             if (!earnOutboxRunning) return;
             void billing.drainAfterCommit().catch((err) =>
               console.warn(`[billing] Earn outbox drain failed: ${(err as Error).message}`));
+            support.flushNotifications();
+            void notifications?.flush().catch(() => console.warn('[notifications] Delivery remains pending.'));
+            void reminders.tick().catch(() => console.warn('[billing] First-payment reminders remain pending.'));
+            if (Date.now() - lastReportRefresh > 5 * 60000) refreshReport();
           }, 15_000);
           earnOutboxTimer.unref();
           setImmediate(() => {

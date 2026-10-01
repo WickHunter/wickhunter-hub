@@ -73,6 +73,13 @@ export interface CustomerRecord {
   refunded: boolean;
   lastEventType: string | null;
   lastEventAtMs: number | null;
+  firstPaymentAtMs?: number | null;
+  firstActualPaymentAtMs?: number | null;
+  discountPercent?: number;
+  nonRenewing?: boolean;
+  cancelAtPeriodEnd?: boolean;
+  lifetimeAccess?: boolean;
+  launchManaged?: boolean;
 }
 
 export type TokenKind = "page" | "install";
@@ -168,6 +175,8 @@ export interface CheckoutSessionRecord {
   planKey?: string | null;
   subscriptionId?: string;
   paymentIntentId?: string;
+  launchIntentId?: string;
+  paidAtMs?: number;
 }
 
 export const roleSubscriptionKey = (customerKey: string, role: BillingRole): string => `${customerKey}::${role}`;
@@ -228,6 +237,8 @@ export class BillingStore {
       (rec.planKey !== undefined && rec.planKey !== null && typeof rec.planKey !== "string") ||
       (rec.subscriptionId !== undefined && typeof rec.subscriptionId !== "string") ||
       (rec.paymentIntentId !== undefined && typeof rec.paymentIntentId !== "string") ||
+      (rec.launchIntentId !== undefined && !/^[a-f0-9]{64}$/.test(rec.launchIntentId)) ||
+      (rec.paidAtMs !== undefined && (!Number.isSafeInteger(rec.paidAtMs) || rec.paidAtMs <= 0)) ||
       (rec.status === "applied" && !rec.licenseId)
     ) throw new Error(`corrupt checkout-session marker for ${sessionId}`);
     return rec as CheckoutSessionRecord;
@@ -274,6 +285,8 @@ export class BillingStore {
       planKey: input.planKey,
       subscriptionId: input.subscriptionId,
       paymentIntentId: input.paymentIntentId,
+      launchIntentId: input.launchIntentId,
+      paidAtMs: input.paidAtMs,
     };
     writeJsonAtomic(this.checkoutSessionPath(input.sessionId), record);
     return { created: true, record };
@@ -344,6 +357,14 @@ export class BillingStore {
     return this.customers()[key] ?? null;
   }
 
+  findByStripeCustomer(customerId: string, livemode?: boolean): CustomerRecord | null {
+    if (!customerId) return null;
+    for (const rec of Object.values(this.customers())) {
+      if (rec.stripeCustomerId === customerId && (livemode === undefined || rec.livemode === livemode)) return rec;
+    }
+    return null;
+  }
+
   putCustomer(rec: CustomerRecord): void {
     const all = this.customers();
     all[rec.key] = rec;
@@ -367,10 +388,10 @@ export class BillingStore {
     return null;
   }
 
-  findByEmail(email: string): CustomerRecord | null {
+  findByEmail(email: string, livemode?: boolean): CustomerRecord | null {
     const e = email.trim().toLowerCase();
     if (!e) return null;
-    for (const rec of Object.values(this.customers())) if (rec.email === e) return rec;
+    for (const rec of Object.values(this.customers())) if (rec.email === e && (livemode === undefined || rec.livemode === livemode)) return rec;
     return null;
   }
 

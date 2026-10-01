@@ -67,7 +67,18 @@ export class Notifications {
     }
     if (changed) this.persist();
   }
-  private persist() { writeTextAtomic(this.file, JSON.stringify(this.state) + '\n'); }
+  private persist() {
+    try { writeTextAtomic(this.file, JSON.stringify(this.state) + '\n'); }
+    catch (error) {
+      // A failed write must not leave an in-memory duplicate marker that
+      // acknowledges work which never became durable.
+      this.state = readJson<State>(this.file, empty());
+      for (const row of this.state.rows) if (row.state === 'sending') {
+        row.state = 'ambiguous'; row.error = 'delivery outcome unknown'; row.nextAttemptAt = this.now();
+      }
+      throw error;
+    }
+  }
   configure(input: { webhookUrl?: unknown; enabledKinds?: unknown }) {
     const next = structuredClone(this.state);
     if (input.webhookUrl !== undefined) {

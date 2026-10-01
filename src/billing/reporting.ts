@@ -40,20 +40,24 @@ function monthSpan(interval: unknown, count: unknown): number | null {
   if (interval === 'year') return 12 * Number(count);
   return null;
 }
-function discountPercentFromStripe(raw: StripeObject, metadata: Record<string, string>): number | null {
-  if (metadata.managed_by === 'wh-launch') {
-    const value = Number(metadata.launch_discount_percent);
-    return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
-  }
+function discountPercentFromStripe(raw: StripeObject, now: number): number | null {
+  // Metadata records the original offer; the live discount may have been
+  // removed or changed in Stripe. Revenue must follow current Stripe facts.
   const discounts = Array.isArray(raw.discounts) ? raw.discounts
     : raw.discount === null ? [] : raw.discount ? [raw.discount] : null;
   if (discounts === null) return null;
   let remaining = 1;
   for (const discount of discounts) {
+    if (typeof discount !== 'object' || !discount) return null;
+    if (Number.isFinite(discount.end) && discount.end * 1000 <= now) continue;
     const source = discount?.source;
     const coupon = discount?.coupon ?? source?.coupon ?? (source?.type === 'coupon' ? source.coupon : null);
-    const percent = Number(coupon?.percent_off);
-    if (!Number.isFinite(percent) || percent < 0 || percent > 100 || coupon?.amount_off != null) return null;
+    const percent = coupon?.percent_off;
+    if (typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100 || coupon?.amount_off != null) return null;
+    // Fixed/one-invoice discounts and mixed product applicability require a
+    // full invoice projection. Expose unknown instead of guessing an MRR.
+    if (coupon.duration === 'once') return null;
+    if (coupon.applies_to?.products && raw.items?.data?.some((item: StripeObject) => !coupon.applies_to.products.includes(id(item.price?.product)))) return null;
     remaining *= (100 - percent) / 100;
   }
   return (1 - remaining) * 100;
@@ -67,15 +71,15 @@ function formatMinor(currency: string, minor: number): string {
 }
 function subscriptionLines(raw: StripeObject): LineFact[] | null {
   const items = raw.items?.data;
-  if (!Array.isArray(items) || !items.length) return null;
+  if (!Array.isArray(items) || !items.length || raw.items.has_more) return null;
   const out: LineFact[] = [];
   for (const item of items) {
     const price = item?.price;
     const currency = typeof price?.currency === 'string' && /^[a-z]{3}$/.test(price.currency) ? price.currency : '';
     const unit = minorAmount(price?.unit_amount ?? price?.unit_amount_decimal);
-    const quantity = Number.isSafeInteger(item?.quantity) && item.quantity > 0 ? item.quantity : 1;
+    const quantity = Number.isSafeInteger(item?.quantity) && item.quantity >= 0 ? item.quantity : null;
     const months = monthSpan(price?.recurring?.interval, price?.recurring?.interval_count ?? 1);
-    if (!currency || unit === null || months === null) return null;
+    if (!currency || unit === null || months === null || quantity === null || price.recurring?.usage_type === 'metered') return null;
     out.push({ currency, amountMinor: unit * quantity, months });
   }
   return out;
@@ -89,6 +93,10 @@ export interface ReportingDeps {
 export class LaunchBillingReporting {
   private readonly file: string;
   private state: Persisted;
+  private tail: Promise<unknown> = Promise.resolve();
+  private serial<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(operation, operation); this.tail = run.catch(() => {}); return run;
+  }
   constructor(private readonly store: BillingStore, private readonly billing: () => BillingConfig,
     private readonly fetcher: typeof fetch = fetch, private readonly now = Date.now, private readonly deps: ReportingDeps = {}) {
     this.file = path.join(store.dataDir, REPORT_FILE);
@@ -118,7 +126,8 @@ export class LaunchBillingReporting {
   /** Refresh exact subscription facts for known software customers. Individual
    * failures are summarized without provider text; old facts remain marked by
    * their original timestamp and are not silently replaced with guesses. */
-  async refresh(mode?: BillingMode) {
+  refresh(mode?: BillingMode) { return this.serial(() => this.refreshNow(mode)); }
+  private async refreshNow(mode?: BillingMode) {
     const modes = mode ? [mode] : [...MODES];
     for (const m of modes) {
       let failures = 0;
@@ -145,20 +154,20 @@ export class LaunchBillingReporting {
   private async pullWithApi(api: EarnStripeApi, mode: BillingMode, customer: CustomerRecord): Promise<SubscriptionFact | null> {
     const subId = customer.subscriptionId;
     if (!subId || !/^sub_[A-Za-z0-9_]+$/.test(subId)) return null;
-    const raw = await api.call('GET', '/v1/subscriptions/' + subId, { 'expand[0]': 'discounts' });
+    const raw = await api.call('GET', '/v1/subscriptions/' + subId, { 'expand[0]': 'discounts.coupon' });
     return this.factFromStripe(raw, mode, customer, subId);
   }
   private factFromStripe(raw: StripeObject, mode: BillingMode, customer: CustomerRecord, subId: string): SubscriptionFact | null {
     const sf = subscriptionFacts(raw);
-    if (sf.subscriptionId !== subId || sf.customerId !== customer.stripeCustomerId || customer.livemode !== (mode === 'live')) return null;
+    if (sf.subscriptionId !== subId || sf.customerId !== customer.stripeCustomerId || customer.livemode !== (mode === 'live')) throw Error('Subscription identity could not be confirmed');
     // The customer's row is the software role boundary: non-software products
     // live in a separate BillingStore ledger. Launch metadata supplies the
     // fixed promo contract; older known software subscriptions remain in the
     // total only when Stripe exposes enough data to price their discount.
-    const plan = sf.metadata.plan;
-    if (!plan || !this.billing().plans.some(p => p.key === plan && p.role === 'software')) return null;
-    const discountPercent = discountPercentFromStripe(raw, sf.metadata);
-    const lines = subscriptionLines(raw);
+    const plan = sf.metadata.plan || customer.planKey || 'unknown';
+    const discountPercent = discountPercentFromStripe(raw, this.now());
+    const configuredPlan = this.billing().plans.find(p => p.key === plan);
+    const lines = configuredPlan?.checkout === 'payment-link' ? subscriptionLines(raw) : null;
     let currency: string | null = null, grossMrrMinor: number | null = null, netMrrMinor: number | null = null;
     if (lines && lines.every(line => line.currency === lines[0].currency) && discountPercent !== null) {
       currency = lines[0].currency;
@@ -176,6 +185,7 @@ export class LaunchBillingReporting {
     const config = this.billing();
     const byMode = Object.fromEntries(MODES.map(mode => {
       const facts = this.state.facts.filter(f => f.mode === mode);
+      const missingFacts = this.customers(mode).filter(c => c.subscriptionId && !facts.some(f => f.subscriptionId === c.subscriptionId));
       const active = facts.filter(f => ['active', 'trialing'].includes(f.status) && !(f.firstPaymentAtMs && f.firstPaymentAtMs > this.now()));
       const scheduled = facts.filter(f => ['active', 'trialing'].includes(f.status) && !!f.firstPaymentAtMs && f.firstPaymentAtMs > this.now());
       const mrr: Record<string, number> = {}, scheduledMrr: Record<string, number> = {};
@@ -191,7 +201,9 @@ export class LaunchBillingReporting {
       return [mode, {
         activeRecurring: active.length, scheduledPrelaunchStarts: scheduled.length,
         oneTimePurchases: counts, mrrMinorByCurrency: mrr, scheduledMrrMinorByCurrency: scheduledMrr,
-        unknownAmountCount: unknownAmount,
+        unknownAmountCount: unknownAmount + missingFacts.length,
+        unrefreshedSubscriptionCount: missingFacts.length,
+        knownRecurringSubscriptions: facts.length + missingFacts.length,
         subscriptions: facts.map(({ customerId, subscriptionId, plan, status, cancelAtPeriodEnd, currentPeriodEndMs, firstPaymentAtMs, discountPercent, currency, netMrrMinor, linesKnown, updatedAtMs }) =>
           ({ customerId, subscriptionId, plan, status, cancelAtPeriodEnd, currentPeriodEndMs, firstPaymentAtMs, discountPercent, currency, netMrrMinor, linesKnown, updatedAtMs })),
         refreshedAtMs: this.state.lastRefreshAtMs[mode] ?? null,
@@ -202,42 +214,50 @@ export class LaunchBillingReporting {
   }
   private knownCustomer(mode: BillingMode, customerId: string, email = ''): CustomerRecord | null {
     if (customerId) return this.customers(mode).find(c => c.stripeCustomerId === customerId) ?? null;
-    const byEmail = email ? this.store.findByEmail(email) : null;
+    const byEmail = email ? this.store.findByEmail(email, mode === 'live') : null;
     return byEmail?.livemode === (mode === 'live') ? byEmail : null;
   }
   private enqueueOnce(dedupeKey: string, input: Omit<NotificationInput, 'key'>, notificationKey = dedupeKey) {
     if (!this.deps.enqueue) return false;
     if (this.state.signupSent[dedupeKey]) return false;
     this.deps.enqueue({ ...input, key: notificationKey });
+    const prior = { ...this.state.signupSent };
     this.state.signupSent[dedupeKey] = notificationKey;
     const keys = Object.keys(this.state.signupSent);
     if (keys.length > 5_000) for (const old of keys.slice(0, keys.length - 5_000)) delete this.state.signupSent[old];
-    this.save(); return true;
+    try { this.save(); }
+    catch (error) { this.state.signupSent = prior; throw error; }
+    return true;
   }
-  private noticeFields(mode: BillingMode, plan: string, snapshot = this.snapshot()) {
+  private noticeFields(mode: BillingMode, plan: string, snapshot = this.snapshot(), fact?: SubscriptionFact) {
     const row = (snapshot.byMode as Record<string, any>)[mode];
     return [
       { name: 'Plan', value: plan, inline: true },
       { name: 'Active recurring subscriptions', value: String(row.activeRecurring), inline: true },
       { name: 'Scheduled prelaunch starts', value: String(row.scheduledPrelaunchStarts), inline: true },
       { name: 'Subscriptions with unknown revenue', value: String(row.unknownAmountCount), inline: true },
+      { name: 'One-time purchases', value: `${row.oneTimePurchases.yearly} Yearly · ${row.oneTimePurchases.lifetime} Lifetime`, inline: true },
+      ...(fact ? [{ name: 'Discount', value: fact.discountPercent === null ? 'Not confirmed' : `${fact.discountPercent}%`, inline: true }] : []),
       ...Object.entries(row.mrrMinorByCurrency as Record<string, number>).map(([currency, amount]) => ({ name: `Expected monthly revenue (${currency.toUpperCase()})`, value: formatMinor(currency, amount), inline: true })),
     ];
   }
   /** Call only after Stripe signature verification and successful BillingService
    * processing. Fetches only the current subscription belonging to a known
    * software customer; event payloads never directly alter aggregate totals. */
-  async handleVerifiedEvent(event: StripeEvent): Promise<{ refreshed: boolean; notices: number; snapshot: unknown }> {
+  handleVerifiedEvent(event: StripeEvent): Promise<{ refreshed: boolean; notices: number; snapshot: unknown }> {
+    return this.serial(() => this.handleEventNow(event));
+  }
+  private async handleEventNow(event: StripeEvent): Promise<{ refreshed: boolean; notices: number; snapshot: unknown }> {
     const mode: BillingMode = event.livemode ? 'live' : 'test';
     const eventObject = event.object as StripeObject;
     let customerId = '', customerEmail = '', subscriptionId = '', plan = '', sourceId = '', managedBy = '';
     let oneTimeCheckout = false;
     let paidInvoice = false;
     let eventKind: 'signup' | 'renewal' | 'discount' | 'paymentFailed' | null = null;
-    if (event.type === 'checkout.session.completed') {
+    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
       const facts = checkoutFacts(eventObject); customerId = facts.customerId; customerEmail = facts.email; subscriptionId = facts.subscriptionId;
       plan = facts.metadata.plan || ''; managedBy = facts.metadata.managed_by || ''; sourceId = facts.sessionId;
-      if (facts.mode === 'subscription' && facts.status === 'complete' && facts.paymentStatus === 'paid') eventKind = 'signup';
+      if (facts.mode === 'subscription' && facts.status === 'complete' && ['paid', 'no_payment_required'].includes(facts.paymentStatus)) eventKind = 'signup';
       else if (facts.mode === 'payment' && facts.status === 'complete' && facts.paymentStatus === 'paid') { eventKind = 'signup'; oneTimeCheckout = true; }
     } else if (['customer.subscription.updated', 'customer.subscription.deleted'].includes(event.type)) {
       const facts = subscriptionFacts(eventObject); customerId = facts.customerId; subscriptionId = facts.subscriptionId;
@@ -258,7 +278,7 @@ export class LaunchBillingReporting {
     let fact: SubscriptionFact | null = null;
     if (subscriptionId && /^sub_[A-Za-z0-9_]+$/.test(subscriptionId)) {
       try { fact = await this.pullWithApi(this.api(mode), mode, customer); this.putFact(fact, mode, subscriptionId); }
-      catch { this.state.lastRefreshError[mode] = 'A known subscription could not be refreshed'; this.save(); }
+      catch { this.state.lastRefreshError[mode] = 'A known subscription could not be refreshed'; this.save(); throw Error('Subscription refresh is pending; retry the committed billing event'); }
     }
     const snapshot = this.snapshot();
     let notices = 0;
@@ -270,22 +290,22 @@ export class LaunchBillingReporting {
       const currentlyBillable = ['active', 'trialing'].includes(fact.status) && !(fact.firstPaymentAtMs && fact.firstPaymentAtMs > this.now());
       // Signup dedupes by subscription even if an invoice-created event races
       // ahead of Checkout completion; renewal/payment-failure dedupe by invoice.
-      if (eventKind === 'signup' && currentlyBillable) {
+      if (eventKind === 'signup' && ['active', 'trialing'].includes(fact.status)) {
         notices += this.enqueueOnce(`signup:${mode}:${subscriptionId}`, {
-          kind: 'signup', title: 'New recurring subscription', fields: this.noticeFields(mode, fact.plan, snapshot),
+          kind: 'signup', title: currentlyBillable ? 'New recurring subscription' : 'New subscription — first payment scheduled', fields: this.noticeFields(mode, fact.plan, snapshot, fact),
         }, `${mode}:${sourceId}:signup`) ? 1 : 0;
       } else if ((eventKind === 'renewal' && currentlyBillable) || eventKind === 'paymentFailed') {
         const notificationKey = `${mode}:${sourceId}:${eventKind}`;
         const dedupeKey = `${eventKind}:${notificationKey}`;
         notices += this.enqueueOnce(dedupeKey, {
           kind: eventKind, title: eventKind === 'renewal' ? 'Subscription renewed' : 'Subscription payment failed',
-          fields: this.noticeFields(mode, fact.plan, snapshot),
+          fields: this.noticeFields(mode, fact.plan, snapshot, fact),
         }, notificationKey) ? 1 : 0;
       }
       if (paidInvoice && ['signup', 'renewal'].includes(eventKind || '') && currentlyBillable && fact.discountPercent !== null && fact.discountPercent > 0) {
         const notificationKey = `${mode}:${sourceId}:discount`;
         notices += this.enqueueOnce(`discount:${notificationKey}`, {
-          kind: 'discount', title: 'Launch discount applied',
+          kind: 'discount', title: 'Subscription discount applied',
           fields: [...this.noticeFields(mode, fact.plan, snapshot), { name: 'Discount', value: `${fact.discountPercent}%`, inline: true }],
         }, notificationKey) ? 1 : 0;
       }

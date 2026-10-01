@@ -32,6 +32,7 @@ const firstPaymentAtMs = Date.parse('2026-10-15T00:00:00-04:00');
 assert.equal(firstPaymentAtMs, 1792036800000, '2026-10-15 00:00 America/New_York is 04:00 UTC');
 const subscription = (id, customer, metadata, price, status = 'active') => ({
   id, customer, status, cancel_at_period_end: false, current_period_end: 1794628800, metadata,
+  ...(metadata.launch_discount_percent !== undefined ? { discounts: Number(metadata.launch_discount_percent) ? [{ coupon: { percent_off: Number(metadata.launch_discount_percent), amount_off: null, duration: 'forever' } }] : [] } : {}),
   items: { data: [{ quantity: 1, price }] },
 });
 const fixtures = {
@@ -59,6 +60,14 @@ const fetcher = async (url, init = {}) => {
 const notifications = [];
 const reporter = new LaunchBillingReporting(store, () => config, fetcher, () => now, { enqueue: n => notifications.push(n) });
 const initial = await reporter.refresh();
+fixtures.sub_one.discounts = [];
+assert.equal((await reporter.refresh()).byMode.test.subscriptions.find(s => s.subscriptionId === 'sub_one').netMrrMinor, 9900,
+  'removed live discount overrides stale original launch metadata');
+fixtures.sub_one.discounts = [{ coupon: { percent_off: 10, amount_off: null, duration: 'forever' } }];
+assert.equal((await reporter.refresh()).byMode.test.subscriptions.find(s => s.subscriptionId === 'sub_one').netMrrMinor, 8910,
+  'changed live discount drives current revenue');
+fixtures.sub_one.discounts = [{ coupon: { percent_off: 25, amount_off: null, duration: 'forever' } }];
+await reporter.refresh();
 const report = initial.byMode.test;
 assert.equal(report.activeRecurring, 3);
 assert.equal(report.scheduledPrelaunchStarts, 1);

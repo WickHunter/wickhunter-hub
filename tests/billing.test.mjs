@@ -311,6 +311,11 @@ await test("check-in carries `subscription` for a licence bound to a Stripe cust
     status: "active",
     currentPeriodEndMs: clock + 30 * DAY,
     portalAvailable: true,
+    firstPaymentAtMs: null,
+    firstActualPaymentAtMs: clock,
+    discountPercent: 0,
+    nonRenewing: false,
+    cancelAtPeriodEnd: false,
   });
 
   const bareIssued = h.store.issue("No Billing Tester", 30);

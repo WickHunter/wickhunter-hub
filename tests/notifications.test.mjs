@@ -60,4 +60,15 @@ assert.equal(JSON.stringify(events).includes('private'), false, 'ticket notifica
 assert.equal(JSON.stringify(events).includes('Private Customer Name'), false);
 assert.equal(JSON.stringify(events).includes('license-secret'), false);
 
+const recoverDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wh-support-notify-recovery-'));
+const unavailable = new SupportChat(recoverDir, { enabled: true, aiEnabled: false, apiKey: '', totalMonthlyMicros: 1_000_000 }, fetch, () => now, () => { throw Error('notification storage unavailable'); });
+await unavailable.message(identity, { text: 'Recover this ticket', requestId: 'recovery_0001', human: true });
+assert.equal(unavailable.admin().notificationPending, 2);
+const recoveredEvents = [];
+const recovered = new SupportChat(recoverDir, { enabled: true, aiEnabled: false, apiKey: '', totalMonthlyMicros: 1_000_000 }, fetch, () => now, e => recoveredEvents.push(e));
+recovered.flushNotifications(); recovered.flushNotifications();
+assert.deepEqual(recoveredEvents.map(e => e.kind), ['supportNew', 'supportHuman']);
+assert.equal(recovered.admin().notificationPending, 0);
+assert.equal(new Set(recoveredEvents.map(e => e.key)).size, 2);
+
 console.log('Discord notification validation, durable queue, redaction and support event hooks passed');

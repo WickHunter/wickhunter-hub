@@ -43,6 +43,7 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
+import { launchGrant, reconcileLaunchSession } from "./launch.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
@@ -81,6 +82,7 @@ const DISPATCHED_EVENT_TYPES = new Set([
   "charge.dispute.created",
 ]);
 const EARN_HOOK_TYPES = new Set([
+  "checkout.session.completed", "checkout.session.async_payment_succeeded", "invoice.payment_failed",
   "invoice.paid", "invoice.payment_succeeded",
   "customer.subscription.updated", "customer.subscription.deleted",
   "charge.refunded", "charge.dispute.created", "charge.dispute.closed",
@@ -91,6 +93,7 @@ export interface BillingServiceDeps {
   now?: () => number;
   /** One injected fetch serves the email provider AND the Stripe portal call. */
   fetchLike?: EmailFetch;
+  launchFetch?: typeof fetch;
   randomBytes?: (n: number) => Buffer;
   log?: (line: string) => void;
   /** Fired after a licence is revoked here, so the server can tell the lease
@@ -134,6 +137,7 @@ interface CustomerFacts {
   subscriptionId: string;
   livemode: boolean;
   planKey: string | null;
+  metadata?: Record<string, string>;
 }
 
 const realFetch: EmailFetch = async (url, init) => {
@@ -145,6 +149,7 @@ export class BillingService {
   readonly store: BillingStore;
   private readonly now: () => number;
   private readonly fetchLike: EmailFetch;
+  private readonly launchFetch: typeof fetch;
   private readonly log: (line: string) => void;
   private readonly onVerifiedEvent: BillingServiceDeps["onVerifiedEvent"];
   private readonly afterCommitOutbox: AfterCommitOutbox | null;
@@ -172,6 +177,7 @@ export class BillingService {
     this.store = new BillingStore(dataDir, deps.randomBytes);
     this.now = deps.now ?? Date.now;
     this.fetchLike = deps.fetchLike ?? realFetch;
+    this.launchFetch = deps.launchFetch ?? fetch;
     this.log = deps.log ?? ((line) => console.log(line));
     this.onRevoke = deps.onRevoke ?? (() => {});
     this.onHostingEvent = deps.onHostingEvent ?? (() => {});
@@ -861,8 +867,22 @@ export class BillingService {
     const f = checkoutFacts(ev.object);
     if (f.mode !== "subscription" && f.mode !== "payment") return { outcome: "ignored", note: `checkout mode ${f.mode || "?"}` };
     if (f.paymentStatus === "unpaid") return { outcome: "ignored", note: "payment not confirmed yet (async_payment_succeeded will follow)" };
+    let launch = null as ReturnType<typeof launchGrant>;
+    if (f.metadata.wh_launch_intent) {
+      if (!f.customerId) throw Error('Launch checkout is missing its Stripe customer');
+      const mode = ev.livemode ? 'live' : 'test';
+      const grant = await reconcileLaunchSession(this.dataDir, f.metadata, ev.livemode, f.sessionId,
+        cfg.stripe[mode].secretKey, this.launchFetch, this.now());
+      launch = grant;
+      if (!grant || f.mode !== grant.stripeParams.mode ||
+        (grant.payment === 'crypto' ? f.paymentStatus !== 'paid' : f.mode === 'payment' && f.paymentStatus !== 'paid')) {
+        throw Error('Launch checkout payment mode or settlement does not match the purchase');
+      }
+      if (f.mode === 'subscription' && !f.subscriptionId) throw Error('Launch checkout is missing its Stripe subscription');
+    }
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "checkout carried neither a customer nor an email" };
-    const known = this.findCustomer(f.customerId, f.email);
+    const known = (launch?.licenseId ? this.store.findByLicense(launch.licenseId) : null)
+      ?? this.findCustomer(f.customerId, f.email, ev.livemode, !launch);
     const lockKeys = [...new Set([known?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
     return this.withCheckoutLocks(lockKeys, () => f.mode === "payment"
       ? this.onPaymentCheckout(ev, cfg, f)
@@ -876,11 +896,14 @@ export class BillingService {
     if (!f.sessionId) throw new Error("payment checkout is missing its Stripe session id");
     const now = this.now();
     const planKey = this.planKeyOf(f.metadata, cfg);
+    const grant = launchGrant(this.dataDir, f.metadata, ev.livemode, f.sessionId);
     const oneOffDays = this.oneOffDaysFor(f.metadata, planByKey(cfg, planKey), cfg);
-    const beforeRecovery = this.findCustomer(f.customerId, f.email);
+    const beforeRecovery = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
+      ?? this.findCustomer(f.customerId, f.email, ev.livemode, !grant);
     const recoveryKeys = [...new Set([beforeRecovery?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
     for (const key of recoveryKeys) await this.recoverPendingCheckout(key, cfg, now, ev);
-    const existing = this.findCustomer(f.customerId, f.email);
+    const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
+      ?? this.findCustomer(f.customerId, f.email, ev.livemode, !grant);
     // If Stripe adds a customer id to a session that was first observed by
     // email, retain the BillingStore row's canonical key for the marker.
     const customerKey = existing?.key ?? (f.customerId || `email:${f.email}`);
@@ -901,12 +924,19 @@ export class BillingService {
       }
     } else {
       targetExpMs = this.capExp({ livemode: ev.livemode, createdAtMs: now }, now + oneOffDays * DAY_MS, cfg);
+      if (grant?.licenseId) {
+        const bound = this.licenses.get(grant.licenseId);
+        if (!bound || this.licenses.isRevoked(bound.id)) throw Error('The checkout license is no longer available');
+        licenseId = bound.id;
+        targetExpMs = Math.min(this.capExp({ livemode: ev.livemode, createdAtMs: now }, Math.max(bound.exp, now) + oneOffDays * DAY_MS, cfg), bound.iat + MAX_LICENSE_DAYS * DAY_MS);
+      }
     }
+    if (grant?.accessUntilMs) targetExpMs = Math.max(targetExpMs, this.capExp({ livemode: ev.livemode, createdAtMs: now }, grant.accessUntilMs, cfg));
     // The pointer is written before the marker so a crash between these two
     // writes leaves only a harmless stale pointer, which the next checkout
     // clears after observing the missing marker.
     this.store.putPendingCheckout(customerKey, f.sessionId);
-    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId });
+    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id } : {}) });
     const marker = claimed.record;
     if (!claimed.created && marker.status === "applied") {
       this.assertAppliedCheckout(marker);
@@ -914,7 +944,7 @@ export class BillingService {
       return { outcome: "duplicate", note: "checkout session was already applied" };
     }
     const { rec, created } = this.ensureCustomer(
-      { customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey },
+      { customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata },
       cfg,
       marker.targetExpMs,
       now,
@@ -938,6 +968,9 @@ export class BillingService {
       this.extendLicense(rec, marker.targetExpMs, cfg, now);
     }
     const checkoutMarker = `cs:${f.sessionId}`;
+    if (planByKey(cfg, planKey)?.lifetime && ev.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
+    if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
+    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
     this.noteCharge(rec, checkoutMarker);
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -969,6 +1002,7 @@ export class BillingService {
       subscriptionId: marker.subscriptionId ?? "",
       livemode: marker.livemode ?? ev.livemode,
       planKey: marker.planKey ?? null,
+      ...(marker.launchIntentId ? { metadata: { wh_launch_intent: marker.launchIntentId, plan: marker.planKey ?? '' } } : {}),
     }, cfg, marker.targetExpMs, now);
     if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`pending checkout ${sessionId} changed license`);
     if (!marker.licenseId) {
@@ -984,6 +1018,9 @@ export class BillingService {
       this.extendLicense(rec, marker.targetExpMs, cfg, now);
     }
     this.noteCharge(rec, `cs:${sessionId}`);
+    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
+    if (planByKey(cfg, marker.planKey)?.lifetime && marker.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
+    if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
     this.noteCharge(rec, marker.paymentIntentId ?? "");
     this.touch(rec, ev, now);
     this.store.putCustomer(rec);
@@ -997,10 +1034,13 @@ export class BillingService {
   private async onSubscriptionCheckout(ev: StripeEvent, cfg: BillingConfig, f: ReturnType<typeof checkoutFacts>): Promise<ApplyResult> {
     const now = this.now();
     const planKey = this.planKeyOf(f.metadata, cfg);
-    const bootstrapExp = now + cfg.policy.bootstrapDays * DAY_MS;
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, bootstrapExp, now);
+    const grant = launchGrant(this.dataDir, f.metadata, ev.livemode, f.sessionId);
+    const bootstrapExp = Math.max(now + cfg.policy.bootstrapDays * DAY_MS, grant?.firstPaymentAtMs ?? 0);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata }, cfg, bootstrapExp, now);
+    if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
-    rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
+    rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
+    if (f.paymentStatus === 'paid') this.noteFirstActualPayment(rec, ev.createdMs);
     this.noteCharge(rec, f.sessionId ? `cs:${f.sessionId}` : "");
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -1047,11 +1087,17 @@ export class BillingService {
   private async onInvoicePaid(ev: StripeEvent, cfg: BillingConfig): Promise<ApplyResult> {
     const f = invoiceFacts(ev.object);
     if (!f.paid) return { outcome: "ignored", note: "invoice not paid" };
+    if (f.metadata.wh_launch_intent && !f.customerId) throw Error('Launch invoice is missing its Stripe customer');
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "invoice carried neither a customer nor an email" };
     const now = this.now();
     const paidThrough = f.periodEndMs !== null ? f.periodEndMs + cfg.policy.graceDays * DAY_MS : null;
     const planKey = this.planKeyOf(f.metadata, cfg);
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
+    if (f.metadata.wh_launch_intent && !launchGrant(this.dataDir, f.metadata, ev.livemode)?.sessionId) throw Error('Launch checkout awaits session reconciliation');
+    const current = this.findCustomer(f.customerId, f.email, ev.livemode, !f.metadata.wh_launch_intent);
+    if ((current?.launchManaged || f.metadata.wh_launch_intent) && current?.subscriptionId && f.subscriptionId && current.subscriptionId !== f.subscriptionId) {
+      return { outcome: 'unclassified', note: 'Paid invoice belongs to a different subscription on this customer; reconcile both charges in Stripe' };
+    }
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
     if (paidThrough !== null) {
       if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;
@@ -1060,6 +1106,12 @@ export class BillingService {
       note += "; invoice had no period end";
     }
     rec.subscriptionStatus = "active";
+    const amountPaid = ev.object.amount_paid;
+    if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
+      const transitions = ev.object.status_transitions as Record<string, unknown> | undefined;
+      const paidAt = transitions?.paid_at;
+      this.noteFirstActualPayment(rec, typeof paidAt === 'number' && Number.isSafeInteger(paidAt) && paidAt > 0 ? paidAt * 1000 : ev.createdMs);
+    }
     this.noteCharge(rec, f.chargeId);
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -1070,8 +1122,9 @@ export class BillingService {
 
   private onInvoiceFailed(ev: StripeEvent): ApplyResult {
     const f = invoiceFacts(ev.object);
-    const rec = this.findCustomer(f.customerId, f.email);
+    const rec = this.findCustomer(f.customerId, f.email, ev.livemode);
     if (!rec) return { outcome: "ignored", note: "customer not known" };
+    if (rec.launchManaged && rec.subscriptionId && f.subscriptionId && rec.subscriptionId !== f.subscriptionId) return { outcome: 'ignored', note: 'failure belongs to an older subscription' };
     rec.subscriptionStatus = "past_due";
     this.touch(rec, ev, this.now());
     this.store.putCustomer(rec);
@@ -1080,10 +1133,12 @@ export class BillingService {
 
   private onSubscriptionUpdated(ev: StripeEvent, cfg: BillingConfig): ApplyResult {
     const f = subscriptionFacts(ev.object);
-    const rec = this.findCustomer(f.customerId, "");
+    const rec = this.findCustomer(f.customerId, "", ev.livemode);
     if (!rec) return { outcome: "ignored", note: "customer not known" };
+    if (rec.launchManaged && rec.subscriptionId && f.subscriptionId && rec.subscriptionId !== f.subscriptionId) return { outcome: 'ignored', note: 'update belongs to an older subscription' };
     const now = this.now();
     rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
+    rec.cancelAtPeriodEnd = f.cancelAtPeriodEnd;
     rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
     let note = `status ${rec.subscriptionStatus}`;
     if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null) {
@@ -1097,8 +1152,9 @@ export class BillingService {
 
   private onSubscriptionDeleted(ev: StripeEvent): ApplyResult {
     const f = subscriptionFacts(ev.object);
-    const rec = this.findCustomer(f.customerId, "");
+    const rec = this.findCustomer(f.customerId, "", ev.livemode);
     if (!rec) return { outcome: "ignored", note: "customer not known" };
+    if (rec.launchManaged && rec.subscriptionId && f.subscriptionId && rec.subscriptionId !== f.subscriptionId) return { outcome: 'ignored', note: 'cancellation belongs to an older subscription' };
     rec.subscriptionStatus = "canceled";
     this.touch(rec, ev, this.now());
     this.store.putCustomer(rec);
@@ -1107,7 +1163,7 @@ export class BillingService {
 
   private onChargeSucceeded(ev: StripeEvent): ApplyResult {
     const f = chargeFacts(ev.object);
-    const rec = this.findCustomer(f.customerId, f.email);
+    const rec = this.findCustomer(f.customerId, f.email, ev.livemode);
     if (!rec) return { outcome: "ignored", note: "customer not known yet (checkout/invoice will attribute later charges)" };
     this.noteCharge(rec, f.chargeId);
     this.noteCharge(rec, f.paymentIntentId);
@@ -1118,8 +1174,8 @@ export class BillingService {
 
   private onRefund(ev: StripeEvent, cfg: BillingConfig): ApplyResult {
     const f = chargeFacts(ev.object);
-    const rec = this.findCustomer(f.customerId, f.email) ?? this.store.findByCharge(f.chargeId) ?? this.store.findByCharge(f.paymentIntentId);
-    if (!rec) return { outcome: "ignored", note: "customer not known — revoke by hand if needed" };
+    const rec = this.findCustomer(f.customerId, f.email, ev.livemode) ?? this.store.findByCharge(f.chargeId) ?? this.store.findByCharge(f.paymentIntentId);
+    if (!rec || rec.livemode !== ev.livemode) return { outcome: "ignored", note: "customer not known — revoke by hand if needed" };
     const now = this.now();
     const full = f.refunded || (f.amount !== null && f.amountRefunded !== null && f.amountRefunded >= f.amount);
     let note: string;
@@ -1137,7 +1193,7 @@ export class BillingService {
   private onDispute(ev: StripeEvent, cfg: BillingConfig): ApplyResult {
     const f = disputeFacts(ev.object);
     const rec = this.store.findByCharge(f.chargeId) ?? this.store.findByCharge(f.paymentIntentId);
-    if (!rec) return { outcome: "ignored", note: `dispute on unknown charge ${f.chargeId || f.paymentIntentId || "?"} — revoke by hand if needed` };
+    if (!rec || rec.livemode !== ev.livemode) return { outcome: "ignored", note: `dispute on unknown charge ${f.chargeId || f.paymentIntentId || "?"} — revoke by hand if needed` };
     const now = this.now();
     rec.disputed = true;
     const note = cfg.policy.revokeOnDispute ? `dispute (${f.reason || "no reason"}): ${this.revoke(rec, "chargeback", now)}` : `dispute recorded (${f.reason || "no reason"}); revokeOnDispute is off`;
@@ -1174,36 +1230,95 @@ export class BillingService {
     return rec.livemode ? exp : Math.min(exp, rec.createdAtMs + cfg.policy.testMaxDays * DAY_MS);
   }
 
-  private findCustomer(customerId: string, email: string): CustomerRecord | null {
-    return (customerId ? this.store.getCustomer(customerId) : null)
-      ?? (email ? this.store.findByEmail(email) : null);
+  private findCustomer(customerId: string, email: string, livemode: boolean, allowEmail = true): CustomerRecord | null {
+    const direct = customerId ? this.store.getCustomer(customerId) ?? this.store.findByStripeCustomer(customerId, livemode) : null;
+    if (direct && direct.livemode === livemode) return direct;
+    if (!allowEmail || !email) return null;
+    const byEmail = this.store.findByEmail(email, livemode);
+    // An email entered at Checkout is not proof that two distinct Stripe
+    // customers own the same installation. Only adopt a legacy email-keyed
+    // row that has not yet acquired a Stripe customer identity.
+    return byEmail && (!customerId || !byEmail.stripeCustomerId || byEmail.stripeCustomerId === customerId) ? byEmail : null;
+  }
+
+  private noteFirstActualPayment(rec: CustomerRecord, paidAtMs: number): void {
+    if (!Number.isSafeInteger(paidAtMs) || paidAtMs <= 0) return;
+    if (!rec.firstActualPaymentAtMs || paidAtMs < rec.firstActualPaymentAtMs) rec.firstActualPaymentAtMs = paidAtMs;
+  }
+
+  /** Older paid Lifetime checkouts predate the explicit entitlement flag. An
+   * applied session marker proves the exact purchase when present. For rows
+   * from before that marker existed, the paid Checkout and payment-intent
+   * indexes must both survive; a plan label by itself is never a grant. */
+  private hasLegacyPaidLifetimeEvidence(rec: CustomerRecord): boolean {
+    if (!rec.livemode || rec.planKey !== 'lifetime' || rec.refunded || rec.disputed) return false;
+    const sessions = rec.chargeIds.filter(id => /^cs:cs_[A-Za-z0-9_]+$/.test(id));
+    let foundDurableMarker = false;
+    for (const indexed of sessions) {
+      let marker: CheckoutSessionRecord | null;
+      try { marker = this.store.getCheckoutSession(indexed.slice(3)); }
+      catch { return false; } // corrupt evidence cannot grant or break check-in
+      if (!marker) continue;
+      foundDurableMarker = true;
+      if (marker.status === 'applied' && marker.customerKey === rec.key && marker.licenseId === rec.licenseId &&
+        marker.planKey === 'lifetime' && marker.livemode === true &&
+        (Number.isSafeInteger(marker.paidAtMs) && marker.paidAtMs! > 0 || /^pi_[A-Za-z0-9_]+$/.test(marker.paymentIntentId ?? ''))) return true;
+    }
+    // Old rows can retain a canceled subscription id from a prior Monthly or
+    // Yearly plan. A still-active subscription makes the pre-marker indexes
+    // ambiguous; only an exact durable Lifetime marker can resolve that case.
+    const priorSubscriptionEnded = !rec.subscriptionId || rec.subscriptionStatus === 'canceled';
+    return !foundDurableMarker && priorSubscriptionEnded && sessions.length > 0 && rec.chargeIds.some(id => /^pi_[A-Za-z0-9_]+$/.test(id));
+  }
+
+  private ensureLifetimeAccess(rec: CustomerRecord, current: ReturnType<LicenseStore['get']>): boolean {
+    if (rec.lifetimeAccess === true) return true;
+    if (!current || !this.hasLegacyPaidLifetimeEvidence(rec)) return false;
+    rec.lifetimeAccess = true;
+    this.store.putCustomer(rec);
+    return true;
   }
 
   /** The customer's record, minting a licence if this is the first time the
    *  Hub hears of them. The record is written BEFORE the caller's handler
    *  continues, so a crash later cannot orphan the freshly issued licence. */
   private ensureCustomer(facts: CustomerFacts, cfg: BillingConfig, initialExp: number, now: number): { rec: CustomerRecord; created: boolean } {
-    const existing = this.findCustomer(facts.customerId, facts.email);
+    const grant = launchGrant(this.dataDir, facts.metadata ?? {}, facts.livemode);
+    const direct = facts.customerId ? this.store.getCustomer(facts.customerId) ?? this.store.findByStripeCustomer(facts.customerId) : null;
+    if (grant?.licenseId && direct && direct.licenseId !== grant.licenseId) throw Error('Stripe customer is already bound to another license');
+    const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
+      ?? this.findCustomer(facts.customerId, facts.email, facts.livemode, !grant);
     if (existing) {
+      if (existing.livemode !== facts.livemode) throw Error('Checkout license is already bound in another Stripe mode');
+      if (grant?.licenseId && existing.licenseId !== grant.licenseId) throw Error('Checkout conflicts with an existing billing license');
+      if (facts.customerId && existing.stripeCustomerId && existing.stripeCustomerId !== facts.customerId) throw Error('Checkout conflicts with an existing Stripe customer');
       if (facts.email && !existing.email) existing.email = facts.email;
       if (facts.name && (!existing.name || existing.name === existing.email)) existing.name = facts.name;
       if (facts.customerId && !existing.stripeCustomerId) existing.stripeCustomerId = facts.customerId;
+      if ((existing.launchManaged || grant) && facts.subscriptionId && existing.subscriptionId && existing.subscriptionId !== facts.subscriptionId && existing.subscriptionStatus !== 'canceled') {
+        throw Error('A different active subscription is already bound to this license');
+      }
       if (facts.subscriptionId) existing.subscriptionId = facts.subscriptionId;
       if (facts.planKey) existing.planKey = facts.planKey;
+      if (grant) { existing.launchManaged = true; existing.firstPaymentAtMs = grant.firstPaymentAtMs; existing.discountPercent = grant.discountPercent; existing.nonRenewing = grant.payment === 'crypto' || grant.plan === 'lifetime'; }
       return { rec: existing, created: false };
     }
     const key = facts.customerId || `email:${facts.email}`;
+    if (this.store.getCustomer(key)) throw Error("Customer identity conflicts across Stripe modes");
     const name = facts.name || facts.email || "Customer";
     const plan = [cfg.policy.plan, facts.planKey, facts.livemode ? null : "test"].filter(Boolean).join("-");
     const exp = this.capExp({ livemode: facts.livemode, createdAtMs: now }, initialExp, cfg);
-    const issued = this.licenses.issueUntil(name, exp, plan, now);
+    const bound = grant?.licenseId ? this.licenses.get(grant.licenseId) : null;
+    if (grant?.licenseId && (!bound || this.licenses.isRevoked(grant.licenseId) || this.store.findByLicense(grant.licenseId))) throw Error('Checkout license is unavailable or already bound');
+    const issuedId = bound?.id ?? this.licenses.issueUntil(name, exp, plan, now).payload.id;
+    if (bound && exp > bound.exp) this.licenses.setExpiry(bound.id, Math.min(exp, bound.iat + MAX_LICENSE_DAYS * DAY_MS), now);
     const rec: CustomerRecord = {
       key,
       stripeCustomerId: facts.customerId,
       email: facts.email,
       name,
       livemode: facts.livemode,
-      licenseId: issued.payload.id,
+      licenseId: issuedId,
       planKey: facts.planKey,
       subscriptionId: facts.subscriptionId || null,
       subscriptionStatus: null,
@@ -1217,9 +1332,10 @@ export class BillingService {
       refunded: false,
       lastEventType: null,
       lastEventAtMs: null,
+      ...(grant ? { launchManaged: true, firstPaymentAtMs: grant.firstPaymentAtMs, discountPercent: grant.discountPercent, nonRenewing: grant.payment === 'crypto' || grant.plan === 'lifetime' } : {}),
     };
     this.store.putCustomer(rec);
-    this.log(`[billing] issued ${plan} licence ${issued.payload.id} for ${facts.email || key} until ${new Date(exp).toISOString().slice(0, 10)}`);
+    this.log(`[billing] ${bound ? 'bound' : 'issued'} ${plan} licence ${issuedId} for ${facts.email || key} until ${new Date(exp).toISOString().slice(0, 10)}`);
     return { rec, created: true };
   }
 
@@ -1264,6 +1380,7 @@ export class BillingService {
    *  payment already happened, and the admin page can resend. Returns a
    *  fragment for the event note. */
   private async sendWelcomeIfNeeded(rec: CustomerRecord, cfg: BillingConfig, now: number, force = false): Promise<string> {
+    this.ensureLifetimeAccess(rec, this.licenses.get(rec.licenseId));
     if (rec.welcomeSentAtMs !== null && !force) return "";
     if (!rec.email) {
       rec.welcomeError = "no email address on the Stripe customer";
@@ -1284,6 +1401,8 @@ export class BillingService {
       pageUrl: `${this.origin}/welcome/${pageToken}`,
       expiresAtMs: exp,
       subscription: !!rec.subscriptionId,
+      lifetime: rec.lifetimeAccess === true,
+      firstPaymentAtMs: rec.firstActualPaymentAtMs ? null : rec.firstPaymentAtMs,
       siteOrigin: cfg.siteOrigin,
       livemode: rec.livemode,
     });
@@ -1322,6 +1441,10 @@ export class BillingService {
     const t = this.store.lookupPage(rawPageToken);
     if (!t) return { ok: false, status: 404, text: "This link is not valid any more. If you were sent a newer email, use that one; otherwise contact support." };
     const rec = this.store.getCustomer(t.customerKey) ?? this.store.findByLicense(t.licenseId);
+    if (rec) {
+      this.ensureLifetimeAccess(rec, this.licenses.get(rec.licenseId));
+      this.refreshLifetimeLicense(rec.licenseId);
+    }
     const lic = this.licenses.list().find((l) => l.id === t.licenseId);
     if (!rec || !lic) return { ok: false, status: 404, text: "This licence is no longer on file. Please contact support." };
     const now = this.now();
@@ -1350,10 +1473,10 @@ export class BillingService {
       statusClass,
       statusLabel,
       plan: lic.plan,
-      expiresOn: new Date(lic.exp).toISOString().slice(0, 10),
+      expiresOn: rec.lifetimeAccess ? 'Lifetime access' : new Date(lic.exp).toISOString().slice(0, 10),
       renewalLine: rec.subscriptionId
         ? (rec.subscriptionStatus?.startsWith("canceled") ? "Subscription cancelled — no further charges" : "Extends automatically when your subscription renews")
-        : "One-time purchase",
+        : rec.lifetimeAccess ? "No recurring charge · technical licence renewal is automatic" : "One-time purchase",
       email: rec.email || "—",
       installCommand: canInstall ? `curl -q -fsSL "${this.origin}/install/${installToken}" | sudo bash` : "",
       noticeTitle: notice?.title ?? "",
@@ -1532,17 +1655,33 @@ export class BillingService {
    *  Sent for a revoked or otherwise unrecognised licence too, for the same
    *  reason `flags` and `latest` are: this is a truthful answer about what
    *  the Hub knows, not a grant of anything. */
-  subscriptionInfoFor(licenseId: string): { plan: string; status: string; currentPeriodEndMs: number | null; portalAvailable: boolean } | null {
+  subscriptionInfoFor(licenseId: string): { plan: string; status: string; currentPeriodEndMs: number | null; portalAvailable: boolean; firstPaymentAtMs: number | null; firstActualPaymentAtMs: number | null; discountPercent: number; nonRenewing: boolean; cancelAtPeriodEnd: boolean } | null {
     const rec = this.store.findByLicense(licenseId);
     if (!rec) return null;
+    this.ensureLifetimeAccess(rec, this.licenses.get(licenseId));
     const cfg = this.config();
     const m = cfg.stripe[rec.livemode ? "live" : "test"];
     return {
       plan: rec.planKey ?? cfg.policy.plan,
       status: rec.subscriptionStatus ?? "none",
-      currentPeriodEndMs: rec.periodEndMs,
+      currentPeriodEndMs: rec.lifetimeAccess ? null : rec.periodEndMs,
       portalAvailable: Boolean(m.secretKey || m.portalUrl),
+      firstPaymentAtMs: rec.firstPaymentAtMs ?? null,
+      firstActualPaymentAtMs: rec.firstActualPaymentAtMs ?? null,
+      discountPercent: rec.discountPercent ?? 0,
+      nonRenewing: rec.nonRenewing ?? (!rec.subscriptionId && rec.planKey === 'lifetime'),
+      cancelAtPeriodEnd: rec.cancelAtPeriodEnd ?? false,
     };
+  }
+
+  /** Lifetime is a purchase entitlement, not an unbounded token format.
+   * Renew only near technical expiry, never for test/refunded/disputed or
+   * revoked licenses. Check-in already proves token possession and the seat. */
+  refreshLifetimeLicense(licenseId: string): void {
+    const rec = this.store.findByLicense(licenseId), current = this.licenses.get(licenseId);
+    if (!rec || !current || !this.ensureLifetimeAccess(rec, current) || !rec.livemode || rec.refunded || rec.disputed) return;
+    if (current.exp - this.now() > 365 * DAY_MS) return;
+    this.licenses.renewLifetimeToken(licenseId, this.now());
   }
 
   // ── admin views ───────────────────────────────────────────────────────────

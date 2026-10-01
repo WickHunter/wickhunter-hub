@@ -52,8 +52,8 @@ export interface Plan {
   interval: PlanInterval | null;
   /** Licence length for a one-time plan (capped by the v1 format at 3650). */
   licenseDays: number | null;
-  /** A one-time plan sold as "lifetime": pinned to the format's maximum,
-   *  3650 days (ten years), which the operator has accepted as the term. */
+  /** A one-time Lifetime entitlement. Its technical tokens last at most
+   *  3650 days; verified live purchases renew those tokens automatically. */
   lifetime: boolean;
   description: string;
   /** Which product this plan buys. Every plan defined before this field

@@ -307,6 +307,22 @@ export class LicenseStore {
     return payload;
   }
 
+  /** Rotate a technical token for an independently verified Lifetime
+   * entitlement. Callers must prove the entitlement; ordinary expiry edits
+   * remain bounded by the original issue date. Identity and seat stay fixed. */
+  renewLifetimeToken(id: string, now = Date.now()): LicensePayload | null {
+    if (!Number.isSafeInteger(now) || now <= 0) throw Error('Invalid renewal date');
+    const registry = readJson<Record<string, LicensePayload>>(this.licensesFile, {});
+    const current = registry[id];
+    if (!current || this.isRevoked(id)) return null;
+    const exp = now + 3650 * 86_400_000;
+    if (exp <= current.exp) return current;
+    const payload: LicensePayload = { v: current.v, id: current.id, name: current.name, exp, iat: now, plan: current.plan };
+    registry[id] = payload;
+    writeJsonAtomic(this.licensesFile, registry);
+    return payload;
+  }
+
   /** The stored payload for an id, or null for an unknown or revoked one. The
    *  check-in reads this to learn whether the registry now promises a LATER
    *  expiry than the token a tester is presenting. */

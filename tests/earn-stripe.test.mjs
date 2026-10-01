@@ -42,6 +42,8 @@ await test('disabled by default; explicit mode and automatic prerequisites',asyn
 await test('forever software-only coupon; custom referrer code and safe Checkout',async()=>{
  await svc.activate(owner);const coupon=calls.find(c=>c.endpoint==='/v1/coupons');assert.equal(coupon.body.duration,'forever');assert.equal(coupon.body.percent_off,'10');assert.equal(coupon.body['applies_to[products][0]'],'prod_wh');
  await svc.checkout(member.code,'monthly');const co=calls.find(c=>c.endpoint==='/v1/checkout/sessions');assert.equal(co.body['subscription_data[metadata][wh_earn_code]'],member.code);assert.equal(co.body['discounts[0][promotion_code]'],'promo_test');assert.equal(co.headers['Stripe-Version'],'2025-03-31.basil');await assert.rejects(svc.checkout(member.code,'hosting'),/unavailable/);
+ assert.equal(svc.launchReferral(member.code,'test').code,member.code);
+ assert.throws(()=>svc.launchReferral(member.code,'live'),/payment mode/);
 });
 await test('test recipient and referral money stay out of real earnings',async()=>{
  await svc.onboard(owner,{country:'US',email:'referrer@example.com'});await svc.handleEvent({...event('invoice.paid','evt_test',{id:'in_test'}),livemode:false});assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.ledger('test').view(owner,'Referrer').balances.referral,1800);

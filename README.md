@@ -1,3 +1,7 @@
+## v0.4.65 — Launch billing and customer support
+
+Adds the October 15 software launch offer, one-time crypto checkout, first-charge reminders, paid Lifetime renewal, current subscription reporting, central notification settings, consent-safe Brevo setup, and clearer support answers. The admin workspace groups billing and release readiness. Production promotion remains disabled; customer release routing preserves existing clients.
+
 ## v0.4.64 — Responsive candle status and collection
 
 Return bounded candle-status snapshots while exact coverage warms, with unchecked symbols reported separately. Count occupied slots without decoding price objects and stop gap discovery at the first missing run. Preserve REST confirmation and historical gap reporting. The first 0.4.63 deployment failed its live freshness check and was rolled back to 0.4.62.

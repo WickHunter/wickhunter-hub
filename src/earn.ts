@@ -9,7 +9,7 @@ import { readJson, writeJsonAtomic } from './jsonfile.js';
 export const EXCHANGES = [
   { id: 'bybit', name: 'Bybit', whPercent: 50, url: 'https://partner.bybit.com/b/WH' },
   { id: 'bitget', name: 'Bitget', whPercent: 50, url: 'https://partner.bitget.com/bg/0J4HKC' },
-  { id: 'bitunix', name: 'Bitunix', whPercent: 50, url: 'https://www.bitunix.com/register?inviteCode=HFVMLK&t_act=-1' },
+  { id: 'bitunix', name: 'Bitunix', whPercent: 50, url: 'https://www.bitunix.com/register?vipCode=wickhunter' },
   { id: 'weex', name: 'WEEX', whPercent: 50, url: 'https://www.weex.com/en/register?vipCode=9fcy' },
 ];
 export const BYBIT_HELP = 'https://www.bybit.com/en/help-center/article/How-to-Transfer-Your-Identity-to-Another-Account';

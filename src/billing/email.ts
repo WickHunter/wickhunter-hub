@@ -15,6 +15,7 @@ export interface EmailMessage {
   subject: string;
   text: string;
   html: string;
+  idempotencyKey?: string;
 }
 
 export interface EmailFetchInit {
@@ -51,7 +52,7 @@ export async function sendEmail(cfg: EmailConfig, msg: EmailMessage, fetchLike: 
     url = RESEND_URL;
     init = {
       method: "POST",
-      headers: { authorization: `Bearer ${cfg.apiKey}`, "content-type": "application/json" },
+      headers: { authorization: `Bearer ${cfg.apiKey}`, "content-type": "application/json", ...(msg.idempotencyKey ? { 'Idempotency-Key': msg.idempotencyKey } : {}) },
       body: JSON.stringify({
         from: cfg.from,
         to: [msg.to],
@@ -109,6 +110,8 @@ export interface WelcomeEmailInput {
   pageUrl: string;
   expiresAtMs: number;
   subscription: boolean;
+  lifetime?: boolean;
+  firstPaymentAtMs?: number | null;
   siteOrigin: string;
   livemode: boolean;
 }
@@ -152,7 +155,9 @@ const GOOD_TO_KNOW: readonly string[] = [
  *  not a credential that cannot. */
 export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage {
   const first = input.name.trim().split(/\s+/)[0] || "there";
-  const until = dateOf(input.expiresAtMs);
+  const until = input.lifetime ? 'Lifetime access' : dateOf(input.expiresAtMs);
+  const accessLine = input.lifetime ? 'Your Lifetime access is active. Technical licence renewal is automatic and does not create a charge.' : `Your licence is active until ${until}.`;
+  const firstCharge = input.firstPaymentAtMs ? `Your first subscription charge is scheduled for ${new Intl.DateTimeFormat('en-US', { dateStyle: 'long', timeZone: 'America/New_York' }).format(input.firstPaymentAtMs)} (Eastern Time). Cancel in Manage billing before then to avoid that charge.` : '';
   const planValue = input.livemode ? "Unleashed" : "Unleashed (test)";
   const renewalValue = input.subscription
     ? "Extends automatically each time your subscription renews"
@@ -167,7 +172,8 @@ export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage
     ``,
     `Hi ${first},`,
     ``,
-    `Thanks for buying Wick Hunter Unleashed. Your licence is active until ${until}.`,
+    `Thanks for choosing Wick Hunter Unleashed. ${accessLine}`,
+    firstCharge || null,
     ``,
     `YOUR LICENCE`,
     `  Plan: ${planValue}`,
@@ -282,7 +288,7 @@ export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 
     <tr><td style="font-family:${FONT};font-size:16px;color:${INK};padding:0 0 8px">Hi ${escapeHtml(first)},</td></tr>
-    <tr><td style="font-family:${FONT};font-size:14px;color:${MUTED};line-height:1.6;padding:0 0 22px">Thanks for buying Wick Hunter Unleashed. Your licence is active until <strong style="color:${INK}">${escapeHtml(until)}</strong>.</td></tr>
+    <tr><td style="font-family:${FONT};font-size:14px;color:${MUTED};line-height:1.6;padding:0 0 22px">Thanks for choosing Wick Hunter Unleashed. ${escapeHtml(accessLine)}${firstCharge ? `<br><br>${escapeHtml(firstCharge)}` : ''}</td></tr>
 
     <tr><td style="padding:0 0 20px">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${INSET};border:1px solid ${BORDER_SOFT};border-radius:10px">

@@ -238,7 +238,7 @@
       pillEl.className = "pill " + pill[0];
       pillEl.textContent = pill[1];
       node.querySelector(".v-plan").textContent = sw.plan || "—";
-      node.querySelector(".v-exp").textContent = fmtDate(sw.exp);
+      node.querySelector(".v-exp").textContent = sw.lifetimeAccess ? 'Lifetime access' : fmtDate(sw.exp);
       node.querySelector(".v-sub").textContent = sw.subscriptionStatus || "one-time purchase";
       node.querySelector(".v-lapsed").hidden = !sw.exitOnly;
 

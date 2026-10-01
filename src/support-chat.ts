@@ -24,8 +24,8 @@ interface Thread {
 interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
 export type SupportNotificationKind = 'supportNew' | 'supportHuman' | 'supportReply' | 'supportResolved';
-export interface SupportNotificationEvent { kind: SupportNotificationKind; ticketId: string; openTickets: number; resolvedTickets: number; at: number }
-interface State { monthlyLimitMicros?: number; guestMonthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number;previousGuestMicros?:number;guestLimitMicros?:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
+export interface SupportNotificationEvent { kind: SupportNotificationKind; ticketId: string; openTickets: number; resolvedTickets: number; at: number; key?: string }
+interface State { pendingNotifications?: SupportNotificationEvent[]; monthlyLimitMicros?: number; guestMonthlyLimitMicros?: number; budgetHistory?: {at:number;previousMicros:number;limitMicros:number;previousGuestMicros?:number;guestLimitMicros?:number}[]; schema: 1; threads: Thread[]; usage: Reservation[]; knowledge: Knowledge[] }
 const MAX_BYTES = 16 * 1024 * 1024;
 const GUEST_OWNER_BYTES = 256 * 1024;
 const OWNER_BYTES = 2 * 1024 * 1024;
@@ -43,6 +43,7 @@ export class SupportChat {
   private state: State;
   private readonly file: string;
   private busy = new Set<string>();
+  private flushingNotifications = false;
   /** Corrupt or oversized support data must not stop licence and billing
    * services from booting. Keep the old file untouched and expose a read-only
    * support view until an operator repairs it. */
@@ -65,20 +66,46 @@ export class SupportChat {
   }
   private commit(next: State) {
     if(this.unavailable) throw new SupportError('Support is temporarily unavailable. Please use Report a bug.',503);
+    if (this.notify) {
+      const pending = next.pendingNotifications ??= [];
+      const stage = (kind: SupportNotificationKind, ticketId: string) => {
+        // Coalesce still-pending updates for a ticket/category. Conversation
+        // history remains complete; an unavailable webhook cannot grow an
+        // unbounded queue or discard the latest attention signal.
+        const event = {kind,ticketId,key:randomUUID(),at:this.now(),openTickets:next.threads.filter(t=>t.status!=='resolved').length,resolvedTickets:next.threads.filter(t=>t.status==='resolved').length};
+        const index=pending.findIndex(e=>e.kind===kind&&e.ticketId===ticketId);
+        if(index>=0)pending[index]=event;else pending.push(event);
+      };
+      for(const thread of next.threads){
+        const prior=this.state.threads.find(t=>t.id===thread.id);
+        if(!prior)stage('supportNew',thread.id);
+        else if(thread.messages.some(m=>m.role==='customer'&&!prior.messages.some(old=>old.id===m.id)))stage('supportReply',thread.id);
+        if(thread.status==='human'&&prior?.status!=='human')stage('supportHuman',thread.id);
+        if(thread.status==='resolved'&&prior?.status!=='resolved')stage('supportResolved',thread.id);
+      }
+    }
     const text=JSON.stringify(next)+'\n';
     if(Buffer.byteLength(text)>MAX_BYTES) throw new SupportError('Support storage is full; contact the team or use Report a bug.',507);
-    writeTextAtomic(this.file,text); this.state=next;
+    writeTextAtomic(this.file,text); this.state=next; this.flushNotifications();
   }
   private storedBytes(match:(t:Thread)=>boolean) {
     let n=0;for(const t of this.state.threads)if(match(t))for(const m of t.messages)n+=Buffer.byteLength(m.text);return n;
   }
   private edit(fn: (s: State)=>void) { const next=structuredClone(this.state); fn(next); this.commit(next); }
-  private notification(kind: SupportNotificationKind, ticketId: string) {
-    if (!this.notify) return;
+  private notification(_kind: SupportNotificationKind, _ticketId: string) { this.flushNotifications(); }
+  flushNotifications() {
+    if (!this.notify || this.flushingNotifications || this.unavailable) return;
+    this.flushingNotifications=true;
     try {
-      this.notify({ kind, ticketId, openTickets: this.state.threads.filter(t => t.status !== 'resolved').length,
-        resolvedTickets: this.state.threads.filter(t => t.status === 'resolved').length, at: this.now() });
-    } catch { /* Notifications must never change support availability. */ }
+      for(const event of [...(this.state.pendingNotifications??[])]){
+        try {
+          this.notify(event);
+          const next=structuredClone(this.state);
+          next.pendingNotifications=(next.pendingNotifications??[]).filter(e=>e.key!==event.key);
+          writeTextAtomic(this.file,JSON.stringify(next)+'\n');this.state=next;
+        } catch { break; }
+      }
+    } finally { this.flushingNotifications=false; }
   }
   private thread(id: string) { const t=this.state.threads.find(t=>t.id===id); if(!t)throw new SupportError('Conversation not found',404); return t; }
   private owned(identity: SupportIdentity,id:string) {const t=this.thread(id);if(t.owner!==identity.owner)throw new SupportError('Conversation not found',404);return t;}
@@ -120,7 +147,7 @@ export class SupportChat {
     }catch{return [];}
   }
   admin() {
-    return {ok:true,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
+    return {ok:true,notificationPending:this.state.pendingNotifications?.length??0,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
       message:this.unavailable??(this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.'),
       items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
       knowledge:this.state.knowledge,limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},

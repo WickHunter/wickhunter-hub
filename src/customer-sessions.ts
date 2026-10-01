@@ -330,6 +330,7 @@ export interface SoftwareView {
   subscriptionStatus: string | null;
   currentPeriodEndMs: number | null;
   portalAvailable: boolean;
+  lifetimeAccess?: boolean;
 }
 
 export interface CustomerStateView {
@@ -475,6 +476,7 @@ export class CustomerSessionService {
       // purchase never buries their real subscription.
       .sort((a, b) => (a.livemode !== b.livemode ? (a.livemode ? -1 : 1) : b.createdAtMs - a.createdAtMs))
       .map((rec) => {
+        this.billing.refreshLifetimeLicense(rec.licenseId);
         const payload = this.licenses.get(rec.licenseId);
         const revoked = this.licenses.isRevoked(rec.licenseId);
         const exp = payload?.exp ?? null;
@@ -491,6 +493,7 @@ export class CustomerSessionService {
           subscriptionStatus: info?.status ?? rec.subscriptionStatus,
           currentPeriodEndMs: info?.currentPeriodEndMs ?? rec.periodEndMs,
           portalAvailable: info?.portalAvailable ?? false,
+          lifetimeAccess: rec.lifetimeAccess === true,
         };
       });
     return {
