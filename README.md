@@ -1,3 +1,7 @@
+## v0.4.66 — Reuse launch coupons safely
+
+Stripe coupon reuse now explicitly retrieves and expands product restrictions before validating the existing `UNLEASHED25` offer. The Hub continues to fail closed when the existing coupon has different terms.
+
 ## v0.4.65 — Launch billing and customer support
 
 Adds the October 15 software launch offer, one-time crypto checkout, first-charge reminders, paid Lifetime renewal, current subscription reporting, central notification settings, consent-safe Brevo setup, and clearer support answers. The admin workspace groups billing and release readiness. Production promotion remains disabled; customer release routing preserves existing clients.
@@ -1807,6 +1811,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.66 — Explicitly expand Stripe coupon product restrictions when validating an existing launch promotion; add regression coverage for reuse and mismatched terms.
 
 - v0.4.65 — Prepare launch billing, fixed October 15 billing dates, recurring discounts, one-time crypto, payment reminders, subscription reporting, support notifications, and customer release channels. Keep release promotion disabled.
 

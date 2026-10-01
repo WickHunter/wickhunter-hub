@@ -13,17 +13,21 @@ billing.updateConfig({ mode: 'live', stripe: { live: { secretKey: 'sk_live_offli
 const calls = [];
 let loseResponse = false;
 let number = 0;
+let promotionExists = false;
+let couponProducts = [];
+let couponOverrides = {};
 const sessions = new Map();
 const fake = async (url, init) => {
-  const p = new URL(url).pathname, params = new URLSearchParams(init.body ?? '');
-  calls.push({ p, params, key: init.headers['Idempotency-Key'] });
+  const parsed = new URL(url), p = parsed.pathname, params = new URLSearchParams(init.body ?? '');
+  calls.push({ p, params, query: parsed.searchParams, key: init.headers['Idempotency-Key'] });
   let result;
   if (p.startsWith('/v1/prices/')) {
     const key = p.slice('/v1/prices/price_'.length), plan = billing.plan(key);
     result = { id: `price_${key}`, active: true, currency: plan.currency, unit_amount: plan.amountCents, product: 'prod_software', recurring: plan.interval ? { interval: plan.interval, interval_count: 1 } : null };
-  } else if (p === '/v1/promotion_codes' && init.method === 'GET') result = { data: [], has_more: false };
-  else if (p === '/v1/coupons') result = { id: 'coupon_launch' };
-  else if (p === '/v1/promotion_codes') result = { id: 'promo_launch' };
+  } else if (p === '/v1/promotion_codes' && init.method === 'GET') result = { data: promotionExists ? [{ id: 'promo_launch', coupon: { id: 'coupon_launch', percent_off: 25, duration: 'forever' }, expires_at: LAUNCH_REDEEM_UNTIL_MS / 1000, customer: null, max_redemptions: null, restrictions: {} }] : [], has_more: false };
+  else if (p === '/v1/coupons' && init.method === 'POST') { couponProducts = [...params].filter(([key]) => key.startsWith('applies_to[products][' )).map(([, value]) => value); result = { id: 'coupon_launch' }; }
+  else if (p === '/v1/coupons/coupon_launch' && init.method === 'GET') result = { id: 'coupon_launch', percent_off: 25, duration: 'forever', ...couponOverrides, ...(parsed.searchParams.get('expand[0]') === 'applies_to' ? { applies_to: { products: [...couponProducts] } } : {}) };
+  else if (p === '/v1/promotion_codes' && init.method === 'POST') { promotionExists = true; result = { id: 'promo_launch' }; }
   else if (p === '/v1/account') result = { capabilities: { crypto_payments: 'active' } };
   else if (p.startsWith('/v1/checkout/sessions/') && init.method === 'GET') {
     const parts = p.split('/'), session = [...sessions.values()].find(s => s.id === parts[4]);
@@ -58,11 +62,22 @@ await test('launch is opt-in and exact plan prices are prepared without activati
   assert.equal(prepared.cryptoCapable, true); assert.equal(prepared.cryptoEnabled, false);
   assert.equal(calls.find(c => c.p === '/v1/coupons').params.get('duration'), 'forever');
   assert.equal(calls.find(c => c.p === '/v1/promotion_codes' && c.params.size).params.get('expires_at'), String(LAUNCH_REDEEM_UNTIL_MS / 1000));
+  await launch.prepare();
+  const couponRead = calls.findLast(c => c.p === '/v1/coupons/coupon_launch');
+  assert.equal(couponRead.query.get('expand[0]'), 'applies_to');
   launch.setEnabled(true, true);
   assert.equal(launch.status().cryptoEnabled, true);
   launch.setEnabled(false, false);
   assert.equal(launch.status().cryptoCapable, true);
   launch.setEnabled(true, true);
+});
+await test('existing UNLEASHED25 coupon with changed scope or terms is refused', async () => {
+  couponOverrides = { percent_off: 20 };
+  await assert.rejects(launch.prepare(), /different terms/);
+  couponOverrides = {};
+  couponProducts = ['prod_unrelated'];
+  await assert.rejects(launch.prepare(), /different terms/);
+  couponProducts = ['prod_software'];
 });
 await test('authenticated app checkout retains license; free period binds to fixed Eastern date', async () => {
   const license = store.issueUntil('Existing tester', LAUNCH_FIRST_PAYMENT_MS, 'beta', clock);

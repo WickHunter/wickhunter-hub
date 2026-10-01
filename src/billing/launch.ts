@@ -179,7 +179,12 @@ export class LaunchBilling {
     if (existing.has_more || existing.data.length > 1) throw Error('Launch promotion is ambiguous');
     let promotion = existing.data[0];
     if (promotion) {
-      const coupon = typeof promotion.coupon === 'string' ? await api.call('GET', `/v1/coupons/${promotion.coupon}`) : promotion.coupon;
+      const couponId = typeof promotion.coupon === 'string' ? promotion.coupon : promotion.coupon?.id;
+      if (!/^coupon_[A-Za-z0-9]+$/.test(couponId ?? '')) throw Error('Existing UNLEASHED25 coupon is invalid');
+      // Stripe's pinned API version may omit applies_to from the promotion-code
+      // expansion and from a plain coupon retrieve. Fetch the coupon by ID and
+      // explicitly expand the product restriction before validating reuse.
+      const coupon = await api.call('GET', `/v1/coupons/${couponId}`, { 'expand[0]': 'applies_to' });
       if (coupon?.percent_off !== 25 || coupon?.duration !== 'forever' || promotion.expires_at !== LAUNCH_REDEEM_UNTIL_MS / 1000 ||
         JSON.stringify([...(coupon?.applies_to?.products ?? [])].sort()) !== JSON.stringify(products) ||
         promotion.customer || promotion.max_redemptions || promotion.restrictions?.first_time_transaction || promotion.restrictions?.minimum_amount) {
