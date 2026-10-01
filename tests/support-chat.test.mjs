@@ -76,11 +76,27 @@ try{
  assert.equal((await fetch(h.origin+'/admin/api/support',{method:'POST',headers:{...auth,'x-hub-csrf':'marketplace-config-v1'},body:JSON.stringify({id:guest.threads[0].id,action:'reply',text:'Human website answer',requestId:'website-human-reply'})})).status,200);
  const reply=await(await fetch(h.origin+'/support/chat',{headers:guestHeaders})).json();assert.equal(reply.threads[0].messages.at(-1).text,'Human website answer');
 }finally{await h.close();}
+const groundedPrompts=[];
 const grounded=new SupportChat(tmpDir('support-grounded'),{...cfg,aiEnabled:true,apiKey:'fake',knowledgeFile:fileURLToPath(new URL('../public/support-knowledge.json',import.meta.url))},async(url,init)=>{
- const payload=JSON.parse(init.body);assert.equal(payload.text.format.type,'json_schema');assert.equal(payload.text.format.strict,true);assert.match(payload.instructions,/Published September 2026 tutorial transcript/);assert.match(payload.instructions,/youtube\.com\/watch/);assert.ok(Buffer.byteLength(payload.instructions+JSON.stringify(payload.input))<=24000);return provider();
+ const payload=JSON.parse(init.body);assert.equal(payload.text.format.type,'json_schema');assert.equal(payload.text.format.strict,true);assert.match(payload.instructions,/Published September 2026 tutorial transcript/);assert.match(payload.instructions,/answer it directly/);assert.ok(Buffer.byteLength(payload.instructions+JSON.stringify(payload.input))<=24000);groundedPrompts.push(payload.instructions);
+ const question=payload.input.at(-1).content;
+ return new Response(JSON.stringify({status:'completed',usage:{input_tokens:100,output_tokens:20},output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({answer:'Read the guide.',human:question.includes('my account')})}]}]}));
 });
-await grounded.message(identity,{text:'How does Hedge Bot minimum tranche coverage work?',requestId:'grounded-request',version:'0.90.129'});
-assert.equal(grounded.customer(identity).threads[0].messages.at(-1).role,'assistant');
+await grounded.message(identity,{text:'What is a DCA Bot?',requestId:'grounded-dca-001',version:'0.90.129'});
+await grounded.message({...identity,owner:'grounded-mismatch',licenseId:'grounded-mismatch'},{text:'What does dollar-cost averaging mean here?',requestId:'grounded-dca-002',version:'0.91.000'});
+await grounded.message({...identity,owner:'grounded-website',licenseId:'grounded-website'},{text:'Is there an averaging bot?',requestId:'grounded-dca-003',version:'website'});
+await grounded.message({...identity,owner:'grounded-bots',licenseId:'grounded-bots'},{text:'What do the TV Signal bot and Manual Bot do?',requestId:'grounded-bots-001',version:'0.91.000'});
+await grounded.message({...identity,owner:'grounded-account',licenseId:'grounded-account'},{text:'Why did a DCA order not fill on my account?',requestId:'grounded-account-001',version:'0.91.000'});
+assert.equal(groundedPrompts.length,5);
+for(const prompt of groundedPrompts.slice(0,4)){
+ assert.match(prompt,/DCA is an averaging ladder/);
+ assert.match(prompt,/not a separate bot or an entry signal/);
+}
+assert.match(groundedPrompts[3],/TV Signal bot opens a deal/);
+assert.match(groundedPrompts[3],/Manual Bot adopts and manages/);
+assert.match(groundedPrompts[4],/Ask for a human when the answer is not supported, concerns account-specific money/);
+assert.equal(grounded.customer({...identity,owner:'grounded-account',licenseId:'grounded-account'}).threads[0].status,'human');
+assert.equal(grounded.customer(identity).threads[0].status,'assistant');
 console.log('Support: durable delivery, ownership, idempotency, takeover, quotas, reservations and HTTP auth passed');
 
 // Delete exactly one support conversation; preserve every other persisted field.
