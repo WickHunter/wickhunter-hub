@@ -21,11 +21,12 @@ export interface SupportConfig {
 }
 export interface SupportIdentity { owner: string; name: string; licenseId: string }
 interface Message { id: string; role: 'customer' | 'assistant' | 'human'; text: string; at: number; feedback?: 'helpful'|'needs_help' }
+type AutoReplyUnavailableReason = 'guest_daily_limit' | 'guest_monthly_limit' | 'member_daily_limit' | 'member_monthly_limit' | 'user_budget' | 'guest_budget' | 'global_budget' | 'support_unavailable' | 'chat_disabled' | 'ai_disabled' | 'provider_unconfigured' | 'provider_error' | 'human_requested' | 'staff_takeover' | 'legacy_human' | 'ai_handoff' | 'resolved' | 'conversation_full';
 interface Thread {
   id: string; owner: string; name: string; licenseId: string; version: string;
-  ts: number; updatedAt: number; waitingForHuman?: boolean; handoffReason?: 'ai' | 'requested' | 'quota' | 'error' | 'staff'; status: 'human' | 'assistant' | 'resolved'; messages: Message[];
+  ts: number; updatedAt: number; waitingForHuman?: boolean; handoffReason?: 'ai' | 'requested' | 'quota' | 'error' | 'config' | 'staff'; lastAutoReplyUnavailableReason?: AutoReplyUnavailableReason; status: 'human' | 'assistant' | 'resolved'; messages: Message[];
 }
-interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean }
+interface Reservation { id: string; owner: string; month: string; day: string; micros: number; pending: boolean; threadId?: string }
 interface Knowledge { id: string; question: string; answer: string; sourceId: string; version: string; at: number }
 export type SupportNotificationKind = 'supportNew' | 'supportHuman' | 'supportReply' | 'supportResolved';
 export interface SupportNotificationEvent { kind: SupportNotificationKind; ticketId: string; openTickets: number; resolvedTickets: number; at: number; key?: string }
@@ -41,6 +42,7 @@ export class SupportChat {
   private state: State;
   private readonly file: string;
   private busy = new Set<string>();
+  private activeReplyThreadId = new Map<string,string>();
   private flushingNotifications = false;
   /** Corrupt or oversized support data must not stop licence and billing
    * services from booting. Keep the old file untouched and expose a read-only
@@ -60,7 +62,24 @@ export class SupportChat {
       this.unavailable = 'Support storage could not be loaded ('+(error instanceof Error?error.message:'unreadable')+'); support is read-only until the operator repairs '+this.file;
       console.error('[support] '+this.unavailable);
     }
-    // Pending provider calls after a restart retain their full reservation.
+    // A pending provider call cannot finish after a process restart. Keep its
+    // full uncertain-cost reservation, but put its unanswered question in the
+    // visible human queue. Older reservations did not record a thread ID.
+    if(!this.unavailable){
+      const orphanIds=new Set<string>();
+      for(const reservation of this.state.usage.filter(u=>u.pending)){
+        const candidates=reservation.threadId?this.state.threads.filter(t=>t.id===reservation.threadId&&t.owner===reservation.owner):this.state.threads.filter(t=>t.owner===reservation.owner);
+        for(const t of candidates)if(t.status==='assistant'&&t.messages.at(-1)?.role==='customer')orphanIds.add(t.id);
+      }
+      if(orphanIds.size)try{
+        this.edit(s=>{for(const t of s.threads)if(orphanIds.has(t.id)){
+          t.status='human';t.waitingForHuman=true;t.handoffReason='error';t.lastAutoReplyUnavailableReason='provider_error';t.updatedAt=this.now();
+        }});
+      }catch(error){
+        this.unavailable='Support storage recovery could not be saved; support is read-only until the operator repairs '+this.file;
+        console.error('[support] '+this.unavailable+' ('+(error instanceof Error?error.message:'write failed')+')');
+      }
+    }
   }
   private model() { return this.config.model === 'gpt-5.6-luna' ? 'gpt-5.6-luna' : 'gpt-6-luna'; }
   private commit(next: State) {
@@ -114,11 +133,37 @@ export class SupportChat {
   private guestLimit() { return Math.min(this.monthlyLimit(),this.configuredGuestLimit()); }
   allowance(owner: string) {
     const p=this.period(), monthly=this.state.usage.filter(u=>u.month===p.month), mine=monthly.filter(u=>u.owner===owner);
-    return {monthlyRemaining:Math.max(0,(owner.startsWith("guest:")?10:200)-mine.length),dailyRemaining:Math.max(0,(owner.startsWith("guest:")?5:20)-mine.filter(u=>u.day===p.day).length),
+    return {monthlyRemaining:Math.max(0,1_000-mine.length),dailyRemaining:Math.max(0,100-mine.filter(u=>u.day===p.day).length),
       userRemainingMicros:Math.max(0,1_000_000-mine.reduce((a,u)=>a+u.micros,0)),
       totalRemainingMicros:Math.max(0,this.monthlyLimit()-monthly.reduce((a,u)=>a+u.micros,0)),
       guestRemainingMicros:Math.max(0,this.guestLimit()-monthly.filter(u=>u.owner.startsWith('guest:')).reduce((a,u)=>a+u.micros,0)),
       resetsAt:Date.UTC(Number(p.month.slice(0,4)),Number(p.month.slice(5,7)),1)};
+  }
+  private autoReplyBlocker(owner:string, allowance=this.allowance(owner)):AutoReplyUnavailableReason|null {
+    if(this.unavailable)return 'support_unavailable';
+    if(!this.config.enabled)return 'chat_disabled';
+    if(!this.config.aiEnabled)return 'ai_disabled';
+    if(!this.config.apiKey)return 'provider_unconfigured';
+    const guest=owner.startsWith('guest:');
+    if(!allowance.dailyRemaining)return guest?'guest_daily_limit':'member_daily_limit';
+    if(!allowance.monthlyRemaining)return guest?'guest_monthly_limit':'member_monthly_limit';
+    if(allowance.userRemainingMicros<RESERVE_MICROS)return 'user_budget';
+    if(guest&&allowance.guestRemainingMicros<RESERVE_MICROS)return 'guest_budget';
+    if(allowance.totalRemainingMicros<RESERVE_MICROS)return 'global_budget';
+    return null;
+  }
+  private autoReplyNotice(reason:AutoReplyUnavailableReason|null,canAutoReply:boolean,priorHuman=false):string|null {
+    if(!reason)return priorHuman&&canAutoReply?'Your earlier question is saved for our team. You can keep asking questions here.':null;
+    if(reason==='resolved')return 'This conversation is resolved. Start a new conversation for another question.';
+    if(reason==='conversation_full')return 'This conversation is full. Start a new conversation for another question.';
+    if(reason==='chat_disabled')return 'Support chat is unavailable right now. Please use Report a bug.';
+    if(reason==='support_unavailable')return 'Support chat is temporarily unavailable. Please use Report a bug.';
+    if(reason==='human_requested'||reason==='staff_takeover'||reason==='legacy_human')return 'This conversation is with the support team. Automatic replies are paused.';
+    if(reason==='ai_handoff')return 'Your earlier question is saved for our team. You can keep asking questions here.';
+    if(reason==='provider_error'&&canAutoReply)return 'We could not answer your earlier question automatically. It is saved for our team; you can keep asking questions here.';
+    if(canAutoReply)return 'Your earlier question is saved for our team. You can keep asking questions here.';
+    const limits:Partial<Record<AutoReplyUnavailableReason,string>>={guest_daily_limit:'The guest daily chat limit has been reached.',guest_monthly_limit:'The guest monthly chat limit has been reached.',member_daily_limit:'The daily chat limit has been reached.',member_monthly_limit:'The monthly chat limit has been reached.',user_budget:'Automatic replies are paused for now.',guest_budget:'Automatic replies are paused for now.',global_budget:'Automatic replies are paused for now.',ai_disabled:'Automatic replies are off right now.',provider_unconfigured:'Automatic replies are unavailable right now.',provider_error:'Automatic replies are temporarily unavailable.'};
+    return (limits[reason]||'Automatic replies are unavailable right now.')+' You can still send a message to our team.';
   }
   customer(identity:SupportIdentity,id?:string) {
     const threads=id?[this.owned(identity,id)]:this.state.threads.filter(t=>t.owner===identity.owner).sort((a,b)=>{
@@ -128,12 +173,19 @@ export class SupportChat {
       return -active||b.updatedAt-a.updatedAt;
     }).slice(0,20);
     const allowance=this.allowance(identity.owner);
-    const quotaReady=allowance.dailyRemaining>0&&allowance.monthlyRemaining>0&&allowance.userRemainingMicros>=RESERVE_MICROS&&allowance.totalRemainingMicros>=RESERVE_MICROS&&(!identity.owner.startsWith('guest:')||allowance.guestRemainingMicros>=RESERVE_MICROS);
-    const aiReady=this.config.enabled&&this.config.aiEnabled&&!!this.config.apiKey&&quotaReady;
+    const currentBlocker=this.autoReplyBlocker(identity.owner,allowance);
+    const aiReady=currentBlocker===null;
     return {ok:true,enabled:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
-      canAutoReply:aiReady,
-      threads:threads.map(({owner,licenseId,...t})=>({...t,canAutoReply:aiReady&&t.messages.length<100&&(t.status==='assistant'||(t.status==='human'&&t.handoffReason==='ai')),
-        messages:t.messages.map(m=>m.role==='customer'?{...m,clientRequestId:m.id}:m)})),allowance};
+      canAutoReply:aiReady,autoReplyUnavailableReason:currentBlocker,autoReplyNotice:this.autoReplyNotice(currentBlocker,aiReady),
+      threads:threads.map(({owner,licenseId,lastAutoReplyUnavailableReason,...t})=>{
+        const requestedByFeedback=t.messages.some(m=>m.role!=='customer'&&m.feedback==='needs_help');
+        const resumable=!requestedByFeedback&&(t.handoffReason==='ai'||t.handoffReason==='quota'||t.handoffReason==='error'||t.handoffReason==='config');
+        const explicitHuman=t.status==='human'&&!resumable;
+        const canAutoReply=aiReady&&t.messages.length<100&&(t.status==='assistant'||resumable);
+        const reason:AutoReplyUnavailableReason|null=t.status==='resolved'?'resolved':explicitHuman?(t.handoffReason==='staff'?'staff_takeover':t.handoffReason==='requested'||requestedByFeedback?'human_requested':'legacy_human'):t.messages.length>=100?'conversation_full':currentBlocker|| (t.waitingForHuman?(t.handoffReason==='ai'?'ai_handoff':lastAutoReplyUnavailableReason||null):null);
+        return {...t,canAutoReply,autoReplyUnavailableReason:reason,autoReplyNotice:this.autoReplyNotice(reason,canAutoReply,t.waitingForHuman===true),replyInProgress:t.status==='assistant'&&this.activeReplyThreadId.get(identity.owner)===t.id,
+        messages:t.messages.map(m=>m.role==='customer'?{...m,clientRequestId:m.id}:m)};
+      }),allowance};
   }
   private legacy() {
     const file=this.config.legacyFile;if(!file)return [];
@@ -166,7 +218,7 @@ export class SupportChat {
     return {ok:true,notificationPending:this.state.pendingNotifications?.length??0,connected:this.config.enabled,aiEnabled:this.config.aiEnabled&&!!this.config.apiKey,
       message:this.unavailable??(this.config.aiEnabled&&this.config.apiKey?'In-app conversations. Human takeover pauses AI replies.':'Human support is available. AI answers are off until the provider is configured.'),
       items:[...this.legacy(),...this.state.threads.map(t=>({id:t.id,name:t.name,ts:t.ts,updatedAt:t.updatedAt,status:t.status,question:t.messages.find(m=>m.role==='customer')?.text||'',messages:t.messages,version:t.version,waitingForHuman:t.waitingForHuman}))].sort((a,b)=>b.updatedAt-a.updatedAt),
-      knowledge:this.state.knowledge,questionGaps:[...gapCounts.values()].sort((a,b)=>b.count-a.count),limits:{monthlyReplies:200,dailyReplies:20,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},
+      knowledge:this.state.knowledge,questionGaps:[...gapCounts.values()].sort((a,b)=>b.count-a.count),limits:{monthlyReplies:1_000,dailyReplies:100,userMonthlyMicros:1_000_000,totalMonthlyMicros:this.monthlyLimit()},
       budget:{limitMicros:this.monthlyLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0),reservedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.pending).reduce((a,u)=>a+u.micros,0),resetsAt:this.allowance('').resetsAt,month:this.period().month,
         guests:{limitMicros:this.guestLimit(),configuredLimitMicros:this.configuredGuestLimit(),usedMicros:this.state.usage.filter(u=>u.month===this.period().month&&u.owner.startsWith('guest:')).reduce((a,u)=>a+u.micros,0)}},
       spentMicros:this.state.usage.filter(u=>u.month===this.period().month).reduce((a,u)=>a+u.micros,0)};
@@ -193,7 +245,9 @@ export class SupportChat {
     let thread=id?this.owned(identity,id):null;
     const existingThread=!!thread;
     if(thread&&thread.messages.length>=100)throw new SupportError('This conversation is full. Start a new conversation.',409);
-    const human=body.human===true || (thread?.status==='human' && thread.handoffReason!=='ai');
+    const requestedByFeedback=thread?.messages.some(m=>m.role!=='customer'&&m.feedback==='needs_help')===true;
+    const resumable=!requestedByFeedback&&(thread?.handoffReason==='ai'||thread?.handoffReason==='quota'||thread?.handoffReason==='error'||thread?.handoffReason==='config');
+    const human=body.human===true || (thread?.status==='human' && !resumable);
     this.edit(s=>{
       if(!thread){
         // Resolved history remains available to the customer, but it must not
@@ -204,35 +258,43 @@ export class SupportChat {
         if(s.threads.length>=500)throw new SupportError('The support inbox is full. Please use Report a bug.',507);
         thread={id:randomUUID(),owner:identity.owner,name:identity.name,licenseId:identity.licenseId,version:clean(body.version,40),ts:this.now(),updatedAt:this.now(),status:human?'human':'assistant',messages:[]};s.threads.push(thread);
       }
-      const t=s.threads.find(t=>t.id===thread!.id)!;t.messages.push({id:requestId,role:'customer',text,at:this.now()});t.updatedAt=this.now();if(t.status==='resolved'){t.status='human';t.handoffReason='staff';}if(t.status==='human'&&t.handoffReason==='ai'&&!human)t.status='assistant';else if(t.status==='human')t.waitingForHuman=true;
+      const t=s.threads.find(t=>t.id===thread!.id)!;t.messages.push({id:requestId,role:'customer',text,at:this.now()});t.updatedAt=this.now();if(t.status==='resolved'){t.status='human';t.handoffReason='staff';}if(requestedByFeedback&&t.status==='human'&&t.handoffReason!=='staff')t.handoffReason='requested';if(t.status==='human'&&resumable&&!human)t.status='assistant';else if(t.status==='human')t.waitingForHuman=true;
     });
     const threadId=thread!.id;
     if (!existingThread) this.notification('supportNew', threadId);
     else this.notification('supportReply', threadId);
     if (!existingThread && human) this.notification('supportHuman', threadId);
-    const quota=this.allowance(identity.owner);
-    if(this.thread(threadId).status==='human'||human||!this.config.aiEnabled||!this.config.apiKey||!quota.dailyRemaining||!quota.monthlyRemaining||quota.userRemainingMicros<RESERVE_MICROS||quota.totalRemainingMicros<RESERVE_MICROS||(guest&&quota.guestRemainingMicros<RESERVE_MICROS)){
+    const blocker=this.autoReplyBlocker(identity.owner);
+    if(this.thread(threadId).status==='human'||human||blocker){
       const wasHuman=this.thread(threadId).status==='human';
-      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;t.handoffReason=body.human===true?'requested':t.handoffReason==='staff'?'staff':'quota';});
+      this.edit(s=>{const t=s.threads.find(t=>t.id===threadId)!;t.status='human';t.waitingForHuman=true;
+        if(t.handoffReason==='staff')return;
+        if(body.human===true)t.handoffReason='requested';
+        else if(t.handoffReason==='requested'||(wasHuman&&!t.handoffReason))return;
+        else if(blocker){t.handoffReason=blocker==='ai_disabled'||blocker==='provider_unconfigured'?'config':'quota';t.lastAutoReplyUnavailableReason=blocker;}
+      });
       if (!wasHuman) this.notification('supportHuman', threadId);
       return this.customer(identity,threadId);
     }
     const reservation=randomUUID();
-    this.edit(s=>{s.usage=s.usage.filter(u=>u.month===this.period().month);s.usage.push({id:reservation,owner:identity.owner,...this.period(),micros:RESERVE_MICROS,pending:true});});
+    this.edit(s=>{s.usage=s.usage.filter(u=>u.month===this.period().month);s.usage.push({id:reservation,owner:identity.owner,...this.period(),micros:RESERVE_MICROS,pending:true,threadId});});
     this.busy.add(identity.owner);
+    this.activeReplyThreadId.set(identity.owner,threadId);
     let definitelyUnbilled = false;
     try {
       const t=this.thread(threadId);
       const queryWords=supportTerms(text);
       const relevance=(value:string)=>queryWords.reduce((score,w)=>score+(value.toLowerCase().includes(w)?1:0),0);
       const knowledge=this.state.knowledge.filter(k=>!k.version||k.version===t.version).map(k=>({k,score:relevance(k.question+' '+k.answer)})).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,2).map(x=>x.k);
-      const previous=t.messages.slice(0,-1).reverse().find(m=>m.role==='customer')?.text || '';
-      const docs=selectSupportGuide(this.config.knowledgeFile,t.version,text,previous);
-      const approvedAnswers=selectSupportAnswers(this.config.knowledgeFile,t.version,text,previous);
+      const priorMessages=t.messages.slice(0,-1).slice(-4);
+      const recentContext=priorMessages.map(m=>m.role+': '+m.text.slice(0,600)).join('\n');
+      const previousCustomerQuestion=[...priorMessages].reverse().find(m=>m.role==='customer')?.text || '';
+      const docs=selectSupportGuide(this.config.knowledgeFile,t.version,text,recentContext);
+      const approvedAnswers=selectSupportAnswers(this.config.knowledgeFile,t.version,text,recentContext);
       let catalog: Record<string, unknown> | undefined;
       try { catalog=this.config.publicCatalog?.(); } catch { /* Billing remains authoritative; unavailable facts must not be guessed. */ }
       const commerceFollowup=queryWords.length<=3&&/\b(it|that|those|them|same|what about)\b/i.test(text);
-      const billingFacts=supportPricingFacts(catalog,text+(commerceFollowup?' '+previous:''));
+      const billingFacts=supportPricingFacts(catalog,text+(commerceFollowup?' '+previousCustomerQuestion:''));
       let hostingOptions: Record<string, unknown> | undefined;
       try { hostingOptions=this.config.publicHostingOptions?.(); } catch { /* Hosting availability is live and may be unavailable. */ }
       const hostingFacts=supportHostingFacts(hostingOptions,text);
@@ -281,9 +343,9 @@ export class SupportChat {
       console.warn('[support] '+(error instanceof Error&&known.includes(error.message)?error.message:'Response unavailable or invalid'));
       this.edit(s=>{
         if (definitelyUnbilled) s.usage=s.usage.filter(u=>u.id!==reservation);
-        const t=s.threads.find(t=>t.id===threadId)!;if(t.status==='assistant'){t.status='human';t.waitingForHuman=true;t.handoffReason='error';}
+        const t=s.threads.find(t=>t.id===threadId)!;if(t.status==='assistant'){t.status='human';t.waitingForHuman=true;t.handoffReason='error';t.lastAutoReplyUnavailableReason='provider_error';}
       });
-    } finally {this.busy.delete(identity.owner);}
+    } finally {this.busy.delete(identity.owner);this.activeReplyThreadId.delete(identity.owner);}
     return this.customer(identity,threadId);
   }
   action(body:Record<string,unknown>) {

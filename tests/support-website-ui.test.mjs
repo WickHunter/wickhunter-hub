@@ -76,8 +76,20 @@ try{
  assert.doesNotMatch(messages.textContent,/Support is writing…/,'human-only thread never claims support is writing');
  humanSend.resolve(response({...human,threads:[{...human.threads[0],messages:[...human.threads[0].messages,{id:'human-follow-up',role:'customer',text:'Following up'}]}]}));await pause();
  const autoHandoff={...human,threads:[{...human.threads[0],canAutoReply:true}]};guest.window.render(autoHandoff);
+ assert.doesNotMatch(messages.textContent,/Support is writing…/,'eligibility for a new question does not mean an old handoff is typing');
  const automated=deferred();postQueue.push(automated);question.value='New AI-eligible question';d.querySelector('#send').click();
  assert.match(messages.textContent,/Support is writing…/,'AI-eligible handoff shows the indicator even with human status');
  automated.resolve(response({...autoHandoff,threads:[{...autoHandoff.threads[0],messages:[...autoHandoff.threads[0].messages,{id:'new-q',role:'customer',text:'New AI-eligible question'},{id:'new-a',role:'assistant',text:'Automated answer'}]}]}));await pause();
+ const quota={ok:true,aiEnabled:true,canAutoReply:false,autoReplyUnavailableReason:'guest_daily_limit',autoReplyNotice:'Today’s automatic reply limit has been reached.',threads:[{id:'quota-thread',status:'human',canAutoReply:false,replyInProgress:false,autoReplyUnavailableReason:'guest_daily_limit',autoReplyNotice:'Today’s automatic reply limit has been reached. Our team can review your message.',messages:[{id:'quota-q',role:'customer',text:'Waiting after limit'}]}]};
+ guest.window.render(quota);assert.equal(d.querySelector('#status').textContent,quota.threads[0].autoReplyNotice);assert.doesNotMatch(messages.textContent,/Support is writing…/);
+ guest.window.render({...quota,threads:[{...quota.threads[0],autoReplyNotice:null}]});assert.match(d.querySelector('#status').textContent,/Today’s automatic reply limit/,'reason fallback explains a paused older response');
+ const provider={...quota,threads:[{...quota.threads[0],autoReplyUnavailableReason:'provider_error',autoReplyNotice:'Automatic replies are temporarily unavailable. Our team can review your message.'}]};
+ guest.window.render(provider);assert.equal(d.querySelector('#status').textContent,provider.threads[0].autoReplyNotice);
+ const recovered={...quota,canAutoReply:true,autoReplyUnavailableReason:null,autoReplyNotice:null,threads:[{...quota.threads[0],canAutoReply:true,autoReplyUnavailableReason:null,autoReplyNotice:'Automatic replies are available again. Ask another question to continue.'}]};
+ guest.window.render(recovered);assert.equal(d.querySelector('#status').textContent,recovered.threads[0].autoReplyNotice);assert.doesNotMatch(messages.textContent,/Support is writing…/,'recovered handoff waits for a new customer question');
+ guest.window.render({...recovered,threads:[{...recovered.threads[0],replyInProgress:true}]});assert.match(messages.textContent,/Support is writing…/,'server explicitly reports active generation');
+ const requested={...quota,threads:[{...quota.threads[0],autoReplyUnavailableReason:'human_requested',autoReplyNotice:'With the support team.'}]};
+ guest.window.render(requested);assert.equal(d.querySelector('#status').textContent,'With the support team.');assert.doesNotMatch(messages.textContent,/Support is writing…/);
+ guest.window.render({ok:true,aiEnabled:false,canAutoReply:false,autoReplyUnavailableReason:'provider_unconfigured',autoReplyNotice:'Automatic replies are unavailable. Our team can review your message.',threads:[]});assert.equal(d.querySelector('#status').textContent,'Automatic replies are unavailable. Our team can review your message.');
  console.log('Website support: guest send, optimistic bubble, retry, draft, polling race, and reply eligibility passed');
 }finally{guest.window.close();}

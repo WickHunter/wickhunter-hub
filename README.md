@@ -1,3 +1,7 @@
+## v0.4.72 — Keep support conversations moving
+
+Support allows 100 replies per day and 1,000 per month for visitors and app users while preserving spending caps. Temporary limits and provider interruptions explain what happened and allow the conversation to continue once available; explicit requests for a person and staff takeover remain with the team.
+
 ## v0.4.71 — Grounded, natural customer support
 
 Support uses 1,000 reviewed questions, effective version-specific guides, and current public billing and hosting facts. GPT-6 Luna replaces GPT-5.6 Luna, with a configuration rollback and model-specific metering. Customer messages appear immediately with reliable retries and writing status. Hub groups unanswered questions for staff review; reusable answers require approval.
@@ -92,7 +96,7 @@ Customers can mark an answer resolved or request more human support. Feedback is
 
 ## v0.4.47 — Daily briefing and customer support
 
-The Hub opens on candle health, unresolved bugs, feature requests and conversations needing a human reply. Customer chat is durable, centrally metered at $50/month overall and $1/month, 200/month and 20/day per licensed user. Website visitors have smaller reply limits. Human replies, takeover, resolution and approval of reusable answers are manual. The Hub briefing does not invoke AI.
+The Hub opens on candle health, unresolved bugs, feature requests and conversations needing a human reply. Customer chat is durable, centrally metered at $50/month overall and $1/month, 1,000 replies/month and 100/day per user. Website visitors share an additional monthly guest spending cap. Human replies, takeover, resolution and approval of reusable answers are manual. The Hub briefing does not invoke AI.
 
 <!-- Private Earn with WH preview: 0.4.42; no Beta publication. -->
 # wickhunter-hub
@@ -1831,6 +1835,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.72 — Increase support reply allowances and recover from temporary handoffs with clear status.
 
 - v0.4.71 — Ground support in 1,000 reviewed questions, effective app guides and live commerce facts; improve chat delivery and staff knowledge review.
 - v0.4.70 — Label the Brevo opt-out callback accurately in the admin status summary.

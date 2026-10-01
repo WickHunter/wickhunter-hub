@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { selectSupportAnswers, selectSupportGuide, supportHostingFacts, supportPricingFacts } from '../dist/src/support-context.js';
+import { selectSupportAnswers, selectSupportGuide, supportHostingFacts, supportPricingFacts, supportTerms } from '../dist/src/support-context.js';
 import { SupportChat } from '../dist/src/support-chat.js';
 import { tmpDir } from './helpers.mjs';
 
@@ -13,8 +13,33 @@ const definition=selectSupportGuide(guide,'0.91.000','What is a DCA bot?');
 assert.match(definition,/DCA is an averaging ladder/);
 assert.doesNotMatch(definition,/\[gd-liq-dca\]/);
 assert.match(selectSupportGuide(guide,'0.90.155','Which bots have DCA?'),/DCA is an averaging ladder/);
+const accountPlanQuestion='if I have 10 accounts do I need two subs?';
+assert.deepEqual(supportTerms(accountPlanQuestion).filter(x=>['account','plan','license'].includes(x)),['account','plan']);
+assert.match(selectSupportGuide(guide,'website',accountPlanQuestion),/\[website-install\] Installation and hosting/,'account/subscription phrasing should retrieve installation licensing and account-scope facts');
 const followup=selectSupportGuide(guide,'website','And how do I install it?','How much is a plan?');
 assert.match(followup,/Installation and hosting/);
+const installClarification=[
+  'customer: How do I install Wick Hunter?',
+  'assistant: I can help with the installation. Which computer are you using, and which VPS provider did you choose?',
+  'customer: How do I use the terminal?',
+  'assistant: What computer and VPS provider are you using?',
+].join('\n');
+const installReply=selectSupportGuide(guide,'website','Vultr and im on a mac',installClarification);
+assert.match(installReply,/\[website-install\] Installation and hosting/,'a short answer to an assistant clarification should retain the installation topic');
+assert.equal(selectSupportAnswers(guide,'website','Vultr and im on a mac',installClarification),'','a clarification answer must not retrieve an incidental Vultr billing example');
+const multilineInstallClarification=[
+  'customer: How do I install Wick Hunter?',
+  'assistant: I can help with the installation.',
+  'customer: How do I use the terminal?',
+  'assistant: Which computer and VPS provider are you using,',
+  'so I can point you to the right install steps?',
+].join('\n');
+assert.match(selectSupportGuide(guide,'website','Vultr and im on a mac',multilineInstallClarification),/\[website-install\] Installation and hosting/,'multiline assistant clarification text should retain its question boundary');
+assert.equal(selectSupportAnswers(guide,'website','Vultr and im on a mac',multilineInstallClarification),'','multiline clarification replies must not retrieve unrelated bank rows');
+const newTopic=selectSupportGuide(guide,'0.90.155','Which bots have DCA?',installClarification);
+assert.match(newTopic,/\[support-core-definitions\]/,'a fresh question should dominate older installation context');
+assert.doesNotMatch(newTopic,/\[website-install\]/,'a fresh question must not inherit unrelated context');
+assert.doesNotMatch(selectSupportAnswers(guide,'0.90.155','Which bots have DCA?',installClarification),/Who pays my Vultr|onb-0058/,'bank retrieval for a new question must remain current-question-first');
 const stale=selectSupportGuide(guide,'0.91.000','How does the Optimized Liquidation Bot set its leverage?');
 assert.doesNotMatch(stale,/\[gd-liq-leverage\]/);
 assert.doesNotMatch(selectSupportGuide(guide,'../../private','How does the Optimized Liquidation Bot set its leverage?'),/\[gd-liq-leverage\]/);
@@ -41,6 +66,7 @@ for(const version of ['0.90.135','0.90.154','0.90.155']){
 const live={mode:'live',plans:[{key:'monthly',name:'Monthly',amountCents:9900,currency:'usd',interval:'month',available:true,buyUrl:'https://hub.test/buy?plan=monthly'},{key:'lifetime',name:'Lifetime',amountCents:99900,currency:'usd',interval:null,lifetime:true,licenseDays:3650,available:true}],launch:{active:true,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:1792036800000,redeemUntilMs:Date.now()+1e7}};
 const facts=supportPricingFacts(live,'How much is a plan?');
 assert.match(facts,/9900/);assert.match(facts,/UNLEASHED25/);assert.doesNotMatch(facts,/secretKey/);
+assert.match(supportPricingFacts(live,accountPlanQuestion),/9900/,'informal “subs” phrasing should request current public plan facts');
 assert.doesNotMatch(facts,/licenseDays|3650/);
 assert.match(supportPricingFacts(live,'When will my card first be charged?'),/firstPaymentEastern/);
 assert.match(supportPricingFacts(live,'When does free access end?'),/firstPaymentEastern/);
@@ -53,6 +79,7 @@ assert.match(supportPricingFacts({...live,mode:'test'},'How much is a plan?'),/c
 assert.equal(supportPricingFacts(live,'What is DCA?'),'');
 const hosting={monthlyPriceLabel:'$20.00',priceIsProposed:false,regions:[{id:'nrt',label:'Tokyo'}],planLabel:'1 vCPU / 2 GB',maximumConnectedAccounts:5,managedBackupsIncluded:false,purchasable:true,bundleEnabled:true,bundles:[{key:'monthly-hosted',interval:'month',amountCents:11900,currency:'usd'}]};
 assert.match(supportHostingFacts(hosting,'Can I buy managed hosting?'),/"purchasable":true/);
+assert.match(supportHostingFacts(hosting,accountPlanQuestion),/"maximumConnectedAccounts":5/,'account-capacity questions should include the current managed-hosting limit');
 assert.match(supportHostingFacts(hosting,'How much is the hosted bundle?'),/11900/);
 assert.match(supportHostingFacts(hosting,'Which hosting region can I choose?'),/Tokyo/);
 assert.doesNotMatch(supportHostingFacts(hosting,'Which hosting region can I choose?'),/"nrt"/);
@@ -75,6 +102,11 @@ r=await chat.message(customer,{id:r.threads[0].id,text:'Is managed hosting avail
 assert.equal(r.threads[0].status,'assistant');
 assert.match(prompts[2],/"purchasable":true/);
 assert.match(prompts[2],/11900/);
+r=await chat.message(customer,{id:r.threads[0].id,text:accountPlanQuestion,requestId:'account-plan-capacity-001'});
+assert.equal(r.threads[0].status,'assistant');
+assert.match(prompts[3],/Installation and hosting/);
+assert.match(prompts[3],/Current public billing facts:.*9900/);
+assert.match(prompts[3],/Current public hosting options:.*"maximumConnectedAccounts":5/);
 const switchResult=await chat.message({...customer,owner:'guest:switch-plan'},{text:'Can I switch from Monthly to Yearly today?',requestId:'billing-switch-001',version:'website'});
 assert.equal(switchResult.threads[0].status,'human');
 assert.match(switchResult.threads[0].messages.at(-1).text,/Open the billing portal to see the options/);

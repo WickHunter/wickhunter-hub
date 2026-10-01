@@ -46,23 +46,27 @@ for(const [configured,expectedModel,expectedMicros] of [[undefined,'gpt-6-luna',
 calls=0;
 const ai=new SupportChat(tmpDir('support-ai'),{...cfg,aiEnabled:true,apiKey:'fake'},provider);
 let aiThread;
-for(let i=0;i<22;i++){const r=await ai.message(identity,{id:aiThread,text:'Question',requestId:'request-'+i});aiThread=r.threads[0].id;}
-assert.equal(calls,20);assert.equal(ai.allowance('owner').dailyRemaining,0);
+for(let i=0;i<102;i++){if(i%49===0)aiThread=undefined;const r=await ai.message(identity,{id:aiThread,text:'Question',requestId:'request-'+i});aiThread=r.threads[0].id;}
+assert.equal(calls,100);assert.equal(ai.allowance('owner').dailyRemaining,0);
+assert.equal(ai.allowance('owner').monthlyRemaining,900);
+assert.deepEqual({daily:ai.admin().limits.dailyReplies,monthly:ai.admin().limits.monthlyReplies},{daily:100,monthly:1000});
 const bounded=new SupportChat(tmpDir('support-cap'),{...cfg,aiEnabled:true,apiKey:'fake',totalMonthlyMicros:7999},provider);
 const before=calls;await bounded.message(identity,{text:'Help',requestId:'cap-request'});assert.equal(calls,before);
 let finish;const inFlight=new SupportChat(tmpDir('support-flight'),{...cfg,aiEnabled:true,apiKey:'fake'},()=>new Promise(r=>{finish=r;}));
 const run=inFlight.message(identity,{text:'Help',requestId:'first-request'});
+assert.equal(inFlight.customer(identity).threads[0].replyInProgress,true);
 await assert.rejects(inFlight.message(identity,{text:'Second',requestId:'second-request'}),e=>e.status===409);
 const tid=inFlight.admin().items[0].id;assert.throws(()=>inFlight.action({id:tid,action:'delete'}),e=>e.status===409);inFlight.action({id:tid,action:'takeover'});finish(await provider());await run;
 assert.equal(inFlight.customer(identity,tid).threads[0].messages.length,1);
 assert.equal(inFlight.customer(identity,tid).threads[0].status,'human');
+assert.equal(inFlight.customer(identity,tid).threads[0].replyInProgress,false);
 const failedDir=tmpDir('support-timeout');const failed=new SupportChat(failedDir,{...cfg,aiEnabled:true,apiKey:'fake'},async()=>{throw new Error('timeout');});
 await failed.message(identity,{text:'Help',requestId:'failed-request'});
 assert.equal(new SupportChat(failedDir,cfg).allowance('owner').userRemainingMicros,992000);
 const refusedDir=tmpDir('support-refused');const refused=new SupportChat(refusedDir,{...cfg,aiEnabled:true,apiKey:'fake'},async()=>new Response('{}',{status:429}));
 await refused.message(identity,{text:'Help',requestId:'refused-request'});
 assert.equal(new SupportChat(refusedDir,cfg).allowance('owner').userRemainingMicros,1_000_000);
-assert.equal(new SupportChat(refusedDir,cfg).allowance('owner').monthlyRemaining,200);
+assert.equal(new SupportChat(refusedDir,cfg).allowance('owner').monthlyRemaining,1000);
 const h=await freshHub({support:cfg});
 try{
  assert.equal((await fetch(h.origin+'/admin/api/support')).status,401);
@@ -81,7 +85,7 @@ try{
  const guestHeaders={...sessionHeaders,cookie:cookie.split(';')[0],'content-type':'application/json'};
  assert.equal((await fetch(h.origin+'/support/chat')).status,401);
  const guest=await(await fetch(h.origin+'/support/chat',{method:'POST',headers:guestHeaders,body:JSON.stringify({text:'Website help',requestId:'website-request',version:'spoofed'})})).json();
- assert.equal(guest.threads[0].version,'website');assert.equal(guest.allowance.dailyRemaining,5);
+ assert.equal(guest.threads[0].version,'website');assert.equal(guest.allowance.dailyRemaining,100);
  assert.equal((await fetch(h.origin+'/support/chat',{headers:{cookie:guestHeaders.cookie+'tampered'}})).status,401);
  assert.equal((await fetch(h.origin+'/api/support/chat?id='+guest.threads[0].id,{headers:{'x-license':issue.token}})).status,404);
  const inbox=await(await fetch(h.origin+'/admin/api/support',{headers:auth})).json();assert.equal(inbox.items.length,2);

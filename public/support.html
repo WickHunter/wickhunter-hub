@@ -39,6 +39,20 @@ function autoReply(d,t){
  if(!t&&typeof d?.canAutoReply==='boolean')return d.canAutoReply;
  return d?.aiEnabled===true&&t?.status!=='human'&&t?.status!=='resolved'; // Older Hub responses.
 }
+function supportStatus(d,t,last){
+ const notice=t?.autoReplyNotice??(!t||t.status!=='human'?d?.autoReplyNotice:null);
+ if(typeof notice==='string'&&notice.trim())return notice.trim();
+ if(t?.status==='human'&&autoReply(d,t))return 'Our team has your earlier message. You can ask another question.';
+ const reason=t?.autoReplyUnavailableReason??d?.autoReplyUnavailableReason;
+ if(['guest_daily_limit','member_daily_limit'].includes(reason))return 'Today’s automatic reply limit has been reached. Our team can review your message.';
+ if(['guest_monthly_limit','member_monthly_limit'].includes(reason))return 'This month’s automatic reply limit has been reached. Our team can review your message.';
+ if(['user_budget','guest_budget','global_budget'].includes(reason))return 'Automatic replies are paused for now. Our team can review your message.';
+ if(reason==='provider_error')return 'Automatic replies are temporarily unavailable. Our team can review your message.';
+ if(['ai_disabled','provider_unconfigured'].includes(reason))return 'Automatic replies are unavailable. Our team can review your message.';
+ if(t?.status==='human')return last?.role==='human'?'Team replied':'With the support team';
+ if(sessionReady&&((t&& !autoReply(d,t))||(!t&&d?.canAutoReply===false)))return 'Automatic replies are unavailable right now. Our team can review your message.';
+ return d.aiEnabled===false?'Send a message to our team.':'';
+}
 function attemptThread(list){
  if(!attempt)return null;
  return list.find(t=>(!attempt.id||t.id===attempt.id)&&t.messages?.some(m=>m.role==='customer'&&(
@@ -69,9 +83,9 @@ function render(d){state=d;const list=d.threads||[];
   box.appendChild(p);
  }
  const last=t?.messages.at(-1);
- if((attempt?.state==='sending'&&attempt.autoReply)||(!attempt&&last?.role==='customer'&&autoReply(d,t))){const writing=document.createElement('div');writing.className='writing';writing.textContent='Support is writing…';box.appendChild(writing);}
+ if((attempt?.state==='sending'&&attempt.autoReply)||(!attempt&&t?.replyInProgress===true)){const writing=document.createElement('div');writing.className='writing';writing.textContent='Support is writing…';box.appendChild(writing);}
  feedback.hidden=!!attempt||!last||last.role==='customer'||!!last.feedback;box.appendChild(feedback);box.scrollTop=follow?box.scrollHeight:scroll;
- el('status').textContent=attempt?.state==='failed'?'Message not confirmed. Retry or remove it to continue.':t?.status==='human'?(last?.role==='human'?'Team replied':'With the support team'):d.aiEnabled===false?'Send a message to our team.':'';
+ el('status').textContent=attempt?.state==='failed'?'Message not confirmed. Retry or remove it to continue.':supportStatus(d,t,last);
  sendState();
 }
 async function load(){if(busy)return;const startEpoch=epoch,seq=++loadSeq;try{const d=await call('/chat');if(startEpoch===epoch&&seq===loadSeq){render(d);sessionReady=true;}}catch(e){if(startEpoch!==epoch||seq!==loadSeq)return;if(e.status===401){sessionReady=false;render({threads:[]});}else el('status').textContent=e.message;}}

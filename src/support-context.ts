@@ -26,11 +26,38 @@ function guidesFor(file:string,version:string): {base:SupportGuide;current:Suppo
 const STOP = new Set('a an and are as at be by can could do does for from have how i in is it me my of on or our the their them there these this to us was what when where which who why with would you your bot bots app wick hunter unleashed please help know tell about here mean'.split(' '));
 const normalizedQuestion = (value:string) => value.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ');
 const aliases: Record<string, string> = {
-  cost: 'price', costs: 'price', pricing: 'price', priced: 'price', expensive: 'price', fees: 'price', fee: 'price', subscription: 'plan', subscriptions: 'plan', annual: 'yearly', buying: 'buy', purchase: 'buy', purchasing: 'buy', pay: 'buy', payment: 'buy', payments: 'buy', install: 'installation', installing: 'installation', installed: 'installation', setup: 'installation', deploy: 'installation', deployment: 'installation', host: 'hosting', hosted: 'hosting', server: 'hosting', vps: 'hosting', averaging: 'dca', average: 'dca', ladder: 'dca', ladders: 'dca',
+  cost: 'price', costs: 'price', pricing: 'price', priced: 'price', expensive: 'price', fees: 'price', fee: 'price', sub: 'plan', subs: 'plan', subscription: 'plan', subscriptions: 'plan', plan: 'plan', plans: 'plan', account: 'account', accounts: 'account', licence: 'license', licences: 'license', license: 'license', licenses: 'license', annual: 'yearly', buying: 'buy', purchase: 'buy', purchasing: 'buy', pay: 'buy', payment: 'buy', payments: 'buy', install: 'installation', installing: 'installation', installed: 'installation', setup: 'installation', deploy: 'installation', deployment: 'installation', host: 'hosting', hosted: 'hosting', server: 'hosting', vps: 'hosting', averaging: 'dca', average: 'dca', ladder: 'dca', ladders: 'dca',
 };
 export function supportTerms(value: string): string[] {
   const normalized = value.toLowerCase().replace(/dollar\s*[- ]?\s*cost\s*[- ]?\s*averaging/g, ' dca ').replace(/d\s*\.\s*c\s*\.\s*a\s*\.?/g, ' dca ');
   return [...new Set((normalized.match(/[a-z0-9]{3,}/g) || []).map(w => aliases[w] || w).filter(w => !STOP.has(w)))];
+}
+interface RecentTurn { role: 'customer' | 'assistant' | 'human'; text: string }
+function recentTurns(value: string): RecentTurn[] {
+  const turns: RecentTurn[] = [];
+  for (const line of value.split(/\r?\n/)) {
+    const match = line.match(/^\s*(customer|assistant|human):\s*(.*)$/i);
+    if (match) turns.push({ role: match[1].toLowerCase() as RecentTurn['role'], text: match[2] });
+    else if (turns.length) turns[turns.length - 1].text += '\n' + line;
+  }
+  return turns;
+}
+function customerContext(value: string): string {
+  const turns = recentTurns(value);
+  // Keep the previous single-question form usable for existing callers/tests.
+  return turns.length ? turns.filter(turn => turn.role === 'customer').map(turn => turn.text).join(' ') : value;
+}
+function isQuestion(value: string): boolean {
+  return /\?|^\s*(?:how|what|when|where|which|who|why|is|are|do|does|did|can|could|would|will|should|may|please)\b/i.test(value);
+}
+/** A short statement after a staff/assistant question is a clarification answer,
+ * not a new search query. Keep the topic from earlier customer turns, but do not
+ * match a reviewed Q&A row against incidental words such as a VPS provider. */
+function isClarificationReply(currentQuestion: string, context: string): boolean {
+  const turns = recentTurns(context);
+  const latest = turns.at(-1);
+  return !!latest && latest.role === 'assistant' && /\?\s*$/.test(latest.text.trim())
+    && !isQuestion(currentQuestion) && supportTerms(currentQuestion).length <= 8;
 }
 function score(section: SupportGuideSection, query: readonly string[]): number {
   const title = new Set(supportTerms(section.title || ''));
@@ -46,13 +73,16 @@ function score(section: SupportGuideSection, query: readonly string[]): number {
   return total + matches * 2;
 }
 /** Only sections explicitly marked stable may cross a guide version boundary. */
-export function selectSupportGuide(file: string | undefined, version: string, currentQuestion: string, previousCustomerQuestion = ''): string {
+export function selectSupportGuide(file: string | undefined, version: string, currentQuestion: string, recentContext = ''): string {
   if (!file) return '';
   const guides=guidesFor(file,version);if(!guides)return '';
   const {base,current:currentGuide}=guides;
   const current = supportTerms(currentQuestion);
-  const followup = current.length <= 3 && /\b(it|that|those|they|them|there|this|what about|and|then|also)\b/i.test(currentQuestion);
-  const prior = followup ? supportTerms(previousCustomerQuestion).filter(w => !current.includes(w)).slice(0, 5) : [];
+  const clarificationReply = isClarificationReply(currentQuestion, recentContext);
+  const followup = !clarificationReply && current.length <= 3 && /\b(it|that|those|they|them|there|this|what about|and|then|also)\b/i.test(currentQuestion);
+  const prior = followup || clarificationReply
+    ? supportTerms(customerContext(recentContext)).filter(w => !current.includes(w)).slice(0, 12)
+    : [];
   const sections=version==='website' ? base.sections! : currentGuide.version===version ? [
     ...currentGuide.sections!.filter(s=>s.audience!=='website'||s.versionIndependent===true),
     ...(currentGuide!==base?base.sections!.filter(s=>s.versionIndependent===true&&!currentGuide.sections!.some(c=>c.id===s.id)):[]),
@@ -81,7 +111,7 @@ interface BankQuestion {
 }
 interface QuestionBank { version?: string; questions?: BankQuestion[]; items?: BankQuestion[]; sources?: {id?:string}[] | Record<string,unknown> }
 /** Staff-reviewed question bank entries are candidate answers, never customer-written facts. */
-export function selectSupportAnswers(guideFile: string | undefined, version: string, currentQuestion: string, previousCustomerQuestion = ''): string {
+export function selectSupportAnswers(guideFile: string | undefined, version: string, currentQuestion: string, recentContext = ''): string {
   if (!guideFile) return '';
   try {
     const bankFile = path.join(path.dirname(guideFile), 'support-question-bank.json');
@@ -100,8 +130,9 @@ export function selectSupportAnswers(guideFile: string | undefined, version: str
     const currentSources = new Map(currentGuide.sections!.filter(s=>s.id).map(s=>[s.id!,s]));
     const manifestSources = Array.isArray(bank) ? new Set<string>() : new Set(Array.isArray(bank.sources) ? bank.sources.map(s=>s.id).filter((id):id is string=>typeof id==='string') : Object.keys(bank.sources || {}));
     const current = supportTerms(currentQuestion);
+    if (isClarificationReply(currentQuestion, recentContext)) return '';
     const followup = current.length <= 3 && /\b(it|that|those|they|them|there|this|what about|and|then|also)\b/i.test(currentQuestion);
-    const prior = followup ? supportTerms(previousCustomerQuestion).filter(w => !current.includes(w)).slice(0, 5) : [];
+    const prior = followup ? supportTerms(customerContext(recentContext)).filter(w => !current.includes(w)).slice(0, 12) : [];
     const allowedDynamic = new Set(['software_price','plan_availability','offer_discount','offer_deadline','hosting_price','billing_status','crypto_plan_availability','lifetime_plan_availability']);
     const sourceEligible = (row:BankQuestion,id:string) => {
       const source=approvedSources.get(id);
@@ -131,7 +162,7 @@ interface PublicPlan { key?: unknown; name?: unknown; amountCents?: unknown; cur
 interface PublicCatalog { mode?: unknown; plans?: unknown; launch?: unknown }
 /** The only pricing input is the public catalog already served to the site. */
 export function supportPricingFacts(catalog: PublicCatalog | undefined, question: string, nowMs = Date.now()): string {
-  const commerce=/\b(plans?|subscriptions?|monthly|yearly|annual|lifetime|discount|coupon|promo|offer codes?|cards?|payments?|checkout|charg\w*|renew\w*|billing|crypto|stablecoin|trial|free access|free period|free until)\b/i.test(question);
+  const commerce=/\b(plans?|subs?|subscriptions?|monthly|yearly|annual|lifetime|discount|coupon|promo|offer codes?|cards?|payments?|checkout|charg\w*|renew\w*|billing|crypto|stablecoin|trial|free access|free period|free until)\b/i.test(question);
   const trading=/\b(dca|pairs?|entry|orders?|markets?|trades?|hedge|vwma|leverage|stops?|exchange|funding|candles?)\b/i.test(question);
   const price=/\b(pric\w*|cost\w*|how much)\b/i.test(question);
   const buy=/\b(buy|purchase)\b/i.test(question);
@@ -148,7 +179,9 @@ export function supportPricingFacts(catalog: PublicCatalog | undefined, question
 
 interface HostingOptions { monthlyPriceLabel?: unknown; priceIsProposed?: unknown; regions?: unknown; planLabel?: unknown; maximumConnectedAccounts?: unknown; managedBackupsIncluded?: unknown; purchasable?: unknown; bundleEnabled?: unknown; bundles?: unknown }
 export function supportHostingFacts(options: HostingOptions | undefined, question: string): string {
-  if(!/\b(hosting|hosted|vps|managed server)\b/i.test(question))return '';
+  const accountCapacity=/\b(?:\d+|how many|many|multiple|several|more than)\b[^.?!]{0,40}\baccounts?\b/i.test(question)
+    || /\baccounts?\b[^.?!]{0,40}\b(?:limit|maximum|capacity|hosting|hosted|vps|plan|subscription|subs?)\b/i.test(question);
+  if(!/\b(hosting|hosted|vps|managed server)\b/i.test(question)&&!accountCapacity)return '';
   if(!options)return 'Current hosting availability could not be verified; refer to the hosting checkout or a human.';
   const bundles=Array.isArray(options.bundles)?options.bundles.filter((b:any)=>b&&typeof b.key==='string'&&Number.isSafeInteger(b.amountCents)&&b.amountCents>=0&&typeof b.currency==='string').map((b:any)=>({key:b.key,interval:b.interval,amountCents:b.amountCents,currency:b.currency})):[];
   const regions=Array.isArray(options.regions)?options.regions.filter((r:any)=>r&&typeof r.label==='string').map((r:any)=>r.label.slice(0,60)).slice(0,10):[];
