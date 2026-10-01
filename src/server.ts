@@ -95,7 +95,8 @@ import {
   type AsyncGzipLimits, type GzipFunction, type GzipReservation,
 } from "./async-gzip.js";
 import { recordCheckin, readRoster, sharingSignals } from "./checkins.js";
-import { flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
+import { EARLY_ACCESS_ELIGIBILITY_FLAG, flagsFor, isUnsafeKey, readFlags, setFlag } from "./flags.js";
+import { compareReleaseVersions, parseCustomerReleaseChannel, productionTransition, type CustomerReleaseChannel } from "./release-routing.js";
 import {
   DEFAULT_FEEDBACK_STORAGE_LIMITS, FEEDBACK_EVIDENCE_SCHEMA, FEEDBACK_STATUSES, FEEDBACK_TEXT_MAX,
   FeedbackQuotaError, FeedbackRateLimiter,
@@ -787,6 +788,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "POST" && p === "/api/feedback") return feedbackIntake(req, res);
     if (m === "GET" && p === "/install.sh") return installScript(url, res);
+    const channelLatest = /^\/api\/releases\/([^/]+)\/latest$/.exec(p);
+    if (m === "GET" && channelLatest) return channelLatestMeta(req, url, res, channelLatest[1]!);
+    const channelDownload = /^\/api\/releases\/([^/]+)\/download\/([^/]+)$/.exec(p);
+    if (m === "GET" && channelDownload) return channelDownloadFile(req, url, res, channelDownload[1]!, channelDownload[2]!);
     if (m === "GET" && p === "/api/latest") return latestMeta(req, url, res);
     if (m === "GET" && p === "/api/candles/seed") return candleSeed(req, url, res);
     if (m === "GET" && p === "/api/candles/snapshot") return candleSnapshot(req, url, res);
@@ -982,6 +987,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     //
     // The signed-token check above prevents a bare licence id reading flags.
     const flags = flagsFor(cfg.dataDir, body.licenseId);
+    // Hub release eligibility is authorization metadata, not an app feature
+    // entitlement and not a Marketplace flag; keep it out of the bot's `flags`.
+    delete flags[EARLY_ACCESS_ELIGIBILITY_FLAG];
     // v0.4.16 — the customer's billing state, for the app's Subscription
     // card (`recordSubscriptionInfo` / `SubscriptionInfo` in
     // liqhunter-private's src/license.ts, which is what fixes this exact
@@ -1720,6 +1728,161 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     return readReleaseFile("latest.json");
   }
 
+  function customerReleaseShelf(channel: CustomerReleaseChannel): string | null {
+    if (channel === "beta") return cfg.releasesDir;
+    if (typeof cfg.productionReleasesDir !== "string" || !cfg.productionReleasesDir.trim()) return null;
+    let betaPath = path.resolve(cfg.releasesDir), productionPath = path.resolve(cfg.productionReleasesDir);
+    try { betaPath = fs.realpathSync(betaPath); } catch { /* retain the configured future path */ }
+    try { productionPath = fs.realpathSync(productionPath); } catch { /* retain the configured future path */ }
+    return betaPath === productionPath ? null : cfg.productionReleasesDir;
+  }
+
+  function readChannelReleaseFile(shelf: string, channel: CustomerReleaseChannel, name: string, maxAgeMs = cfg.releaseMaxAgeMs): SignedReleaseManifest | null {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return null;
+    try {
+      const base = path.resolve(shelf);
+      const file = path.resolve(base, name);
+      if (!file.startsWith(base + path.sep)) return null;
+      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      const manifest = verifyReleaseManifest(raw, {
+        publicKeys: cfg.releasePublicKeys, now: Date.now(), maxAgeMs,
+        channel, platform: cfg.releasePlatform, arch: cfg.releaseArch,
+      });
+      const artifact = fs.readFileSync(path.join(base, manifest.file));
+      verifyReleaseArtifact(manifest, artifact);
+      return manifest;
+    } catch { return null; }
+  }
+
+  function readArchivedChannelRelease(channel: CustomerReleaseChannel, sha256: string): SignedReleaseManifest | null {
+    const shelf = customerReleaseShelf(channel);
+    if (!shelf || !/^[0-9a-f]{64}$/.test(sha256)) return null;
+    const manifest = readChannelReleaseFile(shelf, channel, `manifest-${sha256}.json`, Number.MAX_SAFE_INTEGER);
+    return manifest?.sha256 === sha256 ? manifest : null;
+  }
+
+  function channelLicense(req: IncomingMessage, res: ServerResponse, channelText: string): { channel: CustomerReleaseChannel; id: string } | null {
+    if (cfg.releaseRoutingEnabled !== true) {
+      sendJson(res, 404, { ok: false, error: "channel-aware releases are not enabled" }, { "cache-control": "no-store" });
+      return null;
+    }
+    let channel: CustomerReleaseChannel;
+    try { channel = parseCustomerReleaseChannel(channelText); }
+    catch (error) {
+      const status = channelText === "alpha" ? 404 : 400;
+      sendJson(res, status, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" });
+      return null;
+    }
+    const requested = req.headers["x-release-channel"];
+    if (requested !== channel) {
+      sendJson(res, 400, { ok: false, error: "x-release-channel must match the requested customer release route" }, { "cache-control": "no-store" });
+      return null;
+    }
+    const token = req.headers["x-license"];
+    const verified = typeof token === "string" ? store.verify(token) : null;
+    if (!verified?.ok) {
+      sendJson(res, 403, { ok: false, error: "active license required in x-license" }, { "cache-control": "no-store" });
+      return null;
+    }
+    if (channel === "beta") {
+      if (req.headers["x-early-access-opt-in"] !== "true") {
+        sendJson(res, 403, { ok: false, error: "explicit Early Access opt-in is required" }, { "cache-control": "no-store" });
+        return null;
+      }
+      const eligible = readFlags(cfg.dataDir).byLicense[verified.payload.id]?.[EARLY_ACCESS_ELIGIBILITY_FLAG] === true;
+      if (!eligible) {
+        sendJson(res, 403, { ok: false, error: "this license is not enabled for Early Access by the Hub" }, { "cache-control": "no-store" });
+        return null;
+      }
+    }
+    return { channel, id: verified.payload.id };
+  }
+
+  async function channelLatestMeta(req: IncomingMessage, url: URL, res: ServerResponse, channelText: string): Promise<void> {
+    const access = channelLicense(req, res, channelText);
+    if (!access) return;
+    const shelf = customerReleaseShelf(access.channel);
+    if (!shelf) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no release is available for this channel" }, { "cache-control": "no-store" });
+    const latest = readChannelReleaseFile(shelf, access.channel, "latest.json");
+    if (!latest) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no verified release is available for this channel" }, { "cache-control": "no-store" });
+
+    if (access.channel === "production") {
+      const installedFields = ["installedChannel", "installedVersion", "installedBuildId", "installedSha256"] as const;
+      const supplied = installedFields.some((key) => url.searchParams.has(key));
+      if (supplied) {
+        const installedChannel = url.searchParams.get("installedChannel");
+        const installedVersion = url.searchParams.get("installedVersion");
+        const installedBuildId = url.searchParams.get("installedBuildId");
+        const installedSha256 = url.searchParams.get("installedSha256");
+        if ((installedChannel !== "beta" && installedChannel !== "production") || !installedVersion || !installedBuildId || !installedSha256) {
+          return sendJson(res, 400, { ok: false, channel: "production", error: "complete installed release identity is required" }, { "cache-control": "no-store" });
+        }
+        const installed = readArchivedChannelRelease(installedChannel, installedSha256);
+        if (!installed || installed.version !== installedVersion || installed.buildId !== installedBuildId) {
+          return sendJson(res, 409, { ok: false, channel: "production", status: "waiting-for-production", error: "installed release identity could not be verified" }, { "cache-control": "no-store" });
+        }
+        let transition: ReturnType<typeof productionTransition>;
+        try { transition = productionTransition(installed, latest); }
+        catch (error) { return sendJson(res, 400, { ok: false, channel: "production", error: (error as Error).message }, { "cache-control": "no-store" }); }
+        if (transition === "waiting-for-production") {
+          return sendJson(res, 409, { ok: false, channel: "production", status: transition, installedVersion: installed.version, productionVersion: latest.version }, { "cache-control": "no-store" });
+        }
+        return sendJson(res, 200, { ok: true, ...latest }, {
+          "cache-control": "no-store, no-transform", "x-content-type-options": "nosniff", "x-release-status": transition,
+        });
+      }
+    }
+    sendJson(res, 200, { ok: true, ...latest }, {
+      "cache-control": "no-store, no-transform", "x-content-type-options": "nosniff", "x-release-status": "update-available",
+    });
+  }
+
+  async function channelDownloadFile(req: IncomingMessage, url: URL, res: ServerResponse, channelText: string, name: string): Promise<void> {
+    const access = channelLicense(req, res, channelText);
+    if (!access) return;
+    const shelf = customerReleaseShelf(access.channel);
+    if (!shelf) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no release is available for this channel" }, { "cache-control": "no-store" });
+    const latest = readChannelReleaseFile(shelf, access.channel, "latest.json");
+    if (!latest) return sendJson(res, 404, { ok: false, channel: access.channel, status: "unavailable", error: "no verified release is available for this channel" }, { "cache-control": "no-store" });
+    if (access.channel === "production") {
+      const installedFields = ["installedChannel", "installedVersion", "installedBuildId", "installedSha256"] as const;
+      const supplied = installedFields.some((key) => url.searchParams.has(key));
+      if (supplied) {
+        const installedChannel = url.searchParams.get("installedChannel");
+        const installedVersion = url.searchParams.get("installedVersion");
+        const installedBuildId = url.searchParams.get("installedBuildId");
+        const installedSha256 = url.searchParams.get("installedSha256");
+        if ((installedChannel !== "beta" && installedChannel !== "production") || !installedVersion || !installedBuildId || !installedSha256) {
+          return sendJson(res, 400, { ok: false, channel: "production", error: "complete installed release identity is required" }, { "cache-control": "no-store" });
+        }
+        const installed = readArchivedChannelRelease(installedChannel, installedSha256);
+        if (!installed || installed.version !== installedVersion || installed.buildId !== installedBuildId) {
+          return sendJson(res, 409, { ok: false, channel: "production", status: "waiting-for-production", error: "installed release identity could not be verified" }, { "cache-control": "no-store" });
+        }
+        let transition: ReturnType<typeof productionTransition>;
+        try { transition = productionTransition(installed, latest); }
+        catch (error) { return sendJson(res, 400, { ok: false, channel: "production", error: (error as Error).message }, { "cache-control": "no-store" }); }
+        if (transition === "waiting-for-production") {
+          return sendJson(res, 409, { ok: false, channel: "production", status: transition }, { "cache-control": "no-store" });
+        }
+        if (transition === "current-same-artifact") {
+          res.writeHead(204, { "cache-control": "no-store", "x-release-status": transition });
+          return void res.end();
+        }
+      }
+    }
+    if (name !== "latest" && name !== latest.file) return sendJson(res, 404, { ok: false, error: "no such current channel artifact" }, { "cache-control": "no-store" });
+    const file = path.resolve(shelf, latest.file);
+    const stat = fs.statSync(file);
+    res.writeHead(200, {
+      "content-type": "application/gzip", "cache-control": "no-store", "content-length": stat.size,
+      "content-disposition": `attachment; filename="${latest.file}"`,
+    });
+    const stream = fs.createReadStream(file);
+    stream.pipe(res);
+    stream.on("error", () => res.destroy());
+  }
+
   /** Resolve an in-flight hosting generation after `latest.json` advances.
    * Publishing retains the exact signed manifest as
    * `manifest-<artifact-sha256>.json`; the immutable artifact file named by
@@ -2179,6 +2342,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         // Marketplace is intentionally per-licence alpha. A global default is
         // never treated as authorization here or in the private roster sync.
         marketplaceAlpha: featureFlags.byLicense[l.id]?.marketplace === true,
+        earlyAccessEligible: featureFlags.byLicense[l.id]?.[EARLY_ACCESS_ELIGIBILITY_FLAG] === true,
         lastSeen: roster[l.id] ?? null,
         sharing: sharing[l.id] ?? null,
         seat: seatViews[l.id] ?? null,
@@ -2672,6 +2836,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (isUnsafeKey(body.id) || isUnsafeKey(body.flag)) {
         const bad = isUnsafeKey(body.id) ? `licence id "${body.id}"` : `flag name "${body.flag}"`;
         return sendJson(res, 400, { ok: false, error: `${bad} is not usable — it collides with a JavaScript object member` });
+      }
+      // Early Access eligibility is a per-license Hub authorization, never a
+      // global default. Customer opt-in remains a separate request header.
+      if (body.flag === EARLY_ACCESS_ELIGIBILITY_FLAG) {
+        if (body.id === "default") return sendJson(res, 400, { ok: false, error: "Early Access eligibility must be set per license" });
+        if (!store.isKnown(body.id)) return sendJson(res, 404, { ok: false, error: "unknown license id" });
+        if (body.state === true && store.isRevoked(body.id)) return sendJson(res, 409, { ok: false, error: "a revoked license cannot be enabled for Early Access" });
       }
       const file = setFlag(cfg.dataDir, body.id.slice(0, 64), body.flag, body.state);
       return sendJson(res, 200, { ok: true, flags: file });

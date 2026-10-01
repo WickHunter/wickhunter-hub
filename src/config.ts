@@ -37,6 +37,9 @@ export interface HubConfig {
   support?: import("./support-chat.js").SupportConfig;
   dataDir: string;      // signing key, licenses.json, revoked.json, roster, check-ins
   releasesDir: string;  // beta tarballs + latest.json (see README release contract)
+  /** Optional separate signed Production shelf. Missing/empty means no
+   *  Production release is available; customer routes never fall back to Beta. */
+  productionReleasesDir?: string | null;
   publicDir: string;    // admin.html
   templatesDir: string; // install.sh template served to testers
   host: string;         // always loopback in production; nginx owns the public side
@@ -51,6 +54,9 @@ export interface HubConfig {
   releaseChannel: string;
   releasePlatform: string;
   releaseArch: string;
+  /** New channel-aware endpoints are dark until explicitly enabled. Legacy
+   *  Beta routes keep their existing behavior regardless of this setting. */
+  releaseRoutingEnabled?: boolean;
 
   // ── machine-bound licensing leases ──────────────────────────────────────
   /** Additive WHL1 lease service. Old LHK1/check-in clients do not read this
@@ -226,6 +232,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
   return {
     dataDir: env.HUB_DATA_DIR ?? path.join(ROOT, "data"),
     releasesDir: env.HUB_RELEASES_DIR ?? path.join(ROOT, "releases"),
+    productionReleasesDir: env.HUB_PRODUCTION_RELEASES_DIR?.trim() || null,
     publicDir: env.HUB_PUBLIC_DIR ?? path.join(ROOT, "public"),
     templatesDir: env.HUB_TEMPLATES_DIR ?? path.join(ROOT, "templates"),
     host: env.HUB_HOST ?? "127.0.0.1",
@@ -247,6 +254,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     releaseChannel: (env.HUB_RELEASE_CHANNEL ?? "beta").trim(),
     releasePlatform: (env.HUB_RELEASE_PLATFORM ?? "linux").trim(),
     releaseArch: (env.HUB_RELEASE_ARCH ?? "x64").trim(),
+    releaseRoutingEnabled: env.HUB_RELEASE_CHANNEL_ROUTING_ENABLED === "true",
     licenseLease: {
       activeKeyId: (env.HUB_LICENSE_LEASE_KEY_ID ?? "lease-1").trim(),
       leaseDurationMs: Number(env.HUB_LICENSE_LEASE_DURATION_MS ?? 6 * 60 * 60 * 1_000),

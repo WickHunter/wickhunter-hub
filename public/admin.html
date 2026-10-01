@@ -692,8 +692,8 @@
 <div class="actions"><input id="licenseSearch" type="search" placeholder="Search name, install, version or IP" aria-label="Search licenses"><select id="licenseFilter" aria-label="License status"><option value="">All licenses</option><option>active</option><option>expired</option><option>revoked</option></select><span id="licenseCount" class="muted"></span></div>
 <div id="note"></div>
 <div class="tbl"><table>
-  <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th>Marketplace</th><th></th></tr></thead>
-  <tbody id="rows"><tr><td colspan="9">loading…</td></tr></tbody>
+  <thead><tr><th>Name</th><th>State</th><th>Expires</th><th>Last seen</th><th>Version</th><th>IP</th><th>Install</th><th>Marketplace</th><th>Early Access eligibility</th><th></th></tr></thead>
+  <tbody id="rows"><tr><td colspan="10">loading…</td></tr></tbody>
 </table></div>
 </section>
 
@@ -874,7 +874,7 @@ async function refresh() {
   const rows = document.getElementById("rows");
   rows.innerHTML = "";
   if (data.licenses.length === 0) {
-    rows.innerHTML = '<tr><td colspan="9">no licenses yet</td></tr>';
+    rows.innerHTML = '<tr><td colspan="10">no licenses yet</td></tr>';
     return;
   }
   for (const l of data.licenses) {
@@ -891,6 +891,7 @@ async function refresh() {
       "<td>" + esc(l.lastSeen ? l.lastSeen.ip : "—") + "</td>" +
       '<td class="instcell">' + (l.lastSeen ? esc(l.lastSeen.installId).slice(0, 8) : "—") + "</td>" +
       '<td class="alphacell"></td>' +
+      '<td class="earlycell"></td>' +
       "<td></td>";
     // ── ONE KEY, MORE THAN ONE MACHINE ──────────────────────────────────────
     // Nothing binds a licence to an install, so a shared key runs everywhere at
@@ -1067,6 +1068,33 @@ async function refresh() {
         refresh();
       };
       tr.lastElementChild.appendChild(btn);
+    }
+    const earlyCell = tr.querySelector(".earlycell");
+    if (l.revoked) {
+      earlyCell.textContent = "Unavailable — revoked";
+    } else {
+      const early = document.createElement("button");
+      early.textContent = l.earlyAccessEligible ? "Eligible" : "Enable";
+      early.className = l.earlyAccessEligible ? "ops-ok" : "";
+      early.title = l.earlyAccessEligible
+        ? "This license may request Beta after the customer separately opts in. This does not enroll them, publish a release, or grant Marketplace access."
+        : "Allow this license to request Beta after the customer separately opts in. This does not enroll them, publish a release, or grant Marketplace access.";
+      early.onclick = async () => {
+        early.disabled = true;
+        try {
+          await api("/admin/api/flags", {
+            method: "POST",
+            body: JSON.stringify({ id: l.id, flag: "earlyAccess", state: !l.earlyAccessEligible }),
+          });
+          document.getElementById("note").textContent = l.earlyAccessEligible
+            ? "Early Access eligibility removed for " + l.name + ". The customer remains on their locally selected channel until their next authenticated release request."
+            : "Early Access eligibility enabled for " + l.name + ". The customer must still opt in from the app before Beta manifests are served.";
+        } catch (e) {
+          if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
+        }
+        refresh();
+      };
+      earlyCell.appendChild(early);
     }
     rows.appendChild(tr);
   }

@@ -37,6 +37,9 @@ import path from "node:path";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 
 const FLAGS_FILE = "flags.json";
+/** Per-license Hub authorization required before a customer may opt into the
+ *  signed Beta/Early Access release channel. It never grants Marketplace. */
+export const EARLY_ACCESS_ELIGIBILITY_FLAG = "earlyAccess";
 
 /** ── v0.2.12 — KEYS THAT ARE NOT KEYS ──────────────────────────────────────
  *
