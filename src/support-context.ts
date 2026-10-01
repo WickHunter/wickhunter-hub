@@ -60,7 +60,7 @@ export function selectSupportGuide(file: string | undefined, version: string, cu
   const candidates = sections
     .filter(s => typeof s?.text === 'string' && typeof s?.title === 'string')
     .filter(s => version !== 'website' || s.audience === 'website' || s.versionIndependent === true)
-    .map(s => ({ section: s, rank: score(s, current) * 2 + score(s, prior) + (s.id === 'support-core-definitions' && (/\b(what is|what does|mean|is there|types? of|which bots?)\b/i.test(currentQuestion) || (current.includes('dca') && current.length===1)) ? 30 : 0) + (s.id === 'gd-number-input' && (/\b\d+[.,]\d+\b/.test(currentQuestion)||/\b(decimal|comma|numeric|number)\b/i.test(currentQuestion)) ? 60 : 0) }))
+    .map(s => ({ section: s, rank: score(s, current) * 2 + score(s, prior) + (s.id === 'support-core-definitions' && (/\b(what is|what does|mean|is there|types? of|which bots?)\b/i.test(currentQuestion) || (current.includes('dca') && current.length===1)) ? 30 : 0) + (s.id === 'gd-number-input' && (/\b\d+[.,]\d+\b/.test(currentQuestion)||/\b(decimal|comma|numeric|number)\b/i.test(currentQuestion)) ? 60 : 0) + (s.id === 'support-new-bot-forms' && /\b(new|create|fresh|blank|empty|default|prefill\w*)\b/i.test(currentQuestion) && /\b(bot|form|hedge|setting)\b/i.test(currentQuestion) ? 100 : 0) }))
     .filter(x => x.rank >= 8)
     .sort((a, b) => b.rank - a.rank || String(a.section.id).localeCompare(String(b.section.id)));
   const selected: string[] = [];

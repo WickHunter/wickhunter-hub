@@ -22,6 +22,16 @@ assert.match(selectSupportGuide(guide,'0.90.155','How does the Optimized Liquida
 assert.match(selectSupportGuide(guide,'0.90.154','How does the Optimized Liquidation Bot set its leverage?'),/\[gd-liq-leverage\]/);
 assert.match(selectSupportGuide(guide,'0.90.135','How does the Optimized Liquidation Bot set its leverage?'),/\[gd-liq-leverage\]/);
 assert.match(selectSupportGuide(guide,'0.90.155','Can I enter 1,5 instead of 1.5?'),/\[gd-number-input\]/);
+const hedgeFresh=selectSupportGuide(guide,'0.90.155','Does a new Hedge Bot start with blank fields?');
+assert.match(hedgeFresh,/\[support-new-bot-forms\]/);
+assert.match(hedgeFresh,/name and numeric fields start blank/);
+assert.doesNotMatch(hedgeFresh,/brand-new install already sits on Moderate/);
+assert.match(selectSupportGuide(guide,'0.90.155','What default numbers appear when I create a new bot?'),/\[support-new-bot-forms\]/);
+assert.match(selectSupportAnswers(guide,'0.90.155','Why is a new bot form completely blank?'),/"sourceIds":\["support-new-bot-forms"\]/);
+assert.match(selectSupportAnswers(guide,'0.90.155','Does a new Hedge Bot start with blank fields like the other bots?'),/new Hedge Bot starts with its numeric and name fields blank/);
+assert.doesNotMatch(selectSupportAnswers(guide,'0.90.135','Does a new Hedge Bot start with blank fields like the other bots?'),/whq-8cb5901d64df/,'Alpha-only form behavior must not be asserted for Beta135');
+assert.match(selectSupportAnswers(guide,'0.90.155','Does the safe-zone setting count as a hedge stop?'),/anti-churn pause/);
+assert.match(selectSupportAnswers(guide,'0.90.155','Can I reinstall and expect old local history to reappear automatically?'),/"resolutionType":"direct"/);
 for(const version of ['0.90.135','0.90.154','0.90.155']){
  const replay=selectSupportGuide(guide,version,'Can I use Deal Replay on a closed trade?');
  assert.match(replay,/\[support-feature-availability\]/);
@@ -65,6 +75,13 @@ r=await chat.message(customer,{id:r.threads[0].id,text:'Is managed hosting avail
 assert.equal(r.threads[0].status,'assistant');
 assert.match(prompts[2],/"purchasable":true/);
 assert.match(prompts[2],/11900/);
+const switchResult=await chat.message({...customer,owner:'guest:switch-plan'},{text:'Can I switch from Monthly to Yearly today?',requestId:'billing-switch-001',version:'website'});
+assert.equal(switchResult.threads[0].status,'human');
+assert.match(switchResult.threads[0].messages.at(-1).text,/Open the billing portal to see the options/);
+assert.doesNotMatch(switchResult.threads[0].messages.at(-1).text,/^Yes\b/);
+const historyResult=await chat.message({...customer,owner:'guest:history'},{text:'Can I reinstall and expect old local history to reappear automatically?',requestId:'history-reinstall-001',version:'0.90.155'});
+assert.equal(historyResult.threads[0].status,'assistant','optional recovery help alone must not force a handoff');
+assert.match(prompts.at(-1),/optional staff help in an otherwise complete answer is not a handoff/);
 console.log('Support context: pricing, install, DCA, follow-up and stale version guard passed');
 
 const bankDir=tmpDir('support-bank');

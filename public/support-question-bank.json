@@ -636,6 +636,13 @@
       "versionIndependent": false
     },
     {
+      "id": "support-new-bot-forms",
+      "path": "public/support-knowledge-0.90.155.json#support-new-bot-forms",
+      "title": "New bot forms start blank",
+      "guideVersion": "0.90.155",
+      "versionIndependent": false
+    },
+    {
       "id": "website-install",
       "path": "https://www.wickhunterunleashed.com/unleashed/",
       "title": "Installation and hosting",
@@ -4996,12 +5003,12 @@
       "id": "whq-e8d9e2ac5269",
       "topic": "hedge_management",
       "question": "Does the safe-zone setting count as a hedge stop?",
-      "answer": "No. The safe zone controls when a stop can arm around the relevant price; until an actual stop is armed, the tranche remains unprotected.",
+      "answer": "No. Safe zone is an anti-churn pause after a hedge tranche stop-out or paired take profit. It waits for price to move farther against the main before allowing new hedge tranches; it is not itself a stop order.",
       "sourceIds": [
-        "gd-hedge-arm"
+        "gd-hedge-budget"
       ],
       "sourcePaths": [
-        "public/support-knowledge-0.90.155.json#gd-hedge-arm"
+        "public/support-knowledge-0.90.155.json#gd-hedge-budget"
       ],
       "audience": "app",
       "versionIndependent": false,
@@ -5060,12 +5067,12 @@
       "id": "whq-8cb5901d64df",
       "topic": "hedge_management",
       "question": "Does a new Hedge Bot start with blank fields like the other bots?",
-      "answer": "No. The Hedge Bot is the exception: a new install starts with the Moderate template populated. Other bot forms start blank.",
+      "answer": "Yes. A new Hedge Bot starts with its numeric and name fields blank, like the other new bot forms. Choose the settings before saving; existing bots reopen with their saved values.",
       "sourceIds": [
-        "gd-hedge-templates"
+        "support-new-bot-forms"
       ],
       "sourcePaths": [
-        "public/support-knowledge-0.90.155.json#gd-hedge-templates"
+        "public/support-knowledge-0.90.155.json#support-new-bot-forms"
       ],
       "audience": "app",
       "versionIndependent": false,
@@ -8762,10 +8769,10 @@
       "question": "Why is a new bot form completely blank?",
       "answer": "New bots intentionally leave numeric and name fields blank, including Hedge Bots. Choose your own pairs, sizes, and rules before saving.",
       "sourceIds": [
-        "gd-intro"
+        "support-new-bot-forms"
       ],
       "sourcePaths": [
-        "public/support-knowledge-0.90.155.json"
+        "public/support-knowledge-0.90.155.json#support-new-bot-forms"
       ],
       "audience": "app",
       "versionIndependent": false,
@@ -11246,7 +11253,7 @@
       "id": "onb-0150",
       "topic": "billing_licence_refunds",
       "question": "Can I switch from Monthly to Yearly today?",
-      "answer": "Check which plans are offered in the live catalog, then review your billing portal for changes to an active subscription; human support can confirm account-specific switching terms.",
+      "answer": "Open the billing portal to see the options for your subscription. If Yearly is not shown, our team can review your case. Avoid creating a second subscription while checking.",
       "sourceIds": [
         "public-catalog",
         "website-terms"
@@ -14885,7 +14892,7 @@
       "id": "onb-0368",
       "topic": "updates_recovery",
       "question": "Can I reinstall and expect old local history to reappear automatically?",
-      "answer": "The move procedure requires an export/import to carry setup. Do not assume a fresh server has local history; ask human support about backups if the old server is lost.",
+      "answer": "No. A fresh server does not automatically restore local history from the old install. Use the documented move and export/import steps for supported setup before retiring the old server. If it is already lost, support can help assess what a backup may recover.",
       "sourceIds": [
         "gd-move-setup",
         "website-privacy"
@@ -14897,7 +14904,7 @@
       "audience": "app",
       "versionIndependent": false,
       "dynamicFacts": [],
-      "resolutionType": "clarify_human"
+      "resolutionType": "direct"
     },
     {
       "id": "onb-0369",
@@ -17099,6 +17106,28 @@
       "versionIndependent": false,
       "dynamicFacts": [],
       "resolutionType": "direct"
+    }
+  ],
+  "reviewAmendments": [
+    {
+      "id": "whq-8cb5901d64df",
+      "reason": "Corrected Alpha155/154 blank Hedge Bot form behavior"
+    },
+    {
+      "id": "whq-e8d9e2ac5269",
+      "reason": "Corrected safe-zone purpose and source"
+    },
+    {
+      "id": "onb-0150",
+      "reason": "Account-specific subscription changes require portal or human review"
+    },
+    {
+      "id": "onb-0368",
+      "reason": "General fresh-install history question has a supported direct answer; optional recovery help is not automatic handoff"
+    },
+    {
+      "id": "onb-0006",
+      "reason": "Cite effective Alpha new-form behavior rather than the clipped raw introduction"
     }
   ]
 }
