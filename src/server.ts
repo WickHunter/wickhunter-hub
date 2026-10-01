@@ -606,7 +606,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     log: (msg) => console.log(msg),
   });
 
-  const support = new SupportChat(cfg.dataDir, cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}, undefined, undefined, event => {
+  const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans()}, undefined, undefined, event => {
     if (!notifications) throw Error('Notifications need repair');
     const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };
     notifications.enqueue({ key: `support:${event.key ?? `${event.kind}:${event.ticketId}:${event.at}`}`, kind: event.kind, title: titles[event.kind],
