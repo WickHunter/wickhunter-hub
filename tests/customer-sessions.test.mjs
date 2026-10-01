@@ -32,6 +32,9 @@ const h = await freshHub({}, {
   customerSessionNow: () => clock,
   rateLimitNow: () => clock,
 });
+const browserAction = (cookie) => ({ cookie, "content-type": "application/json",
+  "x-wh-customer-action": "1", origin: new URL(h.cfg.publicOrigin).origin,
+  "sec-fetch-site": "same-origin" });
 const AUTH = { "x-hub-admin": "test-admin-token", "content-type": "application/json" };
 const admin = (p, opts = {}) => jsonReq(`${h.origin}${p}`, { ...opts, headers: { ...AUTH, ...(opts.headers ?? {}) } });
 
@@ -276,18 +279,18 @@ await test("test/live never mix in one identity's view: two records, two rows, n
 await test("install-command / portal are refused for a customerKey that does not belong to the signed-in identity", async () => {
   const stranger = makeCustomer({ email: "stranger@example.com", createdAtMs: clock });
   const install = await fetch(`${h.origin}/api/customer/install-command`, {
-    method: "POST", headers: { cookie: adaCookie, "content-type": "application/json" }, body: JSON.stringify({ customerKey: stranger.key }),
+    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: stranger.key }),
   });
   assert.equal(install.status, 404);
   const portal = await fetch(`${h.origin}/api/customer/portal`, {
-    method: "POST", headers: { cookie: adaCookie, "content-type": "application/json" }, body: JSON.stringify({ customerKey: stranger.key }),
+    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: stranger.key }),
   });
   assert.equal(portal.status, 404);
 });
 
 await test("install-command: mints a fresh one-time command that the existing /install/<token> route accepts", async () => {
   const r = await fetch(`${h.origin}/api/customer/install-command`, {
-    method: "POST", headers: { cookie: adaCookie, "content-type": "application/json" }, body: JSON.stringify({ customerKey: ada.key }),
+    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: ada.key }),
   });
   assert.equal(r.status, 200);
   const body = await r.json();
@@ -301,7 +304,7 @@ await test("install-command: mints a fresh one-time command that the existing /i
 await test("portal: opens the record's own mode's static login link when no secret key is configured", async () => {
   await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { live: { portalUrl: "https://billing.stripe.com/p/login/live_ada" } } }) });
   const r = await fetch(`${h.origin}/api/customer/portal`, {
-    method: "POST", headers: { cookie: adaCookie, "content-type": "application/json" }, body: JSON.stringify({ customerKey: ada.key }),
+    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: ada.key }),
   });
   assert.equal(r.status, 200);
   const body = await r.json();
@@ -309,6 +312,24 @@ await test("portal: opens the record's own mode's static login link when no secr
 });
 
 // ── sign-out revokes exactly the presented session ──────────────────────
+
+await test("a sibling-site POST cannot mutate a signed-in customer session or hosting actions", async () => {
+  const sibling = { ...browserAction(adaCookie), origin: "https://www.wickhunterunleashed.com", "sec-fetch-site": "same-site" };
+  const foreign = await fetch(`${h.origin}/api/customer/signout`, { method: "POST", headers: sibling });
+  assert.equal(foreign.status, 403);
+  assert.equal((await fetch(`${h.origin}/api/customer/state`, { headers: { cookie: adaCookie } })).status, 200,
+    "a cross-origin sign-out cannot revoke the actual session");
+  for (const route of ["/api/hosting/checkout", "/api/hosting/instance-test/cancel", "/api/hosting/instance-test/resume-renewal",
+    "/api/customer/install-command", "/api/customer/portal"]) {
+    const denied = await fetch(`${h.origin}${route}`, { method: "POST", headers: sibling,
+      body: JSON.stringify({ customerKey: ada.key }) });
+    assert.equal(denied.status, 403, `${route} must reject a sibling-site browser before any mutation`);
+  }
+  const missingHeader = await fetch(`${h.origin}/api/customer/signout`, { method: "POST",
+    headers: { cookie: adaCookie, origin: new URL(h.cfg.publicOrigin).origin, "sec-fetch-site": "same-origin" } });
+  assert.equal(missingHeader.status, 403, "same-origin forms without the action header cannot revoke a session");
+  assert.equal((await fetch(`${h.origin}/api/customer/state`, { headers: { cookie: adaCookie } })).status, 200);
+});
 
 await test("sign-out revokes the session; the same cookie is refused afterwards", async () => {
   // This suite's clock is deliberately hand-driven rather than the
@@ -321,7 +342,7 @@ await test("sign-out revokes the session; the same cookie is refused afterwards"
   const cookie = await signInAndGetCookie(adaEmail, "198.51.100.8");
   const before = await fetch(`${h.origin}/api/customer/state`, { headers: { cookie } });
   assert.equal(before.status, 200);
-  const out = await fetch(`${h.origin}/api/customer/signout`, { method: "POST", headers: { cookie } });
+  const out = await fetch(`${h.origin}/api/customer/signout`, { method: "POST", headers: browserAction(cookie) });
   assert.equal(out.status, 200);
   assert.match(out.headers.getSetCookie()[0], /^wh_customer_session=; Path=\/; Max-Age=0/);
   const after = await fetch(`${h.origin}/api/customer/state`, { headers: { cookie } });

@@ -699,6 +699,29 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const p = url.pathname;
     const m = req.method ?? "GET";
 
+    // Customer and hosting actions use an HttpOnly browser session. A sibling
+    // site under wickhunterunleashed.com is same-site for SameSite=Lax cookies,
+    // but it is not this Hub origin. Require a non-simple action header and,
+    // whenever the browser supplies them, an exact Origin and same-origin
+    // Fetch Metadata value before any cookie-authenticated mutation runs.
+    // Stripe webhooks, public bundle checkout, and server-authenticated
+    // hosting callbacks have separate trust contracts and are not in this set.
+    const customerCookieWrite = m === "POST" && (
+      p === "/api/customer/install-command" || p === "/api/customer/portal"
+      || p === "/api/customer/signout" || p === "/api/hosting/checkout"
+      || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal")))
+    );
+    if (customerCookieWrite) {
+      const origin = req.headers.origin;
+      const site = req.headers["sec-fetch-site"];
+      if (req.headers["x-wh-customer-action"] !== "1"
+        || (origin !== undefined && origin !== new URL(cfg.publicOrigin).origin)
+        || (site !== undefined && site !== "same-origin")) {
+        req.resume();
+        return sendJson(res, 403, { ok: false, error: "Customer action requires this Hub origin" }, { "cache-control": "no-store" });
+      }
+    }
+
     if (m === "OPTIONS" && p === "/api/hosting/bundle-checkout") {
       res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "access-control-max-age": "600" });
       res.end();

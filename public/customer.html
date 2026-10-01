@@ -197,7 +197,7 @@
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function fmtDate(ms) { return ms ? new Date(ms).toISOString().slice(0, 10) : "—"; }
   async function api(path, opts) {
-    var res = await fetch(path, Object.assign({ credentials: "same-origin", headers: { "content-type": "application/json" } }, opts || {}));
+    var res = await fetch(path, Object.assign({ credentials: "same-origin", headers: { "content-type": "application/json", "x-wh-customer-action": "1" } }, opts || {}));
     var body = null;
     try { body = await res.json(); } catch (e) {}
     return { status: res.status, ok: res.ok, body: body };
