@@ -120,6 +120,7 @@ assert.equal(recoveryPrompts.length,2);
 assert.equal(recovered.threads[0].status,'assistant');
 assert.equal(recovered.threads[0].waitingForHuman,true);
 assert.equal(recovered.threads[0].messages.find(m=>m.text==='How do I install?').clientRequestId,'recovered-install-001');
+assert.equal(recovery.admin().questionGaps.reduce((n,g)=>n+g.count,0),2,'an AI answer to a follow-up must retain the earlier unresolved gap');
 recovery.action({id:recovered.threads[0].id,action:'takeover'});
 await recovery.message(customer,{id:recovered.threads[0].id,text:'Another question',requestId:'staff-owned-001'});
 assert.equal(recoveryPrompts.length,2);

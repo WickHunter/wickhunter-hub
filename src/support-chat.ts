@@ -155,7 +155,7 @@ export class SupportChat {
     const gapTopics = ['installation','price','plan','hosting','dca','exchange','license','account','refund','bot','other'] as const;
     const gapCounts = new Map<string,{topic:string;count:number;lastSeenAt:number;threadId:string}>();
     for (const thread of this.state.threads) {
-      if (thread.status !== 'human' && !thread.messages.some(m=>m.role!=='customer'&&m.feedback==='needs_help')) continue;
+      if (thread.status !== 'human' && thread.waitingForHuman !== true && !thread.messages.some(m=>m.role!=='customer'&&m.feedback==='needs_help')) continue;
       for (const message of thread.messages.filter(m=>m.role==='customer')) {
         const terms = supportTerms(message.text);
         const topic = gapTopics.find(topic=>topic!=='other'&&terms.includes(topic)) || 'other';
