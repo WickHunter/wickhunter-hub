@@ -1808,6 +1808,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.65 — Prepare launch billing, fixed October 15 billing dates, recurring discounts, one-time crypto, payment reminders, subscription reporting, support notifications, and customer release channels. Keep release promotion disabled.
+
 - v0.4.64 — Keep candle status responsive while coverage warms; reduce coverage and first-gap scanning costs.
 
 - v0.4.63 — Bound candle repair discovery so large historical gaps cannot starve fresh collection.

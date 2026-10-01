@@ -80,6 +80,11 @@ try {
       fail("Production requires --beta-releases-dir, --control-state, --promotion-attestation, --feedback-file, and --rollback-releases-dir");
     }
     const betaDir = path.resolve(values["beta-releases-dir"]);
+    // A typo or symlink must never publish Production over the Beta head.
+    const physical = (value: string): string => fs.existsSync(value)
+      ? fs.realpathSync(value)
+      : path.join(physical(path.dirname(value)), path.basename(value));
+    if (physical(releasesDir) === physical(betaDir)) fail("Beta and Production require separate release shelves");
     const betaRaw: unknown = JSON.parse(fs.readFileSync(path.join(betaDir, "latest.json"), "utf8"));
     const beta = verifyReleaseManifest(betaRaw, { publicKeys, now, maxAgeMs, channel: "beta", platform: manifest.platform, arch: manifest.arch });
     verifyReleaseArtifact(beta, fs.readFileSync(path.join(betaDir, beta.file)));

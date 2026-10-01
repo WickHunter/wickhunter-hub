@@ -87,6 +87,24 @@ await test("publisher refuses private Alpha and keeps Production promotion disab
   assert.deepEqual(fs.readdirSync(enabledButUnprovenShelf), []);
 });
 
+await test("Production cannot target the Beta shelf, including a symlink alias", () => {
+  const shelf = tmpDir("publish-channel-collision");
+  const prod = fixture(tmpDir("publish-channel-collision-input"), { channel: "production" });
+  const alias = path.join(tmpDir("publish-channel-alias"), "same-shelf");
+  fs.symlinkSync(shelf, alias, "dir");
+  for (const target of [shelf, alias]) {
+    const result = publish(target, prod, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "true" }, [
+      "--channel", "production", "--beta-releases-dir", shelf,
+      "--control-state", path.join(shelf, "control.json"),
+      "--promotion-attestation", path.join(shelf, "evidence.json"),
+      "--feedback-file", path.join(shelf, "feedback.jsonl"), "--rollback-releases-dir", shelf,
+    ]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /separate release shelves/);
+    assert.deepEqual(fs.readdirSync(shelf), []);
+  }
+});
+
 await test("publisher fails closed before changing the shelf on artifact or signature tamper", () => {
   for (const tamper of ["artifact", "signature"]) {
     const input = tmpDir(`publish-${tamper}-input`);

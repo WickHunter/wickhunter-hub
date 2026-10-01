@@ -7,9 +7,9 @@ This is a working checklist, not a claim that the launch is complete. No campaig
 
 | Work | Current state | Remaining verification |
 | --- | --- | --- |
-| Website inline support | Published | Live desktop/mobile session and keyboard behavior |
+| Website inline support | Published | Verified live at 390/1440px, close/Escape and inline frame; blank-frame loading flash fixed in website b1c03d2 |
 | Bitunix referral URL | Website published; app/Hub review ongoing | Search all maintained surfaces for stale registration URLs |
-| 25% recurring launch discount | Local Hub implementation and regression coverage | UNLEASHED25 created in test and live. Five test Checkout types accepted and expired without charge. Live Checkout awaits Dashboard Terms URL. |
+| 25% recurring launch discount | Local Hub implementation and regression coverage | UNLEASHED25 created in test and live. All five Checkout types accepted in both modes, required Terms consent verified, then expired without charge or customer/subscription creation. |
 | Free card access until Oct 15, 2026, midnight Eastern | Local fixed-anchor checkout | Stripe test-mode lifecycle, near-deadline behavior, website disclosure |
 | First-charge reminder | Durable local worker; regression tests passing | Integrated event trigger, delivery readiness, Hub visibility |
 | Crypto Yearly/Lifetime | Local one-time checkout | Test async payment/refund behavior and live capability/session creation |
@@ -18,11 +18,11 @@ This is a working checklist, not a claim that the launch is complete. No campaig
 | Subscription reporting and Discord notifications | Local implementation | Review retry durability, current discounts, configured central webhook |
 | Support ticket notifications | Local persisted handoff | Restart/failure regression and configured central webhook |
 | Brevo connection/import safeguards | Local module; no key configured | Hub controls; account connection; preserve unsubscribes on real test contact |
-| Launch email with A/B variants | Local draft | Render, verified offer links, unsubscribe merge field, Brevo setup |
-| Legal terms/privacy/refunds | Published website d035d72; Draft removed | Live Terms verified with launch terms and legal address; website 16/16 tests passed. |
+| Launch email with A/B variants | Local draft | Rendered at 390/900px; offer links and Brevo unsubscribe merge field checked. Real Brevo account setup deferred by user until tomorrow. |
+| Legal terms/privacy/refunds | Published website d035d72; Draft removed | All three live policies verified: no Draft labels, correct entity/address and approved policy. Website 17/17 tests pass. |
 | Lifetime access | Automatic technical token renewal implemented locally | Paid legacy entitlement reconciliation; customer wording and tests |
 | Smarter Support | DCA/common bot explanations fixed locally | Integrated source-backed chat regression and deployment |
-| Hub simplification | Integrated revenue, notifications, Brevo and release overview | Mobile/desktop/light/dark review and integration |
+| Hub simplification | Integrated revenue, notifications, Brevo and release overview | Mobile/desktop/light/dark browser review passed; final integrated release gate/deployment pending. |
 | Release channels and rollback controls | Policy accepted; implementation in progress | Enforced channel routing, seven-day gates, compatible rollback; no publication |
 | Full release gates | Focused tests only on current candidate | Complete Hub and Alpha suites against exact deployable artifacts |
 
@@ -32,4 +32,6 @@ External setup still needed: a Brevo API key/list IDs and the intended central H
 
 The older trading audit remains separate. Its closure review records twelve evidence-dependent findings: BIN-2, BTX-1, BTX-5, BTX-7, ORD-17, UTA-24, UTA-43, UTA-84, WXL-4, WXO-1, WXO-7, WXSP-6. Launch UI/billing work does not close them.
 
-Verified operational state: Hub 0.4.64 and Alpha 0.90.149 remain deployed until final candidate gates pass. Stripe portal policy URLs and webhook dispute-closure/invoice-success events updated in both modes; unrelated portal features preserved. Beta remains 0.90.135, artifact SHA-256 `6c649a93a5371af3ae658512b9947cccd62442666c20d50c7dc1c88e40eb4b1e`.
+Verified operational state: Hub 0.4.64 and Alpha 0.90.149 remain deployed until final candidate gates pass. Stripe portal policy URLs and webhook dispute-closure/invoice-success events updated in both modes; unrelated portal features preserved. Fresh test and live card Monthly/Yearly/Lifetime plus Crypto Yearly/Lifetime Checkout probes all passed and were expired without charges. Beta remains 0.90.135, artifact SHA-256 `6c649a93a5371af3ae658512b9947cccd62442666c20d50c7dc1c88e40eb4b1e`.
+
+Release preparation includes explicit channel preferences, separately verified shelves, fresh-host channel installation and signed seven-day promotion gates. Channel routing and all publishing remain off. No scheduler is activated. First Production publication must have an explicitly reviewed baseline and compatible rollback evidence before automatic promotion can be enabled.
