@@ -1832,6 +1832,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.71 — Ground support in 1,000 reviewed questions, effective app guides and live commerce facts; improve chat delivery and staff knowledge review.
 - v0.4.70 — Label the Brevo opt-out callback accurately in the admin status summary.
 
 - v0.4.69 — Clarify Marketplace service-health scope and identify the Brevo webhook secret as the unsubscribe callback credential.
