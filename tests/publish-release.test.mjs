@@ -38,12 +38,13 @@ function fixture(dir, overrides = {}) {
   return { artifact, manifest, manifestPath, artifactPath };
 }
 
-function publish(releasesDir, item, env = {}) {
+function publish(releasesDir, item, env = {}, extraArgs = []) {
   return spawnSync(process.execPath, [
     fileURLToPath(new URL("../dist/bin/publish-release.js", import.meta.url)),
     "--manifest", item.manifestPath,
     "--artifact", item.artifactPath,
     "--releases-dir", releasesDir,
+    ...extraArgs,
   ], {
     encoding: "utf8",
     env: { ...process.env, HUB_RELEASE_PUBLIC_KEYS_JSON: JSON.stringify(publicKeys), ...env },
@@ -61,6 +62,29 @@ await test("publisher verifies and atomically shelves artifact, immutable manife
   assert.deepEqual(archive, fs.readFileSync(item.manifestPath), "archive retains the exact signed bytes");
   assert.deepEqual(fs.readFileSync(path.join(releases, "latest.json")), archive, "latest moves to the archived signed bytes");
   assert.equal(fs.readdirSync(releases).some((name) => name.endsWith(".tmp")), false);
+});
+
+await test("publisher refuses private Alpha and keeps Production promotion disabled unless explicitly enabled", () => {
+  const input = tmpDir("publish-channel-input");
+  const alphaShelf = tmpDir("publish-alpha-shelf");
+  const item = fixture(input);
+  const alpha = publish(alphaShelf, item, {}, ["--channel", "alpha"]);
+  assert.notEqual(alpha.status, 0);
+  assert.match(alpha.stderr, /Alpha is private/);
+  assert.deepEqual(fs.readdirSync(alphaShelf), []);
+
+  const productionShelf = tmpDir("publish-production-shelf");
+  const prodItem = fixture(tmpDir("publish-production-input"), { channel: "production" });
+  const production = publish(productionShelf, prodItem, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "false" }, ["--channel", "production"]);
+  assert.notEqual(production.status, 0);
+  assert.match(production.stderr, /automatic Production promotion is disabled/);
+  assert.deepEqual(fs.readdirSync(productionShelf), []);
+
+  const enabledButUnprovenShelf = tmpDir("publish-production-unproven-shelf");
+  const enabledButUnproven = publish(enabledButUnprovenShelf, prodItem, { HUB_RELEASE_AUTO_PROMOTION_ENABLED: "true" }, ["--channel", "production"]);
+  assert.notEqual(enabledButUnproven.status, 0);
+  assert.match(enabledButUnproven.stderr, /Production requires/);
+  assert.deepEqual(fs.readdirSync(enabledButUnprovenShelf), []);
 });
 
 await test("publisher fails closed before changing the shelf on artifact or signature tamper", () => {

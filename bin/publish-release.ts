@@ -12,12 +12,26 @@ import {
   verifyReleaseArtifact,
   verifyReleaseManifest,
 } from "../src/release-manifest.js";
+import {
+  assertProductionPromotionEligible,
+  readReleaseControlState,
+  recordBetaPublication,
+  verifyPromotionAttestation,
+  writeReleaseControlState,
+  type ReleaseChannel,
+} from "../src/release-controls.js";
 
 const { values } = parseArgs({
   options: {
     manifest: { type: "string" },
     artifact: { type: "string" },
     "releases-dir": { type: "string" },
+    channel: { type: "string" },
+    "control-state": { type: "string" },
+    "beta-releases-dir": { type: "string" },
+    "promotion-attestation": { type: "string" },
+    "feedback-file": { type: "string" },
+    "rollback-releases-dir": { type: "string" },
   },
 });
 
@@ -34,14 +48,17 @@ const publicKeysRaw = process.env.HUB_RELEASE_PUBLIC_KEYS_JSON;
 if (!publicKeysRaw) fail("HUB_RELEASE_PUBLIC_KEYS_JSON is required (public keys only; never place a signing key on the Hub)");
 
 try {
+  const channel = (values.channel ?? process.env.HUB_RELEASE_CHANNEL ?? "beta").trim() as ReleaseChannel;
+  if (channel !== "beta" && channel !== "production") fail("customer publisher supports only Beta or Production; Alpha is private");
   const manifestBytes = fs.readFileSync(path.resolve(values.manifest));
   const rawManifest: unknown = JSON.parse(manifestBytes.toString("utf8"));
   const maxAgeMs = Number(process.env.HUB_RELEASE_MAX_AGE_MS ?? DEFAULT_RELEASE_MAX_AGE_MS);
+  const publicKeys = parseReleasePublicKeys(publicKeysRaw);
   const manifest = verifyReleaseManifest(rawManifest, {
-    publicKeys: parseReleasePublicKeys(publicKeysRaw),
+    publicKeys,
     now: Date.now(),
     maxAgeMs,
-    channel: (process.env.HUB_RELEASE_CHANNEL ?? "beta").trim(),
+    channel,
     platform: (process.env.HUB_RELEASE_PLATFORM ?? "linux").trim(),
     arch: (process.env.HUB_RELEASE_ARCH ?? "x64").trim(),
   });
@@ -53,6 +70,44 @@ try {
   verifyReleaseArtifact(manifest, artifactBytes);
 
   const releasesDir = path.resolve(values["releases-dir"]);
+  const now = Date.now();
+  let promotionAttestation: ReturnType<typeof verifyPromotionAttestation> | undefined;
+  let controlStatePath = values["control-state"] ? path.resolve(values["control-state"]) : path.join(releasesDir, ".release-control.v1.json");
+  let controlState = readReleaseControlState(controlStatePath);
+  if (channel === "production") {
+    if (process.env.HUB_RELEASE_AUTO_PROMOTION_ENABLED !== "true") fail("automatic Production promotion is disabled; set HUB_RELEASE_AUTO_PROMOTION_ENABLED=true only for the controlled promotion job");
+    if (!values["beta-releases-dir"] || !values["promotion-attestation"] || !values["feedback-file"] || !values["rollback-releases-dir"] || !values["control-state"]) {
+      fail("Production requires --beta-releases-dir, --control-state, --promotion-attestation, --feedback-file, and --rollback-releases-dir");
+    }
+    const betaDir = path.resolve(values["beta-releases-dir"]);
+    const betaRaw: unknown = JSON.parse(fs.readFileSync(path.join(betaDir, "latest.json"), "utf8"));
+    const beta = verifyReleaseManifest(betaRaw, { publicKeys, now, maxAgeMs, channel: "beta", platform: manifest.platform, arch: manifest.arch });
+    verifyReleaseArtifact(beta, fs.readFileSync(path.join(betaDir, beta.file)));
+    const betaArchive = fs.readFileSync(path.join(betaDir, `manifest-${beta.sha256}.json`));
+    const archivedRaw: unknown = JSON.parse(betaArchive.toString("utf8"));
+    const archived = verifyReleaseManifest(archivedRaw, { publicKeys, now, maxAgeMs, channel: "beta", platform: manifest.platform, arch: manifest.arch });
+    if (archived.sha256 !== beta.sha256 || archived.buildId !== beta.buildId || archived.sourceCommit !== beta.sourceCommit || archived.file !== beta.file) {
+      fail("Beta latest does not match its SHA-addressed manifest archive");
+    }
+    controlState = readReleaseControlState(controlStatePath);
+    const attestation = JSON.parse(fs.readFileSync(path.resolve(values["promotion-attestation"]), "utf8"));
+    const verifiedAttestation = verifyPromotionAttestation(attestation, publicKeys);
+    const rollbackDir = path.resolve(values["rollback-releases-dir"]);
+    const rollbackRaw: unknown = JSON.parse(fs.readFileSync(path.join(rollbackDir, `manifest-${verifiedAttestation.rollback.targetSha256}.json`), "utf8"));
+    const rollbackManifest = verifyReleaseManifest(rollbackRaw, {
+      publicKeys, now, maxAgeMs: Number.MAX_SAFE_INTEGER, channel: "production", platform: manifest.platform, arch: manifest.arch,
+    });
+    if (rollbackManifest.buildId !== verifiedAttestation.rollback.targetBuildId || rollbackManifest.sha256 !== verifiedAttestation.rollback.targetSha256) {
+      fail("certified rollback target does not match an archived signed Production manifest");
+    }
+    verifyReleaseArtifact(rollbackManifest, fs.readFileSync(path.join(rollbackDir, rollbackManifest.file)));
+    const rollbackArchive = fs.readFileSync(path.join(rollbackDir, rollbackManifest.file));
+    if (rollbackArchive.length === 0) fail("certified rollback artifact is empty");
+    promotionAttestation = assertProductionPromotionEligible({
+      publicKeys, now, autoPromotionEnabled: true, state: controlState, beta, production: manifest,
+      attestation, feedbackFile: path.resolve(values["feedback-file"]),
+    });
+  }
   fs.mkdirSync(releasesDir, { recursive: true, mode: 0o755 });
   const artifactTarget = path.join(releasesDir, manifest.file);
   const archivedManifestTarget = path.join(releasesDir, `manifest-${manifest.sha256}.json`);
@@ -77,6 +132,15 @@ try {
   verifyReleaseArtifact(published, publishedArtifact);
   if (!publishedManifestBytes.equals(fs.readFileSync(archivedManifestTarget))) {
     fail("latest.json does not exactly match its immutable archived manifest");
+  }
+  if (channel === "beta") {
+    controlState = recordBetaPublication(controlState, published, Date.now());
+    writeReleaseControlState(controlStatePath, controlState);
+  } else if (promotionAttestation) {
+    const attestationBytes = fs.readFileSync(path.resolve(values["promotion-attestation"]!));
+    installImmutable(path.join(releasesDir, `promotion-${promotionAttestation.betaSha256}.json`), attestationBytes, "promotion attestation");
+    controlState = { ...controlState, production: { buildId: published.buildId, file: published.file, publishedAt: new Date().toISOString(), sha256: published.sha256, version: published.version } };
+    writeReleaseControlState(controlStatePath, controlState);
   }
   console.log(`Published authenticated release ${published.version} (${published.buildId}) sha256=${published.sha256}`);
 } catch (error) {
