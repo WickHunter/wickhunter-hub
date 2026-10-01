@@ -35,11 +35,11 @@ assert.equal(restarted.allowance(guest(3).owner).guestRemainingMicros,2000);
 
 pending.splice(0).forEach(resolve=>resolve(answer()));
 await Promise.all([first,member]);
-assert.equal(chat.admin().budget.usedMicros,88);
-assert.equal(chat.admin().budget.guests.usedMicros,44);
+assert.equal(chat.admin().budget.usedMicros,40,'two completed GPT-6 Luna replies each cost 100×0.1 + 20×0.5 = 20 micros');
+assert.equal(chat.admin().budget.guests.usedMicros,20);
 chat.action({action:'budget',monthlyLimitUsd:50,guestMonthlyLimitUsd:5});
 assert.equal(chat.admin().budget.guests.limitMicros,5_000_000);
-assert.equal(chat.admin().budget.guests.usedMicros,44,'editing limits does not reset usage');
+assert.equal(chat.admin().budget.guests.usedMicros,20,'editing limits does not reset usage');
 assert.equal(new SupportChat(dir,cfg).admin().budget.guests.configuredLimitMicros,5_000_000);
 chat.action({action:'budget',monthlyLimitUsd:1});
 assert.equal(chat.admin().budget.guests.configuredLimitMicros,5_000_000,'older clients preserve guest configuration');
