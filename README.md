@@ -1,3 +1,7 @@
+## v0.4.67 — Clarify yearly plan copy
+
+Describe the $699 yearly software plan as billed yearly and cancellable at any time. Pricing and billing terms are unchanged.
+
 ## v0.4.66 — Reuse launch coupons safely
 
 Stripe coupon reuse now explicitly retrieves and expands product restrictions before validating the existing `UNLEASHED25` offer. The Hub continues to fail closed when the existing coupon has different terms.
@@ -1811,6 +1815,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.67 — Correct yearly plan description without changing price or billing terms.
 
 - v0.4.66 — Explicitly expand Stripe coupon product restrictions when validating an existing launch promotion; add regression coverage for reuse and mismatched terms.
 
