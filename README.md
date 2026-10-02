@@ -1,3 +1,7 @@
+## v0.4.75 — Clear customer billing activity
+
+Live customer billing events remain visible. Rejected unsigned requests and test-mode records are grouped under expandable webhook diagnostics with plain-language labels.
+
 ## v0.4.74 — A simpler operator Hub
 
 Daily work is grouped into Home, Customers, Support, Revenue and Releases. One Setup page holds integrations and service inputs; occasional tools and diagnostics stay available behind More and expandable sections. Brevo connection checks preserve editable settings and show a clear result, refreshes keep unsaved input, and marketing unsubscribe and hard-bounce callbacks accept Brevo’s actual event names. The admin page no longer permits cached copies after an update.

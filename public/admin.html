@@ -3113,21 +3113,24 @@ function signinLinkButton(email) {
 function billingEventOutcomeClass(outcome) {
   return outcome === "applied" ? "ops-ok" : (outcome === "error" || outcome === "signature") ? "ops-bad" : "ops-warn";
 }
+function renderBillingEvents(events) {
+  const row = ev => '<div class="eventrow"><span class="custbadge ' + (ev.livemode ? "live" : "test") + '">' + (ev.livemode ? "LIVE" : "TEST") + '</span>'
+    + '<b>' + esc(ev.outcome === "signature" ? "Unverified request" : ev.type) + '</b><span class="muted">' + esc(fmt(ev.receivedAtMs)) + '</span>'
+    + '<span class="' + billingEventOutcomeClass(ev.outcome === "signature" ? "ignored" : ev.outcome) + '">' + esc(ev.outcome === "signature" ? "Rejected" : ev.outcome) + '</span>'
+    + (ev.note ? '<span class="muted">' + esc(ev.note) + '</span>' : '') + '</div>';
+  const activity = events.filter(ev => ev.livemode && ev.outcome !== "signature");
+  const diagnostics = events.filter(ev => !ev.livemode || ev.outcome === "signature");
+  return (activity.length ? activity.map(row).join("") : '<p class="muted">No live customer billing events in this recent history.</p>')
+    + (diagnostics.length ? '<details id="billingEventDiagnostics" class="admin-advanced"><summary>Webhook diagnostics · ' + diagnostics.length + ' records</summary><p class="muted">Unverified requests are rejected before they can change customer billing. Test events are kept here for troubleshooting.</p>' + diagnostics.map(row).join("") + '</details>' : '');
+}
 async function billingEventsRefresh() {
   const box = document.getElementById("billingEvents");
-  let d;
-  try { d = await api("/admin/api/billing/events?limit=100"); }
-  catch (e) { return; } // billing not available on this build — the config card already says so
-  const events = d.events || [];
-  box.innerHTML = events.length
-    ? events.map((ev) =>
-        '<div class="eventrow"><span class="custbadge ' + (ev.livemode ? "live" : "test") + '">' + (ev.livemode ? "LIVE" : "TEST") + "</span>"
-        + "<b>" + esc(ev.type) + "</b><span class=\"muted\">" + esc(fmt(ev.receivedAtMs)) + "</span>"
-        + '<span class="' + billingEventOutcomeClass(ev.outcome) + '">' + esc(ev.outcome) + "</span>"
-        + (ev.note ? '<span class="muted">' + esc(ev.note) + "</span>" : "")
-        + "</div>"
-      ).join("")
-    : '<div class="muted">no events yet</div>';
+  try {
+    const d = await api("/admin/api/billing/events?limit=100");
+    box.innerHTML = renderBillingEvents(Array.isArray(d.events) ? d.events : []);
+  } catch (e) {
+    if (e.message !== "unauthorized") box.textContent = "Could not load recent billing activity. Refresh to try again.";
+  }
 }
 document.getElementById("billingEventsRefresh").onclick = billingEventsRefresh;
 
