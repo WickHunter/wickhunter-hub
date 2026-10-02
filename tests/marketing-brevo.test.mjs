@@ -84,6 +84,12 @@ assert.equal(await service.handleOptOutWebhook(`Bearer ${webhookSecret}`,{event:
 assert.equal(JSON.parse(requests.at(-1).init.body).emailBlacklisted,true);
 assert.equal(await service.handleOptOutWebhook(`Bearer ${webhookSecret}`,{event:'delivered',email:'new.customer@example.com'}),'ignored');
 assert.equal(requests.length,beforeUnauthorized+2,'irrelevant authenticated webhook is ignored');
+// Actual marketing webhook payload names differ from the registration API.
+for (const event of ['unsubscribe', 'hard_bounce']) {
+  responses.push(noContent());
+  assert.equal(await service.handleOptOutWebhook(`Bearer ${webhookSecret}`, {event, email:'New.Customer@example.com', list_id:[17]}), 'suppressed');
+  assert.deepEqual(JSON.parse(requests.at(-1).init.body), {emailBlacklisted:true});
+}
 
 responses.push(notFound(),ok({id:703}),ok({emailBlacklisted:false,listIds:[17]}));
 const concurrent=[

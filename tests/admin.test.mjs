@@ -99,6 +99,7 @@ await test("revoking an unknown id -> 404", async () => {
 await test("admin page is served and drives the three endpoints", async () => {
   const res = await fetch(`${h.origin}/admin`);
   assert.equal(res.status, 200);
+  assert.equal(res.headers.get('cache-control'), 'no-store', 'operator UI must not reuse an old API contract after an update');
   const html = await res.text();
   assert.match(html, /x-hub-admin/);
   assert.match(html, /\/admin\/api\/licenses/);

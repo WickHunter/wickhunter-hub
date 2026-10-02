@@ -2303,7 +2303,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // The page itself is served without auth — it contains no secrets, only
     // the JS that prompts for the token and sends it per-request.
     const html = fs.readFileSync(path.join(cfg.publicDir, "admin.html"));
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
     res.end(html);
   }
 
@@ -2927,7 +2927,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (m === 'GET' && p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.status() }, { 'cache-control': 'no-store' });
       if (m === 'POST') {
         try {
-          if (p === '/admin/api/marketing/brevo/test') return sendJson(res, 200, { ok: true, ...await marketing.brevo.testConnection() }, { 'cache-control': 'no-store' });
+          if (p === '/admin/api/marketing/brevo/test') {
+            await marketing.brevo.testConnection();
+            return sendJson(res, 200, { ok: true, ...await marketing.status() }, { 'cache-control': 'no-store' });
+          }
           const body = await readJsonBody(req, 64 * 1024);
           if (!body) return sendJson(res, 400, { ok: false, error: 'Expected marketing settings' });
           if (p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.configure(body) }, { 'cache-control': 'no-store' });

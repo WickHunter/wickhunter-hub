@@ -74,8 +74,9 @@ try {
   });
   await page.goto(`http://127.0.0.1:${address.port}/admin`);
   await page.evaluate(async () => { token='ui-test-token'; document.getElementById('gate').hidden=true; showHubPage('billing',false); await loadHubPage('billing',true); });
-  await page.getByRole('heading', {name:'Launch offer', exact:true}).waitFor();
-  await page.locator('#launchOfferFacts').waitFor();
+  await page.getByRole('heading', {name:'Revenue', exact:true}).waitFor();
+  await page.waitForFunction(()=>document.getElementById('launchOfferFacts').textContent.includes('Oct 15'));
+  assert.equal(await page.locator('#launchOfferPanel').isVisible(),false,'launch configuration stays in Setup');
   assert.doesNotMatch(await page.locator('#launchOfferFacts').innerText(), /UNLEASHED25/);
   assert.match(await page.locator('#launchOfferFacts').innerText(), /Oct 15/);
   assert.match(await page.locator('#billingReportModes').innerText(), /\$43\.69/);
@@ -88,13 +89,22 @@ try {
     ['Unknown','Unknown','Unknown','Unknown']);
   assert.match(await page.locator('#billingReminderHealth').innerText(), /Worker\s+Processing/);
   assert.match(await page.locator('#billingReportPanel').innerText(), /Separately billed VPS subscriptions are excluded/);
+  assert.equal(calls.some(c => /\/api\/(notifications|marketing\/brevo|billing\/config)$/.test(c.pathname)), false, 'Revenue does not load connection settings');
+  await page.locator('#hubPageSelect').selectOption('setup');
+  await page.locator('details.setup-section').filter({has:page.locator('#notificationSettingsPanel')}).locator('summary').click();
+  await page.locator('#notificationStatus').waitFor();
+  assert.equal(await page.locator('#notificationSettingsPanel').evaluate(el => el.closest('[data-hub-page-panel]')?.dataset.hubPagePanel), 'setup');
+  assert.equal(await page.locator('#marketingSettingsPanel').evaluate(el => el.closest('[data-hub-page-panel]')?.dataset.hubPagePanel), 'setup');
+  assert.equal(await page.locator('#billingBody').evaluate(el => el.closest('[data-hub-page-panel]')?.dataset.hubPagePanel), 'setup');
+  assert.equal(await page.locator('#billingCustomerRows').evaluate(el => el.closest('[data-hub-page-panel]')?.dataset.hubPagePanel), 'licenses');
   assert.equal(await page.locator('#notificationWebhook').inputValue(), '', 'saved webhook URL is never returned to the UI');
   assert.equal(await page.locator('#notificationSettingsPanel button').filter({hasText:/test message/i}).count(), 0, 'there is no arbitrary notification test sender');
   assert.equal(await page.getByRole('button', {name:/publish/i}).count(), 0, 'no release publishing action is exposed');
-  assert.equal(await page.locator('details.admin-advanced:not([open])').count(), 3, 'advanced billing, customer records and marketing setup start collapsed');
+  assert.equal(await page.locator('#marketingSettingsPanel').evaluate(el => el.open), false, 'marketing settings start collapsed');
   assert.ok(await page.locator('#billingProvisionLive').count(), 'existing Live provisioning control remains in advanced settings');
 
   page.on('dialog', dialog => dialog.accept());
+  await page.locator('#checkoutSettingsPanel > summary').click();
   await page.getByRole('button', {name:'Verify Stripe prices'}).click();
   await page.locator('#launchEnabled').check();
   await page.locator('#launchCryptoEnabled').check();
@@ -102,6 +112,7 @@ try {
   assert.ok(calls.some(c => c.pathname.endsWith('/api/billing/launch') && c.method==='POST' && JSON.parse(c.body).action==='prepare'));
   assert.ok(calls.some(c => c.pathname.endsWith('/api/billing/launch') && c.method==='POST' && JSON.parse(c.body).enabled===true && JSON.parse(c.body).cryptoEnabled===true));
 
+  await page.locator('#hubPageSelect').selectOption('setup');
   await page.locator('#notificationWebhook').fill('https://discord.com/api/webhooks/12345678901234567/' + 'a'.repeat(50));
   await page.locator('[data-notification-kind="renewal"]').uncheck();
   await page.getByRole('button', {name:'Save notification settings'}).click();
@@ -118,9 +129,10 @@ try {
   const brevoPost=calls.find(c=>c.pathname.endsWith('/api/marketing/brevo') && c.method==='POST');
   assert.deepEqual(JSON.parse(brevoPost.body), {apiKey:'write-only-api-key',listIds:[4,12]}, 'Brevo update omits the blank webhook secret to retain it');
   await page.getByRole('button', {name:'Check Brevo connection'}).click();
-  await page.waitForFunction(()=>document.getElementById('marketingBrevoStatus').textContent.includes('Account reachable'));
+  await page.waitForFunction(()=>document.getElementById('marketingBrevoStatus').textContent.includes('Connected to Brevo'));
   assert.ok(calls.some(c=>c.pathname.endsWith('/api/marketing/brevo/test') && c.method==='POST'));
 
+  await page.locator('#hubPageSelect').selectOption('billing');
   await page.getByRole('button', {name:'Refresh Stripe facts'}).click();
   assert.ok(calls.some(c=>c.pathname.endsWith('/api/billing/report/refresh') && c.method==='POST'));
   assert.equal(await page.locator('.mobile-nav').isVisible(), true, 'phone-width navigation uses the selector');
@@ -128,6 +140,23 @@ try {
   assert.equal(await page.locator('[data-hub-page-panel="support"]').isVisible(), true);
   assert.equal(await page.locator('body').evaluate(el=>el.scrollWidth <= window.innerWidth), true, 'mobile layout does not overflow horizontally');
   assert.equal(await page.locator('html').evaluate(el=>getComputedStyle(el).colorScheme), 'light dark');
+  await page.setViewportSize({width:1280,height:900});
+  await page.locator('#hubMore > summary').click();
+  await page.locator('#hubMore [data-hub-page="features"]').click();
+  assert.equal(await page.locator('#hubMore').evaluate(el=>el.open), false, 'More closes after navigation');
+  assert.equal(await page.locator('#hubMore [data-hub-page="features"]').getAttribute('aria-current'), 'page');
+  if (process.env.HUB_SCREENSHOT_DIR) {
+    fs.mkdirSync(process.env.HUB_SCREENSHOT_DIR, {recursive:true});
+    await page.evaluate(async()=>{showHubPage('overview',false);await loadHubPage('overview',true);});
+    await page.screenshot({path:`${process.env.HUB_SCREENSHOT_DIR}/home-desktop.png`,fullPage:true});
+    await page.evaluate(async()=>{showHubPage('setup',false);await loadHubPage('setup',true);document.querySelectorAll('.setup-section').forEach(el=>{el.open=false;});});
+    await page.screenshot({path:`${process.env.HUB_SCREENSHOT_DIR}/setup-desktop.png`,fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    await page.evaluate(()=>showHubPage('overview',false));
+    await page.screenshot({path:`${process.env.HUB_SCREENSHOT_DIR}/home-mobile.png`,fullPage:true});
+    await page.evaluate(()=>showHubPage('setup',false));
+    await page.screenshot({path:`${process.env.HUB_SCREENSHOT_DIR}/setup-mobile.png`,fullPage:true});
+  }
   console.log('Admin launch UI: mocked billing/report/notification workflows, protected writes, release hold and mobile view passed');
 } finally {
   await browser.close();

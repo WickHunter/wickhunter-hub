@@ -1,3 +1,7 @@
+## v0.4.74 — A simpler operator Hub
+
+Daily work is grouped into Home, Customers, Support, Revenue and Releases. One Setup page holds integrations and service inputs; occasional tools and diagnostics stay available behind More and expandable sections. Brevo connection checks preserve editable settings and show a clear result, refreshes keep unsaved input, and marketing unsubscribe and hard-bounce callbacks accept Brevo’s actual event names. The admin page no longer permits cached copies after an update.
+
 ## v0.4.73 — Private launch discounts
 
 Public pricing shows base prices and the free-until-October-15 card subscription period. Customers enter privately issued promotion codes at Stripe Checkout; the public catalog and support answers no longer disclose or automatically apply a launch code.
@@ -1840,6 +1844,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.74: Reorganize Hub around daily tasks and one Setup page; repair Brevo connection feedback, unsaved-input handling and marketing opt-out event names.
 - v0.4.73: Keep private promotion codes out of public prices and support; retain launch trial timing and record actual checkout discounts.
 
 - v0.4.72 — Increase support reply allowances and recover from temporary handoffs with clear status.

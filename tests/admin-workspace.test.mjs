@@ -18,13 +18,21 @@ const w=dom.window,doc=w.document;const settle=()=>new Promise(r=>setTimeout(r,2
 await settle();assert.equal(errors.length,0,errors.join('\n'));
 assert.equal(doc.querySelector('[data-hub-page-panel="overview"]').hidden,false);
 assert.equal(calls.filter(x=>!x.endsWith('/api/health')).length,0,'no admin requests before sign in');
+for(const [id,page] of Object.entries({supportBudgetForm:'setup',notificationSettingsPanel:'setup',marketingSettingsPanel:'setup',billingBody:'setup',mktConfigForm:'setup',hostingPolicyCard:'setup',earnStripeConfig:'setup',billingCustomerRows:'licenses'})){
+ assert.equal(doc.getElementById(id).closest('[data-hub-page-panel]')?.dataset.hubPagePanel,page,`${id} belongs to ${page}`);
+}
+const ids=[...doc.querySelectorAll('[id]')].map(el=>el.id);assert.equal(new Set(ids).size,ids.length,'all moved sections keep unique IDs');
+assert.deepEqual([...doc.querySelectorAll('#hubNav > [data-hub-page]')].map(el=>el.textContent),['Home','Customers','Support','Revenue','Releases','Setup']);
+assert.deepEqual([...doc.querySelectorAll('#hubPageSelect option')].map(el=>el.value),['overview','licenses','support','billing','system','setup','bugs','features','earn','hosting','marketplace','market-data']);
 w.eval('token="test";loadHubPage("overview",true)');await settle();
 assert.match(doc.getElementById('briefBugs').textContent,/Red · 1 open/);
 assert.match(doc.getElementById('briefFeatures').textContent,/Amber · 1 open/);
 assert.equal(doc.getElementById('briefCandles').textContent,'Green');
 assert.match(doc.getElementById('briefSupport').textContent,/Red · 1 waiting/);
 assert.match(doc.getElementById('supportBudgetSummary').textContent,/\$12.00 used.*\$50.00.*\$38.00 remaining/);
-assert.equal(calls.some(x=>x.includes('billing')),false,'do not fetch settings on entry');
+assert.equal(calls.some(x=>x.includes('/billing/config')),false,'do not fetch settings on entry');
+assert.equal(calls.some(x=>x.includes('/billing/report')),true,'Home loads revenue without first visiting Revenue');
+assert.notEqual(doc.getElementById('briefRevenue').textContent,'Checking…');
 doc.querySelector('[data-hub-page="bugs"]').click();await settle();
 assert.equal(doc.querySelector('[data-hub-page-panel="reports"]').hidden,false);
 assert.equal(doc.querySelectorAll('#fbRows [data-report-id]').length,1);
@@ -35,5 +43,13 @@ assert.match(doc.getElementById('fbRows').textContent,/New chart/);assert.equal(
 doc.querySelector('[data-hub-page="overview"]').click();doc.querySelector('#briefBugList button').click();await settle();
 assert.equal(doc.querySelector('.fbdetailrow').hidden,false);
 assert.equal(doc.querySelector('#fbRows script'),null,'customer text escaped');
+// All secondary destinations stay reachable through More, with the selected destination reflected in mobile navigation.
+w.eval('token=""');const more=doc.getElementById('hubMore');more.open=true;doc.querySelector('#hubMore [data-hub-page="marketplace"]').click();
+assert.equal(more.open,false,'More closes after selecting a page');
+assert.equal(doc.getElementById('hubPageSelect').value,'marketplace');
+assert.equal(doc.querySelector('[data-hub-page-panel="marketplace"]').hidden,false);
+doc.querySelector('[data-hub-page="setup"]').click();
+assert.equal(doc.querySelectorAll('[data-hub-page-panel="setup"]:not([hidden])').length,1,'Setup is a single visible page');
+assert.equal(doc.querySelector('[data-hub-page-panel="billing"]').hidden,true,'operational Revenue is separate from Setup');
 assert.equal(errors.length,0,errors.join('\n'));dom.window.close();
-process.stdout.write('Admin workspace: default briefing, truthful counts, filters, safe text and report drilldown passed\n');
+process.stdout.write('Admin workspace: briefing, reports, simple navigation and separated setup passed\n');

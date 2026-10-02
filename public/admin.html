@@ -227,13 +227,13 @@
   .secretrow input { min-width:0; }
   .configgroup, .custcard, .plancard, .venue { min-width:0; }
   .hubpage p, .billing-savenote { overflow-wrap:anywhere; }
-  [data-hub-page-panel="earn"] > .card { border:1px solid var(--line); border-radius:var(--r); padding:1.1rem; margin:1rem 0; background:var(--raised); min-width:0; }
-  [data-hub-page-panel="earn"] h3 { margin:0 0 .8rem; font-size:1rem; }
-  [data-hub-page-panel="earn"] form { display:block; }
-  [data-hub-page-panel="earn"] form .actions, #earnRates { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr)); align-items:end; gap:.85rem; }
-  [data-hub-page-panel="earn"] label { display:flex; flex-direction:column; gap:.35rem; color:var(--muted); font-size:.85rem; min-width:0; }
-  [data-hub-page-panel="earn"] label:has(input[type="checkbox"]) { flex-direction:row; align-items:center; min-height:44px; color:var(--ink); }
-  [data-hub-page-panel="earn"] input:not([type="checkbox"]), [data-hub-page-panel="earn"] select { width:100%; min-width:0; }
+  [data-hub-page-panel="earn"] > .card, .setup-section > .card { border:1px solid var(--line); border-radius:var(--r); padding:1.1rem; margin:1rem 0; background:var(--raised); min-width:0; }
+  [data-hub-page-panel="earn"] h3, #earnStripeConfig h3 { margin:0 0 .8rem; font-size:1rem; }
+  [data-hub-page-panel="earn"] form, #earnStripeConfig { display:block; }
+  [data-hub-page-panel="earn"] form .actions, #earnStripeConfig .actions, #earnRates { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr)); align-items:end; gap:.85rem; }
+  [data-hub-page-panel="earn"] label, #earnStripeConfig label { display:flex; flex-direction:column; gap:.35rem; color:var(--muted); font-size:.85rem; min-width:0; }
+  [data-hub-page-panel="earn"] label:has(input[type="checkbox"]), #earnStripeConfig label:has(input[type="checkbox"]) { flex-direction:row; align-items:center; min-height:44px; color:var(--ink); }
+  [data-hub-page-panel="earn"] input:not([type="checkbox"]), [data-hub-page-panel="earn"] select, #earnStripeConfig input:not([type="checkbox"]), #earnStripeConfig select { width:100%; min-width:0; }
   input[type="checkbox"] { width:20px; height:20px; min-height:20px; accent-color:var(--accent); flex-shrink:0; }
   .earn-table { overflow-x:auto; margin-top:.8rem; }
   .earn-table td { white-space:normal; overflow-wrap:anywhere; max-width:24rem; }
@@ -278,15 +278,26 @@
   [hidden] { display:none !important; }
   body { max-width:90rem; }
   .topbar h1 small { display:none; }
-  .hubnav { flex-wrap:wrap; }
-  .nav-group { display:flex; gap:.35rem; flex-wrap:wrap; align-items:center; }
-  .nav-group + .nav-group { border-top:1px solid var(--line); padding-top:.55rem; margin-top:.15rem; width:100%; }
-  .nav-caption { color:var(--muted); font-size:.75rem; padding:.2rem .4rem; }
+  .hubnav { flex-wrap:wrap; overflow:visible; align-items:center; }
+  .hub-more { position:relative; }
+  .hub-more > summary { list-style:none; cursor:pointer; border:1px solid var(--line); background:var(--raised); color:var(--muted); padding:.45rem .8rem; border-radius:var(--r-sm); font-weight:600; }
+  .hub-more > summary::-webkit-details-marker { display:none; }
+  .hub-more[open] > summary, .hub-more:has([aria-current="page"]) > summary { color:var(--ink); border-color:var(--accent-line); background:var(--accent-dim); }
+  .hub-more-menu { position:absolute; z-index:8; top:calc(100% + .35rem); right:0; display:grid; gap:.2rem; min-width:13rem; padding:.45rem; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--raised); box-shadow:0 16px 40px #0005; }
+  .hub-more-menu button { text-align:left; border:0; border-radius:6px; }
+  .hub-more-menu button:hover { background:var(--accent-dim); }
   .hubnav button { padding:.45rem .8rem; border-radius:var(--r-sm); }
+  .setup-intro { max-width:44rem; color:var(--muted); }
+  .setup-section { margin:1rem 0; }
+  .setup-section > summary { font-size:1rem; }
+  .setup-section > summary small { display:block; margin-top:.1rem; color:var(--muted); font-size:.8rem; font-weight:400; }
+  .briefing-grid .brief-card[data-open-page="support"] { order:-3; }
+  .briefing-grid .brief-card[data-open-page="bugs"] { order:-2; }
+  .briefing-grid .brief-card[data-open-page="billing"] { order:-1; }
   .briefing-head { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin:1.4rem 0 .8rem; }
   .briefing-head h2 { margin:0; font-size:1.7rem; }
   .briefing-head p { margin:.35rem 0; color:var(--muted); }
-  .briefing-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; }
+  .briefing-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.8rem; }
   .brief-card { text-align:left; padding:1rem; border-radius:var(--r); display:flex; flex-direction:column; gap:.45rem; min-width:0; }
   .brief-card strong { font-size:1.25rem; }
   .brief-card small { color:var(--muted); font-size:.83rem; overflow-wrap:anywhere; }
@@ -398,13 +409,13 @@
     </div>
   </div>
   <nav class="hubnav" id="hubNav" aria-label="Hub admin pages">
-<div class="nav-group"><span class="nav-caption">Daily work</span><button type="button" data-hub-page="overview">Today’s briefing</button><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="support">Support inbox</button></div><div class="nav-group"><span class="nav-caption">Manage</span><button type="button" data-hub-page="licenses">Licenses &amp; installs</button><button type="button" data-hub-page="billing">Revenue &amp; subscriptions</button><button type="button" data-hub-page="earn">Earn with WH</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button><button type="button" data-hub-page="system">Settings &amp; releases</button></div></nav>
-<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Today’s briefing</option><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="support">Support inbox</option></optgroup><optgroup label="Manage"><option value="licenses">Licenses &amp; installs</option><option value="billing">Revenue &amp; subscriptions</option><option value="earn">Earn with WH</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option><option value="system">Settings &amp; releases</option></optgroup></select></label>
+<button type="button" data-hub-page="overview">Home</button><button type="button" data-hub-page="licenses">Customers</button><button type="button" data-hub-page="support">Support</button><button type="button" data-hub-page="billing">Revenue</button><button type="button" data-hub-page="system">Releases</button><button type="button" data-hub-page="setup">Setup</button><details class="hub-more" id="hubMore"><summary>More <span aria-hidden="true">▾</span></summary><div class="hub-more-menu"><button type="button" data-hub-page="bugs">Bug reports</button><button type="button" data-hub-page="features">Feature requests</button><button type="button" data-hub-page="earn">Referrals &amp; payouts</button><button type="button" data-hub-page="hosting">Hosting</button><button type="button" data-hub-page="marketplace">Marketplace</button><button type="button" data-hub-page="market-data">Market data</button></div></details></nav>
+<label class="mobile-nav" for="hubPageSelect">Section <select id="hubPageSelect" aria-label="Admin section"><optgroup label="Daily work"><option value="overview">Home</option><option value="licenses">Customers</option><option value="support">Support</option><option value="billing">Revenue</option><option value="system">Releases</option><option value="setup">Setup</option></optgroup><optgroup label="More"><option value="bugs">Bug reports</option><option value="features">Feature requests</option><option value="earn">Referrals &amp; payouts</option><option value="hosting">Hosting</option><option value="marketplace">Marketplace</option><option value="market-data">Market data</option></optgroup></select></label>
 <div id="pageNotice" class="hub-error" role="status"></div>
 </header>
 
 <section class="hubpage" data-hub-page-panel="overview" hidden>
-  <div class="briefing-head"><div><h2>Today’s briefing</h2><p id="briefingDate"></p></div><span class="muted" id="briefingUpdated" role="status">Refresh to check current status</span></div>
+  <div class="briefing-head"><div><h2>Home</h2><p id="briefingDate">What needs your attention today</p></div><span class="muted" id="briefingUpdated" role="status">Refresh to check current status</span></div>
   <div class="briefing-grid">
     <button class="brief-card" data-open-page="market-data"><span>Candle Data</span><strong id="briefCandles" class="brief-status unknown">Checking…</strong><small id="briefCandlesNote">Exchange collector health</small></button>
     <button class="brief-card" data-open-page="bugs"><span>Bug Reports</span><strong id="briefBugs" class="brief-status unknown">Checking…</strong><small id="briefBugsNote">Unresolved customer reports</small></button>
@@ -414,12 +425,11 @@
     <button class="brief-card" data-open-page="system"><span>Release readiness</span><strong id="briefRelease" class="brief-status unknown">Checking…</strong><small id="briefReleaseNote">Build, source and upgrade status</small></button>
   </div>
   <p class="muted">Red: needs attention · Amber: review or recovery in progress · Green: clear · Unknown: could not verify. Status reflects all open work, not just today.</p>
-  <section class="brief-section" style="margin-top:1rem" aria-labelledby="supportBudgetTitle"><h3 id="supportBudgetTitle">AI support budget</h3><p id="supportBudgetSummary" role="status">Checking this month’s usage…</p><progress id="supportBudgetProgress" max="100" value="0" aria-label="Monthly AI support budget used" style="width:100%;accent-color:var(--accent)"></progress><p id="supportBudgetDetail" class="muted"></p><form id="supportBudgetForm" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end"><label style="display:grid;gap:6px">Monthly limit ($) <input id="supportBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><label style="display:grid;gap:6px">Website guests ($) <input id="supportGuestBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><button type="submit">Save limits</button></form><p class="muted">Changes apply immediately without resetting usage. $0 pauses AI replies; human support stays available. The website guest cap is part of the total, not extra spending. Per-user limits are $1/month, 1,000 replies/month and 100/day for app users and website visitors.</p><p id="supportBudgetNotice" role="status"></p></section>
   <div class="brief-columns">
-    <section class="brief-section"><h3>Bug reports needing attention</h3><div id="briefBugList" class="muted">Loading reports…</div><button data-open-page="bugs">All bug reports</button></section>
     <section class="brief-section"><h3>Waiting for a human answer</h3><div id="briefSupportList" class="muted">Checking inbox…</div><button data-open-page="support">Open support inbox</button></section>
+    <section class="brief-section"><h3>Bug reports needing attention</h3><div id="briefBugList" class="muted">Loading reports…</div><button data-open-page="bugs">All bug reports</button></section>
     <section class="brief-section"><h3>Feature requests to review</h3><div id="briefFeatureList" class="muted">Loading requests…</div><button data-open-page="features">All feature requests</button></section>
-    <section class="brief-section"><h3>Data issues</h3><div id="briefDataList" class="muted">Checking collectors…</div><button data-open-page="market-data">View exchange details</button></section>
+    <details class="brief-section"><summary>Market data diagnostics</summary><div id="briefDataList" class="muted">Checking collectors…</div><button data-open-page="market-data">View exchange details</button></details>
   </div>
 </section>
 <section class="hubpage" data-hub-page-panel="support" hidden>
@@ -431,7 +441,7 @@
 
 
 <section class="hubpage" data-hub-page-panel="earn" hidden>
-<h2>Earn with WH</h2><p class="muted">Manage member rates, monthly rebates and payouts.</p><div class="card"><h3>Stripe automation</h3><form id="earnStripeConfig"><div class="actions"><label>Mode <select name="mode"><option value="test">Test</option><option value="live">Live</option></select></label><label><input type="checkbox" name="enabled"> Enable Stripe earning tools</label><label><input type="checkbox" name="automatic"> Monthly automatic payouts</label><label>Payout day (UTC) <input name="payoutDay" type="number" min="1" max="28" value="1"></label><label>Financial account <input name="financialAccount" placeholder="fa_…"></label><label>Payout API key <input name="payoutKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved key"></label><button>Save Stripe settings</button></div></form><div class="actions"><button id="earnStripeCheck">Check Stripe access</button><button id="earnStripeRun">Reconcile / run eligible payouts</button></div><p id="earnStripeStatus" class="muted" role="status"></p><div id="earnStripeJobs"></div><p class="muted">Test and live money are separate. Payouts reserve approved prior-month earnings before submission. Refunds and disputes adjust future payable balances. Never record a manual payout for an unresolved Stripe reservation.</p></div><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
+<h2>Earn with WH</h2><p class="muted">Manage member rates, monthly rebates and payouts.</p><p class="muted">Hub-owned earnings in USD. Recording a payout records money already sent; it does not send a Stripe payment.</p>
 <button id="earnRefresh" type="button">Refresh earnings</button><p id="earnError" role="status"></p>
 <div class="card"><h3>Members &amp; rates</h3><label>Member <select id="earnMember"></select></label>
 <form id="earnRates" class="actions"><label>Customer discount % <input name="discountPercent" type="number" min="0" max="100" required></label><label>Commission % override <input name="commissionPercent" type="number" min="0" max="100" placeholder="Automatic tier"></label><label>Exchange rebate % <input name="rebatePercent" type="number" min="0" max="100" required></label><button>Save rates</button></form><p class="muted">Standard commission tiers: 0–20 = 20%, 21–40 = 30%, 41+ = 40%. A blank override uses the tier.</p><div id="earnUids"></div></div>
@@ -443,9 +453,11 @@
 </section>
 
 <section class="hubpage" data-hub-page-panel="system" hidden>
-<h1 style="margin-top:2.2rem">Settings &amp; releases <small>— system health and operational controls</small></h1><div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
+<h1 style="margin-top:2.2rem">Releases</h1>
 <p class="safe-note" id="releaseHoldNotice">Beta publication and Production promotion are disabled for this rollout.</p>
 <div class="opsgrid" id="releaseChannelSummary" aria-live="polite"><div class="opscard muted">Loading release status…</div></div>
+<details class="admin-advanced"><summary>Build details and machine leases</summary>
+<div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
 
 <h1 style="margin-top:2.2rem">Machine leases <small>— staged licensing rollout; public verifier only</small></h1>
@@ -455,101 +467,16 @@
 </div>
 <p class="muted">The key shown here is PUBLIC and is the exact value a signed app build must pin before lease enforcement can be enabled. Existing LHK1 installs and every exit remain unchanged during rollout.</p>
 <div class="opsgrid" id="leaseSummary"><div class="opscard muted">Loading machine-lease status…</div></div>
-</section>
-
-<section class="hubpage" data-hub-page-panel="marketplace" hidden>
-<h1 style="margin-top:2.2rem">Marketplace operations <small>— alpha only; private service status</small></h1>
-<div class="actions">
-  <button type="button" id="mktRefresh">Refresh</button>
-  <span id="mktMeta" class="muted"></span>
-</div>
-<p class="muted">Marketplace controls connect to the private API. This view shows service health without exposing credentials.</p>
-<div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
-
-<h2 style="margin:1.2rem 0 .2rem">Provider approvals</h2>
-<p class="muted" style="margin:.2rem 0">Provider applications are approved here. Every decision requires a written reason and is durably audited by the private Marketplace service.</p>
-<div class="actions"><button type="button" id="mktProvidersRefresh">Refresh providers</button><span id="mktProvidersNote" class="muted"></span></div>
-<div class="tbl"><table>
-  <thead><tr><th>Provider</th><th>Status</th><th>Written reason</th><th>Decision</th></tr></thead>
-  <tbody id="mktProviderRows"><tr><td colspan="4">loading…</td></tr></tbody>
-</table></div>
-<details style="margin-top:.8rem">
-  <summary>Advanced technical diagnostics</summary>
-  <p class="muted">These are read-only service facts for troubleshooting. They are not a setup checklist for you.</p>
-  <div class="tbl"><table id="mktInputs">
-    <thead><tr><th>Service fact</th><th>State</th><th>Safe value/detail</th><th>Recovery detail</th></tr></thead>
-    <tbody><tr><td colspan="4">loading…</td></tr></tbody>
-  </table></div>
 </details>
-
-<h2 style="margin:1.2rem 0 .2rem">Finish Marketplace setup</h2>
-<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Subscriptions remain in explicit mock mode; MoonPay is deferred and its credentials are neither requested nor stored. Configured secrets are never shown again.</p>
-<form id="mktConfigForm" style="display:block">
-  <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
-  <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
-  <button type="submit" style="margin-top:.8rem">Save setup and configure everything else</button>
-  <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
-</form>
 </section>
 
-<section class="hubpage" data-hub-page-panel="billing" hidden>
-<h1 style="margin-top:2.2rem">Revenue &amp; subscriptions <small>— launch offer, recurring revenue and customer billing</small></h1>
+<section class="hubpage" data-hub-page-panel="setup" hidden>
+<h1>Setup</h1>
+<p class="setup-intro">Manage connections and settings here. Open a section when you need to make a change. Saved keys stay private.</p>
 <div id="billingUnavailable" class="opscard muted" hidden>This Hub build has no billing yet.</div>
-<section class="launch-card" id="launchOfferPanel" aria-labelledby="launchOfferTitle">
-  <h2 id="launchOfferTitle">Launch offer</h2>
-  <p id="launchOfferSummary" class="muted" role="status">Checking offer status…</p>
-  <div id="launchOfferFacts" class="launch-metrics"></div>
-  <div class="actions">
-    <label class="launch-toggle"><input type="checkbox" id="launchEnabled"> Enable launch offer</label>
-    <label class="launch-toggle"><input type="checkbox" id="launchCryptoEnabled"> Enable crypto checkout</label>
-    <button type="button" id="launchOfferSave">Save offer settings</button>
-    <button type="button" id="launchOfferPrepare">Verify Stripe prices</button>
-  </div>
-  <p id="launchOfferNote" class="muted" role="status"></p>
-  <p class="muted">This verifies the configured software prices and crypto capability in Stripe. Private promotion codes are managed in Stripe. Checkout activation is a separate setting.</p>
-</section>
-<section class="launch-card" id="billingReportPanel" aria-labelledby="billingReportTitle" style="margin-top:.8rem">
-  <div class="actions" style="justify-content:space-between;margin-top:0"><h2 id="billingReportTitle">Revenue and subscription report</h2><button type="button" id="billingReportRefresh">Refresh Stripe facts</button></div>
-  <p id="billingReportMeta" class="muted" role="status">Loading report…</p>
-  <p class="muted">This report covers software subscriptions only. Separately billed VPS subscriptions are excluded.</p>
-  <div id="billingReportModes" class="launch-grid"></div>
-  <div id="billingSubscriptions" class="launch-table"></div>
-  <h3 style="margin:.9rem 0 .35rem">Payment reminders</h3><div id="billingReminderHealth" class="launch-metrics"></div>
-  <div id="billingReportNote" class="muted" role="status"></div>
-</section>
-<section class="launch-card" id="notificationSettingsPanel" aria-labelledby="notificationSettingsTitle" style="margin-top:.8rem">
-  <h2 id="notificationSettingsTitle">Notifications</h2>
-  <p id="notificationStatus" class="muted" role="status">Loading notification health…</p>
-  <form id="notificationSettingsForm" style="display:block">
-    <label for="notificationWebhook">Discord webhook URL</label>
-    <input id="notificationWebhook" type="password" autocomplete="new-password" placeholder="Paste a new URL; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
-    <label class="launch-toggle"><input type="checkbox" id="notificationClearWebhook"> Clear the saved webhook</label>
-    <div id="notificationKinds" class="kind-grid"></div>
-    <button type="submit">Save notification settings</button>
-    <span id="notificationSaveNote" class="muted" role="status"></span>
-  </form>
-</section>
-<details class="admin-advanced" id="marketingSettingsPanel">
-  <summary>Marketing email integration · Brevo</summary>
-  <p class="muted">Connection and consent-based audience setup. Keys are write-only. Connection check reads account status; it does not send a message.</p>
-  <p id="marketingBrevoStatus" class="muted" role="status">Checking Brevo configuration…</p>
-  <form id="marketingBrevoForm" style="display:block">
-    <label for="marketingBrevoKey">Brevo API key</label>
-    <input id="marketingBrevoKey" type="password" autocomplete="new-password" placeholder="Paste a new key; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
-    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearKey"> Clear the saved API key</label>
-    <label for="marketingBrevoLists">Brevo list IDs</label>
-    <input id="marketingBrevoLists" inputmode="numeric" placeholder="e.g. 4, 12" style="width:min(100%,24rem);margin:.35rem 0">
-    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearLists"> Clear configured list IDs</label>
-    <label for="marketingBrevoWebhookSecret">Brevo unsubscribe webhook bearer secret</label>
-    <p class="muted">Bearer secret used by the Brevo opt-out callback at <code>/api/marketing/brevo/webhook</code>.</p>
-    <input id="marketingBrevoWebhookSecret" type="password" autocomplete="new-password" placeholder="Paste a new secret; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
-    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearWebhook"> Clear the saved webhook secret</label>
-    <div class="actions"><button type="submit">Save Brevo settings</button><button type="button" id="marketingBrevoTest">Check Brevo connection</button><span id="marketingBrevoNote" class="muted" role="status"></span></div>
-  </form>
-</details>
 <div id="billingBody" hidden>
 
-<details class="admin-advanced"><summary>Advanced billing setup, payment links and policy</summary>
+<details class="admin-advanced setup-section"><summary>Payments · Stripe, email and policy <small>Set payment keys, prices, receipts and checkout rules.</small></summary>
 <div class="billinghead">
   <span class="muted">Mode</span>
   <div class="modeswitch" id="billingModeSwitch" role="group" aria-label="Billing mode">
@@ -619,8 +546,132 @@
 <span class="muted">Advanced billing controls retain the same test/live separation and existing write-only secret fields.</span>
 </details>
 
-<details class="admin-advanced"><summary>Customer records and billing events</summary>
-<h2 style="margin:1.2rem 0 .2rem">Customers</h2>
+</div>
+<details class="admin-advanced setup-section" id="marketingSettingsPanel">
+  <summary>Marketing email · Brevo <small>Connect a consent-based audience and unsubscribe callback.</small></summary>
+  <p class="muted">Connection and consent-based audience setup. Keys are write-only. Connection check reads account status; it does not send a message.</p>
+  <p id="marketingBrevoStatus" class="muted" role="status">Checking Brevo configuration…</p>
+  <form id="marketingBrevoForm" style="display:block">
+    <label for="marketingBrevoKey">Brevo API key</label>
+    <input id="marketingBrevoKey" type="password" autocomplete="new-password" placeholder="Paste a new key; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearKey"> Clear the saved API key</label>
+    <label for="marketingBrevoLists">Brevo list IDs</label>
+    <input id="marketingBrevoLists" inputmode="numeric" placeholder="e.g. 4, 12" style="width:min(100%,24rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearLists"> Clear configured list IDs</label>
+    <label for="marketingBrevoWebhookSecret">Brevo unsubscribe webhook bearer secret</label>
+    <p class="muted">Bearer secret used by the Brevo opt-out callback at <code>/api/marketing/brevo/webhook</code>.</p>
+    <input id="marketingBrevoWebhookSecret" type="password" autocomplete="new-password" placeholder="Paste a new secret; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="marketingBrevoClearWebhook"> Clear the saved webhook secret</label>
+    <div class="actions"><button type="submit">Save Brevo settings</button><button type="button" id="marketingBrevoTest">Check Brevo connection</button><span id="marketingBrevoNote" class="muted" role="status"></span></div>
+  </form>
+</details>
+<details class="admin-advanced setup-section"><summary>Notifications · Discord <small>Choose alerts and connect your private webhook.</small></summary>
+<section class="launch-card" id="notificationSettingsPanel" aria-labelledby="notificationSettingsTitle" style="margin-top:.8rem">
+  <h2 id="notificationSettingsTitle">Notifications</h2>
+  <p id="notificationStatus" class="muted" role="status">Loading notification health…</p>
+  <form id="notificationSettingsForm" style="display:block">
+    <label for="notificationWebhook">Discord webhook URL</label>
+    <input id="notificationWebhook" type="password" autocomplete="new-password" placeholder="Paste a new URL; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
+    <label class="launch-toggle"><input type="checkbox" id="notificationClearWebhook"> Clear the saved webhook</label>
+    <div id="notificationKinds" class="kind-grid"></div>
+    <button type="submit">Save notification settings</button>
+    <span id="notificationSaveNote" class="muted" role="status"></span>
+  </form>
+</section>
+</details>
+<details class="admin-advanced setup-section" id="checkoutSettingsPanel"><summary>Checkout &amp; launch offer <small>Manage the free period and available payment options.</small></summary>
+<section class="launch-card" id="launchOfferPanel" aria-labelledby="launchOfferTitle">
+  <h2 id="launchOfferTitle">Launch offer</h2>
+  <p id="launchOfferSummary" class="muted" role="status">Checking offer status…</p>
+  <div id="launchOfferFacts" class="launch-metrics"></div>
+  <div class="actions">
+    <label class="launch-toggle"><input type="checkbox" id="launchEnabled"> Enable launch offer</label>
+    <label class="launch-toggle"><input type="checkbox" id="launchCryptoEnabled"> Enable crypto checkout</label>
+    <button type="button" id="launchOfferSave">Save offer settings</button>
+    <button type="button" id="launchOfferPrepare">Verify Stripe prices</button>
+  </div>
+  <p id="launchOfferNote" class="muted" role="status"></p>
+  <p class="muted">This verifies the configured software prices and crypto capability in Stripe. Private promotion codes are managed in Stripe. Checkout activation is a separate setting.</p>
+</section>
+</details>
+<details class="admin-advanced setup-section"><summary>Support spending <small>Set the monthly AI reply limit and check usage.</small></summary>
+<section class="brief-section" aria-labelledby="supportBudgetTitle"><h3 id="supportBudgetTitle">AI support budget</h3><p id="supportBudgetSummary" role="status">Checking this month’s usage…</p><progress id="supportBudgetProgress" max="100" value="0" aria-label="Monthly AI support budget used" style="width:100%;accent-color:var(--accent)"></progress><p id="supportBudgetDetail" class="muted"></p><form id="supportBudgetForm" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end"><label style="display:grid;gap:6px">Monthly limit ($) <input id="supportBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><label style="display:grid;gap:6px">Website guests ($) <input id="supportGuestBudgetLimit" type="number" min="0" max="10000" step="0.01" required style="width:8rem"></label><button type="submit">Save limits</button></form><p class="muted">Changes apply immediately without resetting usage. $0 pauses AI replies; human support stays available. The website guest cap is part of the total, not extra spending. Per-user limits are $1/month, 1,000 replies/month and 100/day for app users and website visitors.</p><p id="supportBudgetNotice" role="status"></p></section>
+</details>
+<details class="admin-advanced setup-section"><summary>Hosting · Vultr <small>Connect the provider and choose provisioning limits.</small></summary>
+<section class="configgroup" id="hostingPolicyCard">
+  <h2>Hosting settings</h2>
+  <p class="muted" style="margin:.2rem 0 .6rem">Set the provider key, server image, pinned release and provisioning policy here. The Vultr API key is write-only.</p>
+  <div class="configfields" id="hostingPolicyFields"></div>
+  <button type="button" id="hostingPolicySave" style="margin-top:.7rem">Save policy</button>
+  <span class="muted" id="hostingPolicyNote" style="margin-left:.5rem"></span>
+</section>
+</details>
+<details class="admin-advanced setup-section"><summary>Referrals &amp; payouts · Stripe <small>Connect payout access and choose automation settings.</small></summary>
+<div class="card"><h3>Stripe automation</h3><form id="earnStripeConfig"><div class="actions"><label>Mode <select name="mode"><option value="test">Test</option><option value="live">Live</option></select></label><label><input type="checkbox" name="enabled"> Enable Stripe earning tools</label><label><input type="checkbox" name="automatic"> Monthly automatic payouts</label><label>Payout day (UTC) <input name="payoutDay" type="number" min="1" max="28" value="1"></label><label>Financial account <input name="financialAccount" placeholder="fa_…"></label><label>Payout API key <input name="payoutKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved key"></label><button>Save Stripe settings</button></div></form><div class="actions"><button id="earnStripeCheck">Check Stripe access</button><button id="earnStripeRun">Reconcile / run eligible payouts</button></div><p id="earnStripeStatus" class="muted" role="status"></p><div id="earnStripeJobs"></div><p class="muted">Test and live money are separate. Payouts reserve approved prior-month earnings before submission. Refunds and disputes adjust future payable balances. Never record a manual payout for an unresolved Stripe reservation.</p></div>
+</details>
+<details class="admin-advanced setup-section"><summary>Marketplace connection <small>Supply the master account details used for Demo providers.</small></summary>
+<h2 style="margin:1.2rem 0 .2rem">Marketplace setup</h2>
+<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Subscriptions remain in explicit mock mode; MoonPay is deferred and its credentials are neither requested nor stored. Configured secrets are never shown again.</p>
+<form id="mktConfigForm" style="display:block">
+  <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
+  <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
+  <button type="submit" style="margin-top:.8rem">Save setup and configure everything else</button>
+  <span id="mktConfigNote" class="muted" style="margin-left:.5rem"></span>
+</form>
+</details>
+</section>
+
+
+
+<section class="hubpage" data-hub-page-panel="marketplace" hidden>
+<h1 style="margin-top:2.2rem">Marketplace operations <small>— alpha only; private service status</small></h1>
+<div class="actions">
+  <button type="button" id="mktRefresh">Refresh</button>
+  <span id="mktMeta" class="muted"></span>
+</div>
+<p class="muted">Marketplace controls connect to the private API. This view shows service health without exposing credentials.</p>
+<div id="mktSummary" class="opsgrid"><div class="opscard muted">Loading Marketplace readiness…</div></div>
+
+<h2 style="margin:1.2rem 0 .2rem">Provider approvals</h2>
+<p class="muted" style="margin:.2rem 0">Provider applications are approved here. Every decision requires a written reason and is durably audited by the private Marketplace service.</p>
+<div class="actions"><button type="button" id="mktProvidersRefresh">Refresh providers</button><span id="mktProvidersNote" class="muted"></span></div>
+<div class="tbl"><table>
+  <thead><tr><th>Provider</th><th>Status</th><th>Written reason</th><th>Decision</th></tr></thead>
+  <tbody id="mktProviderRows"><tr><td colspan="4">loading…</td></tr></tbody>
+</table></div>
+<details style="margin-top:.8rem">
+  <summary>Advanced technical diagnostics</summary>
+  <p class="muted">These are read-only service facts for troubleshooting. They are not a setup checklist for you.</p>
+  <div class="tbl"><table id="mktInputs">
+    <thead><tr><th>Service fact</th><th>State</th><th>Safe value/detail</th><th>Recovery detail</th></tr></thead>
+    <tbody><tr><td colspan="4">loading…</td></tr></tbody>
+  </table></div>
+</details>
+
+</section>
+
+
+<section class="hubpage" data-hub-page-panel="billing" hidden>
+<h1 style="margin-top:2.2rem">Revenue</h1>
+
+<div class="actions"><p id="revenueOfferSummary" class="muted" role="status">Checking checkout status…</p><button type="button" data-open-page="setup">Checkout settings</button></div>
+<section class="launch-card" id="billingReportPanel" aria-labelledby="billingReportTitle" style="margin-top:.8rem">
+  <div class="actions" style="justify-content:space-between;margin-top:0"><h2 id="billingReportTitle">Revenue and subscription report</h2><button type="button" id="billingReportRefresh">Refresh Stripe facts</button></div>
+  <p id="billingReportMeta" class="muted" role="status">Loading report…</p>
+  <p class="muted">This report covers software subscriptions only. Separately billed VPS subscriptions are excluded.</p>
+  <div id="billingReportModes" class="launch-grid"></div>
+  <div id="billingSubscriptions" class="launch-table"></div>
+  <h3 style="margin:.9rem 0 .35rem">Payment reminders</h3><div id="billingReminderHealth" class="launch-metrics"></div>
+  <div id="billingReportNote" class="muted" role="status"></div>
+</section>
+</section>
+
+
+
+<section class="hubpage" data-hub-page-panel="licenses" hidden>
+
+<h1>Customers</h1>
+<section class="launch-card" style="margin-top:1rem" aria-labelledby="customerRecordsTitle"><h2 id="customerRecordsTitle">Billing customers</h2>
 <div class="actions">
   <button type="button" id="billingCustomersRefresh">Refresh</button>
   <span id="billingCustomersMeta" class="muted"></span>
@@ -637,9 +688,7 @@
 </div>
 <div id="billingEvents"><div class="muted">loading&hellip;</div></div>
 
-</details>
-
-</div>
+</section>
 </section>
 
 <section class="hubpage" data-hub-page-panel="hosting" hidden>
@@ -650,14 +699,6 @@
   <span id="hostingCostMeta" class="muted"></span>
 </div>
 
-<section class="configgroup" id="hostingPolicyCard">
-  <h2>Policy</h2>
-  <p class="muted" style="margin:.2rem 0 .6rem">Purchasable checkout/provisioning stays OFF until this is turned on — that master switch, the OS image id and the pinned release are launch inputs an operator supplies (see the delivery report). The Vultr API key is write-only over the wire, exactly like a Stripe secret key.</p>
-  <div class="configfields" id="hostingPolicyFields"></div>
-  <button type="button" id="hostingPolicySave" style="margin-top:.7rem">Save policy</button>
-  <span class="muted" id="hostingPolicyNote" style="margin-left:.5rem"></span>
-</section>
-
 <h2 style="margin:1.2rem 0 .2rem">Instances</h2>
 <p class="muted" style="margin:.2rem 0">Every hosted VPS, whatever its stage. Retry re-attempts provisioning on the same row (bounded, same as an automatic attempt). Force suspend/delete drive the SAME lease-guarded pipeline a real expiry uses — never a shortcut that skips it.</p>
 <div class="tbl"><table>
@@ -667,8 +708,10 @@
 </section>
 
 
+
+
 <section class="hubpage" data-hub-page-panel="licenses">
-<h1 style="margin-top:2.2rem">Licenses &amp; install commands</h1>
+<h2>Licenses &amp; installs</h2>
 <form id="issueForm">
   <label>Customer name <input name="name" placeholder="Customer name" required></label>
   <label>Days <input name="days" type="number" value="30" min="1" max="3650" required></label>
@@ -763,7 +806,7 @@
 const base = location.pathname.replace(/\/admin\/?$/, "");
 let token = ""; // memory only, by design — the browser's password manager persists it
 
-const HUB_PAGES = new Set(["overview", "bugs", "features", "support", "licenses", "market-data", "marketplace", "billing", "earn", "hosting", "system"]);
+const HUB_PAGES = new Set(["overview", "licenses", "support", "billing", "system", "setup", "bugs", "features", "earn", "hosting", "marketplace", "market-data"]);
 let currentHubPage = "overview";
 const loadedPages = new Set();
 const loadingPages = new Map();
@@ -777,6 +820,7 @@ function showHubPage(wanted, remember) {
     button.setAttribute("aria-selected", String(active));
     if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
   });
+  document.getElementById("hubMore").open = false;
   document.getElementById("hubPageSelect").value = page;
   if (panelName === "reports") {
     document.getElementById("fbKindFilter").value = page === "bugs" ? "bug" : "feature";
@@ -792,11 +836,13 @@ async function loadHubPage(page, force = false) {
   if (loadingPages.has(key)) return loadingPages.get(key);
   if (!force && loadedPages.has(key)) return;
   const loaders = {
-    overview: [briefingRefresh, opsRefresh], reports: [fbRefresh], support: [supportRefresh],
-    licenses: [refresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
-    marketplace: [mktRefresh, mktConfigRefresh, mktProvidersRefresh],
-    billing: [billingConfigRefresh, billingCustomersRefresh, billingEventsRefresh, billingLaunchRefresh, billingReportRefresh, notificationSettingsRefresh, marketingBrevoRefresh],
-    earn: [earnRefresh], hosting: [hostingRefresh], system: [opsRefresh, leaseRefresh, releaseStatusRefresh],
+    overview: [briefingRefresh, opsRefresh, billingReportRefresh], reports: [fbRefresh], support: [supportRefresh],
+    licenses: [refresh, billingCustomersRefresh, billingEventsRefresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
+    marketplace: [mktRefresh, mktProvidersRefresh],
+    billing: [billingLaunchRefresh, billingReportRefresh],
+    system: [opsRefresh, leaseRefresh, releaseStatusRefresh],
+    setup: [supportRefresh, billingLaunchRefresh, notificationSettingsRefresh, marketingBrevoRefresh, billingConfigRefresh, mktConfigRefresh, earnRefresh, hostingRefresh],
+    earn: [earnRefresh], hosting: [hostingRefresh],
   };
   const pending = Promise.all((loaders[key] || []).map(fn => fn())).then(() => loadedPages.add(key)).catch(e => {
     if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
@@ -1126,6 +1172,7 @@ document.getElementById("issueForm").onsubmit = async (ev) => {
 };
 document.getElementById("copyIssued").onclick = () => navigator.clipboard.writeText(installCmd);
 document.getElementById("refresh").onclick = async () => {
+  if (currentHubPage === "setup" && loadedPages.has("setup") && !window.confirm("Reload saved setup? Any unsaved changes will be discarded.")) return;
   const button = document.getElementById("refresh"); button.disabled = true;
   document.getElementById("pageNotice").textContent = "";
   try { await loadHubPage(currentHubPage, true); } finally { button.disabled = false; }
@@ -2694,12 +2741,14 @@ function renderLaunchOffer(data) {
     typeof data.cryptoEnabled === "boolean" && typeof data.active === "boolean" &&
     Number.isSafeInteger(data.firstPaymentAtMs) && Number.isSafeInteger(data.redeemUntilMs) ? data : null;
   if (!launchOfferStatus) {
+    document.getElementById("revenueOfferSummary").textContent = "Checkout status could not be loaded. Refresh to try again.";
     summary.textContent = "Offer status unavailable. Controls are disabled until Hub data is valid.";
     facts.innerHTML = metric("Offer status", "Unknown");
     enabled.disabled = crypto.disabled = document.getElementById("launchOfferSave").disabled = document.getElementById("launchOfferPrepare").disabled = true;
     return;
   }
   const s = launchOfferStatus;
+  document.getElementById("revenueOfferSummary").textContent = s.active ? "Card subscriptions: free until October 15. " + (s.cryptoEnabled ? "Crypto checkout enabled." : "Crypto checkout disabled.") : "Launch offer inactive. Review checkout settings in Setup.";
   summary.textContent = (s.active ? "Active" : "Inactive") + " · " + s.mode.toUpperCase() + (s.prepared ? " · Stripe prices verified" : " · Stripe setup needed");
   facts.innerHTML = metric("First payment", easternDate(s.firstPaymentAtMs)) + metric("Private code window through", easternDate(s.redeemUntilMs - 1)) +
     metric("Offer", s.enabled ? "Enabled" : "Disabled") + metric("Crypto", s.cryptoEnabled ? "Enabled" : "Disabled");
@@ -2758,7 +2807,9 @@ function renderBillingReport(data) {
       metric("Last Stripe refresh", Number.isSafeInteger(d.refreshedAtMs) && d.refreshedAtMs > 0 ? easternDate(d.refreshedAtMs) : "Not refreshed") +
       '</div>' + (d.refreshError ? '<p class="ops-warn">' + esc(d.refreshError) + '</p>' : "") + '</section>';
   };
-  modes.innerHTML = makeMode("test") + makeMode("live");
+  const otherMode = data.activeMode === "live" ? "test" : "live";
+  modes.style.gridTemplateColumns = "1fr";
+  modes.innerHTML = makeMode(data.activeMode) + '<details><summary>' + (otherMode === "test" ? 'Test billing data' : 'Live billing data') + '</summary>' + makeMode(otherMode) + '</details>';
   const current = data.byMode[data.activeMode];
   const subs = Array.isArray(current.subscriptions) ? current.subscriptions : [];
   if (!subs.length) rows.innerHTML = '<p class="muted">No subscription records in the active mode.</p>';
@@ -2827,7 +2878,13 @@ document.getElementById("notificationSettingsForm").onsubmit = async event => {
   catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
   finally { button.disabled = false; }
 };
-function renderBrevoSettings(data) {
+let brevoFormDirty = false;
+let brevoFormRevision = 0;
+for (const event of ["input", "change"]) document.getElementById("marketingBrevoForm").addEventListener(event, () => {
+  brevoFormDirty = true;
+  brevoFormRevision++;
+});
+function renderBrevoSettings(data, savedRevision) {
   if (!data || data.ok !== true || typeof data.configured !== "boolean" || typeof data.webhookConfigured !== "boolean" || !Array.isArray(data.listIds) ||
       !data.listIds.every(id => Number.isSafeInteger(id) && id > 0)) {
     document.getElementById("marketingBrevoStatus").textContent = "Brevo settings unavailable.";
@@ -2835,17 +2892,20 @@ function renderBrevoSettings(data) {
     return;
   }
   document.getElementById("marketingBrevoStatus").textContent =
-    (data.configured ? "API key configured" : "API key missing") + " · " +
-    (data.webhookConfigured ? "unsubscribe webhook configured" : "unsubscribe webhook missing") +
-    " · " + data.listIds.length + " list ID(s)" +
-    (typeof data.lastTestAt === "string" && Number.isFinite(Date.parse(data.lastTestAt)) ? " · last check " + easternDate(Date.parse(data.lastTestAt)) + (data.lastTestOk === true ? " passed" : data.lastTestOk === false ? " failed" : "") : "");
-  if (typeof data.lastTestMessage === "string" && data.lastTestMessage) document.getElementById("marketingBrevoStatus").textContent += " · " + data.lastTestMessage;
-  document.getElementById("marketingBrevoLists").value = data.listIds.join(", ");
-  document.getElementById("marketingBrevoClearKey").checked = false;
-  document.getElementById("marketingBrevoClearWebhook").checked = false;
-  document.getElementById("marketingBrevoClearLists").checked = false;
-  document.getElementById("marketingBrevoKey").value = "";
-  document.getElementById("marketingBrevoWebhookSecret").value = "";
+    (!data.configured ? "Not connected — add your Brevo API key." : data.lastTestOk === true ? "Connected to Brevo." : data.lastTestOk === false ? (data.lastTestMessage || "Brevo connection failed.") : "API key saved — check the connection.") + " " +
+    (data.webhookConfigured ? "Unsubscribe protection connected." : "Unsubscribe callback needs setup.") + " " +
+    (data.listIds.length ? data.listIds.length + " audience list(s) connected." : "Choose an audience list to finish setup.");
+  // A status refresh must never erase a pasted key or unsaved audience edits.
+  // Only the response for the exact saved revision can clear submitted secrets.
+  if (savedRevision !== undefined && savedRevision === brevoFormRevision) {
+    brevoFormDirty = false;
+    document.getElementById("marketingBrevoClearKey").checked = false;
+    document.getElementById("marketingBrevoClearWebhook").checked = false;
+    document.getElementById("marketingBrevoClearLists").checked = false;
+    document.getElementById("marketingBrevoKey").value = "";
+    document.getElementById("marketingBrevoWebhookSecret").value = "";
+  }
+  if (!brevoFormDirty) document.getElementById("marketingBrevoLists").value = data.listIds.join(", ");
   document.getElementById("marketingBrevoForm").querySelectorAll("input,button").forEach(el => el.disabled = false);
 }
 async function marketingBrevoRefresh() {
@@ -2871,18 +2931,25 @@ document.getElementById("marketingBrevoForm").onsubmit = async event => {
     }
     body.listIds = [...new Set(ids.map(Number))];
   }
+  if (!Object.keys(body).length) { note.textContent = "Enter a key or change a setting before saving."; return; }
+  const savedRevision = brevoFormRevision;
   button.disabled = true; note.textContent = "Saving…";
-  try { renderBrevoSettings(await api("/admin/api/marketing/brevo", { method:"POST", body:JSON.stringify(body) })); note.textContent = "Brevo settings saved."; }
+  try {
+    const result = await api("/admin/api/marketing/brevo", { method:"POST", body:JSON.stringify(body) });
+    renderBrevoSettings(result, savedRevision);
+    note.textContent = result.configured ? "Settings saved. Use Check Brevo connection to verify." : "Settings saved. Brevo is not connected yet.";
+  }
   catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
   finally { button.disabled = false; }
 };
 document.getElementById("marketingBrevoTest").onclick = async () => {
   const button = document.getElementById("marketingBrevoTest"), note = document.getElementById("marketingBrevoNote");
+  if (brevoFormDirty) { note.textContent = "Save your changes before checking the connection."; return; }
   button.disabled = true; note.textContent = "Checking account connection…";
   try {
     const result = await api("/admin/api/marketing/brevo/test", { method:"POST", body:"{}" });
     renderBrevoSettings(result);
-    note.textContent = "Brevo account connection checked; no message was sent.";
+    note.textContent = result.lastTestOk === true ? "Connected to Brevo. No email was sent." : (result.lastTestMessage || "Could not connect to Brevo. Check the saved key and try again.");
   } catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
   finally { button.disabled = false; }
 };
@@ -2929,7 +2996,12 @@ async function billingCustomersRefresh() {
   try { d = await api("/admin/api/billing/customers"); }
   catch (e) {
     if (e.message === "unauthorized") return;
-    return; // billing not available on this build — the config card already says so
+    meta.textContent = "Could not refresh customers: " + e.message;
+    if (!billingCustomers.length) {
+      rows.innerHTML = '<tr><td colspan="7">Customer records unavailable. Refresh to try again.</td></tr>';
+      cards.textContent = "Customer records unavailable. Refresh to try again.";
+    }
+    return;
   }
   billingCustomers = d.customers || [];
   meta.textContent = billingCustomers.length + " customer(s)";

@@ -208,7 +208,9 @@ export class BrevoMarketing {
     if (!event || typeof event !== "object") throw new Error("Invalid Brevo webhook event.");
     const payload = event as { event?: unknown; email?: unknown };
     const kind = typeof payload.event === "string" ? payload.event : "";
-    if (!["unsubscribed", "spam", "hardBounce", "invalid"].includes(kind)) return "ignored";
+    // Brevo's subscription API uses camelCase names, but marketing email
+    // deliveries use "unsubscribe" and "hard_bounce" in the event payload.
+    if (!["unsubscribe", "unsubscribed", "spam", "hard_bounce", "hardBounce", "invalid"].includes(kind)) return "ignored";
     const email = typeof payload.email === "string" ? normalizedEmail(payload.email) : "";
     if (!EMAIL.test(email) || email.length > 320) throw new Error("Invalid Brevo webhook contact.");
     const key = await this.apiKey();

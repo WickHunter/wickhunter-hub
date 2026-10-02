@@ -52,7 +52,12 @@ try {
     const text = await save.text(); assert(!text.includes(secret)); assert(!text.includes('X'.repeat(40)));
     assert.equal(outbound.length, 0);
     const check = await fetch(hub.origin + endpoint + '/test', { method: 'POST', headers, body: '{}' });
-    assert.equal((await check.json()).lastTestOk, true);
+    const checked = await check.json();
+    assert.equal(checked.lastTestOk, true);
+    assert.equal(checked.configured, true);
+    assert.equal(checked.webhookConfigured, true, 'connection result keeps the full settings shape expected by the admin form');
+    assert.deepEqual(checked.listIds, [15]);
+    assert(!JSON.stringify(checked).includes(secret));
     assert.equal(outbound.length, 1); assert.equal(outbound[0].init.method, 'GET');
   });
   await test('consented import still skips blocked contacts and leaves opt-out intact', async () => {
