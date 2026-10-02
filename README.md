@@ -1,3 +1,7 @@
+## v0.4.77 — Marketplace operations and recovery
+
+Show pending copier deliveries and halted Demo provisioning prominently. Provider decisions follow the permitted state transitions. Failed Alpha access changes restore and re-synchronize the previous setting, with an explicit warning if reconciliation fails. Root-helper settings are reconstructed from known fields before reaching the browser.
+
 ## v0.4.76 — Billing replay and safe Hub updates
 
 Replayed one-time Checkout events after a refund acknowledge the already-applied purchase without restoring revoked access. A signed-webhook lifecycle regression covers first-charge reminders, private-discount reporting, starter-pack delivery, renewals, cancellations, refunds and one-time purchases.
