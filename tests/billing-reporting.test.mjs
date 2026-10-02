@@ -19,7 +19,7 @@ store.putCustomer(customer('one', 'cus_one', 'sub_one', 'monthly'));
 store.putCustomer(customer('two', 'cus_two', 'sub_two', 'yearly'));
 store.putCustomer(customer('scheduled', 'cus_scheduled', 'sub_scheduled', 'monthly'));
 store.putCustomer(customer('unknown-amount', 'cus_unknown', 'sub_unknown', 'monthly'));
-store.putCustomer(customer('live', 'cus_live', 'sub_live', 'monthly', true));
+store.putCustomer({ ...customer('live', 'cus_live', 'sub_live', 'monthly', true), launchManaged: true, discountPercent: 0 });
 store.putCustomer(customer('yearly-onetime', '', null, 'yearly'));
 store.putCustomer(customer('lifetime-onetime', '', null, 'lifetime'));
 store.putRoleSubscription({ key: 'cus_one::hosting', customerKey: 'cus_one', role: 'hosting', livemode: false,
@@ -80,6 +80,15 @@ assert.equal(report.unknownAmountCount, 1, 'unknown discounts remain counted as 
 assert.equal(report.subscriptions.some(s => s.subscriptionId === 'sub_foreign'), false, 'role-subscription hosting rows are never fetched or counted');
 assert.equal(initial.byMode.live.activeRecurring, 1, 'test and live customers have separate totals');
 assert.equal(initial.byMode.live.mrrMinorByCurrency.eur, 8000, 'a 0% launch discount remains exact');
+fixtures.sub_live.discounts = [{ coupon: { percent_off: 40, amount_off: null, duration: 'forever' } }];
+const privateCodeReport = await reporter.refresh();
+assert.equal(privateCodeReport.byMode.live.mrrMinorByCurrency.eur, 4800,
+  'a privately entered Stripe discount overrides the original zero-discount checkout metadata');
+assert.equal(privateCodeReport.byMode.live.subscriptions[0].discountPercent, 40);
+assert.equal(store.getCustomer('live').discountPercent, 40, 'the app subscription card receives the verified private discount');
+fixtures.sub_live.discounts = [];
+await reporter.refresh();
+assert.equal(store.getCustomer('live').discountPercent, 0, 'removing the Stripe discount clears the app card');
 assert.ok(requests.every(r => r.url.startsWith('https://api.stripe.com/v1/subscriptions/')));
 assert.equal(JSON.stringify(initial).includes('sk_test_reportingonly123'), false);
 assert.equal(JSON.stringify(initial).includes('Private Customer'), false);
@@ -132,5 +141,16 @@ assert.equal(result.refreshed, true);
 assert.equal(result.notices, 0);
 assert.equal(result.snapshot.byMode.test.activeRecurring, 2, 'a fresh Stripe cancellation removes the subscription from active totals');
 assert.equal(result.snapshot.byMode.test.mrrMinorByCurrency.usd, 4368.75);
+
+store.putCustomer({ ...customer('one-time-private', 'cus_one_time_private', null, 'lifetime'), launchManaged: true, discountPercent: 40 });
+const oneTime = { id: 'cs_one_time_private', mode: 'payment', status: 'complete', payment_status: 'paid',
+  customer: 'cus_one_time_private', metadata: { managed_by: 'wh-launch', plan: 'lifetime' },
+  amount_subtotal: 99900, total_details: { amount_discount: 39960 } };
+result = await reporter.handleVerifiedEvent(event('checkout.session.completed', oneTime));
+assert.equal(result.notices, 2, 'a verified one-time private code emits signup and discount notices');
+assert.deepEqual(notifications.slice(-2).map(n => n.kind), ['signup', 'discount']);
+assert.ok(notifications.at(-1).fields.some(f => f.name === 'Discount' && f.value === '40%'));
+assert.equal((await reporter.handleVerifiedEvent(event('checkout.session.completed', oneTime))).notices, 0,
+  'one-time discount notices dedupe by Checkout Session');
 
 console.log('Launch billing report: known software subscriptions, normalized net MRR, scheduled starts, one-time counts and event dedupe passed');

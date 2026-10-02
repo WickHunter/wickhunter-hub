@@ -13,10 +13,6 @@ billing.updateConfig({ mode: 'live', stripe: { live: { secretKey: 'sk_live_offli
 const calls = [];
 let loseResponse = false;
 let number = 0;
-let promotionExists = false;
-let couponId = 'zqhBEq04';
-let couponProducts = [];
-let couponOverrides = {};
 const sessions = new Map();
 const fake = async (url, init) => {
   const parsed = new URL(url), p = parsed.pathname, params = new URLSearchParams(init.body ?? '');
@@ -25,11 +21,7 @@ const fake = async (url, init) => {
   if (p.startsWith('/v1/prices/')) {
     const key = p.slice('/v1/prices/price_'.length), plan = billing.plan(key);
     result = { id: `price_${key}`, active: true, currency: plan.currency, unit_amount: plan.amountCents, product: 'prod_software', recurring: plan.interval ? { interval: plan.interval, interval_count: 1 } : null };
-  } else if (p === '/v1/promotion_codes' && init.method === 'GET') result = { data: promotionExists ? [{ id: 'promo_launch', coupon: { id: couponId, percent_off: 25, duration: 'forever' }, expires_at: LAUNCH_REDEEM_UNTIL_MS / 1000, customer: null, max_redemptions: null, restrictions: {} }] : [], has_more: false };
-  else if (p === '/v1/coupons' && init.method === 'POST') { couponProducts = [...params].filter(([key]) => key.startsWith('applies_to[products][' )).map(([, value]) => value); result = { id: couponId }; }
-  else if (p === `/v1/coupons/${couponId}` && init.method === 'GET') result = { id: couponId, percent_off: 25, duration: 'forever', ...couponOverrides, ...(parsed.searchParams.get('expand[0]') === 'applies_to' ? { applies_to: { products: [...couponProducts] } } : {}) };
-  else if (p === '/v1/promotion_codes' && init.method === 'POST') { promotionExists = true; result = { id: 'promo_launch' }; }
-  else if (p === '/v1/account') result = { capabilities: { crypto_payments: 'active' } };
+  } else if (p === '/v1/account') result = { capabilities: { crypto_payments: 'active' } };
   else if (p.startsWith('/v1/checkout/sessions/') && init.method === 'GET') {
     const parts = p.split('/'), session = [...sessions.values()].find(s => s.id === parts[4]);
     if (!session) throw Error('Unknown fixture session');
@@ -61,32 +53,19 @@ await test('launch is opt-in and exact plan prices are prepared without activati
   const prepared = await launch.prepare();
   assert.equal(prepared.prepared, true); assert.equal(prepared.enabled, false);
   assert.equal(prepared.cryptoCapable, true); assert.equal(prepared.cryptoEnabled, false);
-  assert.equal(calls.find(c => c.p === '/v1/coupons').params.get('duration'), 'forever');
-  assert.equal(calls.find(c => c.p === '/v1/promotion_codes' && c.params.size).params.get('expires_at'), String(LAUNCH_REDEEM_UNTIL_MS / 1000));
+  assert.equal(calls.some(c => c.p.includes('/v1/coupons') || c.p.includes('/v1/promotion_codes')), false);
   await launch.prepare();
-  const couponRead = calls.findLast(c => c.p === '/v1/coupons/zqhBEq04');
-  assert.equal(couponRead.query.get('expand[0]'), 'applies_to');
   launch.setEnabled(true, true);
   assert.equal(launch.status().cryptoEnabled, true);
   launch.setEnabled(false, false);
   assert.equal(launch.status().cryptoCapable, true);
   launch.setEnabled(true, true);
 });
-await test('existing UNLEASHED25 coupon with changed scope or terms is refused', async () => {
-  couponOverrides = { percent_off: 20 };
-  await assert.rejects(launch.prepare(), /different terms/);
-  couponOverrides = {};
-  couponProducts = ['prod_unrelated'];
-  await assert.rejects(launch.prepare(), /different terms/);
-  couponProducts = ['prod_software'];
-});
-await test('realistic unprefixed Stripe coupon IDs are accepted and unsafe IDs are refused', async () => {
-  couponId = '../../etc/passwd';
-  const requestCount = calls.length;
-  await assert.rejects(launch.prepare(), /coupon is invalid/);
-  assert.equal(calls.length, requestCount + 4); // three exact prices and the promotion lookup; no coupon path request
-  couponId = 'zqhBEq04';
-  await launch.prepare();
+await test('catalog advertises timing and full base prices without a promotion', () => {
+  const catalog = launch.publicPlans();
+  assert.deepEqual(Object.keys(catalog.launch).sort(), ['active', 'cryptoEnabled', 'firstPaymentAtMs', 'redeemUntilMs']);
+  assert.equal(JSON.stringify(catalog).includes('UNLEASHED25'), false);
+  for (const plan of catalog.plans) assert.equal('discountedAmountCents' in plan, false);
 });
 await test('authenticated app checkout retains license; free period binds to fixed Eastern date', async () => {
   const license = store.issueUntil('Existing tester', LAUNCH_FIRST_PAYMENT_MS, 'beta', clock);
@@ -96,7 +75,9 @@ await test('authenticated app checkout retains license; free period binds to fix
   assert.equal(params.get('subscription_data[billing_cycle_anchor]'), String(LAUNCH_FIRST_PAYMENT_MS / 1000));
   assert.equal(params.get('subscription_data[proration_behavior]'), 'none');
   assert.equal(params.get('payment_method_collection'), 'always');
-  assert.equal(params.get('discounts[0][promotion_code]'), 'promo_launch');
+  assert.equal(params.get('discounts[0][promotion_code]'), null);
+  assert.equal(params.get('allow_promotion_codes'), 'true');
+  assert.equal(params.get('metadata[launch_discount_percent]'), null);
   assert(!params.toString().includes(license.token)); assert(!params.toString().includes(license.payload.id));
   const meta = metadata(params), result = await billing.applyEvent(event('checkout.session.completed', paidSession(meta)));
   assert.equal(result.outcome, 'applied');
@@ -233,8 +214,10 @@ await test('prelaunch crypto yearly is paid once, grants Oct15 2027 only after s
   const params = checkoutCalls().at(-1).params, meta = metadata(params);
   assert.equal(params.get('mode'), 'payment'); assert.equal(params.get('payment_method_types[0]'), 'crypto');
   assert.equal(params.get('line_items[0][price_data][unit_amount]'), '69900');
+  assert.equal(params.get('allow_promotion_codes'), 'true');
   assert.equal(params.get('subscription_data[billing_cycle_anchor]'), null);
-  const session = paidSession(meta, { mode: 'payment', payment_status: 'unpaid', subscription: null });
+  const session = paidSession(meta, { mode: 'payment', payment_status: 'unpaid', subscription: null,
+    amount_subtotal: 69900, total_details: { amount_discount: 17475 } });
   const before = store.list().length;
   assert.equal((await billing.applyEvent(event('checkout.session.completed', session))).outcome, 'ignored');
   assert.equal(store.list().length, before);
@@ -242,6 +225,7 @@ await test('prelaunch crypto yearly is paid once, grants Oct15 2027 only after s
   assert.equal((await billing.applyEvent(event('checkout.session.async_payment_succeeded', paid))).outcome, 'applied');
   const customer = billing.store.getCustomer(session.customer), exp = store.get(customer.licenseId).exp;
   assert.equal(exp, LAUNCH_YEARLY_END_MS); assert.equal(customer.nonRenewing, true);
+  assert.equal(customer.discountPercent, 25, 'signed Stripe Checkout totals record the private crypto discount');
   assert.equal(customer.firstActualPaymentAtMs, clock);
   assert.equal((await billing.applyEvent(event('checkout.session.completed', paid))).outcome, 'duplicate');
   assert.equal(store.get(customer.licenseId).exp, exp);
@@ -251,15 +235,17 @@ await test('launch dates come from a mode-bound durable intent, not arbitrary we
   const meta = metadata(checkoutCalls().at(-1).params);
   assert.throws(() => launchGrant(dataDir, meta, false), /persisted checkout/);
 });
-await test('October15 card charges immediately with discount; next day loses only new-redemption discount', async () => {
+await test('October15 card charges immediately and private promotion entry remains available', async () => {
   clock = LAUNCH_FIRST_PAYMENT_MS;
   await launch.checkout(input());
   assert.equal(checkoutCalls().at(-1).params.get('subscription_data[billing_cycle_anchor]'), null);
-  assert.equal(checkoutCalls().at(-1).params.get('discounts[0][promotion_code]'), 'promo_launch');
+  assert.equal(checkoutCalls().at(-1).params.get('discounts[0][promotion_code]'), null);
+  assert.equal(checkoutCalls().at(-1).params.get('allow_promotion_codes'), 'true');
   assert.equal(checkoutCalls().at(-1).params.get('expires_at'), String(LAUNCH_REDEEM_UNTIL_MS / 1000));
   clock = LAUNCH_REDEEM_UNTIL_MS;
   await launch.checkout(input());
   assert.equal(checkoutCalls().at(-1).params.get('discounts[0][promotion_code]'), null);
+  assert.equal(checkoutCalls().at(-1).params.get('allow_promotion_codes'), 'true');
 });
 await test('Checkout Sessions are bounded by the free-period cutoff when Stripe permits a 30-minute minimum', async () => {
   clock = LAUNCH_FIRST_PAYMENT_MS - 12 * 3600_000;
@@ -271,11 +257,15 @@ await test('Checkout Sessions are bounded by the free-period cutoff when Stripe 
 });
 await test('a paid Lifetime purchase renews its technical token without another payment or a new identity', async () => {
   await launch.checkout(input({ plan: 'lifetime' }));
-  const meta = metadata(checkoutCalls().at(-1).params);
-  const session = paidSession(meta, { mode: 'payment', payment_status: 'paid', subscription: null });
+  const params = checkoutCalls().at(-1).params, meta = metadata(params);
+  assert.equal(params.get('allow_promotion_codes'), 'true');
+  assert.equal(params.get('line_items[0][price]'), 'price_lifetime');
+  const session = paidSession(meta, { mode: 'payment', payment_status: 'paid', subscription: null,
+    amount_subtotal: 99900, total_details: { amount_discount: 39960 } });
   await billing.applyEvent(event('checkout.session.completed', session));
   const customer = billing.store.getCustomer(session.customer);
   assert.equal(customer.lifetimeAccess, true);
+  assert.equal(customer.discountPercent, 40, 'signed Stripe Checkout totals record the private Lifetime discount');
   assert.equal(customer.firstActualPaymentAtMs, clock);
   const before = store.get(customer.licenseId), oldToken = store.tokenFor(before.id);
   billing.refreshLifetimeLicense(before.id);
@@ -304,19 +294,21 @@ await test('test and live purchases with the same email cannot share a license o
   assert.equal(testCustomer.lifetimeAccess, undefined); assert.equal(liveCustomer.lifetimeAccess, true);
   assert(store.get(testCustomer.licenseId).exp <= clock + 14 * 86400000);
 });
-await test('referrals retain attribution and free access while selecting a single best discount', async () => {
+await test('referrals retain attribution and free access without stacking a private promotion', async () => {
   billing.updateConfig({ mode: 'live' }); clock = Date.parse('2026-10-03T12:00:00Z');
   const referralLaunch = new LaunchBilling(dataDir, billing, store, 'https://hub.example.test', fake, () => clock,
     code => ({ code: 'MEMBER', promotionId: 'promo_referral', discountPercent: code === 'FORTY' ? 40 : 20 }));
   await referralLaunch.checkout(input({ referral: 'TWENTY' }));
   let params = checkoutCalls().at(-1).params;
-  assert.equal(params.get('discounts[0][promotion_code]'), 'promo_launch');
+  assert.equal(params.get('discounts[0][promotion_code]'), 'promo_referral');
+  assert.equal(params.get('allow_promotion_codes'), null);
   assert.equal(params.get('metadata[wh_earn_code]'), 'MEMBER');
   assert.equal(params.get('subscription_data[metadata][wh_earn_code]'), 'MEMBER');
   assert.equal(params.get('subscription_data[billing_cycle_anchor]'), String(LAUNCH_FIRST_PAYMENT_MS / 1000));
   await referralLaunch.checkout(input({ referral: 'FORTY' }));
   params = checkoutCalls().at(-1).params;
   assert.equal(params.get('discounts[0][promotion_code]'), 'promo_referral');
+  assert.equal(params.get('allow_promotion_codes'), null);
   assert.equal(params.get('metadata[launch_discount_percent]'), '40');
   assert.equal(params.get('discounts[1][promotion_code]'), null);
 });

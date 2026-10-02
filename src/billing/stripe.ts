@@ -58,6 +58,17 @@ export function signStripePayload(rawBody: Buffer | string, secret: string, time
 // ── event readers ───────────────────────────────────────────────────────────
 
 type Obj = Record<string, unknown>;
+
+/** Effective discount on a settled one-time Checkout Session. The signed
+ * Stripe total is authoritative; checkout intent metadata cannot know a
+ * private promotion code entered later by the buyer. */
+export function checkoutDiscountPercent(o: Obj): number | null {
+  const subtotal = o.amount_subtotal;
+  const discount = asObj(o.total_details).amount_discount;
+  if (!Number.isSafeInteger(subtotal) || Number(subtotal) <= 0 ||
+      !Number.isSafeInteger(discount) || Number(discount) < 0 || Number(discount) > Number(subtotal)) return null;
+  return Math.round(Number(discount) / Number(subtotal) * 10_000) / 100;
+}
 const asObj = (v: unknown): Obj => (v && typeof v === "object" && !Array.isArray(v) ? (v as Obj) : {});
 const asStr = (v: unknown): string => (typeof v === "string" ? v : "");
 const asNum = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);

@@ -7,7 +7,7 @@ import { readJson, writeJsonAtomic } from '../jsonfile.js';
 import { EarnStripeApi, type StripeObject } from '../earn-stripe-api.js';
 import type { BillingConfig, BillingMode } from './config.js';
 import type { BillingStore, CustomerRecord } from './store.js';
-import { checkoutFacts, invoiceFacts, subscriptionFacts, type StripeEvent } from './stripe.js';
+import { checkoutDiscountPercent, checkoutFacts, invoiceFacts, subscriptionFacts, type StripeEvent } from './stripe.js';
 import type { NotificationInput } from '../notifications.js';
 
 const REPORT_FILE = 'launch-billing-report.v1.json';
@@ -122,6 +122,16 @@ export class LaunchBillingReporting {
     this.state.facts = this.state.facts.filter(f => !(f.mode === mode && f.subscriptionId === subId));
     if (fact) this.state.facts.push(fact);
     this.save();
+    // Checkout cannot know which private code the buyer entered. Keep the
+    // app's subscription card aligned with the verified Stripe subscription,
+    // including a later removal or change of the discount.
+    if (fact?.discountPercent !== null && fact?.discountPercent !== undefined) {
+      const current = this.store.findByStripeCustomer(fact.customerId, mode === 'live');
+      if (current?.launchManaged && current.subscriptionId === subId && current.discountPercent !== fact.discountPercent) {
+        current.discountPercent = fact.discountPercent;
+        this.store.putCustomer(current);
+      }
+    }
   }
   /** Refresh exact subscription facts for known software customers. Individual
    * failures are summarized without provider text; old facts remain marked by
@@ -283,9 +293,20 @@ export class LaunchBillingReporting {
     const snapshot = this.snapshot();
     let notices = 0;
     if (eventKind === 'signup' && oneTimeCheckout && (plan === 'yearly' || plan === 'lifetime')) {
-      if (customer.planKey === plan) notices += this.enqueueOnce(`signup:${mode}:${sourceId}`, {
-        kind: 'signup', title: 'New one-time software purchase', fields: this.noticeFields(mode, plan, snapshot),
-      }, `${mode}:${sourceId}:signup`) ? 1 : 0;
+      if (customer.planKey === plan) {
+        const discount = checkoutDiscountPercent(eventObject);
+        notices += this.enqueueOnce(`signup:${mode}:${sourceId}`, {
+          kind: 'signup', title: 'New one-time software purchase', fields: [
+            ...this.noticeFields(mode, plan, snapshot),
+            ...(discount !== null && discount > 0 ? [{ name: 'Discount', value: `${discount}%`, inline: true }] : []),
+          ],
+        }, `${mode}:${sourceId}:signup`) ? 1 : 0;
+        if (discount !== null && discount > 0) notices += this.enqueueOnce(`discount:${mode}:${sourceId}`, {
+          kind: 'discount', title: 'One-time software discount applied', fields: [
+            ...this.noticeFields(mode, plan, snapshot), { name: 'Discount', value: `${discount}%`, inline: true },
+          ],
+        }, `${mode}:${sourceId}:discount`) ? 1 : 0;
+      }
     } else if (fact) {
       const currentlyBillable = ['active', 'trialing'].includes(fact.status) && !(fact.firstPaymentAtMs && fact.firstPaymentAtMs > this.now());
       // Signup dedupes by subscription even if an invoice-created event races

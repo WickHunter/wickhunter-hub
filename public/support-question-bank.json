@@ -10468,7 +10468,7 @@
       "id": "onb-0107",
       "topic": "billing_licence_refunds",
       "question": "Is the launch discount still active today?",
-      "answer": "Check the live offer fields and checkout summary for eligibility and the current deadline; an older answer cannot establish today's promotion.",
+      "answer": "Private promotion codes are validated at Stripe Checkout, which shows the accepted discount and terms before confirmation. The public free-access period for eligible card subscriptions is separate; check its current deadline in the live catalog.",
       "sourceIds": [
         "public-catalog",
         "website-terms",
@@ -10491,7 +10491,7 @@
       "id": "onb-0108",
       "topic": "billing_licence_refunds",
       "question": "Does an offer code have to be typed manually?",
-      "answer": "Use the current checkout summary to see whether the offer is applied automatically or requires a code. Do not rely on a past promotion's instructions.",
+      "answer": "If you have received a private promotion code, enter it in Stripe Checkout and confirm the accepted discount in the checkout summary. General visitors do not receive an automatic discount.",
       "sourceIds": [
         "public-catalog",
         "website-launch"
@@ -11210,7 +11210,7 @@
       "id": "onb-0148",
       "topic": "billing_licence_refunds",
       "question": "Will my recurring discount apply to future software renewals?",
-      "answer": "For an eligible card Monthly or Yearly subscription, the published launch discount applies to the software base price at each renewal while that subscription remains active. Check your own billing summary for the applied rate.",
+      "answer": "An eligible recurring software discount accepted at checkout continues on the active subscription according to that offer. Check your own billing summary for the applied rate; hosting is excluded.",
       "sourceIds": [
         "website-terms",
         "public-catalog",

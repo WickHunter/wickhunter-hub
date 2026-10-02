@@ -65,13 +65,13 @@ for(const version of ['0.90.135','0.90.154','0.90.155']){
 }
 const live={mode:'live',plans:[{key:'monthly',name:'Monthly',amountCents:9900,currency:'usd',interval:'month',available:true,buyUrl:'https://hub.test/buy?plan=monthly'},{key:'lifetime',name:'Lifetime',amountCents:99900,currency:'usd',interval:null,lifetime:true,licenseDays:3650,available:true}],launch:{active:true,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:1792036800000,redeemUntilMs:Date.now()+1e7}};
 const facts=supportPricingFacts(live,'How much is a plan?');
-assert.match(facts,/9900/);assert.match(facts,/UNLEASHED25/);assert.doesNotMatch(facts,/secretKey/);
+assert.match(facts,/9900/);assert.doesNotMatch(facts,/UNLEASHED25|discountedAmountCents|discountPercent/);assert.doesNotMatch(facts,/secretKey/);
 assert.match(supportPricingFacts(live,accountPlanQuestion),/9900/,'informal “subs” phrasing should request current public plan facts');
 assert.doesNotMatch(facts,/licenseDays|3650/);
 assert.match(supportPricingFacts(live,'When will my card first be charged?'),/firstPaymentEastern/);
 assert.match(supportPricingFacts(live,'When does free access end?'),/firstPaymentEastern/);
 assert.match(supportPricingFacts(live,'How much is it?'),/9900/);
-assert.match(supportPricingFacts(live,'Does an offer code have to be typed manually?'),/UNLEASHED25/);
+assert.match(supportPricingFacts(live,'Does an offer code have to be typed manually?'),/entered at Stripe Checkout/);
 assert.equal(supportPricingFacts(live,'How do trading fees work?'),'');
 assert.equal(supportPricingFacts(live,'How much DCA should I use?'),'');
 assert.equal(supportPricingFacts(live,'Can I buy an exchange order?'),'');

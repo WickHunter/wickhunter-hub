@@ -48,6 +48,7 @@ import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfi
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
   chargeFacts,
+  checkoutDiscountPercent,
   checkoutFacts,
   disputeFacts,
   invoiceFacts,
@@ -940,6 +941,14 @@ export class BillingService {
     const marker = claimed.record;
     if (!claimed.created && marker.status === "applied") {
       this.assertAppliedCheckout(marker);
+      if (grant) {
+        const verifiedDiscount = checkoutDiscountPercent(ev.object);
+        const applied = this.store.getCustomer(marker.customerKey);
+        if (applied && verifiedDiscount !== null && applied.discountPercent !== verifiedDiscount) {
+          applied.discountPercent = verifiedDiscount;
+          this.store.putCustomer(applied);
+        }
+      }
       this.store.clearPendingCheckout(customerKey, f.sessionId);
       return { outcome: "duplicate", note: "checkout session was already applied" };
     }
@@ -969,6 +978,10 @@ export class BillingService {
     }
     const checkoutMarker = `cs:${f.sessionId}`;
     if (planByKey(cfg, planKey)?.lifetime && ev.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
+    if (grant) {
+      const verifiedDiscount = checkoutDiscountPercent(ev.object);
+      if (verifiedDiscount !== null) rec.discountPercent = verifiedDiscount;
+    }
     if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
     if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
     this.noteCharge(rec, checkoutMarker);

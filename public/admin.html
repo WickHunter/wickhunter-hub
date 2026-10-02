@@ -503,10 +503,10 @@
     <label class="launch-toggle"><input type="checkbox" id="launchEnabled"> Enable launch offer</label>
     <label class="launch-toggle"><input type="checkbox" id="launchCryptoEnabled"> Enable crypto checkout</label>
     <button type="button" id="launchOfferSave">Save offer settings</button>
-    <button type="button" id="launchOfferPrepare">Prepare Stripe offer</button>
+    <button type="button" id="launchOfferPrepare">Verify Stripe prices</button>
   </div>
   <p id="launchOfferNote" class="muted" role="status"></p>
-  <p class="muted">Preparation creates the configured Stripe coupon and prices. Checkout activation is a separate setting. This does not publish a release.</p>
+  <p class="muted">This verifies the configured software prices and crypto capability in Stripe. Private promotion codes are managed in Stripe. Checkout activation is a separate setting.</p>
 </section>
 <section class="launch-card" id="billingReportPanel" aria-labelledby="billingReportTitle" style="margin-top:.8rem">
   <div class="actions" style="justify-content:space-between;margin-top:0"><h2 id="billingReportTitle">Revenue and subscription report</h2><button type="button" id="billingReportRefresh">Refresh Stripe facts</button></div>
@@ -2692,7 +2692,6 @@ function renderLaunchOffer(data) {
   launchOfferStatus = data && data.ok === true && ["test","live"].includes(data.mode) &&
     typeof data.enabled === "boolean" && typeof data.prepared === "boolean" &&
     typeof data.cryptoEnabled === "boolean" && typeof data.active === "boolean" &&
-    typeof data.code === "string" && Number.isFinite(data.discountPercent) &&
     Number.isSafeInteger(data.firstPaymentAtMs) && Number.isSafeInteger(data.redeemUntilMs) ? data : null;
   if (!launchOfferStatus) {
     summary.textContent = "Offer status unavailable. Controls are disabled until Hub data is valid.";
@@ -2701,9 +2700,8 @@ function renderLaunchOffer(data) {
     return;
   }
   const s = launchOfferStatus;
-  summary.textContent = (s.active ? "Active" : "Inactive") + " · " + s.mode.toUpperCase() + (s.prepared ? " · Stripe offer prepared" : " · Stripe setup needed");
-  facts.innerHTML = metric("Offer code", s.code) + metric("Discount", s.discountPercent + "%") +
-    metric("First payment", easternDate(s.firstPaymentAtMs)) + metric("Redeem through", easternDate(s.redeemUntilMs - 1)) +
+  summary.textContent = (s.active ? "Active" : "Inactive") + " · " + s.mode.toUpperCase() + (s.prepared ? " · Stripe prices verified" : " · Stripe setup needed");
+  facts.innerHTML = metric("First payment", easternDate(s.firstPaymentAtMs)) + metric("Private code window through", easternDate(s.redeemUntilMs - 1)) +
     metric("Offer", s.enabled ? "Enabled" : "Disabled") + metric("Crypto", s.cryptoEnabled ? "Enabled" : "Disabled");
   enabled.checked = s.enabled; crypto.checked = s.cryptoEnabled;
   enabled.disabled = crypto.disabled = false;
@@ -2733,9 +2731,9 @@ document.getElementById("launchOfferSave").onclick = async () => {
 document.getElementById("launchOfferPrepare").onclick = async () => {
   const note = document.getElementById("launchOfferNote"), button = document.getElementById("launchOfferPrepare");
   if (!launchOfferStatus || launchOfferStatus.prepared) return;
-  if (!window.confirm("Prepare the launch coupon and prices in Stripe " + launchOfferStatus.mode.toUpperCase() + "?")) return;
-  button.disabled = true; note.textContent = "Preparing Stripe offer…";
-  try { renderLaunchOffer(await api("/admin/api/billing/launch", { method:"POST", body:JSON.stringify({ action:"prepare" }) })); note.textContent = "Stripe offer prepared."; }
+  if (!window.confirm("Verify the software prices in Stripe " + launchOfferStatus.mode.toUpperCase() + "?")) return;
+  button.disabled = true; note.textContent = "Verifying Stripe prices…";
+  try { renderLaunchOffer(await api("/admin/api/billing/launch", { method:"POST", body:JSON.stringify({ action:"prepare" }) })); note.textContent = "Stripe prices verified."; }
   catch (e) { if (e.message !== "unauthorized") note.textContent = e.message; }
   finally { button.disabled = !!(launchOfferStatus && launchOfferStatus.prepared); }
 };

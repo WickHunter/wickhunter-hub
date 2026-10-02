@@ -1,3 +1,7 @@
+## v0.4.73 — Private launch discounts
+
+Public pricing shows base prices and the free-until-October-15 card subscription period. Customers enter privately issued promotion codes at Stripe Checkout; the public catalog and support answers no longer disclose or automatically apply a launch code.
+
 ## v0.4.72 — Keep support conversations moving
 
 Support allows 100 replies per day and 1,000 per month for visitors and app users while preserving spending caps. Temporary limits and provider interruptions explain what happened and allow the conversation to continue once available; explicit requests for a person and staff takeover remain with the team.
@@ -1835,6 +1839,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.73: Keep private promotion codes out of public prices and support; retain launch trial timing and record actual checkout discounts.
 
 - v0.4.72 — Increase support reply allowances and recover from temporary handoffs with clear status.
 

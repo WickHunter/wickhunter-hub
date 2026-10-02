@@ -53,12 +53,12 @@ try {
     else if (pathname.endsWith('/api/billing/config')) { status=404; body={ok:false,error:'not configured'}; }
     else if (pathname.endsWith('/api/billing/customers')) body={ok:true,customers:[]};
     else if (pathname.endsWith('/api/billing/events')) body={ok:true,events:[]};
-    else if (pathname.endsWith('/api/billing/launch') && request.method()==='GET') body={ok:true,mode:'test',enabled:offerEnabled,prepared,cryptoEnabled,active:offerEnabled,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:Date.UTC(2026,9,15,4),redeemUntilMs:Date.UTC(2026,9,16,4)};
+    else if (pathname.endsWith('/api/billing/launch') && request.method()==='GET') body={ok:true,mode:'test',enabled:offerEnabled,prepared,cryptoEnabled,active:offerEnabled,firstPaymentAtMs:Date.UTC(2026,9,15,4),redeemUntilMs:Date.UTC(2026,9,16,4)};
     else if (pathname.endsWith('/api/billing/launch') && request.method()==='POST') {
       const input=request.postDataJSON();
       if (input.action==='prepare') prepared=true;
       else { offerEnabled=input.enabled; cryptoEnabled=input.cryptoEnabled; }
-      body={ok:true,mode:'test',enabled:offerEnabled,prepared,cryptoEnabled,active:offerEnabled,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:Date.UTC(2026,9,15,4),redeemUntilMs:Date.UTC(2026,9,16,4)};
+      body={ok:true,mode:'test',enabled:offerEnabled,prepared,cryptoEnabled,active:offerEnabled,firstPaymentAtMs:Date.UTC(2026,9,15,4),redeemUntilMs:Date.UTC(2026,9,16,4)};
     } else if (pathname.endsWith('/api/billing/report/refresh')) { status=202; body={ok:true,refreshing:true}; }
     else if (pathname.endsWith('/api/billing/report')) body=report;
     else if (pathname.endsWith('/api/notifications') && request.method()==='GET') body={ok:true,configured:true,enabledKinds:{...kinds},counts:{queued:1,sending:0,delivered:5,failed:0,ambiguous:0},recent:[]};
@@ -76,7 +76,7 @@ try {
   await page.evaluate(async () => { token='ui-test-token'; document.getElementById('gate').hidden=true; showHubPage('billing',false); await loadHubPage('billing',true); });
   await page.getByRole('heading', {name:'Launch offer', exact:true}).waitFor();
   await page.locator('#launchOfferFacts').waitFor();
-  assert.match(await page.locator('#launchOfferFacts').innerText(), /UNLEASHED25/);
+  assert.doesNotMatch(await page.locator('#launchOfferFacts').innerText(), /UNLEASHED25/);
   assert.match(await page.locator('#launchOfferFacts').innerText(), /Oct 15/);
   assert.match(await page.locator('#billingReportModes').innerText(), /\$43\.69/);
   assert.match(await page.locator('#briefRevenueNote').innerText(), /\$43\.69 \/ month/);
@@ -95,7 +95,7 @@ try {
   assert.ok(await page.locator('#billingProvisionLive').count(), 'existing Live provisioning control remains in advanced settings');
 
   page.on('dialog', dialog => dialog.accept());
-  await page.getByRole('button', {name:'Prepare Stripe offer'}).click();
+  await page.getByRole('button', {name:'Verify Stripe prices'}).click();
   await page.locator('#launchEnabled').check();
   await page.locator('#launchCryptoEnabled').check();
   await page.getByRole('button', {name:'Save offer settings'}).click();

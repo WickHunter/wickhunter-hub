@@ -10,7 +10,6 @@ import { paymentLinkFor, type BillingMode, type Plan } from './config.js';
 export const LAUNCH_FIRST_PAYMENT_MS = Date.parse('2026-10-15T00:00:00-04:00');
 export const LAUNCH_REDEEM_UNTIL_MS = Date.parse('2026-10-16T00:00:00-04:00');
 export const LAUNCH_YEARLY_END_MS = Date.parse('2027-10-15T00:00:00-04:00');
-export const LAUNCH_CODE = 'UNLEASHED25';
 const BASE_PLANS = ['monthly', 'yearly', 'lifetime'];
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
 interface LaunchMode {
@@ -115,31 +114,30 @@ export class LaunchBilling {
   status(): Record<string, unknown> {
     const cfg = this.billing.config(), mode = this.modeConfig(cfg.mode);
     return { ...this.offer(), mode: cfg.mode, enabled: mode.enabled, cryptoEnabled: mode.cryptoEnabled,
-      cryptoCapable: mode.cryptoCapable, prepared: !!mode.promotionId && BASE_PLANS.every(k => !!mode.prices[k]) };
+      cryptoCapable: mode.cryptoCapable, prepared: BASE_PLANS.every(k => !!mode.prices[k]) };
   }
   offer(): Record<string, unknown> {
     const mode = this.modeConfig();
-    return { active: mode.enabled && this.now() < LAUNCH_REDEEM_UNTIL_MS, code: LAUNCH_CODE,
-      discountPercent: 25, firstPaymentAtMs: LAUNCH_FIRST_PAYMENT_MS,
+    return { active: mode.enabled && this.now() < LAUNCH_REDEEM_UNTIL_MS,
+      firstPaymentAtMs: LAUNCH_FIRST_PAYMENT_MS,
       redeemUntilMs: LAUNCH_REDEEM_UNTIL_MS, cryptoEnabled: mode.enabled && mode.cryptoEnabled };
   }
   publicPlans(): Record<string, unknown> {
-    const result = this.billing.publicPlans(), mode = this.modeConfig(), offer = this.offer();
-    return { ...result, launch: offer, plans: (result.plans as Record<string, unknown>[]).map(plan => {
+    const result = this.billing.publicPlans(), mode = this.modeConfig();
+    return { ...result, launch: this.offer(), plans: (result.plans as Record<string, unknown>[]).map(plan => {
       const base = BASE_PLANS.includes(String(plan.key));
-      return { ...plan, cryptoAvailable: base && plan.key !== 'monthly' && mode.enabled && mode.cryptoEnabled,
-        ...(base && offer.active ? { discountedAmountCents: Math.round(Number(plan.amountCents) * .75) } : {}) };
+      return { ...plan, cryptoAvailable: base && plan.key !== 'monthly' && mode.enabled && mode.cryptoEnabled };
     }) };
   }
   setEnabled(enabled: boolean, cryptoEnabled: boolean): void {
     const mode = this.billing.config().mode, cfg = this.modeConfig(mode);
-    if (enabled && (!cfg.promotionId || !BASE_PLANS.every(k => cfg.prices[k]))) throw Error('Prepare the launch offer first');
+    if (enabled && !BASE_PLANS.every(k => cfg.prices[k])) throw Error('Prepare the launch checkout prices first');
     if (cryptoEnabled && !cfg.cryptoCapable) throw Error('Verify Stripe crypto capability before enabling crypto');
     this.saveMode(mode, { ...cfg, enabled, cryptoEnabled });
   }
 
   /** Reuse and validate existing prices; never silently change the amount
-   * on a live offer. Promotion creation has a stable Stripe idempotency key. */
+   * on a live offer. Private promotion codes are managed separately in Stripe. */
   async prepare(): Promise<Record<string, unknown>> {
     const cfg = this.billing.config(), mode = cfg.mode, api = this.api(mode), old = this.modeConfig(mode);
     const prices: LaunchMode['prices'] = {};
@@ -175,32 +173,9 @@ export class LaunchBilling {
       prices[key] = { id: price.id, product, amount: price.unit_amount, currency: price.currency, interval: plan.interval };
     }
     const products = [...new Set(Object.values(prices).map(p => p.product))].sort();
-    const existing = await api.call('GET', '/v1/promotion_codes', { code: LAUNCH_CODE, active: true, limit: 100, 'expand[0]': 'data.coupon' });
-    if (existing.has_more || existing.data.length > 1) throw Error('Launch promotion is ambiguous');
-    let promotion = existing.data[0];
-    if (promotion) {
-      const couponId = typeof promotion.coupon === 'string' ? promotion.coupon : promotion.coupon?.id;
-      if (!/^[A-Za-z0-9_-]{1,255}$/.test(couponId ?? '')) throw Error('Existing UNLEASHED25 coupon is invalid');
-      // Stripe's pinned API version may omit applies_to from the promotion-code
-      // expansion and from a plain coupon retrieve. Fetch the coupon by ID and
-      // explicitly expand the product restriction before validating reuse.
-      const coupon = await api.call('GET', `/v1/coupons/${couponId}`, { 'expand[0]': 'applies_to' });
-      if (coupon?.percent_off !== 25 || coupon?.duration !== 'forever' || promotion.expires_at !== LAUNCH_REDEEM_UNTIL_MS / 1000 ||
-        JSON.stringify([...(coupon?.applies_to?.products ?? [])].sort()) !== JSON.stringify(products) ||
-        promotion.customer || promotion.max_redemptions || promotion.restrictions?.first_time_transaction || promotion.restrictions?.minimum_amount) {
-        throw Error('Existing UNLEASHED25 code has different terms');
-      }
-    } else {
-      if (this.now() >= LAUNCH_REDEEM_UNTIL_MS) throw Error('The launch redemption window has ended');
-      const params: StripeObject = { percent_off: 25, duration: 'forever', name: 'Unleashed launch — 25% off', 'metadata[managed_by]': 'wh-launch' };
-      products.forEach((product, i) => { params[`applies_to[products][${i}]`] = product; });
-      const coupon = await api.call('POST', '/v1/coupons', params, { key: `wh-launch-${mode}-20261015-coupon-${sha(JSON.stringify(products)).slice(0,16)}` });
-      promotion = await api.call('POST', '/v1/promotion_codes', { coupon: coupon.id, code: LAUNCH_CODE, expires_at: LAUNCH_REDEEM_UNTIL_MS / 1000,
-        'metadata[managed_by]': 'wh-launch' }, { key: `wh-launch-${mode}-20261015-code` });
-    }
     const account = await api.call('GET', '/v1/account');
     const cryptoEnabled = account.capabilities?.crypto_payments === 'active';
-    this.saveMode(mode, { ...old, promotionId: promotion.id, prices, cryptoCapable: cryptoEnabled, cryptoEnabled: old.cryptoEnabled && cryptoEnabled });
+    this.saveMode(mode, { ...old, prices, cryptoCapable: cryptoEnabled, cryptoEnabled: old.cryptoEnabled && cryptoEnabled });
     this.billing.updateConfig({ stripe: { [mode]: { priceIds: { ...cfg.stripe[mode].priceIds, ...Object.fromEntries(Object.entries(prices).map(([k,p]) => [k,p.id])) } } },
       roles: { [mode]: { software: { priceIds: [...new Set([...cfg.roles[mode].software.priceIds, ...Object.values(prices).map(p => p.id)])],
         productIds: [...new Set([...cfg.roles[mode].software.productIds, ...products])] } } } });
@@ -272,18 +247,18 @@ export class LaunchBilling {
     if (!intent) {
       const subscription = !crypto && !!plan.interval;
       const firstPayment = subscription && now < LAUNCH_FIRST_PAYMENT_MS ? LAUNCH_FIRST_PAYMENT_MS : null;
-      let discount = now < LAUNCH_REDEEM_UNTIL_MS ? 25 : 0;
-      let promotionId = discount ? launch.promotionId : '';
+      let discount = 0;
+      let promotionId = '';
       let referral: { code: string; promotionId: string; discountPercent: number } | null = null;
       if (input.referral) {
         if (typeof input.referral !== 'string' || input.referral.length > 128 || !this.resolveReferral) throw Error('Invalid referral code');
         referral = this.resolveReferral(input.referral, mode);
-        // Referral coupons cover recurring software. Choose one discount;
-        // never stack the launch offer with a referral coupon.
-        if (subscription && referral.discountPercent > discount) { discount = referral.discountPercent; promotionId = referral.promotionId; }
+        // Referral coupons cover recurring software. An applied referral
+        // occupies Stripe's single promotion slot for this checkout.
+        if (subscription) { discount = referral.discountPercent; promotionId = referral.promotionId; }
       }
       const metadata: Record<string,string> = { managed_by: 'wh-launch', plan: plan.key, wh_launch_intent: id,
-        launch_discount_percent: String(discount), ...(referral && subscription ? { wh_earn_code: referral.code } : {}), ...(firstPayment ? { first_payment_at_ms: String(firstPayment) } : {}),
+        ...(promotionId ? { launch_discount_percent: String(discount) } : {}), ...(referral && subscription ? { wh_earn_code: referral.code } : {}), ...(firstPayment ? { first_payment_at_ms: String(firstPayment) } : {}),
         ...(!subscription ? { non_renewing: 'true', license_days: String(plan.key === 'yearly' ? 365 : plan.licenseDays) } : {}) };
       const params: StripeObject = { mode: subscription ? 'subscription' : 'payment',
         client_reference_id: id,
@@ -303,7 +278,8 @@ export class LaunchBilling {
         params.payment_method_collection = 'always';
         if (firstPayment) { params['subscription_data[billing_cycle_anchor]'] = firstPayment / 1000; params['subscription_data[proration_behavior]'] = 'none'; }
       } else if (!params.customer) params.customer_creation = 'always';
-      if (discount) params['discounts[0][promotion_code]'] = promotionId;
+      if (promotionId) params['discounts[0][promotion_code]'] = promotionId;
+      else params.allow_promotion_codes = true;
       for (const [key,value] of Object.entries(metadata)) {
         params[`metadata[${key}]`] = value;
         if (subscription) params[`subscription_data[metadata][${key}]`] = value;
