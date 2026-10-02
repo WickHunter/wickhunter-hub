@@ -11,7 +11,9 @@ const providers = ["submitted", "approved", "suspended", "rejected"].map((status
 }));
 const requests = [];
 let alphaEnabled = false;
-let configFails = true;
+let privateAlpha = false;
+let configFailure = "before";
+let configCalls = 0;
 const license = () => ({
   id: "lic_alpha", name: "Alpha Tester", exp: Date.now() + 86_400_000,
   revoked: false, marketplaceAlpha: alphaEnabled, earlyAccessEligible: false,
@@ -46,8 +48,20 @@ const dom = new JSDOM(html, {
       }
       if (pathname.endsWith("/admin/api/licenses")) response = { ok: true, licenses: [license()] };
       if (pathname.endsWith("/admin/api/flags") && body?.flag === "marketplace") alphaEnabled = body.state;
-      if (pathname.endsWith("/admin/api/marketplace-config") && configFails) {
-        response = { ok: false, error: "private sync failed" };
+      if (pathname.endsWith("/admin/api/marketplace-config")) {
+        configCalls++;
+        if (configCalls === 1 && configFailure === "before") {
+          response = { ok: false, error: "private sync failed before commit" };
+        } else {
+          privateAlpha = alphaEnabled;
+          if (configCalls === 1 && (configFailure === "after" || configFailure === "recovery-fails")) {
+            response = { ok: false, error: "private sync response lost after commit" };
+          }
+        }
+        if (configCalls === 2 && configFailure === "recovery-fails") {
+          privateAlpha = true;
+          response = { ok: false, error: "recovery sync unavailable" };
+        }
       }
       return { status: response.ok ? 200 : 503, json: async () => response };
     };
@@ -82,9 +96,28 @@ try {
   await document.querySelector("#rows .alphacell button").onclick();
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(alphaEnabled, false, "failed private sync restores the prior alpha grant");
+  assert.equal(privateAlpha, false, "recovery sync mirrors the restored grant");
+  assert.equal(configCalls, 2, "a failed sync always gets a compensating private sync");
   assert.deepEqual(requests.filter((request) => request.pathname.endsWith("/admin/api/flags") && request.body?.flag === "marketplace")
     .map((request) => request.body.state), [true, false]);
-  assert.match(document.getElementById("note").textContent, /was not changed/);
+  assert.match(document.getElementById("note").textContent, /rolled back and the private roster resynchronized/);
+
+  configFailure = "after";
+  configCalls = 0;
+  await document.querySelector("#rows .alphacell button").onclick();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(alphaEnabled, false);
+  assert.equal(privateAlpha, false, "a committed sync with a lost reply is undone by the compensating sync");
+  assert.equal(configCalls, 2);
+  assert.match(document.getElementById("note").textContent, /rolled back and the private roster resynchronized/);
+
+  configFailure = "recovery-fails";
+  configCalls = 0;
+  await document.querySelector("#rows .alphacell button").onclick();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(alphaEnabled, false);
+  assert.equal(privateAlpha, true, "an ambiguous private commit can remain when compensation fails");
+  assert.match(document.getElementById("note").textContent, /private Marketplace access may differ/);
   assert.equal(scriptErrors.length, 0, scriptErrors.join("\n"));
 } finally {
   dom.window.close();

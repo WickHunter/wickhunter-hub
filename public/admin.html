@@ -1078,9 +1078,17 @@ async function refresh() {
                 method: "POST",
                 body: JSON.stringify({ id: l.id, flag: "marketplace", state: l.marketplaceAlpha }),
               });
-              document.getElementById("note").textContent = "Marketplace alpha was not changed for " + l.name + ". Private synchronization failed: " + syncError.message;
+              // The first helper may have committed even if its HTTP reply
+              // was lost. Re-run its idempotent automatic sync against the
+              // restored flag before claiming the original grant is intact.
+              try {
+                await api("/admin/api/marketplace-config", { method: "POST", body: JSON.stringify({ automatic: true }) });
+                document.getElementById("note").textContent = "Marketplace alpha change was rolled back and the private roster resynchronized for " + l.name + ". Initial synchronization failed: " + syncError.message;
+              } catch (recoverySyncError) {
+                document.getElementById("note").textContent = "The Hub alpha switch was restored for " + l.name + ", but private Marketplace access may differ. Retry synchronization from Setup and verify readiness before using Marketplace. " + recoverySyncError.message;
+              }
             } catch (rollbackError) {
-              document.getElementById("note").textContent = "Marketplace alpha synchronization and switch recovery both failed for " + l.name + ". Check this licence and retry before using Marketplace. " + syncError.message;
+              document.getElementById("note").textContent = "Marketplace alpha synchronization and switch recovery both failed for " + l.name + ". Hub and private access may differ. Check this licence, resynchronize from Setup, and verify readiness before using Marketplace. " + rollbackError.message;
             }
           }
         } catch (e) {
