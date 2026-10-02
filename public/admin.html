@@ -1073,7 +1073,15 @@ async function refresh() {
               ? "Marketplace alpha removed for " + l.name + "; its central access is now exit-only."
               : "Marketplace alpha enabled and synchronized for " + l.name + ".";
           } catch (syncError) {
-            document.getElementById("note").textContent = "The alpha switch was saved safely, but the private service is not ready to synchronize yet: " + syncError.message;
+            try {
+              await api("/admin/api/flags", {
+                method: "POST",
+                body: JSON.stringify({ id: l.id, flag: "marketplace", state: l.marketplaceAlpha }),
+              });
+              document.getElementById("note").textContent = "Marketplace alpha was not changed for " + l.name + ". Private synchronization failed: " + syncError.message;
+            } catch (rollbackError) {
+              document.getElementById("note").textContent = "Marketplace alpha synchronization and switch recovery both failed for " + l.name + ". Check this licence and retry before using Marketplace. " + syncError.message;
+            }
           }
         } catch (e) {
           if (e.message !== "unauthorized") document.getElementById("pageNotice").textContent = e.message;
@@ -1289,6 +1297,36 @@ function renderStatusCard(title, value) {
   return '<div class="opscard"><h2>' + esc(title) + '</h2><div class="logtail">' + esc(JSON.stringify(value, null, 2)) + '</div></div>';
 }
 
+function renderMarketplaceAttention(upstream) {
+  const outbox = upstream.outbox || {};
+  const links = (upstream.bybitDemo || {}).links || {};
+  const readiness = upstream.readiness || {};
+  const pending = Number.isSafeInteger(outbox.pending) && outbox.pending > 0 ? outbox.pending : 0;
+  const due = Number.isSafeInteger(outbox.due) && outbox.due > 0 ? outbox.due : 0;
+  const exitBearing = Number.isSafeInteger(outbox.exitBearing) && outbox.exitBearing > 0 ? outbox.exitBearing : 0;
+  const halted = Number.isSafeInteger(links.halted) && links.halted > 0 ? links.halted : 0;
+  let cards = "";
+  if (pending || due) {
+    const oldest = Number.isSafeInteger(outbox.oldestPendingAtMs) && outbox.oldestPendingAtMs > 0
+      ? " Oldest pending item: " + esc(fmt(outbox.oldestPendingAtMs)) + " UTC."
+      : "";
+    cards += '<div class="opscard ' + (exitBearing ? 'ops-bad' : 'ops-warn') + '"><h2>Outbox delivery needs review</h2><p>'
+      + pending + ' undelivered item(s), ' + due + ' due, including ' + exitBearing + ' marked as exit-bearing.' + oldest
+      + '</p><p>Inspect private outbox topics and, for copier delivery topics, follower receipts. A healthy Hub worker does not confirm follower delivery. Keep exit-bearing rows available until their authenticated receipts arrive.</p></div>';
+  }
+  if (halted) {
+    cards += '<div class="opscard ops-warn"><h2>Demo provisioning halted</h2><p>' + halted
+      + ' Demo link(s) need review. Inspect the private worker’s redacted provisioning step and venue refusal, resolve the cause, then use its guarded retry path. Other ready Demo links remain separate.</p></div>';
+  }
+  const warnings = Array.isArray(readiness.warnings) ? readiness.warnings.filter((v) => typeof v === "string").slice(0, 20) : [];
+  const otherWarnings = warnings.filter((v) => !(pending && /^\d+ due outbox item\(s\)$/.test(v)));
+  if (otherWarnings.length) {
+    cards += '<div class="opscard ops-warn"><h2>Other Marketplace warnings</h2><ul>'
+      + otherWarnings.map((v) => '<li>' + esc(v) + '</li>').join("") + '</ul></div>';
+  }
+  return cards;
+}
+
 // HUB-03: a plain sentence per component naming what to update, rather than
 // the raw JSON `renderStatusCard` prints for everything else — this is the
 // one card an operator needs to be able to read at a glance.
@@ -1352,6 +1390,7 @@ async function mktRefresh() {
   meta.textContent = "bridge " + (bridge.state || "unknown") + " · refreshed " + fmt(d.generatedAtMs) + " UTC";
   let cards = '<div class="opscard"><h2>Private bridge</h2><p class="' + stateClass(bridge.state) + '">' + esc(bridge.state || "unknown") + '</p><p>' + esc(bridge.refusal || "Dedicated loopback credential accepted; only sanitized status is rendered.") + '</p></div>';
   if (upstream) {
+    cards += renderMarketplaceAttention(upstream);
     if (vc) cards += renderVersionCompatibilityCard(vc);
     for (const name of ["build", "service", "feature", "api", "alphaClient", "worker", "storage", "outbox", "subscriptionBilling", "bybitDemo", "moonPay", "readiness", "latency"]) {
       if (upstream[name] !== undefined) cards += renderStatusCard(name, upstream[name]);
@@ -1404,9 +1443,15 @@ async function mktProvidersRefresh() {
       const reasonCell = document.createElement("td");
       const reason = document.createElement("input");
       reason.type = "text"; reason.placeholder = "Required audit reason"; reason.autocomplete = "off";
-      reason.maxLength = 1000; reasonCell.appendChild(reason);
+      reason.maxLength = 1000;
       const actions = document.createElement("td");
-      const targets = provider.status === "approved" ? ["suspended"] : ["approved", "rejected"];
+      // Mirror the private provider state machine. Rejected is terminal;
+      // suspended providers may only be restored to approved.
+      const targets = provider.status === "submitted" ? ["approved", "rejected"]
+        : provider.status === "approved" ? ["suspended"]
+          : provider.status === "suspended" ? ["approved"] : [];
+      if (targets.length) reasonCell.appendChild(reason);
+      else reasonCell.textContent = "—";
       for (const target of targets) {
         const button = document.createElement("button");
         button.type = "button";
@@ -1422,12 +1467,13 @@ async function mktProvidersRefresh() {
                 idempotencyKey: "hub-provider-" + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + "-" + provider.id),
               }),
             });
-            note.textContent = provider.displayName + " moved to " + target + ".";
             await mktProvidersRefresh();
+            note.textContent = provider.displayName + " moved to " + target + ".";
           } catch (e) { note.textContent = e.message; button.disabled = false; }
         };
         actions.appendChild(button);
       }
+      if (!targets.length) actions.textContent = "No further decisions";
       tr.append(name, status, reasonCell, actions);
       rows.appendChild(tr);
     }

@@ -559,6 +559,7 @@ function exactSnapshot(value: unknown): MarketplaceInputSnapshot {
     throw new MarketplaceInputError(null, "Marketplace root helper returned an incomplete masked snapshot");
   }
   const seen = new Set<string>();
+  const fields: MarketplaceInputRow[] = [];
   for (const item of row.fields) {
     if (item === null || typeof item !== "object" || Array.isArray(item)) {
       throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid field");
@@ -575,6 +576,23 @@ function exactSnapshot(value: unknown): MarketplaceInputSnapshot {
     if (!definition.secret && Object.hasOwn(field, "safeValue") && typeof field.safeValue !== "string") {
       throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid safe value");
     }
+    if (Object.hasOwn(field, "safeValue")) {
+      if (field.state !== "configured") {
+        throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid safe value");
+      }
+      try {
+        if (cleanSubmittedValue(definition.name, field.safeValue as string) !== field.safeValue) {
+          throw new Error("noncanonical");
+        }
+      } catch {
+        throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid safe value");
+      }
+    }
+    fields.push({
+      ...definition,
+      state: field.state as MarketplaceInputRow["state"],
+      ...(!definition.secret && typeof field.safeValue === "string" ? { safeValue: field.safeValue } : {}),
+    });
     seen.add(definition.name);
   }
   const exactNames = (item: unknown): boolean => Array.isArray(item)
@@ -585,7 +603,26 @@ function exactSnapshot(value: unknown): MarketplaceInputSnapshot {
     || row.restartUnits.some((unit, index) => unit !== MARKETPLACE_RESTART_UNITS[index])) {
     throw new MarketplaceInputError(null, "Marketplace root helper returned an invalid masked summary");
   }
-  return value as MarketplaceInputSnapshot;
+  const missing = (setup?: MarketplaceInputSetup): string[] => fields
+    .filter((field) => field.required && field.state !== "configured" && (setup === undefined || field.setup === setup))
+    .map((field) => field.name);
+  const sameNames = (actual: readonly string[], expectedNames: readonly string[]): boolean =>
+    actual.length === expectedNames.length && actual.every((name, index) => name === expectedNames[index]);
+  if (row.configuredCount !== fields.filter((field) => field.state === "configured").length
+    || !sameNames(row.requiredMissing as string[], missing())
+    || !sameNames(row.operatorMissing as string[], missing("operator"))
+    || !sameNames(row.automaticMissing as string[], missing("automatic"))
+    || !sameNames(row.deploymentMissing as string[], missing("deployment"))) {
+    throw new MarketplaceInputError(null, "Marketplace root helper returned an inconsistent masked summary");
+  }
+  // Rebuild from the Hub's own definitions. Unknown helper fields, including
+  // accidental secret additions, never reach an administrator's browser.
+  return {
+    schemaVersion: 1, fields, configuredCount: row.configuredCount,
+    requiredMissing: missing(), operatorMissing: missing("operator"),
+    automaticMissing: missing("automatic"), deploymentMissing: missing("deployment"),
+    restartUnits: MARKETPLACE_RESTART_UNITS,
+  };
 }
 
 type HelperRequest =

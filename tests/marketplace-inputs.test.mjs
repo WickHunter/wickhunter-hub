@@ -423,6 +423,33 @@ await test("the unprivileged client sends bounded stdin to one fixed helper and 
   assert.deepEqual(calls.map((call) => call.request.action), ["snapshot", "apply", "provider-list", "provider-decision"]);
 });
 
+await test("privileged helper snapshots cannot smuggle extra fields, unsafe values or inconsistent readiness", async () => {
+  const direct = config("marketplace-helper-mask");
+  const base = marketplaceInputSnapshot(direct.cfg);
+  const leaked = "private-value-must-never-reach-browser";
+  const responses = [
+    { ...base, unexpectedSecret: leaked, fields: base.fields.map((field) => ({ ...field, unexpectedSecret: leaked })) },
+    { ...base, fields: base.fields.map((field) => field.name === "MARKETPLACE_HTTP_PORT"
+      ? { ...field, state: "configured", safeValue: leaked } : field) },
+    { ...base, configuredCount: 99 },
+  ];
+  const spawn = (_command, _args, _options) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stdin = new Writable({ write(_chunk, _encoding, done) { done(); } });
+    child.stdin.on("finish", () => {
+      child.stdout.end(JSON.stringify({ ok: true, config: responses.shift() }));
+      queueMicrotask(() => child.emit("exit", 0));
+    });
+    return child;
+  };
+  const cfg = { ...direct.cfg, rootHelper: "/usr/local/libexec/wickhunter-hub-root-helper" };
+  const clean = await readMarketplaceInputSnapshot(cfg, spawn);
+  assert.equal(JSON.stringify(clean).includes(leaked), false);
+  await assert.rejects(readMarketplaceInputSnapshot(cfg, spawn), /invalid safe value/);
+  await assert.rejects(readMarketplaceInputSnapshot(cfg, spawn), /inconsistent masked summary/);
+});
+
 await test("restart failure restores exact prior bytes and recovery uses the same unit allowlist", async () => {
   const { cfg } = config("marketplace-rollback");
   await applyMarketplaceInputUpdate(cfg, {
