@@ -2880,8 +2880,16 @@ document.getElementById("notificationSettingsForm").onsubmit = async event => {
 };
 let brevoFormDirty = false;
 let brevoFormRevision = 0;
+let brevoSavedLists = "";
+function brevoHasChanges() {
+  const value = id => document.getElementById(id).value.trim();
+  const lists = value("marketingBrevoLists").split(",").map(s => s.trim()).join(",");
+  return Boolean(value("marketingBrevoKey") || value("marketingBrevoWebhookSecret") ||
+    (lists && lists !== brevoSavedLists) ||
+    ["marketingBrevoClearKey", "marketingBrevoClearWebhook", "marketingBrevoClearLists"].some(id => document.getElementById(id).checked));
+}
 for (const event of ["input", "change"]) document.getElementById("marketingBrevoForm").addEventListener(event, () => {
-  brevoFormDirty = true;
+  brevoFormDirty = brevoHasChanges();
   brevoFormRevision++;
 });
 function renderBrevoSettings(data, savedRevision) {
@@ -2897,6 +2905,7 @@ function renderBrevoSettings(data, savedRevision) {
     (data.listIds.length ? data.listIds.length + " audience list(s) connected." : "Choose an audience list to finish setup.");
   // A status refresh must never erase a pasted key or unsaved audience edits.
   // Only the response for the exact saved revision can clear submitted secrets.
+  brevoSavedLists = data.listIds.join(",");
   if (savedRevision !== undefined && savedRevision === brevoFormRevision) {
     brevoFormDirty = false;
     document.getElementById("marketingBrevoClearKey").checked = false;

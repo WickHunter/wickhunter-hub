@@ -20,6 +20,16 @@ const save = () => el('marketingBrevoForm').onsubmit({preventDefault(){}, target
 try {
   w.renderBrevoSettings(state);
   assert.match(el('marketingBrevoStatus').textContent, /Connected to Brevo/);
+  fill('marketingBrevoKey', 'unsubmitted-key');
+  fill('marketingBrevoKey', '');
+  let checksBefore = calls.length;
+  await el('marketingBrevoTest').onclick();
+  assert.equal(calls.length, checksBefore + 1, 'reverting an edit lets the saved connection be checked');
+  fill('marketingBrevoLists', '99');
+  fill('marketingBrevoLists', '15');
+  checksBefore = calls.length;
+  await el('marketingBrevoTest').onclick();
+  assert.equal(calls.length, checksBefore + 1, 'restoring the saved audience clears unsaved-change state');
   fill('marketingBrevoKey', 'replacement-key-kept-private');
   fill('marketingBrevoLists', '17');
   await w.marketingBrevoRefresh();
