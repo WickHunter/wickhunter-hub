@@ -1860,6 +1860,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
 - v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.
 
 - v0.4.75 — Deliver verified launch signup starter packs, sync customer attributes to existing Brevo audience contacts, preserve Marketplace deployment settings, and separate webhook diagnostics from customer billing activity.
