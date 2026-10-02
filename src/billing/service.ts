@@ -916,7 +916,18 @@ export class BillingService {
     let targetExpMs: number;
     if (existing) {
       const current = this.licenses.get(existing.licenseId);
-      if (!current) throw new Error(`checkout customer ${customerKey} has no license registry entry`);
+      if (!current) {
+        // A refunded purchase can replay after its license is revoked. The
+        // applied session remains durable proof that this exact purchase was
+        // already handled; acknowledge it without restoring any entitlement.
+        const completed = this.store.getCheckoutSession(f.sessionId);
+        if (this.licenses.isRevoked(existing.licenseId) && completed?.status === 'applied' &&
+            completed.customerKey === customerKey) {
+          this.assertAppliedCheckout(completed);
+          return { outcome: 'duplicate', note: 'revoked checkout session was already applied' };
+        }
+        throw new Error(`checkout customer ${customerKey} has no license registry entry`);
+      }
       licenseId = existing.licenseId;
       targetExpMs = this.paymentTarget(existing, current.exp, oneOffDays, cfg, now);
       // A legacy marker already proved that this purchase was applied before
@@ -1086,7 +1097,9 @@ export class BillingService {
   private assertAppliedCheckout(marker: CheckoutSessionRecord): void {
     if (!marker.licenseId) throw new Error(`applied checkout session ${marker.sessionId} has no license`);
     const rec = this.store.getCustomer(marker.customerKey) ?? this.store.findByLicense(marker.licenseId);
-    if (!rec || rec.key !== marker.customerKey || rec.licenseId !== marker.licenseId || !this.licenses.get(marker.licenseId)) {
+    const issued = this.licenses.get(marker.licenseId) ||
+      (this.licenses.isRevoked(marker.licenseId) && this.licenses.isKnown(marker.licenseId));
+    if (!rec || rec.key !== marker.customerKey || rec.licenseId !== marker.licenseId || !issued) {
       throw new Error(`applied checkout session ${marker.sessionId} has inconsistent durable state`);
     }
   }

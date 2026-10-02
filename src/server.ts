@@ -667,6 +667,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       source,
       sourceVsRuntime: source.relationToRuntime,
       upgrade,
+      ...(includeLog ? { privilegedUpgradeConfigured: marketplaceInputsConfig.rootHelper !== undefined } : {}),
       ...(includeLog ? { upgradeLogTail: readUpgradeLogTail(cfg.dataDir) } : {}),
     };
   }

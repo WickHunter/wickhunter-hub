@@ -458,6 +458,7 @@
 <div class="opsgrid" id="releaseChannelSummary" aria-live="polite"><div class="opscard muted">Loading release status…</div></div>
 <details class="admin-advanced"><summary>Build details and machine leases</summary>
 <div class="actions"><button type="button" id="upgradeHub">Upgrade hub</button></div>
+<p id="upgradeSourceNote" class="muted" role="status">Checking whether the configured source is safe to upgrade from…</p>
 <div class="opsgrid" id="hubOps"><div class="opscard muted">Loading exact build and upgrade state…</div></div>
 
 <h1 style="margin-top:2.2rem">Machine leases <small>— staged licensing rollout; public verifier only</small></h1>
@@ -1241,6 +1242,7 @@ async function opsRefresh() {
   catch (e) {
     if (e.message !== "unauthorized") {
       box.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>';
+      document.getElementById("upgradeSourceNote").textContent = "Source safety could not be checked. The detached updater verifies version and commit ancestry before installation; review its recorded result before retrying.";
       document.getElementById("briefRelease").textContent = "Unknown";
       document.getElementById("briefRelease").className = "brief-status unknown";
       document.getElementById("briefReleaseNote").textContent = "Could not verify build or source status";
@@ -1248,6 +1250,16 @@ async function opsRefresh() {
     return;
   }
   const b = d.build || {}, s = d.source || {}, u = d.upgrade || {};
+  const upgradeNote = document.getElementById("upgradeSourceNote");
+  upgradeNote.textContent = !s.available
+    ? d.privilegedUpgradeConfigured === true
+      ? "The Hub service cannot read the root-owned source checkout directly. The configured privileged upgrader checks the target version and commit ancestry before installing; an older or unrelated origin/main is refused."
+      : "The Hub service cannot inspect its source checkout and no privileged upgrader is configured. Automatic updates are not ready; do not change permissions on /root to expose the checkout."
+    : s.dirty === true
+      ? "The source checkout has local edits. The upgrader refuses dirty trees so operator work is preserved."
+      : s.branch !== "main" || ["ahead", "diverged", "unknown"].includes(s.relationToOriginMain)
+        ? "The source checkout is not a verified fast-forward from origin/main. The upgrader will refuse it."
+        : "The updater verifies the exact origin/main commit and refuses downgrades or unrelated history.";
   document.getElementById("hubVer").textContent = "hub v" + (d.packageVersion || "?") + " · " + shortSha(b.commit);
   box.innerHTML =
     '<div class="opscard"><h2>Running build</h2><dl>' +

@@ -42,6 +42,9 @@ await test("upgrade spawns ONE detached exact-origin/main runner for the configu
   const ops = await jsonReq(`${h.origin}/admin/api/operations`, { headers: ADMIN });
   assert.equal(ops.body.upgrade.state, "queued");
   assert.equal(ops.body.upgrade.fromCommit, null);
+  assert.equal(ops.body.privilegedUpgradeConfigured, false);
+  const health = await jsonReq(`${h.origin}/api/health`);
+  assert.equal(Object.hasOwn(health.body, "privilegedUpgradeConfigured"), false, "helper configuration is admin-only");
 });
 
 await test("a second upgrade while one is in flight is refused, and spawns nothing", async () => {
@@ -60,6 +63,8 @@ await test("the admin page carries the sign-in form, upgrade button and mobile p
   assert.ok(html.includes('id="upgradeHub"'), "the upgrade button exists");
   assert.ok(html.includes("/admin/api/upgrade"), "…and calls the upgrade API");
   assert.ok(html.includes("/admin/api/operations"), "exact build/source/runtime/upgrade facts are rendered");
+  assert.ok(html.includes('id="upgradeSourceNote"'), "source permission limits are explained next to the updater");
+  assert.ok(html.includes("privilegedUpgradeConfigured"), "root-owned source access is distinguished from an absent checkout");
   assert.ok(html.includes("Upgrade log tail"), "operator-visible upgrade failure evidence is rendered");
   assert.ok(html.includes('class="tbl"'), "tables scroll in their own container on phones");
   assert.ok(html.includes("width=device-width"), "viewport meta present");
@@ -68,6 +73,8 @@ await test("the admin page carries the sign-in form, upgrade button and mobile p
 
 await test("upgrade implementation verifies origin/main and records identity only after the new runtime answers", () => {
   const runner = fs.readFileSync(new URL("../bin/upgrade-runner.ts", import.meta.url), "utf8");
+  assert.match(runner, /upgradeRefusal\(HUB_VERSION, installed\.packageVersion, targetVersion, before, head, targetDescendsFromRuntime\)/,
+    "the detached runner refuses older targets and requires the deployed build as an ancestor");
   assert.match(runner, /git[\s\S]*fetch[\s\S]*origin[\s\S]*main/);
   assert.match(runner, /merge[\s\S]*--ff-only[\s\S]*origin\/main/);
   assert.match(runner, /head !== originMain/);

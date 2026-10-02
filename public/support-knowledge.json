@@ -515,6 +515,26 @@
       "audience": "both",
       "versionIndependent": true,
       "text": "Launch-offer timing is conditional on the live public billing catalog and the selected checkout. When its launch offer is active, read firstPaymentAtMs and redeemUntilMs from that catalog; quote an amount only from the selected live plan and checkout. The published Terms and current launch checkout code specify that eligible card Monthly and Yearly software subscriptions started before the catalog's first-payment timestamp collect a card at signup, provide software access without charge until that timestamp, and make the first non-prorated charge then. A reminder is emailed before the scheduled first charge; the customer can cancel in the billing portal before it to avoid the charge. An eligible subscription started at or after the first-payment timestamp is charged at signup. Private promotion codes can be entered at Stripe Checkout; general visitors do not receive an automatic discount. Do not reveal, invent, or volunteer a promotion code. A code is validated by checkout, and its discount is shown there before confirmation. An eligible subscription discount applies to the software base price on each renewal while that subscription remains active; it is not guaranteed after cancellation and a later new purchase. Hosting, VPS charges, and add-ons are excluded unless checkout explicitly says otherwise. The current published launch window ends at 11:59 p.m. New York time on October 15, 2026, but live catalog and checkout determine whether the offer is active for a new purchase. Card Lifetime, crypto Yearly, and crypto Lifetime are one-time payments made at checkout, not delayed subscriptions, and do not renew automatically. Crypto Yearly bought before the first-payment timestamp under this offer gives access through October 15, 2027; otherwise the access-through date shown at checkout governs. The seven-day voluntary first-purchase refund request period starts on the first actual charge, not card collection. Never infer a particular customer's eligibility, applied discount, paid status, first-charge schedule, or renewal amount without their billing record."
+    },
+    {
+      "id": "website-starter-pack",
+      "title": "Launch starter settings pack: access, copy, download and import",
+      "audience": "both",
+      "versionIndependent": true,
+      "keywords": [
+        "starter",
+        "settings",
+        "pack",
+        "bonus",
+        "configuration",
+        "import",
+        "copy",
+        "download",
+        "Liquidation",
+        "Hedge",
+        "welcome"
+      ],
+      "text": "The October 2026 launch starter pack contains a Liquidation Bot and a Hedge Bot configuration. Eligible new completed live signups from October 1 through October 15, 2026, at 11:59 p.m. Eastern Time receive access in their signed-in account and private welcome-page link. Starting Checkout or joining the email list alone does not grant it. The card free-software period ends at the START of October 15; the bonus signup deadline is the END of that day. Lifetime and crypto purchases are paid immediately. Open the starter pack in your account or welcome email. Use Copy full pack or copy one bot; Download provides a backup JSON file. In your own Wick Hunter app, open My Bots \u2192 Import, paste the JSON, then Preview. Import each bot from its preview. Liquidation opens an unsaved form: review its sizing, pairs and settings, then save. Hedge asks for confirmation and creates a separate paused bot with no pairs; open it, choose pairs, review settings and enable it only when ready. Importing does not start trading automatically. These are editable starting configurations, not personalized recommendations or guaranteed results. If the pack is missing, sign in using the purchase email and check that signup completed and access is active; a refunded, disputed or revoked purchase does not retain this entitlement. Ask support to check eligibility rather than promising access or inventing a download link. Never ask for exchange keys or share another customer\u2019s private welcome link."
     }
   ]
 }

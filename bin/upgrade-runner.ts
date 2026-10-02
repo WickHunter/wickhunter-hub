@@ -9,6 +9,7 @@ import {
   readBuildRecord,
   writeUpgradeStatus,
 } from "../src/operations.js";
+import { upgradeRefusal } from "../src/upgrade-safety.js";
 import { HUB_VERSION } from "../src/version.js";
 
 function arg(name: string): string | null {
@@ -37,7 +38,8 @@ function run(command: string, args: readonly string[]): string {
   return String(result.stdout ?? "").trim();
 }
 
-const before = readBuildRecord(statusDataDir, HUB_VERSION).commit;
+const installed = readBuildRecord(statusDataDir, HUB_VERSION);
+const before = installed.commit;
 const startedAtMs = Date.now();
 writeUpgradeStatus(statusDataDir, {
   state: "running", startedAtMs, completedAtMs: null, fromCommit: before,
@@ -56,6 +58,22 @@ try {
   if (!/^[a-f0-9]{40}$/.test(head) || head !== originMain) {
     throw new Error("source checkout did not land exactly on origin/main");
   }
+  let targetVersion = "";
+  try {
+    const pkg: unknown = JSON.parse(fs.readFileSync(path.join(sourceDir, "package.json"), "utf8"));
+    if (pkg !== null && typeof pkg === "object" && typeof (pkg as { version?: unknown }).version === "string") {
+      targetVersion = (pkg as { version: string }).version;
+    }
+  } catch { /* fail closed below */ }
+  let targetDescendsFromRuntime = false;
+  if (before) {
+    try {
+      run("git", ["merge-base", "--is-ancestor", before, head]);
+      targetDescendsFromRuntime = true;
+    } catch { /* unknown or unrelated runtime ancestry is not an automatic upgrade */ }
+  }
+  const refusal = upgradeRefusal(HUB_VERSION, installed.packageVersion, targetVersion, before, head, targetDescendsFromRuntime);
+  if (refusal) throw new Error(refusal);
   writeUpgradeStatus(statusDataDir, {
     state: "running", startedAtMs, completedAtMs: null, fromCommit: before,
     targetCommit: head, message: "origin/main verified; installing the exact fetched commit.",

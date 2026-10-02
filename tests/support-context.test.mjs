@@ -63,6 +63,15 @@ for(const version of ['0.90.135','0.90.154','0.90.155']){
  assert.doesNotMatch(replay,/\[gd-replay\]/);
  assert.match(replay,/unavailable in this released app build/);
 }
+for (const version of ['website', '0.90.135', '0.90.156']) {
+  const starter = selectSupportGuide(guide, version, 'Where is my starter settings pack and how do I copy and import it?');
+  assert.match(starter, /\[website-starter-pack\]/);
+  assert.match(starter, /START of October 15/);
+  assert.match(starter, /END of that day/);
+  assert.match(starter, /Importing does not start trading automatically/);
+  assert.match(starter, /refunded, disputed or revoked/);
+  assert.doesNotMatch(starter, /WHVIP25|WHVIP40/);
+}
 const live={mode:'live',plans:[{key:'monthly',name:'Monthly',amountCents:9900,currency:'usd',interval:'month',available:true,buyUrl:'https://hub.test/buy?plan=monthly'},{key:'lifetime',name:'Lifetime',amountCents:99900,currency:'usd',interval:null,lifetime:true,licenseDays:3650,available:true}],launch:{active:true,code:'UNLEASHED25',discountPercent:25,firstPaymentAtMs:1792036800000,redeemUntilMs:Date.now()+1e7}};
 const facts=supportPricingFacts(live,'How much is a plan?');
 assert.match(facts,/9900/);assert.doesNotMatch(facts,/UNLEASHED25|discountedAmountCents|discountPercent/);assert.doesNotMatch(facts,/secretKey/);

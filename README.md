@@ -1,3 +1,9 @@
+## v0.4.76 — Billing replay and safe Hub updates
+
+Replayed one-time Checkout events after a refund acknowledge the already-applied purchase without restoring revoked access. A signed-webhook lifecycle regression covers first-charge reminders, private-discount reporting, starter-pack delivery, renewals, cancellations, refunds and one-time purchases.
+
+Automatic Hub updates refuse older versions, mismatched build records and source that cannot be proven to descend from the running commit. The admin page explains protected source-checkout access. Support knows how eligible customers access, copy, download and safely import their launch starter settings.
+
 ## v0.4.75 — Signup starter pack and customer sync
 
 Qualifying launch signups receive the Liquidation Bot and Hedge Bot starter pack on their private welcome and account pages, with copy, download and import instructions. Grants survive webhook retries and use the signed signup time. Hub updates customer plan, subscription and starter-pack attributes on existing Brevo contacts every minute without adding subscribers or changing opt-outs.
@@ -1849,6 +1855,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.
 
 - v0.4.75 — Deliver verified launch signup starter packs, sync customer attributes to existing Brevo audience contacts, preserve Marketplace deployment settings, and separate webhook diagnostics from customer billing activity.
 
