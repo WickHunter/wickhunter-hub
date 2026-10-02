@@ -51,6 +51,7 @@
   .warn{border-color:rgba(242,169,59,.45);background:var(--warn-dim)}
   .bad{border-color:rgba(240,85,110,.45);background:var(--short-dim)}
   .fine{color:var(--dim);font-size:12.5px}
+  .pack-json{display:block;width:100%;min-height:74px;margin:8px 0 12px;padding:9px;color:var(--ink);background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);font:11px/1.4 var(--mono);resize:vertical}
   form{display:inline}
   @media (max-width:520px){.cmd{padding-right:14px;padding-bottom:52px}.copy{top:auto;bottom:9px;right:9px}.kv{grid-template-columns:1fr}}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -109,6 +110,28 @@
   </div>
   {{/if}}
 
+  {{#if starterPack}}
+  <div class="card" id="starterPackCard">
+    <span class="eyebrow">Included with your signup</span>
+    <h2 style="margin-top:6px">Liquidation Bot + Hedge Bot starter pack</h2>
+    <p class="fine">Your starter pack is ready now. Copy the full bundle or one bot at a time. Download buttons provide backup JSON files.</p>
+    <p class="fine"><b>Liquidation Bot:</b> {{starterPackLiquidationSummary}}</p>
+    <p class="fine"><b>Hedge Bot:</b> {{starterPackHedgeSummary}}</p>
+    <ol>
+      <li>In your Wick Hunter dashboard, open <b>Import</b>, paste the full pack or an individual bot JSON, then press <b>Preview</b>.</li>
+      <li>Import each bot from its preview. Liquidation opens an unsaved form: review the settings, then save it.</li>
+      <li>Hedge asks for confirmation and creates a separate, paused bot with no pairs. Open it, choose pairs, and enable it only when you are ready. Importing does not start trading.</li>
+    </ol>
+    <p class="fine">Liquidation starts with a 1% of balance entry. Its DCA rung sizes are 1%, 2.5%, 6%, and 12.5% of balance. Review both bots and choose Hedge pairs before enabling either one.</p>
+    <div class="row"><button class="btn" type="button" data-pack-copy="bundle">Copy full pack</button><button class="btn quiet" type="button" data-pack-download="bundle">Download full pack</button></div>
+    <textarea class="pack-json" id="starterBundleJson" aria-label="Full starter pack JSON" readonly>{{starterPackBundle}}</textarea>
+    <div class="row"><button class="btn" type="button" data-pack-copy="liquidation">Copy Liquidation Bot</button><button class="btn quiet" type="button" data-pack-download="liquidation">Download Liquidation Bot</button></div>
+    <textarea class="pack-json" id="starterLiquidationJson" aria-label="Liquidation Bot JSON" readonly>{{starterPackLiquidation}}</textarea>
+    <div class="row"><button class="btn" type="button" data-pack-copy="hedge">Copy Hedge Bot</button><button class="btn quiet" type="button" data-pack-download="hedge">Download Hedge Bot</button></div>
+    <textarea class="pack-json" id="starterHedgeJson" aria-label="Hedge Bot JSON" readonly>{{starterPackHedge}}</textarea>
+  </div>
+  {{/if}}
+
   {{#if notice}}
   <div class="card {{noticeClass}}">
     <h2>{{noticeTitle}}</h2>
@@ -127,6 +150,18 @@
   </div>
 </div>
 <script>
+  var packNames = {bundle:'wick-hunter-starter-pack.json',liquidation:'liquidation-bot.json',hedge:'hedge-bot.json'};
+  function packBox(kind){return document.getElementById('starter'+kind.charAt(0).toUpperCase()+kind.slice(1)+'Json');}
+  document.querySelectorAll('[data-pack-copy]').forEach(function(b){b.addEventListener('click',async function(){
+    var box=packBox(b.dataset.packCopy);if(!box)return;
+    try{await navigator.clipboard.writeText(box.value);var original=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=original;},1600);}
+    catch(e){box.focus();box.select();}
+  });});
+  document.querySelectorAll('[data-pack-download]').forEach(function(b){b.addEventListener('click',function(){
+    var kind=b.dataset.packDownload,box=packBox(kind);if(!box)return;
+    var url=URL.createObjectURL(new Blob([box.value],{type:'application/json'})),a=document.createElement('a');
+    a.href=url;a.download=packNames[kind];document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url);},4000);
+  });});
   document.querySelectorAll('[data-copy]').forEach(function (b) {
     b.addEventListener('click', function () {
       var el = document.getElementById(b.getAttribute('data-copy'));

@@ -1,0 +1,129 @@
+{
+  "ok": true,
+  "kind": "liqhunter-config",
+  "v": 1,
+  "name": "LiquidationBot",
+  "exportedAt": 1790908857728,
+  "app": "0.90.156",
+  "bots": [
+    {
+      "type": "bot1",
+      "config": {
+        "entry": {
+          "longBandPct": 1.4,
+          "shortBandPct": 2.5,
+          "minLiqUsd": 25,
+          "vwmaPeriod": 5,
+          "vwmaTimeframe": "1m",
+          "vwmaIncludeForming": false,
+          "leverage": 10,
+          "entrySizeUsd": 1,
+          "sizeType": "percent",
+          "maxOpenPairs": 5,
+          "maxPerSide": 5,
+          "side": "short",
+          "liqSources": [
+            "bybit-usdt",
+            "binance-usdt"
+          ],
+          "pairMode": "auto",
+          "manualPairs": [],
+          "bookMarket": "futures",
+          "maxLong": 2,
+          "maxShort": 5,
+          "entryOrderType": "market",
+          "isolationModePct": 60,
+          "liqSizeMode": "usd"
+        },
+        "strategy": {
+          "baseOrderQuote": 10,
+          "firstDcaUsd": 1,
+          "dcaMultiplier": 2.2,
+          "dcaSizeType": "percent",
+          "dcaDeviation": 8,
+          "dcaStepScale": 2,
+          "dcaNumOrders": 3,
+          "levels": [
+            8,
+            24,
+            56
+          ],
+          "tpPct": 0.7,
+          "tpType": "fixed",
+          "takerFeePct": 0,
+          "slPct": 0,
+          "dcaMaxResting": 1,
+          "maxPositionNotionalPct": 300,
+          "dcaMode": "builder",
+          "breakevenRetracePcts": [
+            3,
+            5
+          ],
+          "martingaleMaxLevels": 2,
+          "tpTrailActivationPct": 2,
+          "tpTrailPct": 1,
+          "dcaExecution": "market",
+          "tpMode": "single",
+          "slOffsetType": "initial",
+          "dcaAtrMult": 1,
+          "dcaAtrTimeframe": "1h",
+          "dcaAtrLength": 14,
+          "dcaMinDeviationPct": 2,
+          "dcaMaxDeviationPct": 0,
+          "dcaRungs": [
+            {
+              "kind": "distance",
+              "distancePct": 5,
+              "size": 1
+            },
+            {
+              "kind": "distance",
+              "distancePct": 15,
+              "size": 2.5
+            },
+            {
+              "kind": "time",
+              "delayFromOpenMs": 43200000,
+              "minDistancePct": 10,
+              "size": 6,
+              "skipIfHedgePctOfMain": 100
+            },
+            {
+              "kind": "time",
+              "delayFromOpenMs": 259200000,
+              "minDistancePct": 15,
+              "size": 12.5,
+              "skipIfHedgePctOfMain": 100
+            }
+          ],
+          "tpAtrTimeframe": "1h",
+          "tpTrailEnabled": false
+        },
+        "filters": {
+          "minLeverage": 10,
+          "minPositionSizeUsd": 5000,
+          "minMarketOrderSizeUsd": 5000,
+          "maxFundingAbs": 0.1,
+          "minRolling24hVolumeUsdt": 100000,
+          "max4hMovePct": 0,
+          "max4hCandles": 1,
+          "max30dMovePct": 0,
+          "excludeStTagged": true,
+          "excludeDelisting": true,
+          "excludedCategories": [],
+          "blacklist": [],
+          "refreshMin": 10,
+          "minSpikes24h": 0,
+          "minAssetMarketCapUsd": "0",
+          "allowCoinGeckoMarketCapFallback": false,
+          "volatilityRules": [],
+          "disabled": [
+            "minRolling24hVolumeUsdt",
+            "minAssetMarketCapUsd"
+          ]
+        }
+      },
+      "label": "LiquidationBot"
+    }
+  ]
+}

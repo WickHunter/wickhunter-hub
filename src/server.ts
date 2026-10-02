@@ -2,6 +2,7 @@ import { SupportSessionLimiter } from "./support-session-limiter.js";
 import { SupportChat, SupportError } from "./support-chat.js";
 import { readReleaseControlState, countUnresolvedHubBugs, DEFAULT_PRODUCTION_SOAK_MS } from "./release-controls.js";
 import { MarketingSettings } from './marketing-settings.js';
+import { MarketingCustomerSync, type MarketingCustomerSyncResult } from './marketing-customer-sync.js';
 import { EarnStripeService } from "./earn-stripe.js";
 import { EarnService, earnOwner } from "./earn.js";
 // src/server.ts
@@ -118,6 +119,7 @@ import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
 import { LaunchBilling } from "./billing/launch.js";
 import { LaunchBillingReporting } from "./billing/reporting.js";
+import { loadStarterPack, starterPackEligible } from "./billing/starter-pack.js";
 import { FirstPaymentReminders } from "./billing/reminders.js";
 import { Notifications } from "./notifications.js";
 import type { CustomerRecord } from "./billing/store.js";
@@ -396,6 +398,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // construction time.
   let hostingRef: HostingService | null = null;
   let earnOutboxTimer: ReturnType<typeof setInterval> | null = null;
+  let marketingSyncTimer: ReturnType<typeof setInterval> | null = null;
   let earnOutboxRunning = false;
   const earn = new EarnService(cfg.dataDir);
   let earnStripe: EarnStripeService;
@@ -431,6 +434,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   });
   const launchBilling = new LaunchBilling(cfg.dataDir, billing, store, cfg.publicOrigin.replace(/\/+$/, ''), launchFetch, deps.billingNow,
     (code, mode) => earnStripe.launchReferral(code, mode));
+  const marketingSync = new MarketingCustomerSync({
+    dataDir: cfg.dataDir,
+    readApiKey: () => marketing?.getApiKeyForSync() ?? null,
+    readAllowedListIds: () => marketing?.getListIdsForSync() ?? [],
+    listCustomers: () => billing.store.customers(),
+    fetch: deps.marketingFetch,
+    now: deps.billingNow,
+  });
+  let marketingSyncLast: (MarketingCustomerSyncResult & { checkedAtMs: number }) | null = null;
+  const syncMarketingCustomers = async () => {
+    const result = await marketingSync.runOnce();
+    marketingSyncLast = { ...result, checkedAtMs: (deps.billingNow ?? Date.now)() };
+  };
   try { reporting = new LaunchBillingReporting(billing.store, () => billing.config(), launchFetch, deps.billingNow, {
     enqueue: input => { if (!notifications) throw Error('Notifications need repair'); return notifications.enqueue(input); },
   }); } catch { console.warn('[billing] Saved reporting state needs repair; core billing remains available.'); }
@@ -1604,7 +1620,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   function customerState(req: IncomingMessage, res: ServerResponse): void {
     const identity = authenticatedCustomer(req);
     if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
-    sendJson(res, 200, { ok: true, ...customerSessions.dashboardState(identity), earnAvailable: Object.values(billing.store.customers()).some(c => c.livemode && normalizeCustomerEmail(c.email) === normalizeCustomerEmail(identity.email) && flagsFor(cfg.dataDir, c.licenseId).earn === true) }, { "cache-control": "no-store" });
+    const customers = Object.values(billing.store.customers()).filter(c => c.livemode && normalizeCustomerEmail(c.email) === normalizeCustomerEmail(identity.email));
+    const starterPack = customers.some(c => starterPackEligible(c) && !store.isRevoked(c.licenseId)) ? loadStarterPack(cfg.templatesDir) : null;
+    sendJson(res, 200, { ok: true, ...customerSessions.dashboardState(identity), starterPack,
+      earnAvailable: customers.some(c => flagsFor(cfg.dataDir, c.licenseId).earn === true) }, { "cache-control": "no-store" });
   }
 
   async function customerInstallCommand(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -2924,7 +2943,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // ── billing ─────────────────────────────────────────────────────────
     if (p.startsWith('/admin/api/marketing/brevo')) {
       if (!marketing) return sendJson(res, 503, { ok: false, error: 'Marketing settings need repair' });
-      if (m === 'GET' && p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.status() }, { 'cache-control': 'no-store' });
+      if (m === 'GET' && p === '/admin/api/marketing/brevo') return sendJson(res, 200, { ok: true, ...await marketing.status(), customerSync: marketingSyncLast }, { 'cache-control': 'no-store' });
       if (m === 'POST') {
         try {
           if (p === '/admin/api/marketing/brevo/test') {
@@ -3166,8 +3185,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             if (Date.now() - lastReportRefresh > 5 * 60000) refreshReport();
           }, 15_000);
           earnOutboxTimer.unref();
+          marketingSyncTimer = setInterval(() => { void syncMarketingCustomers(); }, 60_000);
+          marketingSyncTimer.unref();
           setImmediate(() => {
             if (!earnOutboxRunning) return;
+            void syncMarketingCustomers();
             void billing.drainAfterCommit().catch((err) =>
               console.warn(`[billing] Earn outbox startup drain failed: ${(err as Error).message}`));
           });
@@ -3184,7 +3206,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         earnStripe.stop();
         if (earnOutboxTimer) clearInterval(earnOutboxTimer);
         earnOutboxTimer = null;
-        server.close((err) => (err ? reject(err) : resolve()));
+        if (marketingSyncTimer) clearInterval(marketingSyncTimer);
+        marketingSyncTimer = null;
+        const syncStopped = marketingSync.stop();
+        server.close((err) => { void syncStopped.then(() => err ? reject(err) : resolve(), reject); });
         server.closeAllConnections();
       }),
   };

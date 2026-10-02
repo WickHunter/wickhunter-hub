@@ -44,6 +44,7 @@ import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from 
 import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { launchGrant, reconcileLaunchSession } from "./launch.js";
+import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
 import {
@@ -139,6 +140,8 @@ interface CustomerFacts {
   livemode: boolean;
   planKey: string | null;
   metadata?: Record<string, string>;
+  /** Signed event qualification, applied only with the first customer insert. */
+  starterPackCandidateAtMs?: number | null;
 }
 
 const realFetch: EmailFetch = async (url, init) => {
@@ -937,10 +940,19 @@ export class BillingService {
     // writes leaves only a harmless stale pointer, which the next checkout
     // clears after observing the missing marker.
     this.store.putPendingCheckout(customerKey, f.sessionId);
-    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id } : {}) });
+    const starterPackGrantAtMs = starterPackGrantAt(grant, ev, newCustomer);
+    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id } : {}), ...(starterPackGrantAtMs !== null ? { starterPackGrantAtMs } : {}) });
     const marker = claimed.record;
     if (!claimed.created && marker.status === "applied") {
       this.assertAppliedCheckout(marker);
+      const starterPackGrant = starterPackGrantAt(grant, ev, marker.newCustomer);
+      if (starterPackGrant !== null) {
+        const applied = this.store.getCustomer(marker.customerKey);
+        if (applied && !applied.starterPackGrantedAtMs) {
+          applied.starterPackGrantedAtMs = starterPackGrant;
+          this.store.putCustomer(applied);
+        }
+      }
       if (grant) {
         const verifiedDiscount = checkoutDiscountPercent(ev.object);
         const applied = this.store.getCustomer(marker.customerKey);
@@ -953,7 +965,7 @@ export class BillingService {
       return { outcome: "duplicate", note: "checkout session was already applied" };
     }
     const { rec, created } = this.ensureCustomer(
-      { customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata },
+      { customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: marker.starterPackGrantAtMs },
       cfg,
       marker.targetExpMs,
       now,
@@ -977,6 +989,7 @@ export class BillingService {
       this.extendLicense(rec, marker.targetExpMs, cfg, now);
     }
     const checkoutMarker = `cs:${f.sessionId}`;
+    if (marker.starterPackGrantAtMs && !rec.starterPackGrantedAtMs && marker.newCustomer) rec.starterPackGrantedAtMs = marker.starterPackGrantAtMs;
     if (planByKey(cfg, planKey)?.lifetime && ev.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
     if (grant) {
       const verifiedDiscount = checkoutDiscountPercent(ev.object);
@@ -1015,6 +1028,7 @@ export class BillingService {
       subscriptionId: marker.subscriptionId ?? "",
       livemode: marker.livemode ?? ev.livemode,
       planKey: marker.planKey ?? null,
+      starterPackCandidateAtMs: marker.starterPackGrantAtMs,
       ...(marker.launchIntentId ? { metadata: { wh_launch_intent: marker.launchIntentId, plan: marker.planKey ?? '' } } : {}),
     }, cfg, marker.targetExpMs, now);
     if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`pending checkout ${sessionId} changed license`);
@@ -1049,7 +1063,7 @@ export class BillingService {
     const planKey = this.planKeyOf(f.metadata, cfg);
     const grant = launchGrant(this.dataDir, f.metadata, ev.livemode, f.sessionId);
     const bootstrapExp = Math.max(now + cfg.policy.bootstrapDays * DAY_MS, grant?.firstPaymentAtMs ?? 0);
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata }, cfg, bootstrapExp, now);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: starterPackGrantAt(grant, ev, true) }, cfg, bootstrapExp, now);
     if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
@@ -1105,12 +1119,13 @@ export class BillingService {
     const now = this.now();
     const paidThrough = f.periodEndMs !== null ? f.periodEndMs + cfg.policy.graceDays * DAY_MS : null;
     const planKey = this.planKeyOf(f.metadata, cfg);
-    if (f.metadata.wh_launch_intent && !launchGrant(this.dataDir, f.metadata, ev.livemode)?.sessionId) throw Error('Launch checkout awaits session reconciliation');
+    const launchInvoice = f.metadata.wh_launch_intent ? launchGrant(this.dataDir, f.metadata, ev.livemode) : null;
+    if (f.metadata.wh_launch_intent && !launchInvoice?.sessionId) throw Error('Launch checkout awaits session reconciliation');
     const current = this.findCustomer(f.customerId, f.email, ev.livemode, !f.metadata.wh_launch_intent);
     if ((current?.launchManaged || f.metadata.wh_launch_intent) && current?.subscriptionId && f.subscriptionId && current.subscriptionId !== f.subscriptionId) {
       return { outcome: 'unclassified', note: 'Paid invoice belongs to a different subscription on this customer; reconcile both charges in Stripe' };
     }
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: f.billingReason === 'subscription_create' ? starterPackGrantAt(launchInvoice, ev, true) : null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
     if (paidThrough !== null) {
       if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;
@@ -1346,6 +1361,7 @@ export class BillingService {
       lastEventType: null,
       lastEventAtMs: null,
       ...(grant ? { launchManaged: true, firstPaymentAtMs: grant.firstPaymentAtMs, discountPercent: grant.discountPercent, nonRenewing: grant.payment === 'crypto' || grant.plan === 'lifetime' } : {}),
+      ...(grant && facts.starterPackCandidateAtMs ? { starterPackGrantedAtMs: facts.starterPackCandidateAtMs } : {}),
     };
     this.store.putCustomer(rec);
     this.log(`[billing] ${bound ? 'bound' : 'issued'} ${plan} licence ${issuedId} for ${facts.email || key} until ${new Date(exp).toISOString().slice(0, 10)}`);
@@ -1418,6 +1434,7 @@ export class BillingService {
       firstPaymentAtMs: rec.firstActualPaymentAtMs ? null : rec.firstPaymentAtMs,
       siteOrigin: cfg.siteOrigin,
       livemode: rec.livemode,
+      starterPack: starterPackEligible(rec),
     });
     const result = await sendEmail(cfg.email, msg, this.fetchLike);
     if (result.ok) {
@@ -1499,12 +1516,21 @@ export class BillingService {
       siteOrigin: cfg.siteOrigin,
       supportEmail,
     };
+    const starterPack = starterPackEligible(rec) && !lic.revoked ? loadStarterPack(this.templatesDir) : null;
+    if (starterPack) {
+      vars.starterPackBundle = starterPack.bundle;
+      vars.starterPackLiquidation = starterPack.liquidation;
+      vars.starterPackHedge = starterPack.hedge;
+      vars.starterPackLiquidationSummary = starterPack.summary.liquidation;
+      vars.starterPackHedgeSummary = starterPack.summary.hedge;
+    }
     const flags: Record<string, boolean> = {
       canInstall,
       notice: notice !== null,
       portal,
       site: !!cfg.siteOrigin,
       support: !!supportEmail && supportEmail.includes("@"),
+      starterPack: starterPack !== null,
     };
     return { ok: true, html: renderTemplate(fs.readFileSync(path.join(this.templatesDir, "welcome.html"), "utf8"), vars, flags) };
   }

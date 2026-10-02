@@ -57,6 +57,7 @@
   .btn.quiet{color:var(--muted);background:transparent;border:1px solid var(--line)}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .fine{color:var(--dim);font-size:12.5px;margin:8px 0 0}
+  .pack-json{display:block;width:100%;min-height:76px;margin:8px 0 10px;padding:9px;color:var(--ink);background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);font:11px/1.4 var(--mono);resize:vertical}
   .err{color:var(--short);font-size:13px;margin:10px 0 0}
   .ok{color:var(--long);font-size:13px;margin:10px 0 0}
   input[type=email]{font:inherit;color:var(--ink);background:var(--inset);border:1px solid var(--line);border-radius:var(--r-sm);padding:11px 13px;min-height:42px;width:100%;max-width:340px}
@@ -110,6 +111,22 @@
     <p class="sub" id="accountEmail"></p>
 
     <div id="softwareCards"></div>
+
+    <div class="card" id="starterPackCard" hidden>
+      <span class="eyebrow">Included with your signup</span>
+      <h2 style="margin-top:5px">Liquidation Bot + Hedge Bot starter pack</h2>
+      <p class="fine">Copy the full pack or either bot separately. The JSON is also available to download as a backup.</p>
+      <p class="fine"><b>Liquidation Bot:</b> <span id="starterLiquidationSummary"></span></p>
+      <p class="fine"><b>Hedge Bot:</b> <span id="starterHedgeSummary"></span></p>
+      <p class="fine">In your Wick Hunter dashboard, open <b>Import</b>, paste one JSON export, and press <b>Preview</b>. Import each bot from the preview. Liquidation opens an unsaved form: review its settings, then save. Hedge asks for confirmation and creates a separate paused bot with no pairs. Open that bot, choose pairs and enable it only when ready. Importing this pack does not start trading.</p>
+      <div class="row" style="margin-top:14px"><button class="btn" type="button" data-pack-copy="bundle">Copy full pack</button><button class="btn quiet" type="button" data-pack-download="bundle">Download full pack</button></div>
+      <textarea class="pack-json" id="starterBundleJson" aria-label="Full starter pack JSON" readonly></textarea>
+      <div class="row"><button class="btn" type="button" data-pack-copy="liquidation">Copy Liquidation Bot</button><button class="btn quiet" type="button" data-pack-download="liquidation">Download Liquidation Bot</button></div>
+      <textarea class="pack-json" id="starterLiquidationJson" aria-label="Liquidation Bot JSON" readonly></textarea>
+      <div class="row"><button class="btn" type="button" data-pack-copy="hedge">Copy Hedge Bot</button><button class="btn quiet" type="button" data-pack-download="hedge">Download Hedge Bot</button></div>
+      <textarea class="pack-json" id="starterHedgeJson" aria-label="Hedge Bot JSON" readonly></textarea>
+      <p class="fine">Liquidation starts with a 1% of balance entry. Its DCA rung sizes are 1%, 2.5%, 6%, and 12.5% of balance. Review both bots and choose Hedge pairs before enabling either one.</p>
+    </div>
 
     <div id="hostingCard"></div>
   </div>
@@ -418,8 +435,37 @@
     signedInEl.hidden = false;
     document.getElementById("accountEmail").textContent = state.email;
     renderSoftware(state.software || []);
+    renderStarterPack(state.starterPack);
     renderHosting(state.hosting);
   }
+
+  function renderStarterPack(pack) {
+    var card = document.getElementById("starterPackCard");
+    card.hidden = !pack;
+    if (!pack) return;
+    document.getElementById("starterLiquidationSummary").textContent = pack.summary.liquidation;
+    document.getElementById("starterHedgeSummary").textContent = pack.summary.hedge;
+    document.getElementById("starterBundleJson").value = pack.bundle;
+    document.getElementById("starterLiquidationJson").value = pack.liquidation;
+    document.getElementById("starterHedgeJson").value = pack.hedge;
+  }
+
+  var packNames = { bundle: "wick-hunter-starter-pack.json", liquidation: "liquidation-bot.json", hedge: "hedge-bot.json" };
+  function packText(kind) { return document.getElementById("starter" + kind.charAt(0).toUpperCase() + kind.slice(1) + "Json").value; }
+  document.querySelectorAll("[data-pack-copy]").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      var text = packText(button.dataset.packCopy);
+      try { await navigator.clipboard.writeText(text); button.textContent = "Copied"; setTimeout(function () { button.textContent = button.dataset.packCopy === "bundle" ? "Copy full pack" : "Copy " + (button.dataset.packCopy === "hedge" ? "Hedge Bot" : "Liquidation Bot"); }, 1600); }
+      catch (e) { var box = document.getElementById("starter" + button.dataset.packCopy.charAt(0).toUpperCase() + button.dataset.packCopy.slice(1) + "Json"); box.focus(); box.select(); }
+    });
+  });
+  document.querySelectorAll("[data-pack-download]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var kind = button.dataset.packDownload, url = URL.createObjectURL(new Blob([packText(kind)], { type: "application/json" }));
+      var link = document.createElement("a"); link.href = url; link.download = packNames[kind]; document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    });
+  });
 
   async function boot() {
     var r = await api("/api/customer/state");

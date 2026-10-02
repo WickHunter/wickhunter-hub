@@ -36,6 +36,9 @@ export class MarketingSettings {
     this.lists.clear(); next.listIds.forEach(id => this.lists.add(id));
   }
   async status() { return { ...await this.brevo.status(), listIds: [...this.config.listIds], webhookConfigured: Boolean(this.config.webhookBearerSecret) }; }
+  /** Server-internal credential callback for the billing contact sync. */
+  getApiKeyForSync(): string | null { return this.config.apiKey; }
+  getListIdsForSync(): number[] { return [...this.config.listIds]; }
   async configure(input: Record<string, unknown>) {
     const next = { ...this.config };
     for (const name of ['apiKey', 'webhookBearerSecret'] as const) {

@@ -511,6 +511,12 @@ function valuesFrom(config: MarketplaceInputsConfig): { readonly filename: strin
 
 export function marketplaceInputSnapshot(config: MarketplaceInputsConfig): MarketplaceInputSnapshot {
   const { values } = valuesFrom(config);
+  return marketplaceInputSnapshotFromValues(values);
+}
+
+/** Build the same masked view from values already hydrated by the privileged
+ * helper. Snapshot requests must not create or rewrite its private state file. */
+export function marketplaceInputSnapshotFromValues(values: ReadonlyMap<string, string>): MarketplaceInputSnapshot {
   const fields = MARKETPLACE_INPUT_DEFINITIONS.map((definition): MarketplaceInputRow => {
     const value = values.get(definition.name);
     let validValue: string | undefined;

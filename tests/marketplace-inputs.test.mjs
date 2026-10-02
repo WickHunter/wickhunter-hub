@@ -15,6 +15,7 @@ import {
   MARKETPLACE_ROLE_INPUT_NAMES,
   MarketplaceInputError,
   marketplaceInputSnapshot,
+  marketplaceInputSnapshotFromValues,
   readMarketplaceInputSnapshot,
 } from "../dist/src/marketplace-inputs.js";
 
@@ -370,6 +371,16 @@ await test("existing malformed values are invalid and never echoed as configured
   assert.equal(JSON.stringify(snapshot).includes("tiny"), false);
 });
 
+await test("a privileged snapshot can be built from hydrated values without an environment-file write", () => {
+  const snapshot = marketplaceInputSnapshotFromValues(new Map([
+    ["MARKETPLACE_HTTP_PORT", "8100"],
+    ["MARKETPLACE_DATABASE_URL", "postgres://user:private-pass@localhost:5432/marketplace"],
+  ]));
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_HTTP_PORT").safeValue, "8100");
+  assert.equal(snapshot.fields.find((field) => field.name === "MARKETPLACE_DATABASE_URL").state, "configured");
+  assert.equal(JSON.stringify(snapshot).includes("private-pass"), false);
+});
+
 await test("the unprivileged client sends bounded stdin to one fixed helper and validates masked replies", async () => {
   const direct = config("marketplace-helper-snapshot");
   const snapshot = marketplaceInputSnapshot(direct.cfg);
@@ -538,7 +549,7 @@ await test("desktop/mobile admin workflow shows only vendor inputs and keeps tec
   assert.match(html, /Advanced technical diagnostics/);
   assert.match(html, /field\.setup === "operator"/);
   assert.match(html, /Bybit Demo account creation/);
-  assert.match(html, /MoonPay is deferred and its credentials are neither requested nor stored/);
+  assert.match(html, /Internal services and payment settings are managed by deployment/);
   assert.doesNotMatch(html, /MoonPay crypto payments \(optional — mocked for now\)/);
   assert.doesNotMatch(html, /data-moonpay-recipient-part/);
   assert.match(html, /Enable Marketplace for this licence only/);
@@ -576,6 +587,10 @@ await test("the public Hub is unprivileged and can invoke only the fixed root he
   assert.match(installer, /for private_file in "\$MARKETPLACE_STATE_ENV_FILE" "\$MARKETPLACE_BRIDGE_ENV_FILE"/);
   assert.match(installer, /chmod 600 "\$private_file"/);
   const helper = fs.readFileSync(new URL("../bin/root-helper.ts", import.meta.url), "utf8");
+  assert.match(helper, /function seedState\(persist = true\): Map<string, string>/);
+  assert.match(helper, /if \(persist && \(stateBytes === null \|\| !stateBytes\.equals\(next\)\)\) atomic\(STATE_ENV, next, null, 0o600\)/);
+  assert.match(helper, /const seededValues = seedState\(row\.action !== "snapshot"\)/);
+  assert.match(helper, /marketplaceInputSnapshotFromValues\(seededValues\)/);
   assert.match(helper, /demo-vault-import-cli\.js/);
   assert.match(helper, /const LEGACY_ENV = "\/etc\/liqhunter\/marketplace\.env"/);
   assert.match(helper, /const LEGACY_VAULT = "\/var\/lib\/liqhunter\/marketplace\/demo-credentials\.vault"/);

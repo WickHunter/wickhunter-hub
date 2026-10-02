@@ -257,6 +257,24 @@ await test("GET /api/customer/state: 401 with no session, 200 with one; a lapsed
   clock = before;
 });
 
+await test('starter pack appears only in the signed-in eligible customer state', async () => {
+  const rec = h.hub.billing.store.getCustomer(ada.key);
+  rec.starterPackGrantedAtMs = Date.parse('2026-10-01T12:00:00Z');
+  rec.launchManaged = true;
+  h.hub.billing.store.putCustomer(rec);
+  assert.equal((await fetch(`${h.origin}/api/customer/state`)).status, 401);
+  const response = await fetch(`${h.origin}/api/customer/state`, { headers: { cookie: adaCookie } });
+  const state = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(state.starterPack.bundle).bots.length, 2);
+  assert.equal(JSON.parse(state.starterPack.liquidation).bots[0].config.entry.entrySizeUsd, 1);
+  delete rec.starterPackGrantedAtMs;
+  delete rec.launchManaged;
+  h.hub.billing.store.putCustomer(rec);
+  const ordinary = await (await fetch(`${h.origin}/api/customer/state`, { headers: { cookie: adaCookie } })).json();
+  assert.equal(ordinary.starterPack, null);
+});
+
 await test("test/live never mix in one identity's view: two records, two rows, never blended", async () => {
   const email = "both-modes@example.com";
   const live = makeCustomer({ email, livemode: true, planKey: "unleashed-yearly", createdAtMs: clock - 5000 });

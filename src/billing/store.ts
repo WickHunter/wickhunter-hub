@@ -80,6 +80,8 @@ export interface CustomerRecord {
   cancelAtPeriodEnd?: boolean;
   lifetimeAccess?: boolean;
   launchManaged?: boolean;
+  /** Signed first launch checkout completion, durable across webhook retries. */
+  starterPackGrantedAtMs?: number;
 }
 
 export type TokenKind = "page" | "install";
@@ -177,6 +179,8 @@ export interface CheckoutSessionRecord {
   paymentIntentId?: string;
   launchIntentId?: string;
   paidAtMs?: number;
+  /** Verified first-purchase qualification, persisted before issuing a license. */
+  starterPackGrantAtMs?: number;
 }
 
 export const roleSubscriptionKey = (customerKey: string, role: BillingRole): string => `${customerKey}::${role}`;
@@ -239,6 +243,7 @@ export class BillingStore {
       (rec.paymentIntentId !== undefined && typeof rec.paymentIntentId !== "string") ||
       (rec.launchIntentId !== undefined && !/^[a-f0-9]{64}$/.test(rec.launchIntentId)) ||
       (rec.paidAtMs !== undefined && (!Number.isSafeInteger(rec.paidAtMs) || rec.paidAtMs <= 0)) ||
+      (rec.starterPackGrantAtMs !== undefined && (!Number.isSafeInteger(rec.starterPackGrantAtMs) || rec.starterPackGrantAtMs <= 0 || !rec.newCustomer || !rec.launchIntentId)) ||
       (rec.status === "applied" && !rec.licenseId)
     ) throw new Error(`corrupt checkout-session marker for ${sessionId}`);
     return rec as CheckoutSessionRecord;
@@ -287,6 +292,7 @@ export class BillingStore {
       paymentIntentId: input.paymentIntentId,
       launchIntentId: input.launchIntentId,
       paidAtMs: input.paidAtMs,
+      starterPackGrantAtMs: input.starterPackGrantAtMs,
     };
     writeJsonAtomic(this.checkoutSessionPath(input.sessionId), record);
     return { created: true, record };

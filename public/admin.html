@@ -551,6 +551,7 @@
   <summary>Marketing email · Brevo <small>Connect a consent-based audience and unsubscribe callback.</small></summary>
   <p class="muted">Connection and consent-based audience setup. Keys are write-only. Connection check reads account status; it does not send a message.</p>
   <p id="marketingBrevoStatus" class="muted" role="status">Checking Brevo configuration…</p>
+  <p id="marketingCustomerSyncStatus" class="muted" role="status">Customer details sync to existing Brevo contacts automatically. Signup bonuses arrive in the account welcome email.</p>
   <form id="marketingBrevoForm" style="display:block">
     <label for="marketingBrevoKey">Brevo API key</label>
     <input id="marketingBrevoKey" type="password" autocomplete="new-password" placeholder="Paste a new key; saved value is never shown" style="width:min(100%,38rem);margin:.35rem 0">
@@ -611,7 +612,7 @@
 </details>
 <details class="admin-advanced setup-section"><summary>Marketplace connection <small>Supply the master account details used for Demo providers.</small></summary>
 <h2 style="margin:1.2rem 0 .2rem">Marketplace setup</h2>
-<p class="muted" style="margin:.2rem 0">Enter the two Bybit master values used to create isolated Demo accounts. The Hub fills localhost settings, PostgreSQL mode, signing keys, credentials, vault, worker timing, build facts and safe defaults automatically. Subscriptions remain in explicit mock mode; MoonPay is deferred and its credentials are neither requested nor stored. Configured secrets are never shown again.</p>
+<p class="muted" style="margin:.2rem 0">Connect the Bybit master account used for Marketplace Demo accounts. Internal services and payment settings are managed by deployment. Saved secrets stay private.</p>
 <form id="mktConfigForm" style="display:block">
   <div id="mktConfigFields" class="configgroups"><div class="opscard muted">Loading masked configuration fields…</div></div>
   <div id="mktManagedSummary" class="muted" style="margin-top:.7rem"></div>
@@ -1531,18 +1532,26 @@ function mktRenderConfig(config) {
       : "Vendor information is saved. Readiness still depends on live service checks.";
 }
 
+let mktConfigLoaded = false;
 async function mktConfigRefresh() {
   const wrap = document.getElementById("mktConfigFields");
+  const save = document.querySelector('#mktConfigForm button[type="submit"]');
+  mktConfigLoaded = false; save.disabled = true;
   try {
     const data = await api("/admin/api/marketplace-config");
     mktRenderConfig(data.config);
+    mktConfigLoaded = true; save.disabled = false;
   } catch (e) {
-    if (e.message !== "unauthorized") wrap.innerHTML = '<div class="opscard ops-bad">' + esc(e.message) + '</div>';
+    if (e.message !== "unauthorized") {
+      wrap.innerHTML = '<div class="opscard ops-bad">Marketplace settings could not be loaded. Refresh Setup to try again.</div>';
+      document.getElementById("mktConfigNote").textContent = e.message;
+    }
   }
 }
 
 document.getElementById("mktConfigForm").onsubmit = async (ev) => {
   ev.preventDefault();
+  if (!mktConfigLoaded) { document.getElementById("mktConfigNote").textContent = "Load Marketplace settings before saving."; return; }
   const changes = {};
   for (const input of document.querySelectorAll("#mktConfigFields [data-marketplace-name]")) {
     const name = input.dataset.marketplaceName;
@@ -2903,6 +2912,14 @@ function renderBrevoSettings(data, savedRevision) {
     (!data.configured ? "Not connected — add your Brevo API key." : data.lastTestOk === true ? "Connected to Brevo." : data.lastTestOk === false ? (data.lastTestMessage || "Brevo connection failed.") : "API key saved — check the connection.") + " " +
     (data.webhookConfigured ? "Unsubscribe protection connected." : "Unsubscribe callback needs setup.") + " " +
     (data.listIds.length ? data.listIds.length + " audience list(s) connected." : "Choose an audience list to finish setup.");
+  if (Object.hasOwn(data, "customerSync")) {
+    const sync = data.customerSync;
+    document.getElementById("marketingCustomerSyncStatus").textContent = !data.configured
+      ? "Connect Brevo to sync customer details."
+      : !sync ? "Customer sync starts automatically after Hub connects."
+      : sync.failed ? "Some customer updates are waiting to retry. Existing unsubscribe choices are preserved."
+      : "Customer sync running · last checked " + new Date(sync.checkedAtMs).toLocaleTimeString() + ". Signup bonuses arrive in the account welcome email.";
+  }
   // A status refresh must never erase a pasted key or unsaved audience edits.
   // Only the response for the exact saved revision can clear submitted secrets.
   brevoSavedLists = data.listIds.join(",");

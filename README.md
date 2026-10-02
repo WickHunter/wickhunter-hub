@@ -1,6 +1,8 @@
-## v0.4.75 — Clear customer billing activity
+## v0.4.75 — Signup starter pack and customer sync
 
-Live customer billing events remain visible. Rejected unsigned requests and test-mode records are grouped under expandable webhook diagnostics with plain-language labels.
+Qualifying launch signups receive the Liquidation Bot and Hedge Bot starter pack on their private welcome and account pages, with copy, download and import instructions. Grants survive webhook retries and use the signed signup time. Hub updates customer plan, subscription and starter-pack attributes on existing Brevo contacts every minute without adding subscribers or changing opt-outs.
+
+Marketplace setup recognizes and preserves deployment-managed Stripe settings without exposing their values. Live customer billing events remain visible. Rejected unsigned requests and test-mode records are grouped under expandable webhook diagnostics with plain-language labels.
 
 ## v0.4.74 — A simpler operator Hub
 

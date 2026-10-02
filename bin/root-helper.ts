@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import {
   applyMarketplaceInputUpdate,
   marketplaceInputSnapshot,
+  marketplaceInputSnapshotFromValues,
   MARKETPLACE_INPUT_DEFINITIONS,
   MARKETPLACE_RESTART_UNITS,
   MARKETPLACE_ROLE_INPUT_NAMES,
@@ -21,6 +22,7 @@ import {
   type MarketplaceInputsConfig,
 } from "../src/marketplace-inputs.js";
 import { readFlags } from "../src/flags.js";
+import { MARKETPLACE_DEPLOYMENT_FIELDS, preservedDeploymentEnv } from "../src/marketplace-deployment-env.js";
 
 const HUB_DIR = "/opt/wickhunter-hub";
 const APP_DIR = "/opt/liqhunter";
@@ -232,7 +234,7 @@ function masterFromStoredSources(): { apiKey: string; apiSecret: string } | null
   return masterPair(exactValues(STATE_ENV, KNOWN)) ?? masterPair(legacyValues());
 }
 
-function seedState(): void {
+function seedState(persist = true): Map<string, string> {
   const stateBytes = safeFile(STATE_ENV);
   const values = new Map<string, string>();
   // A pre-v0.89.45 monolithic file may be the only source on the first
@@ -248,8 +250,8 @@ function seedState(): void {
   const deployment = new Set(MARKETPLACE_INPUT_DEFINITIONS
     .filter((field) => field.setup === "deployment").map((field) => field.name));
   const roleSources = [
-    [COMMON_ENV, new Set([...COMMON, "MARKETPLACE_INTENT_PUBLIC_KEY"])],
-    [API_ENV, new Set([...API, "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256"])],
+    [COMMON_ENV, new Set([...COMMON, "MARKETPLACE_INTENT_PUBLIC_KEY", ...MARKETPLACE_DEPLOYMENT_FIELDS.common])],
+    [API_ENV, new Set([...API, "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256", ...MARKETPLACE_DEPLOYMENT_FIELDS.api])],
     [WORKER_ENV, WORKER],
     [BRIDGE_ENV, BRIDGE],
   ] as const;
@@ -266,7 +268,8 @@ function seedState(): void {
     values.set("MARKETPLACE_DEMO_MASTER_API_SECRET", MASTER_SECRET_MARKER);
   }
   const next = serialized(values);
-  if (stateBytes === null || !stateBytes.equals(next)) atomic(STATE_ENV, next, null, 0o600);
+  if (persist && (stateBytes === null || !stateBytes.equals(next))) atomic(STATE_ENV, next, null, 0o600);
+  return values;
 }
 
 function publicKey(seedB64u: string): string {
@@ -289,8 +292,12 @@ function distribute(): void {
   if (workerCredential !== undefined) {
     api.set("MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256", createHash("sha256").update(workerCredential).digest("hex"));
   }
-  const commonNames = new Set([...COMMON, "MARKETPLACE_INTENT_PUBLIC_KEY"]);
-  const apiNames = new Set([...API, "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256"]);
+  const commonNames = new Set([...COMMON, "MARKETPLACE_INTENT_PUBLIC_KEY", ...MARKETPLACE_DEPLOYMENT_FIELDS.common]);
+  const apiNames = new Set([...API, "MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256", ...MARKETPLACE_DEPLOYMENT_FIELDS.api]);
+  // Read before replacing either role; a Hub settings save must not erase
+  // commerce credentials installed by a newer Marketplace deployment.
+  const commonDeployment = preservedDeploymentEnv("common", exactValues(COMMON_ENV, commonNames));
+  const apiDeployment = preservedDeploymentEnv("api", exactValues(API_ENV, apiNames));
   // Derived names are intentionally serialized after the public schema order.
   let commonBytes = serialized(common, commonNames);
   if (common.has("MARKETPLACE_INTENT_PUBLIC_KEY")) {
@@ -300,8 +307,8 @@ function distribute(): void {
   if (api.has("MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256")) {
     apiBytes = Buffer.concat([apiBytes, Buffer.from(`MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256=${quote(api.get("MARKETPLACE_DEMO_WORKER_CREDENTIAL_SHA256")!)}\n`)]);
   }
-  atomic(COMMON_ENV, commonBytes, "liqhunter-marketplace-common", 0o640);
-  atomic(API_ENV, apiBytes, "liqhunter-marketplace-api", 0o640);
+  atomic(COMMON_ENV, Buffer.concat([commonBytes, commonDeployment]), "liqhunter-marketplace-common", 0o640);
+  atomic(API_ENV, Buffer.concat([apiBytes, apiDeployment]), "liqhunter-marketplace-api", 0o640);
   atomic(WORKER_ENV, serialized(worker, WORKER), "liqhunter-marketplace-worker", 0o640);
   atomic(MIGRATE_ENV, Buffer.from("# Reserved for the dedicated migrator role.\n"), "liqhunter-marketplace-migrate", 0o640);
 }
@@ -448,11 +455,11 @@ async function main(): Promise<void> {
   // Capture a pre-split master only for an apply transaction. Snapshot remains
   // non-mutating with respect to the worker vault and never returns the value.
   const storedMaster = row.action === "apply" ? masterFromStoredSources() : null;
-  seedState();
+  const seededValues = seedState(row.action !== "snapshot");
   const cfg = directConfig();
   if (row.action === "snapshot") {
     if (Object.keys(row).some((name) => name !== "action")) refuse();
-    process.stdout.write(JSON.stringify({ ok: true, config: marketplaceInputSnapshot(cfg) }));
+    process.stdout.write(JSON.stringify({ ok: true, config: marketplaceInputSnapshotFromValues(seededValues) }));
     return;
   }
   if (Object.keys(row).some((name) => name !== "action" && name !== "update")

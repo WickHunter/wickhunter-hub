@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { JSDOM } from 'jsdom';
 import { freshStore, test, summary } from './helpers.mjs';
 import { BillingService } from '../dist/src/billing/service.js';
 import { LaunchBilling, LAUNCH_FIRST_PAYMENT_MS, LAUNCH_REDEEM_UNTIL_MS, LAUNCH_YEARLY_END_MS, launchGrant } from '../dist/src/billing/launch.js';
@@ -83,6 +84,15 @@ await test('authenticated app checkout retains license; free period binds to fix
   assert.equal(result.outcome, 'applied');
   const customer = billing.store.findByLicense(license.payload.id);
   assert(customer); assert.equal(customer.firstPaymentAtMs, LAUNCH_FIRST_PAYMENT_MS);
+  assert.equal(customer.starterPackGrantedAtMs, clock, 'the verified free-trial checkout grants the pack immediately');
+  const pageToken = billing.store.mint('page', customer.licenseId, customer.key, clock);
+  const welcome = billing.welcomePage(pageToken, true);
+  assert.equal(welcome.ok, true);
+  assert.match(welcome.html, /Liquidation Bot \+ Hedge Bot starter pack/);
+  assert.match(welcome.html, /Copy full pack/);
+  assert.match(welcome.html, /Download Hedge Bot/);
+  const page = new JSDOM(welcome.html).window.document;
+  assert.deepEqual(JSON.parse(page.querySelector('#starterBundleJson').value).bots.map(b => b.type), ['bot1', 'bot3']);
   assert.equal(customer.firstActualPaymentAtMs ?? null, null);
   assert.equal(store.list().length, 1);
   assert.equal((await launch.checkout(request)).ok, true);
@@ -100,6 +110,49 @@ await test('the first real paid invoice starts the refund clock after a free car
     lines: { data: [{ period: { end: LAUNCH_FIRST_PAYMENT_MS / 1000 + 30 * 86400 }, price: { id: 'price_monthly', product: 'prod_software' } }] } };
   await billing.applyEvent(event('invoice.paid', invoice));
   assert.equal(billing.store.getCustomer(session.customer).firstActualPaymentAtMs, LAUNCH_FIRST_PAYMENT_MS);
+});
+await test('an invoice-first signup grants the pack before its Checkout webhook arrives', async () => {
+  await launch.checkout(input());
+  const params = checkoutCalls().at(-1).params, meta = metadata(params);
+  const customer = 'cus_invoice_first_pack', subscription = 'sub_invoice_first_pack';
+  const invoice = { id: 'in_invoice_first_pack', customer, paid: true, amount_paid: 0, billing_reason: 'subscription_create',
+    parent: { subscription_details: { subscription, metadata: meta } },
+    lines: { data: [{ period: { end: LAUNCH_FIRST_PAYMENT_MS / 1000 }, price: { id: 'price_monthly', product: 'prod_software' } }] } };
+  assert.equal((await billing.applyEvent(event('invoice.paid', invoice))).outcome, 'applied');
+  assert.equal(billing.store.getCustomer(customer).starterPackGrantedAtMs, clock);
+  const checkout = paidSession(meta, { customer, subscription, customer_details: { email: 'invoice-first-pack@example.test', name: 'Invoice First' } });
+  assert.equal((await billing.applyEvent(event('checkout.session.completed', checkout))).outcome, 'applied');
+  assert.equal(billing.store.getCustomer(customer).starterPackGrantedAtMs, clock);
+});
+await test('a first signup keeps its pack grant when the customer write succeeds but the webhook crashes', async () => {
+  await launch.checkout(input());
+  const meta = metadata(checkoutCalls().at(-1).params);
+  const customer = 'cus_pack_retry', subscription = 'sub_pack_retry';
+  const checkout = paidSession(meta, { customer, subscription, customer_details: { email: 'pack-retry@example.test', name: 'Retry' } });
+  const original = billing.store.putCustomer.bind(billing.store);
+  let interrupted = false;
+  billing.store.putCustomer = rec => {
+    original(rec);
+    if (!interrupted && rec.key === customer) { interrupted = true; throw Error('simulated crash after customer write'); }
+  };
+  try { await assert.rejects(billing.applyEvent(event('checkout.session.completed', checkout)), /simulated crash/); }
+  finally { billing.store.putCustomer = original; }
+  assert.equal(billing.store.getCustomer(customer).starterPackGrantedAtMs, clock, 'qualification must be in the first durable customer write');
+  assert.equal((await billing.applyEvent(event('checkout.session.completed', checkout))).outcome, 'applied');
+  assert.equal(billing.store.getCustomer(customer).starterPackGrantedAtMs, clock);
+});
+await test('a forged or unreconciled launch invoice cannot issue a license or starter pack', async () => {
+  const invoice = (customer, meta) => ({ id: `in_${customer}`, customer, paid: true, amount_paid: 0, billing_reason: 'subscription_create',
+    parent: { subscription_details: { subscription: `sub_${customer}`, metadata: meta } },
+    lines: { data: [{ period: { end: LAUNCH_FIRST_PAYMENT_MS / 1000 }, price: { id: 'price_monthly', product: 'prod_software' } }] } });
+  const forged = 'cus_forged_launch_invoice';
+  await assert.rejects(billing.applyEvent(event('invoice.paid', invoice(forged, { wh_launch_intent: 'f'.repeat(64), plan: 'monthly' }))), /persisted checkout/);
+  assert.equal(billing.store.getCustomer(forged), null);
+  const req = input(); loseResponse = true;
+  await assert.rejects(launch.checkout(req), /lost response/);
+  const unreconciled = 'cus_unreconciled_launch_invoice', meta = metadata(checkoutCalls().at(-1).params);
+  await assert.rejects(billing.applyEvent(event('invoice.paid', invoice(unreconciled, meta))), /session reconciliation/);
+  assert.equal(billing.store.getCustomer(unreconciled), null);
 });
 await test('forged license proof, hosting plan and monthly crypto cannot create sessions', async () => {
   const n = checkoutCalls().length;
@@ -225,10 +278,33 @@ await test('prelaunch crypto yearly is paid once, grants Oct15 2027 only after s
   assert.equal((await billing.applyEvent(event('checkout.session.async_payment_succeeded', paid))).outcome, 'applied');
   const customer = billing.store.getCustomer(session.customer), exp = store.get(customer.licenseId).exp;
   assert.equal(exp, LAUNCH_YEARLY_END_MS); assert.equal(customer.nonRenewing, true);
+  assert.equal(customer.starterPackGrantedAtMs, clock, 'settled crypto purchase grants the pack');
   assert.equal(customer.discountPercent, 25, 'signed Stripe Checkout totals record the private crypto discount');
   assert.equal(customer.firstActualPaymentAtMs, clock);
   assert.equal((await billing.applyEvent(event('checkout.session.completed', paid))).outcome, 'duplicate');
   assert.equal(store.get(customer.licenseId).exp, exp);
+});
+await test('a settled one-time signup keeps its pack grant across a crash and payment retry', async () => {
+  await launch.checkout(input({ plan: 'yearly', payment: 'crypto' }));
+  const params = checkoutCalls().at(-1).params, meta = metadata(params);
+  const session = paidSession(meta, { mode: 'payment', payment_status: 'paid', subscription: null,
+    customer: 'cus_pack_payment_retry', customer_details: { email: 'pack-payment-retry@example.test', name: 'Retry' } });
+  const original = billing.store.putCustomer.bind(billing.store);
+  let interrupted = false;
+  billing.store.putCustomer = rec => {
+    original(rec);
+    if (!interrupted && rec.key === session.customer) { interrupted = true; throw Error('simulated crash after payment customer write'); }
+  };
+  try { await assert.rejects(billing.applyEvent(event('checkout.session.async_payment_succeeded', session)), /simulated crash/); }
+  finally { billing.store.putCustomer = original; }
+  const marker = billing.store.getCheckoutSession(session.id);
+  assert.equal(marker.status, 'pending');
+  assert.equal(marker.newCustomer, true);
+  assert.equal(marker.starterPackGrantAtMs, clock);
+  assert.equal(billing.store.getCustomer(session.customer).starterPackGrantedAtMs, clock);
+  await billing.applyEvent(event('checkout.session.async_payment_succeeded', session));
+  assert.equal(billing.store.getCheckoutSession(session.id).status, 'applied');
+  assert.equal(billing.store.getCustomer(session.customer).starterPackGrantedAtMs, clock);
 });
 await test('launch dates come from a mode-bound durable intent, not arbitrary webhook metadata', () => {
   assert.throws(() => launchGrant(dataDir, { wh_launch_intent: 'a'.repeat(64), plan: 'yearly' }, true), /persisted checkout/);
