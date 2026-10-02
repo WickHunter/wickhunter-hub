@@ -1850,6 +1850,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.75 — Deliver verified launch signup starter packs, sync customer attributes to existing Brevo audience contacts, preserve Marketplace deployment settings, and separate webhook diagnostics from customer billing activity.
+
 - v0.4.74: Reorganize Hub around daily tasks and one Setup page; repair Brevo connection feedback, unsaved-input handling and marketing opt-out event names.
 - v0.4.73: Keep private promotion codes out of public prices and support; retain launch trial timing and record actual checkout discounts.
 
