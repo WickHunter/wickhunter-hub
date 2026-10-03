@@ -123,7 +123,9 @@ export class EarnService {
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
       paidCents: -entries.filter(e=>e.kind==='payout' || (e.kind==='reversal' && s.entries.find(o=>o.id===e.reverses)?.kind==='payout')).reduce((a,e)=>a+e.cents,0) || 0,
-      entries:entries.slice().reverse(), months:s.months.flatMap(mo=>mo.rows.filter(r=>r.owner===owner).map(r=>({...r,period:mo.period}))) };
+      entries:entries.slice().reverse(), months:s.months.flatMap(mo=>mo.rows.filter(r=>r.owner===owner).map(r=>({
+        ...r, period:mo.period, earnedCents:r.qualified?r.rebateCents:0,
+      }))) };
   }
   addUid(owner: string, input: Record<string,unknown>) {
     if(input.accountType !== 'main')throw new Error('Only main account UIDs are accepted; subaccounts are not eligible');
@@ -132,7 +134,17 @@ export class EarnService {
     const s=this.read(), m=s.members.find(m=>m.id===owner);if(!m)throw new Error('Member not found');
     // Submission is a claim, not proof. Do not disclose another member's
     // ownership or let an unverified claim block its actual owner.
-    if(m.uids.some(u=>u.exchange===exchange))throw new Error('A main account UID is already registered for this exchange; contact support to correct it');
+    const current=m.uids.find(u=>u.exchange===exchange);
+    if(input.expectedUid!==undefined) {
+      const expectedUid=text(input.expectedUid,80);
+      if(!current || current.uid!==expectedUid)throw new Error('UID changed since you opened this page; refresh and review it before saving');
+      if(current.uid===uid)return;
+      const before=structuredClone(m);
+      current.uid=uid;current.verified=false;current.submittedAt=this.date();
+      (s.audit??=[]).push({at:this.date(),actor:'member',owner:m.id,before,after:structuredClone(m)});
+      this.save(s);return;
+    }
+    if(current)throw new Error('A main account UID is already registered for this exchange; refresh before editing it');
     m.uids.push({exchange,uid,verified:false,submittedAt:this.date()});this.save(s);
   }
   configure(input: Record<string,unknown>) {

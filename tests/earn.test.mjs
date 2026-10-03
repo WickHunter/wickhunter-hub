@@ -2,6 +2,7 @@ import { setFlag } from "../dist/src/flags.js";
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { JSDOM } from 'jsdom';
 import { EarnService, EXCHANGES, tierPercent, csvRows, usdCents } from '../dist/src/earn.js';
 import { tmpDir, test, summary, freshHub } from './helpers.mjs';
 const dir=tmpDir('earn'), now=()=>Date.parse('2026-09-17T12:00:00Z'), svc=new EarnService(dir,now);
@@ -43,6 +44,52 @@ await test('monthly minimum aggregates exchanges but does not roll forward',()=>
  assert.equal(svc.view('alice','Alice').balances.exchange,3000);
  assert.throws(()=>svc.previewCsv({period:'2026-09',csv}),/completed months/);
 });
+await test('UID replacement re-verifies future imports without changing finalized earnings',()=>{
+ const isolated=tmpDir('earn-uid-replacement');let clock=Date.parse('2026-09-17T12:00:00Z');
+ const book=new EarnService(isolated,()=>clock);
+ try {
+  book.member('owner','Owner');book.member('other','Other');
+  book.addUid('owner',{exchange:'bitunix',uid:'1223',accountType:'main'});
+  book.configure({owner:'owner',exchange:'bitunix',uid:'1223',verified:true});
+  const importMonth=(period,uid,amount)=>{
+   const csv=`exchange,uid,commission_usd\nbitunix,${uid},${amount}`;
+   const preview=book.previewCsv({period,csv});book.importCsv({period,csv,digest:preview.digest});return preview;
+  };
+  importMonth('2026-06','1223','100.00');importMonth('2026-07','1223','10.00');
+  const before=book.view('owner','Owner');
+  assert.deepEqual(before.months.map(m=>[m.period,m.commissionCents,m.rebateCents,m.earnedCents,m.qualified]),[
+   ['2026-06',10000,5000,5000,true],['2026-07',1000,500,0,false],
+  ]);
+  assert.equal(before.balances.exchange,5000);
+  const staleCsv='exchange,uid,commission_usd\nbitunix,1223,30.00';
+  const stalePreview=book.previewCsv({period:'2026-08',csv:staleCsv});
+  clock+=60_000;
+  book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'1223',accountType:'main'});
+  const replaced=book.view('owner','Owner');
+  assert.deepEqual(replaced.months,before.months);
+  assert.equal(replaced.balances.exchange,5000);
+  assert.deepEqual(replaced.member.uids.map(u=>[u.exchange,u.uid,u.verified]),[['bitunix','5678',false]]);
+  assert.equal(book.admin().audit.at(-1).actor,'member');
+  assert.equal(book.admin().audit.at(-1).before.uids[0].uid,'1223');
+  assert.equal(book.admin().audit.at(-1).after.uids[0].uid,'5678');
+  assert.throws(()=>book.importCsv({period:'2026-08',csv:staleCsv,digest:stalePreview.digest}),/not verified/);
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'9999',expectedUid:'1223',accountType:'main'}),/changed since/);
+  assert.throws(()=>book.configure({owner:'owner',exchange:'bitunix',uid:'1223',verified:true}),/UID not found/);
+  assert.throws(()=>book.previewCsv({period:'2026-08',csv:'exchange,uid,commission_usd\nbitunix,5678,100.00'}),/not verified/);
+  const auditCount=book.admin().audit.length;
+  book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'5678',accountType:'main'});
+  assert.equal(book.admin().audit.length,auditCount,'same-value retry does not revoke verification or create another audit');
+  book.addUid('other',{exchange:'bitunix',uid:'5678',accountType:'main'});
+  book.configure({owner:'other',exchange:'bitunix',uid:'5678',verified:true});
+  assert.throws(()=>book.configure({owner:'owner',exchange:'bitunix',uid:'5678',verified:true}),/already verified/);
+  book.configure({owner:'other',exchange:'bitunix',uid:'5678',verified:false});
+  book.configure({owner:'owner',exchange:'bitunix',uid:'5678',verified:true});
+  importMonth('2026-08','5678','30.00');
+  const after=new EarnService(isolated,()=>clock).view('owner','Owner');
+  assert.equal(after.balances.exchange,6500);
+  assert.deepEqual(after.months.slice(0,2),before.months);
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
+});
 await test('custom rates snapshot; changed preview rejected',()=>{
  const p=svc.previewCsv({period:'2026-05',csv});svc.configure({owner:'alice',rebatePercent:60,discountPercent:15,commissionPercent:35});
  assert.throws(()=>svc.importCsv({period:'2026-05',csv,digest:p.digest}),/Preview changed/);
@@ -63,6 +110,30 @@ await test('provider earnings are separate; malformed amounts and dates rejected
  assert.throws(()=>svc.record({...payout,reference:'bad',cents:0.1}),/integer/);
 });
 await test('customer and admin browser scripts parse',()=>{for(const file of ['earn.html','admin.html','customer.html']){const html=fs.readFileSync(new URL('../public/'+file,import.meta.url),'utf8');for(const m of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new vm.Script(m[1]);}});
+await test('Earn page labels editable main UID and shows credited rather than calculated rebate',()=>{
+ const html=fs.readFileSync(new URL('../public/earn.html',import.meta.url),'utf8');
+ const dom=new JSDOM(html,{url:'https://example.test/earn',runScripts:'dangerously',beforeParse(window){
+  window.WH_EARN_PREVIEW={member:{id:'owner',code:'WHCODE',uids:[{exchange:'bitunix',uid:'1223',verified:false}],rebatePercent:50},
+   balances:{referral:0,exchange:5000,marketplace:0},paidCents:0,activeSubscribers:0,commissionPercent:20,
+   exchanges:EXCHANGES,bybitHelp:'https://example.test/help',entries:[],months:[
+    {period:'2026-06',commissionCents:10000,rebateCents:5000,earnedCents:5000,qualified:true,rate:50},
+    {period:'2026-07',commissionCents:1000,rebateCents:500,earnedCents:0,qualified:false,rate:50},
+   ]};
+ }});
+ try {
+  const page=dom.window.document;
+  const bitunix=[...page.querySelectorAll('.exchange')].find(card=>card.querySelector('h3')?.textContent==='Bitunix');
+  assert.ok(bitunix);
+  assert.equal(bitunix.querySelector('.uid label').textContent.trim(),'UID (Main account)');
+  assert.equal(bitunix.querySelector('.uid input').value,'1223');
+  assert.match(bitunix.textContent,/Pending verification/);
+  const rows=[...page.querySelectorAll('#months tbody tr')];
+  assert.equal(rows.length,2);
+  assert.equal(rows[0].children[2].textContent,'$50.00');
+  assert.equal(rows[1].children[2].textContent,'$0.00');
+  assert.match(rows[1].children[3].textContent,/\$5.00 calculated/);
+ } finally {dom.window.close();}
+});
 const h=await freshHub();try{
  await test('earn routes enforce license/admin and never trust body ownership',async()=>{
  const issued=h.store.issueUntil('Test member',Date.now()+86400000,'unleashed');
@@ -75,6 +146,13 @@ const h=await freshHub();try{
  const r=await fetch(h.origin+'/api/hub/earn',{headers});assert.equal(r.status,200);const member=(await r.json()).member;
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9001',accountType:'main'})})).status,200);
  const own=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(own.member.id,member.id);assert.equal(own.member.uids[0].uid,'9001');
+ assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9002',expectedUid:'9001',accountType:'main'})})).status,200);
+ const changed=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();
+ assert.equal(changed.member.id,member.id);assert.equal(changed.member.uids[0].uid,'9002');assert.equal(changed.member.uids[0].verified,false);
+ const stale=await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({exchange:'bybit',uid:'9003',expectedUid:'9001',accountType:'main'})});
+ assert.equal(stale.status,400);assert.match((await stale.json()).error,/changed since/);
+ assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers:{'content-type':'application/json','x-wh-earn':'1'},body:JSON.stringify({exchange:'bybit',uid:'9999',expectedUid:'9002',accountType:'main'})})).status,401);
+ assert.equal((await fetch(h.origin+'/api/hub/earn',{headers})).status,200);
  assert.equal((await fetch(h.origin+'/api/hub/earn/onboard',{method:'POST',headers,body:JSON.stringify({country:'US',email:'attacker@example.com'})})).status,403);
  assert.equal((await fetch(h.origin+'/admin/api/earn',{headers})).status,401);
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers:{...headers,'sec-fetch-site':'cross-site'},body:'{}'})).status,403);
