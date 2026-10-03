@@ -2371,7 +2371,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const m = req.method ?? "GET";
     const p = url.pathname;
 
-    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.admin(), stripe: earnStripe.admin() }, { "cache-control": "no-store" });
+    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.adminView(), stripe: earnStripe.admin() }, { "cache-control": "no-store" });
     if (p.startsWith("/admin/api/earn/") && m === "POST") {
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 1_100_000);

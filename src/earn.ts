@@ -72,6 +72,12 @@ export class EarnService {
     return m;
   }
   admin() { return this.read(); }
+  /** Admin responses expose the same read-only compatibility revision as the
+   * member view, without rewriting historical claims in the ledger. */
+  adminView() {
+    const state=this.read();
+    return {...state,members:state.members.map(m=>({...m,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))}))};
+  }
   /** Rename-on-save changes inode, including on filesystems with coarse mtimes.
    * A missing file is a distinct version and is still read on first use. */
   fileVersion(): string {
@@ -164,9 +170,13 @@ export class EarnService {
     if(input.commissionPercent!==undefined)m.commissionPercent=input.commissionPercent===null?null:percent(input.commissionPercent);
     if(input.rebatePercent!==undefined)m.rebatePercent=percent(input.rebatePercent);
     if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');
-      if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
-        throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
-      if(u.verified!==input.verified){u.verified=input.verified;u.revision=randomUUID();}}
+      if(u.verified!==input.verified){
+        if(typeof input.expectedRevision!=='string' || input.expectedRevision!==uidRevision(m.id,u))
+          throw new Error('UID claim changed since this admin view loaded; refresh and check current exchange evidence');
+        if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
+          throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
+        u.verified=input.verified;u.revision=randomUUID();
+      }}
     (s.audit??=[]).push({at:this.date(),actor:'hub-admin',owner:m.id,before,after:structuredClone(m)});
     this.save(s);
   }
