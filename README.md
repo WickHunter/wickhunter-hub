@@ -1,3 +1,7 @@
+## v0.4.78 — Verified Earn UIDs and clear monthly statements
+
+Members can update their main UID for an exchange. A changed UID needs a new Hub verification before it qualifies for future exchange rebates; claim revisions prevent stale member edits and admin approvals. The customer statement labels WH commission received and shows the amount actually credited, including $0 below the existing $15 combined monthly minimum. Finalized months, payout history and rebate rates are unchanged.
+
 ## v0.4.77 — Marketplace operations and recovery
 
 Show pending copier deliveries and halted Demo provisioning prominently. Provider decisions follow the permitted state transitions. Failed Alpha access changes restore and re-synchronize the previous setting, with an explicit warning if reconciliation fails. Root-helper settings are reconstructed from known fields before reaching the browser.
@@ -1860,6 +1864,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.78 — Re-verify edited Earn UIDs with claim-revision checks and show credited monthly exchange rebates clearly.
 - v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
 - v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.
 
