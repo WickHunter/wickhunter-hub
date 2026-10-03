@@ -63,8 +63,9 @@ await test('UID replacement re-verifies future imports without changing finalize
   assert.equal(before.balances.exchange,5000);
   const staleCsv='exchange,uid,commission_usd\nbitunix,1223,30.00';
   const stalePreview=book.previewCsv({period:'2026-08',csv:staleCsv});
+  const originalRevision=before.member.uids[0].revision;
   clock+=60_000;
-  book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'1223',accountType:'main'});
+  book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'1223',expectedRevision:originalRevision,accountType:'main'});
   const replaced=book.view('owner','Owner');
   assert.deepEqual(replaced.months,before.months);
   assert.equal(replaced.balances.exchange,5000);
@@ -73,7 +74,7 @@ await test('UID replacement re-verifies future imports without changing finalize
   assert.equal(book.admin().audit.at(-1).before.uids[0].uid,'1223');
   assert.equal(book.admin().audit.at(-1).after.uids[0].uid,'5678');
   assert.throws(()=>book.importCsv({period:'2026-08',csv:staleCsv,digest:stalePreview.digest}),/not verified/);
-  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'9999',expectedUid:'1223',accountType:'main'}),/changed since/);
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'9999',expectedUid:'1223',expectedRevision:originalRevision,accountType:'main'}),/changed since/);
   assert.throws(()=>book.configure({owner:'owner',exchange:'bitunix',uid:'1223',verified:true}),/UID not found/);
   assert.throws(()=>book.previewCsv({period:'2026-08',csv:'exchange,uid,commission_usd\nbitunix,5678,100.00'}),/not verified/);
   const auditCount=book.admin().audit.length;
@@ -88,6 +89,45 @@ await test('UID replacement re-verifies future imports without changing finalize
   const after=new EarnService(isolated,()=>clock).view('owner','Owner');
   assert.equal(after.balances.exchange,6500);
   assert.deepEqual(after.months.slice(0,2),before.months);
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
+});
+await test('opaque UID revision rejects stale A-to-B-to-A and re-verification races',()=>{
+ const isolated=tmpDir('earn-uid-revision');const book=new EarnService(isolated,now);
+ try {
+  book.member('owner','Owner');book.addUid('owner',{exchange:'bitunix',uid:'A123',accountType:'main'});
+  const first=book.view('owner','Owner').member.uids[0];
+  assert.equal(typeof first.revision,'string');
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'B123',expectedUid:'A123',accountType:'main'}),/refresh and review/);
+  book.addUid('owner',{exchange:'bitunix',uid:'B123',expectedUid:'A123',expectedRevision:first.revision,accountType:'main'});
+  const second=book.view('owner','Owner').member.uids[0];
+  book.addUid('owner',{exchange:'bitunix',uid:'A123',expectedUid:'B123',expectedRevision:second.revision,accountType:'main'});
+  const third=book.view('owner','Owner').member.uids[0];
+  assert.notEqual(third.revision,first.revision);
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'C123',expectedUid:'A123',expectedRevision:first.revision,accountType:'main'}),/refresh and review/);
+  book.configure({owner:'owner',exchange:'bitunix',uid:'A123',verified:true});
+  const verified=book.view('owner','Owner').member.uids[0];
+  assert.notEqual(verified.revision,third.revision);
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'C123',expectedUid:'A123',expectedRevision:third.revision,accountType:'main'}),/refresh and review/);
+  const auditCount=book.admin().audit.length;
+  book.addUid('owner',{exchange:'bitunix',uid:'A123',expectedUid:'A123',accountType:'main'});
+  assert.equal(book.view('owner','Owner').member.uids[0].verified,true);
+  assert.equal(book.admin().audit.length,auditCount);
+  book.addUid('owner',{exchange:'bitunix',uid:'C123',expectedUid:'A123',expectedRevision:verified.revision,accountType:'main'});
+  assert.equal(book.view('owner','Owner').member.uids[0].verified,false);
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
+});
+await test('legacy UID claim gets stable view revision without mutating stored history',()=>{
+ const isolated=tmpDir('earn-uid-legacy-revision');const book=new EarnService(isolated,now);
+ try {
+  book.member('owner','Owner');book.addUid('owner',{exchange:'bitunix',uid:'1223',accountType:'main'});
+  book.transaction(state=>{delete state.members[0].uids[0].revision;});
+  const prior=book.admin();
+  const token=book.view('owner','Owner').member.uids[0].revision;
+  assert.equal(token,book.view('owner','Owner').member.uids[0].revision);
+  assert.deepEqual(book.admin(),prior,'read-only view does not rewrite legacy Earn data');
+  assert.throws(()=>book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'1223',accountType:'main'}),/refresh and review/);
+  book.addUid('owner',{exchange:'bitunix',uid:'5678',expectedUid:'1223',expectedRevision:token,accountType:'main'});
+  assert.notEqual(book.view('owner','Owner').member.uids[0].revision,token);
  } finally {fs.rmSync(isolated,{recursive:true,force:true});}
 });
 await test('custom rates snapshot; changed preview rejected',()=>{
@@ -150,11 +190,15 @@ const h=await freshHub();try{
  const r=await fetch(h.origin+'/api/hub/earn',{headers});assert.equal(r.status,200);const member=(await r.json()).member;
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9001',accountType:'main'})})).status,200);
  const own=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(own.member.id,member.id);assert.equal(own.member.uids[0].uid,'9001');
- assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9002',expectedUid:'9001',accountType:'main'})})).status,200);
+ assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9002',expectedUid:'9001',expectedRevision:own.member.uids[0].revision,accountType:'main'})})).status,200);
  const changed=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();
  assert.equal(changed.member.id,member.id);assert.equal(changed.member.uids[0].uid,'9002');assert.equal(changed.member.uids[0].verified,false);
- const stale=await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({exchange:'bybit',uid:'9003',expectedUid:'9001',accountType:'main'})});
+ assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({exchange:'bybit',uid:'9001',expectedUid:'9002',expectedRevision:changed.member.uids[0].revision,accountType:'main'})})).status,200);
+ const back=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();
+ assert.notEqual(back.member.uids[0].revision,own.member.uids[0].revision);
+ const stale=await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({exchange:'bybit',uid:'9003',expectedUid:'9001',expectedRevision:own.member.uids[0].revision,accountType:'main'})});
  assert.equal(stale.status,400);assert.match((await stale.json()).error,/changed since/);
+ assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({exchange:'bybit',uid:'9001',expectedUid:'9001',accountType:'main'})})).status,200);
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers:{'content-type':'application/json','x-wh-earn':'1'},body:JSON.stringify({exchange:'bybit',uid:'9999',expectedUid:'9002',accountType:'main'})})).status,401);
  assert.equal((await fetch(h.origin+'/api/hub/earn',{headers})).status,200);
  assert.equal((await fetch(h.origin+'/api/hub/earn/onboard',{method:'POST',headers,body:JSON.stringify({country:'US',email:'attacker@example.com'})})).status,403);

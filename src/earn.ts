@@ -14,12 +14,19 @@ export const EXCHANGES = [
 ];
 export const BYBIT_HELP = 'https://www.bybit.com/en/help-center/article/How-to-Transfer-Your-Identity-to-Another-Account';
 export type EarnSource = 'referral' | 'exchange' | 'marketplace';
-type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string };
+type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string; revision?: string };
 export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
 export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
+/** Historical claims predate revisions. Their stable view token changes as soon
+ * as any replacement or verification writes a fresh stored revision. */
+function uidRevision(owner: string, claim: UID): string {
+  return claim.revision ?? createHash('sha256').update(JSON.stringify([
+    'earn-uid-legacy-v1',owner,claim.exchange,claim.uid,claim.submittedAt,claim.verified,
+  ])).digest('hex');
+}
 /** Resolve exact verified keys against one already-read financial snapshot.
  * This keeps invoice admission from parsing the whole ledger once per
  * candidate customer while preserving the same conflict refusal as boundOwner. */
@@ -119,7 +126,8 @@ export class EarnService {
   view(owner: string, name: string) {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);
     const active=s.referrals.filter(r=>r.code===m.code && r.active && (r.paidThrough===undefined || r.paidThrough>this.now())).length;
-    return { member:m, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
+    const member={...m,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))};
+    return { member, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
       paidCents: -entries.filter(e=>e.kind==='payout' || (e.kind==='reversal' && s.entries.find(o=>o.id===e.reverses)?.kind==='payout')).reduce((a,e)=>a+e.cents,0) || 0,
@@ -139,13 +147,15 @@ export class EarnService {
       const expectedUid=text(input.expectedUid,80);
       if(!current || current.uid!==expectedUid)throw new Error('UID changed since you opened this page; refresh and review it before saving');
       if(current.uid===uid)return;
+      if(typeof input.expectedRevision!=='string' || input.expectedRevision!==uidRevision(m.id,current))
+        throw new Error('UID verification or value changed since you opened this page; refresh and review it before saving');
       const before=structuredClone(m);
-      current.uid=uid;current.verified=false;current.submittedAt=this.date();
+      current.uid=uid;current.verified=false;current.submittedAt=this.date();current.revision=randomUUID();
       (s.audit??=[]).push({at:this.date(),actor:'member',owner:m.id,before,after:structuredClone(m)});
       this.save(s);return;
     }
     if(current)throw new Error('A main account UID is already registered for this exchange; refresh before editing it');
-    m.uids.push({exchange,uid,verified:false,submittedAt:this.date()});this.save(s);
+    m.uids.push({exchange,uid,verified:false,submittedAt:this.date(),revision:randomUUID()});this.save(s);
   }
   configure(input: Record<string,unknown>) {
     const s=this.read(), m=s.members.find(m=>m.id===input.owner);if(!m)throw new Error('Member not found');
@@ -156,7 +166,7 @@ export class EarnService {
     if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');
       if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
         throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
-      u.verified=input.verified;}
+      if(u.verified!==input.verified){u.verified=input.verified;u.revision=randomUUID();}}
     (s.audit??=[]).push({at:this.date(),actor:'hub-admin',owner:m.id,before,after:structuredClone(m)});
     this.save(s);
   }
