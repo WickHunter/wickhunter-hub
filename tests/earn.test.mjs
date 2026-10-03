@@ -132,6 +132,10 @@ await test('Earn page labels editable main UID and shows credited rather than ca
   assert.equal(rows[0].children[2].textContent,'$50.00');
   assert.equal(rows[1].children[2].textContent,'$0.00');
   assert.match(rows[1].children[3].textContent,/\$5.00 calculated/);
+  const mobile=[...page.querySelectorAll('#months .monthCard')];
+  assert.equal(mobile.length,2);
+  assert.match(mobile[0].textContent,/WH commission received\$100.00Earned\$50.00Qualified/);
+  assert.match(mobile[1].textContent,/WH commission received\$10.00Earned\$0.00Below \$15 combined monthly minimum/);
  } finally {dom.window.close();}
 });
 const h=await freshHub();try{
