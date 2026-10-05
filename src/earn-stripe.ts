@@ -7,16 +7,17 @@ import type {BillingConfig,BillingMode} from './billing/config.js';
 import type {StripeEvent} from './billing/stripe.js';
 
 type Settings={mode:BillingMode; enabled:boolean; automatic:boolean; payoutDay:number; financialAccount:string};
-type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:string;amount:number;allocations:{source:EarnSource;cents:number}[];status:string;created:number;stripeId?:string;error?:string;released?:boolean;paid?:boolean;returned?:boolean;checked?:number};
+type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:string;amount:number;allocations:{source:EarnSource;cents:number}[];status:string;created:number;stripeId?:string;error?:string;released?:boolean;paid?:boolean;returned?:boolean;checked?:number;identityConflict?:boolean};
 type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean};
 const sources:EarnSource[]=['referral','exchange','marketplace'];
 const POSTED_RECHECK_MS=6*60*60_000;
 const SEEN_EVENT_MAX=10_000;
+const RECOVERY_JOB_LIMIT_PER_MODE=25;
 const defaults:Settings={mode:'test',enabled:false,automatic:false,payoutDay:1,financialAccount:''};
 const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String((v as StripeObject).id||''):'';
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex').slice(0,40);
-const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j.financialAccount,j.amount,j.allocations,j.stripeId]);
+const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j.financialAccount,j.amount,j.allocations,j.stripeId,j.created]);
 /** Consumer Gmail alone documents both dotted usernames and plus tags as one
  * inbox. Workspace/custom domains do not share the dot rule. This key is ONLY
  * a commission exclusion; it never merges customers or Earn owners.
@@ -349,7 +350,7 @@ export class EarnStripeService {
    // check. On restart the memo is empty, so every durable obligation is read.
    if(memo&&memo.version===version&&at<memo.nextDue)continue;
    const all=memo?.version===version?memo.jobs:book(own.admin()).jobs as Job[];
-   const candidates=all.filter(j=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
+   const candidates=all.filter(j=>j.stripeId&&!j.identityConflict&&!['returned','failed','canceled'].includes(j.status)
     && (j.status!=='posted'||at-(j.checked||0)>=POSTED_RECHECK_MS)).sort((a,b)=>(a.checked||0)-(b.checked||0)).slice(0,100);
    const outcomes:{id:string;identity:string;status?:string;error?:unknown}[]=[];
    for(const job of candidates){const identity=payoutIdentity(job);try{outcomes.push({id:job.id,identity,status:await this.readPayoutStatus(rail,job)});}catch(error){outcomes.push({id:job.id,identity,error});}}
@@ -357,7 +358,7 @@ export class EarnStripeService {
    if(outcomes.length)own.transactionIfChanged(s=>{
     const current=book(s).jobs as Job[];latest=current;let changed=false;
     for(const outcome of outcomes){const job=current.find(j=>j.id===outcome.id);if(!job)continue;
-     if(payoutIdentity(job)!==outcome.identity){const message='Payout identity changed during reconciliation; manual review required';if(job.error!==message){job.error=message;changed=true;}continue;}
+     if(payoutIdentity(job)!==outcome.identity){job.status='needs_review';job.identityConflict=true;job.error='Payout identity changed during reconciliation; manual review required';changed=true;continue;}
      if(outcome.error!==undefined){const message=outcome.error instanceof EarnStripeError?outcome.error.message:'Stripe could not be reached; reconciliation will retry';if(job.checked!==at||job.error!==message){job.checked=at;job.error=message;changed=true;}}
      else if(outcome.status!==undefined)try{changed=this.settleInState(s,job,outcome.status,at)||changed;}catch{
       const message='Payout ledger settlement needs review';if(job.checked!==at||job.error!==message){job.checked=at;job.error=message;changed=true;}
@@ -365,46 +366,64 @@ export class EarnStripeService {
     }
     return changed;
    });
-   // A 101st due job remains due on the next tick; non-posted jobs must also
-   // continue to poll each tick. Only an all-posted/no-due book can sleep.
-   const nextDue=latest.reduce((due,j)=>j.stripeId&&!['returned','failed','canceled'].includes(j.status)
-    ?Math.min(due,j.status==='posted'?(j.checked||0)+POSTED_RECHECK_MS:0):due,Number.POSITIVE_INFINITY);
+   // Committed unknown submissions are obligations, independently of a new
+   // admission switch, month, or member-selected destination. Reuse only the
+   // durable body/key. Each mode gets a bounded, oldest-checked recovery batch
+   // so one rail cannot starve the other, and the 26th job remains due.
+   const recoverable=all.filter(j=>!j.stripeId&&j.status==='submitting'&&!j.identityConflict)
+    .sort((a,b)=>(a.checked||0)-(b.checked||0)).slice(0,RECOVERY_JOB_LIMIT_PER_MODE);
+   for(const job of recoverable)await this.submit(rail,job);
+   if(recoverable.length)latest=book(own.admin()).jobs as Job[];
+   // A 101st known-ID job remains due on the next tick, as do unresolved
+   // submitting jobs. Only a posted/no-due or reviewed book may sleep.
+   const nextDue=latest.reduce((due,j)=>j.identityConflict?due:j.stripeId&&!['returned','failed','canceled'].includes(j.status)
+    ?Math.min(due,j.status==='posted'?(j.checked||0)+POSTED_RECHECK_MS:0):!j.stripeId&&j.status==='submitting'?0:due,Number.POSITIVE_INFINITY);
    this.payoutScan[rail]={version:own.fileVersion(),nextDue,jobs:latest};
   }
   if(!c.enabled||!c.automatic)return;
   const date=new Date(this.now());if(date.getUTCDate()<c.payoutDay)return;const cycle=date.toISOString().slice(0,7);
-  const fa=await this.payoutApi(mode).call('GET','/v2/money_management/financial_accounts/'+c.financialAccount);if(fa.status!=='open'||fa.livemode!==(mode==='live'))throw Error('The payout financial account is not open in this mode');
+  // Admin configuration can change outside this serial worker while provider
+  // requests await. Its snapshot authorizes only the same current settings;
+  // already-committed recovery above remains independent of these switches.
+  const admissionOpen=()=>{const fresh=this.settings(),at=new Date(this.now());return fresh.enabled&&fresh.automatic&&fresh.mode===mode&&fresh.financialAccount===c.financialAccount&&fresh.payoutDay===c.payoutDay&&at.getUTCDate()>=fresh.payoutDay&&at.toISOString().slice(0,7)===cycle;};
+  const fa=await this.payoutApi(mode).call('GET','/v2/money_management/financial_accounts/'+c.financialAccount);if(!admissionOpen())return;if(fa.status!=='open'||fa.livemode!==(mode==='live'))throw Error('The payout financial account is not open in this mode');
   for(const m of ledger.admin().members){
    jobs=book(ledger.admin()).jobs as Job[];const old=jobs.find(j=>j.owner===m.id&&j.cycle===cycle);
-   // A saved destination blocks new admission. An existing ambiguous job
-   // still needs its original idempotency key to recover an accepted payment.
-   if(old){if(!old.stripeId&&old.status==='submitting')await this.submit(mode,old,c);continue;}
+   // The recovery pass owns existing submissions; do not retry one twice in
+   // this run or bypass its recovery batch limit through new admission.
+   if(old)continue;
    if(m.payoutPreference)continue;
-   let recipient:string|null;try{recipient=await this.recipient(mode,m.id);}catch{continue;}if(!recipient)continue;
-   const job=ledger.transaction(s=>{const b=book(s);if(s.members.find(member=>member.id===m.id)?.payoutPreference||b.jobs.some((j:Job)=>j.owner===m.id&&j.cycle===cycle))return null;
+   let recipient:string|null;try{recipient=await this.recipient(mode,m.id);}catch{continue;}if(!admissionOpen())return;if(!recipient)continue;
+   const job=ledger.transaction(s=>{if(!admissionOpen())return null;const b=book(s);if(s.members.find(member=>member.id===m.id)?.payoutPreference||b.profiles[m.id]?.recipient!==recipient||b.jobs.some((j:Job)=>j.owner===m.id&&j.cycle===cycle))return null;
     const totals=sources.map(source=>({source,cents:s.entries.filter(e=>e.owner===m.id&&e.source===source).reduce((n,e)=>n+(e.period<cycle?e.cents:Math.min(0,e.cents)),0)}));
     // A debt in any program reduces the combined payable amount.
     let debt=-totals.filter(a=>a.cents<0).reduce((n,a)=>n+a.cents,0);const allocations=totals.filter(a=>a.cents>0).map(a=>{const offset=Math.min(a.cents,debt);debt-=offset;return {...a,cents:a.cents-offset};}).filter(a=>a.cents>0);const amount=allocations.reduce((n,a)=>n+a.cents,0);if(amount<1)return null;
     const job:Job={id:randomUUID(),owner:m.id,cycle,recipient:recipient!,financialAccount:c.financialAccount,amount,allocations,status:'submitting',created:this.now()};b.jobs.push(job);
     for(const a of allocations)s.entries.push(entry(m.id,a.source,'hold',-a.cents,'stripe:hold:'+job.id+':'+a.source,cycle,'Reserved for automatic Stripe payout',this.now()));return job;
-   });if(job)await this.submit(mode,job,c);
+   });if(job)await this.submit(mode,job);
   }
  });}
- private jobError(mode:BillingMode,jobId:string,error:unknown){this.ledger(mode).transactionIfChanged(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===jobId);if(!j)return false;const at=this.now(),message=error instanceof EarnStripeError?error.message:'Stripe could not be reached; reconciliation will retry';if(j.checked===at&&j.error===message)return false;j.checked=at;j.error=message;return true;});}
- private async submit(mode:BillingMode,job:Job,c:Settings){
-  if(this.now()-job.created>23*3600000){this.ledger(mode).transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.status='needs_review';j.error='Unknown submission outcome; reconcile in Stripe before releasing this reservation';});return;}
-  let accepted=false;try{const result=await this.payoutApi(mode).call('POST','/v2/money_management/outbound_payments',{from:{financial_account:job.financialAccount,currency:'usd'},to:{recipient:job.recipient},amount:{value:job.amount,currency:'usd'},description:`Wick Hunter earnings ${job.cycle}`,metadata:{wh_payout_id:job.id}},{key:'wh_payout_'+job.id});if(!id(result))throw Error('Missing outbound payment ID');accepted=true;this.ledger(mode).transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.stripeId=result.id;});await this.reconcile(mode,{...job,stripeId:result.id});}
-  catch(e){this.jobError(mode,job.id,e);if(!accepted&&e instanceof EarnStripeError&&[400,402,403,404,422].includes(e.status))this.settle(mode,job.id,'failed');}
+ private jobError(mode:BillingMode,jobId:string,error:unknown,expectedIdentity?:string){this.ledger(mode).transactionIfChanged(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===jobId);if(!j||j.identityConflict)return false;if(expectedIdentity&&payoutIdentity(j)!==expectedIdentity){j.status='needs_review';j.identityConflict=true;j.error='Payout identity changed during submission; manual review required';return true;}const at=this.now(),message=error instanceof EarnStripeError?error.message:'Stripe could not be reached; reconciliation will retry';if(j.checked===at&&j.error===message)return false;j.checked=at;j.error=message;return true;});}
+ private async submit(mode:BillingMode,job:Job){
+  const ledger=this.ledger(mode),identity=payoutIdentity(job),current=(book(ledger.admin()).jobs as Job[]).find(j=>j.id===job.id);
+  if(!current||current.stripeId||current.status!=='submitting'||current.identityConflict)return;
+  if(payoutIdentity(current)!==identity){ledger.transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.status='needs_review';j.identityConflict=true;j.error='Payout identity changed before recovery; manual review required';});return;}
+  const age=this.now()-job.created;
+  if(!Number.isSafeInteger(job.created)||age<0||age>23*3600000){ledger.transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;j.status='needs_review';j.error='Unknown submission outcome; reconcile in Stripe before releasing this reservation';});return;}
+  let accepted=false,expected=identity;try{const result=await this.payoutApi(mode).call('POST','/v2/money_management/outbound_payments',{from:{financial_account:job.financialAccount,currency:'usd'},to:{recipient:job.recipient},amount:{value:job.amount,currency:'usd'},description:`Wick Hunter earnings ${job.cycle}`,metadata:{wh_payout_id:job.id}},{key:'wh_payout_'+job.id});if(!id(result))throw Error('Missing outbound payment ID');accepted=true;const stored=ledger.transaction(s=>{const j=(book(s).jobs as Job[]).find(j=>j.id===job.id)!;
+   if(payoutIdentity(j)!==identity||j.status!=='submitting'){j.status='needs_review';j.identityConflict=true;j.error='Payout identity changed after submission; accepted Stripe payment requires manual review';j.stripeId??=result.id;return false;}
+   j.stripeId=result.id;return true;});if(stored){expected=payoutIdentity({...job,stripeId:result.id});await this.reconcile(mode,{...job,stripeId:result.id});}}
+  catch(e){this.jobError(mode,job.id,e,expected);if(!accepted&&e instanceof EarnStripeError&&[400,402,403,404,422].includes(e.status))this.settle(mode,job.id,'failed',expected);}
  }
  private async readPayoutStatus(mode:BillingMode,job:Job):Promise<string>{const result=await this.payoutApi(mode).call('GET','/v2/money_management/outbound_payments/'+job.stripeId);if(result.amount?.value!==job.amount||result.amount?.currency!=='usd'||id(result.to?.recipient)!==job.recipient||result.livemode!==(mode==='live'))throw Error('Stripe payout identity mismatch');return result.status;}
- private async reconcile(mode:BillingMode,job:Job){this.settle(mode,job.id,await this.readPayoutStatus(mode,job));}
- private settle(mode:BillingMode,jobId:string,status:string){
+ private async reconcile(mode:BillingMode,job:Job){this.settle(mode,job.id,await this.readPayoutStatus(mode,job),payoutIdentity(job));}
+ private settle(mode:BillingMode,jobId:string,status:string,expectedIdentity?:string){
   if(!['processing','posted','failed','canceled','returned'].includes(status))return;
-  const at=this.now();this.ledger(mode).transactionIfChanged(s=>{const job=(book(s).jobs as Job[]).find(j=>j.id===jobId);return job?this.settleInState(s,job,status,at):false;});
+  const at=this.now();this.ledger(mode).transactionIfChanged(s=>{const job=(book(s).jobs as Job[]).find(j=>j.id===jobId);if(!job)return false;if(expectedIdentity&&payoutIdentity(job)!==expectedIdentity){job.status='needs_review';job.identityConflict=true;job.error='Payout identity changed during reconciliation; manual review required';return true;}return this.settleInState(s,job,status,at);});
  }
  private settleInState(s:EarnState,job:Job,status:string,at:number):boolean{
    if(!['processing','posted','failed','canceled','returned'].includes(status)
-     ||job.returned||(['failed','canceled'].includes(job.status)))return false;
+     ||job.identityConflict||job.returned||(['failed','canceled'].includes(job.status)))return false;
    const originals=new Map<EarnSource,Entry>();
    if(['failed','canceled','returned'].includes(status)&&job.paid&&!job.returned)
     for(const a of job.allocations){const orig=s.entries.find(e=>e.reference==='stripe:payout:'+job.id+':'+a.source);
