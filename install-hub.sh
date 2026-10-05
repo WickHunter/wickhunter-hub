@@ -20,6 +20,7 @@ HUB_DIR=${HUB_DIR:-/opt/wickhunter-hub}
 ENV_FILE=${HUB_ENV_FILE:-/etc/wickhunter-hub/env}
 MARKETPLACE_STATE_ENV_FILE=/etc/wickhunter-hub/marketplace-state.env
 MARKETPLACE_BRIDGE_ENV_FILE=/etc/wickhunter-hub/marketplace.env
+SUPPORT_ENV_FILE=${HUB_SUPPORT_ENV_FILE:-/etc/wickhunter-hub/support.env}
 ROOT_HELPER=/usr/local/libexec/wickhunter-hub-root-helper
 SUDOERS_FILE=/etc/sudoers.d/wickhunter-hub-root-helper
 SERVICE=wickhunter-hub
@@ -192,6 +193,7 @@ printf '%s\n' \
   "WorkingDirectory=$HUB_DIR" \
   "EnvironmentFile=$ENV_FILE" \
   "EnvironmentFile=-$MARKETPLACE_BRIDGE_ENV_FILE" \
+  "EnvironmentFile=-$SUPPORT_ENV_FILE" \
   'Environment=NODE_ENV=production' \
   "ExecStart=$(command -v node) dist/src/main.js" \
   'Restart=always' \
