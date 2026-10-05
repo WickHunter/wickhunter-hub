@@ -7,7 +7,8 @@ const dir=tmpDir('earn-stripe');let now=Date.parse('2026-09-17T12:00:00Z');
 const ledger=new EarnService(dir,()=>now),owner=earnOwner('email:referrer@example.com');const member=ledger.member(owner,'Referrer');
 const cfg={plans:[{key:'monthly',role:'software',checkout:'payment-link',interval:'month',currency:'usd'}],stripe:{test:{secretKey:'sk_test_fixture',priceIds:{monthly:'price_month'}},live:{secretKey:'sk_live_fixture',priceIds:{monthly:'price_month'}}}};
 let calls=[],refund=0,dispute=false,disputeStatus='needs_response',subStatus='active',failSubmit=false,postReadFailure=false;
-let invoiceId='in_1',email='friend@example.com',priceId='price_month',currency='usd',paid=9900,total=9000;
+let invoiceId='in_1',email='friend@example.com',priceId='price_month',currency='usd',paid=9900,total=9000,subscriptionCode=member.code,cancelAtPeriodEnd=false;
+const coupons=new Map(),promos=new Map(),subscriptionPromos={test:null,live:null};let promoSerial=0;
 const payouts=new Map(),idempotency=new Map();let sends=0;
 const fake=async (url,init)=>{
  const u=new URL(url),endpoint=u.pathname,mode=init.headers.authorization.includes('live')?'live':'test',live=mode==='live';const body=init.method==='POST'?(endpoint.startsWith('/v2')?JSON.parse(init.body):Object.fromEntries(new URLSearchParams(init.body))):{};
@@ -15,13 +16,18 @@ const fake=async (url,init)=>{
  if(endpoint==='/v1/prices/price_month')return ok({id:'price_month',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
  if(endpoint==='/v1/prices/price_legacy')return ok({id:'price_legacy',active:false,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
  if(endpoint==='/v1/prices/price_hosting')return ok({id:'price_hosting',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_hosting'});
- if(endpoint.startsWith('/v1/coupons/'))return ok({error:{code:'resource_missing'}},404);if(endpoint==='/v1/coupons')return ok({id:body.id,percent_off:Number(body.percent_off),duration:body.duration,metadata:{managed_by:'wh-earn'}});if(endpoint==='/v1/promotion_codes')return init.method==='GET'?ok({data:[]}):ok({id:'promo_'+mode});if(endpoint.startsWith('/v1/promotion_codes/'))return ok({});
- if(endpoint==='/v1/checkout/sessions')return ok({url:'https://checkout.stripe.com/test-session'});
+ if(endpoint.startsWith('/v1/coupons/')){const c=coupons.get(mode+':'+endpoint.split('/').at(-1));return c?ok(c):ok({error:{code:'resource_missing'}},404);}if(endpoint==='/v1/coupons'){const applies=Object.entries(body).filter(([k])=>k.startsWith('applies_to[products][' )).map(([,v])=>v);const c={id:body.id,percent_off:Number(body.percent_off),duration:body.duration,valid:true,applies_to:{products:applies},metadata:{managed_by:body['metadata[managed_by]'],...(body['metadata[wh_earn_owner]']?{wh_earn_owner:body['metadata[wh_earn_owner]']}:{})}};coupons.set(mode+':'+c.id,c);return ok(c);}
+ if(endpoint==='/v1/promotion_codes'){
+  if(init.method==='GET'){const p=[...promos.values()].find(x=>x.mode===mode&&x.code===u.searchParams.get('code')&&x.active);return ok({data:p?[p]:[]});}
+  const promo={id:'promo_'+mode+'_'+(++promoSerial),mode,code:body.code,coupon:body.coupon,active:true,livemode:live,expires_at:null,max_redemptions:null,metadata:{managed_by:'wh-earn',wh_earn_owner:body['metadata[wh_earn_owner]']}};promos.set(promo.id,promo);return ok(promo);
+ }
+ if(endpoint.startsWith('/v1/promotion_codes/')){const p=promos.get(endpoint.split('/').at(-1));if(init.method==='POST'&&p)p.active=body.active!=='false';return p?ok(p):ok({error:{code:'resource_missing'}},404);}
+ if(endpoint==='/v1/checkout/sessions'){subscriptionPromos[mode]=body['discounts[0][promotion_code]'];return ok({url:'https://checkout.stripe.com/test-session'});}
  if(endpoint.startsWith('/v1/invoices/'))return ok({id:endpoint.split('/').at(-1),customer:'cus_friend',status:'paid',currency,livemode:live,amount_paid:paid,total_excluding_tax:total,total_taxes:[{amount:900}],parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[{pricing:{price_details:{price:priceId}},period:{end:now/1000+86400}}]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}});
- if(endpoint==='/v1/subscriptions/sub_friend')return ok({id:'sub_friend',status:subStatus,metadata:{wh_earn_code:member.code},items:{data:[{price:'price_month'}]}});
+ if(endpoint==='/v1/subscriptions/sub_friend')return ok({id:'sub_friend',status:subStatus,cancel_at_period_end:cancelAtPeriodEnd,metadata:subscriptionCode?{wh_earn_code:subscriptionCode}:{},discounts:subscriptionPromos[mode]?[{promotion_code:subscriptionPromos[mode]}]:[],items:{data:[{price:'price_month'}]}});
  if(endpoint==='/v1/customers/cus_friend')return ok({email});
  if(endpoint==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'payment_intent',payment_intent:{latest_charge:'ch_'+u.searchParams.get('invoice')}}}]});
- if(endpoint.startsWith('/v1/charges/'))return ok({amount_refunded:refund,disputed:dispute,livemode:live});
+ if(endpoint.startsWith('/v1/charges/'))return ok({amount_refunded:endpoint.endsWith('/ch_in_1')?refund:0,disputed:endpoint.endsWith('/ch_in_1')&&dispute,livemode:live});
  if(endpoint==='/v1/disputes')return ok({data:[{status:disputeStatus}]});
  if(endpoint==='/v2/core/accounts'&&init.method==='POST')return ok({id:'acct_'+mode});
  if(endpoint.startsWith('/v2/core/accounts/'))return ok({id:'acct_'+mode,defaults:{payout_methods:{usd:'usba_test_fixture'}},configuration:{recipient:{capabilities:{bank_accounts:{local:{status:'active'}}}}}});
@@ -41,9 +47,19 @@ try{
 await test('disabled by default; explicit mode and automatic prerequisites',async()=>{const before=calls.length;await svc.handleEvent(event('invoice.paid','evt_unconfigured',{id:'in_unconfigured'}));assert.equal(calls.length,before);await assert.rejects(svc.activate(owner),/not enabled/);assert.throws(()=>svc.configure({automatic:true}),/select/);svc.configure({enabled:true});});
 await test('forever software-only coupon; custom referrer code and safe Checkout',async()=>{
  await svc.activate(owner);const coupon=calls.find(c=>c.endpoint==='/v1/coupons');assert.equal(coupon.body.duration,'forever');assert.equal(coupon.body.percent_off,'10');assert.equal(coupon.body['applies_to[products][0]'],'prod_wh');
- await svc.checkout(member.code,'monthly');const co=calls.find(c=>c.endpoint==='/v1/checkout/sessions');assert.equal(co.body['subscription_data[metadata][wh_earn_code]'],member.code);assert.equal(co.body['discounts[0][promotion_code]'],'promo_test');assert.equal(co.headers['Stripe-Version'],'2025-03-31.basil');await assert.rejects(svc.checkout(member.code,'hosting'),/unavailable/);
+ assert.equal(svc.view(owner).appliedDiscountPercent,10);assert.equal(svc.view(owner).appliedDiscountDuration,'forever');assert.equal(svc.view(owner).activationRequired,false);
+ svc.ledger('test').transaction(s=>{s.stripe??={profiles:{}};s.stripe.profiles[owner].verifiedPromotion=null;s.stripe.profiles[owner].appliedDiscountPercent=77;});assert.equal(svc.view(owner).referralUrl,null);assert.equal(svc.view(owner).appliedDiscountPercent,null);assert.equal(svc.view(owner).activationRequired,true);
+ const proofReads=calls.length;await svc.activate(owner);const currentPromo=svc.admin().profiles[owner].promotion;assert.ok(calls.slice(proofReads).some(c=>c.endpoint==='/v1/promotion_codes/'+currentPromo));assert.ok(calls.slice(proofReads).some(c=>c.endpoint.startsWith('/v1/coupons/')));assert.equal(svc.view(owner).appliedDiscountPercent,10);
+ const couponId=promos.get(currentPromo).coupon,savedPercent=coupons.get('test:'+couponId).percent_off;coupons.get('test:'+couponId).percent_off=12;
+ await assert.rejects(svc.activate(owner),/coupon does not match/);assert.equal(svc.view(owner).referralUrl,null);coupons.get('test:'+couponId).percent_off=savedPercent;await svc.activate(owner);
+ await svc.checkout(member.code,'monthly');const co=calls.find(c=>c.endpoint==='/v1/checkout/sessions');assert.equal(co.body['subscription_data[metadata][wh_earn_code]'],member.code);assert.equal(co.body['discounts[0][promotion_code]'],subscriptionPromos.test);assert.equal(co.headers['Stripe-Version'],'2025-03-31.basil');await assert.rejects(svc.checkout(member.code,'hosting'),/unavailable/);
  assert.equal(svc.launchReferral(member.code,'test').code,member.code);
  assert.throws(()=>svc.launchReferral(member.code,'live'),/payment mode/);
+});
+await test('Oskaras one-time setup registers only the three reviewed reusable forever offers',async()=>{
+ const result=await svc.registerOskarasOffers(owner);assert.deepEqual(result.offers.map(o=>[o.code,o.percent,o.duration]),[['OskarasTrading10K7',10,'forever'],['OskarasTrading20M4',20,'forever'],['OskarasTrading25R8',25,'forever']]);
+ for(const offer of result.offers){const promo=promos.get(offer.promotion),coupon=coupons.get('test:'+promo.coupon);assert.equal(promo.active,true);assert.equal(promo.max_redemptions,null);assert.equal(promo.expires_at,null);assert.equal(coupon.duration,'forever');assert.equal(coupon.percent_off,offer.percent);assert.deepEqual(coupon.applies_to.products,['prod_wh']);assert.equal(svc.launchReferral(offer.code,'test').discountPercent,offer.percent);assert.equal(svc.launchReferral(offer.code,'test').code,member.code);}
+ await svc.checkout('OskarasTrading20M4','monthly');const checkout=calls.filter(c=>c.endpoint==='/v1/checkout/sessions').at(-1);assert.equal(checkout.body['discounts[0][promotion_code]'],result.offers[1].promotion);assert.equal(checkout.body['subscription_data[metadata][wh_earn_code]'],member.code);
 });
 await test('test recipient and referral money stay out of real earnings',async()=>{
  await svc.onboard(owner,{country:'US',email:'referrer@example.com'});await svc.handleEvent({...event('invoice.paid','evt_test',{id:'in_test'}),livemode:false});assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.ledger('test').view(owner,'Referrer').balances.referral,1800);
@@ -57,7 +73,7 @@ await test('older shared referral codes resolve to the current promotion after d
  await svc.checkout(member.code,'monthly');await svc.checkout(firstRotated,'monthly');
  assert.equal(calls.filter(c=>c.endpoint==='/v1/checkout/sessions').length,count+2);
 });
-svc.configure({mode:'live'});assert.throws(()=>svc.configure({payoutKey:'sk_live_fixture'}),/restricted/);svc.configure({payoutKey:'rk_live_fixture'});assert.ok(!JSON.stringify(svc.admin()).includes('rk_live_fixture'));await svc.activate(owner);
+svc.configure({mode:'live'});assert.throws(()=>svc.configure({payoutKey:'sk_live_fixture'}),/restricted/);svc.configure({payoutKey:'rk_live_fixture'});assert.ok(!JSON.stringify(svc.admin()).includes('rk_live_fixture'));await svc.activate(owner);await svc.registerOskarasOffers(owner);await svc.checkout('OskarasTrading10K7','monthly');
 await test('manual payout destination blocks new Stripe admission but preserves existing job reconciliation',async()=>{
  const isolated=tmpDir('earn-manual-destination'),at=Date.parse('2026-10-17T12:00:00Z');
  try {
@@ -117,19 +133,22 @@ await test('renewals credit once per invoice, even with two event types and rest
  await svc.handleEvent(event('invoice.paid','evt_paid',{id:'in_1'}));await svc.handleEvent(event('invoice.payment_succeeded','evt_other',{id:'in_1'}));
  svc=new EarnStripeService(dir,ledger,()=>cfg,'https://hub.example',()=>now,fake);await svc.handleEvent(event('invoice.paid','evt_retry',{id:'in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,1800);
  await svc.handleEvent(event('invoice.paid','evt_renewal',{id:'in_2'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,3600);assert.equal(ledger.view(owner,'Referrer').activeSubscribers,1);
+ subscriptionCode='';const before=ledger.view(owner,'Referrer').balances.referral;await svc.handleEvent(event('invoice.paid','evt_typed_code',{id:'in_typed_code'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,before+1800,'actual registered Stripe promotion attributes a typed code without trusting subscription metadata');assert.equal(ledger.admin().stripe.invoices.in_typed_code.owner,owner);
+ const afterTyped=ledger.view(owner,'Referrer').balances.referral,active=promos.get(subscriptionPromos.live);active.metadata.wh_earn_owner='forged-owner';await svc.handleEvent(event('invoice.paid','evt_forged_code_owner',{id:'in_forged_code_owner'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,afterTyped,'a member-code metadata value cannot override mismatched Stripe promotion ownership');assert.equal(ledger.admin().stripe.invoices.in_forged_code_owner,undefined);active.metadata.wh_earn_owner=owner;subscriptionCode=member.code;
 });
 await test('paused enrollment still reconciles refunds and disputes without double debit',async()=>{
- svc.configure({enabled:false});refund=4950;await svc.handleEvent(event('charge.refunded','evt_refund',{id:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);
- dispute=true;await svc.handleEvent(event('charge.dispute.created','evt_dispute',{charge:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,1800);
- disputeStatus='won';await svc.handleEvent(event('charge.dispute.closed','evt_won',{charge:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);
- await svc.handleEvent(event('charge.refunded','evt_refund_again',{id:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);assert.equal(ledger.view(owner,'Referrer').activeSubscribers,1);refund=0;dispute=false;svc.configure({enabled:true});
+ svc.configure({enabled:false});refund=4950;await svc.handleEvent(event('charge.refunded','evt_refund',{id:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,4500);
+ dispute=true;await svc.handleEvent(event('charge.dispute.created','evt_dispute',{charge:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,3600);
+ disputeStatus='won';await svc.handleEvent(event('charge.dispute.closed','evt_won',{charge:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,4500);
+ const adjustmentsBefore=ledger.admin().entries.filter(e=>e.kind==='adjustment'&&e.reference.startsWith('stripe:adjust:')).length;
+ await svc.handleEvent(event('charge.dispute.created','evt_dispute_repeat',{charge:'ch_in_1'}));await svc.handleEvent(event('charge.dispute.closed','evt_won_repeat',{charge:'ch_in_1'}));await svc.handleEvent(event('charge.refunded','evt_refund_again',{id:'ch_in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,4500);assert.equal(ledger.admin().entries.filter(e=>e.kind==='adjustment'&&e.reference.startsWith('stripe:adjust:')).length,adjustmentsBefore,'repeat webhook deliveries do not add duplicate clawbacks');assert.equal(ledger.view(owner,'Referrer').activeSubscribers,1);refund=0;dispute=false;svc.configure({enabled:true});
 });
 await test('self referrals, foreign prices and non-USD invoices do not earn',async()=>{
  const before=ledger.view(owner,'Referrer').balances.referral,version=ledger.fileVersion();email='referrer@example.com';await svc.handleEvent(event('invoice.paid','evt_self',{id:'in_self'}));email='friend@example.com';priceId='price_hosting';await svc.handleEvent(event('invoice.paid','evt_foreign',{id:'in_foreign'}));priceId='price_month';currency='eur';await svc.handleEvent(event('invoice.paid','evt_eur',{id:'in_eur'}));currency='usd';assert.equal(ledger.view(owner,'Referrer').balances.referral,before);
  assert.equal(ledger.fileVersion(),version,'proved unrelated events do not rewrite the financial ledger');
  const callsBefore=calls.length;await svc.handleEvent(event('invoice.paid','evt_foreign',{id:'in_foreign'}));assert.equal(calls.length,callsBefore,'bounded sidecar dedupes foreign event replay');
 });
-await test('subscription cancellation removes active count',async()=>{subStatus='canceled';await svc.handleEvent(event('customer.subscription.deleted','evt_cancel',{id:'sub_friend'}));assert.equal(ledger.view(owner,'Referrer').activeSubscribers,0);});
+await test('scheduled cancellation remains active until Stripe ends the period',async()=>{subStatus='active';cancelAtPeriodEnd=true;await svc.handleEvent(event('customer.subscription.updated','evt_cancel_scheduled',{id:'sub_friend'}));assert.equal(ledger.view(owner,'Referrer').activeSubscribers,1);cancelAtPeriodEnd=false;subStatus='canceled';await svc.handleEvent(event('customer.subscription.deleted','evt_cancel',{id:'sub_friend'}));assert.equal(ledger.view(owner,'Referrer').activeSubscribers,0);});
 await svc.onboard(owner,{country:'US',email:'referrer@example.com'});svc.configure({financialAccount:'fa_test_fixture',automatic:true});
 await test('reserve before sending; unknown network outcome retries same key after restart',async()=>{
  failSubmit=true;await svc.run();assert.equal(sends,1);const after=ledger.view(owner,'Referrer');assert.equal(after.balances.referral,0);assert.equal(after.paidCents,0);
@@ -139,15 +158,22 @@ await test('reserve before sending; unknown network outcome retries same key aft
 await test('posted settles once; returned funds restore owed earnings and paid total',async()=>{
  payouts.get('obp_1').status='posted';await svc.run();const postedReads=calls.filter(c=>c.endpoint==='/v2/money_management/outbound_payments/obp_1').length;
  await svc.run();assert.equal(calls.filter(c=>c.endpoint==='/v2/money_management/outbound_payments/obp_1').length,postedReads);
- assert.equal(ledger.view(owner,'Referrer').paidCents,2700);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);
- payouts.get('obp_1').status='returned';now+=6*60*60_000;await svc.run();await svc.run();assert.equal(ledger.view(owner,'Referrer').paidCents,0);assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);assert.equal(sends,1);
+ assert.equal(ledger.view(owner,'Referrer').paidCents,4500);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);
+ payouts.get('obp_1').status='returned';now+=6*60*60_000;await svc.run();await svc.run();assert.equal(ledger.view(owner,'Referrer').paidCents,0);assert.equal(ledger.view(owner,'Referrer').balances.referral,4500);assert.equal(sends,1);
 });
 await test('accepted payout plus failed status read never releases money',async()=>{
- now=Date.parse('2026-10-17T12:00:00Z');postReadFailure=true;await svc.run();assert.equal(sends,2);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.admin().jobs[1].status,'submitting');postReadFailure=false;payouts.get('obp_2').status='failed';await svc.run();assert.equal(ledger.view(owner,'Referrer').balances.referral,2700);
+ now=Date.parse('2026-10-17T12:00:00Z');postReadFailure=true;await svc.run();assert.equal(sends,2);assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.admin().jobs[1].status,'submitting');postReadFailure=false;payouts.get('obp_2').status='failed';await svc.run();assert.equal(ledger.view(owner,'Referrer').balances.referral,4500);
 });
 await test('Stripe-managed entries cannot be manually reversed',()=>{const e=ledger.admin().entries.find(e=>e.actor==='stripe');assert.throws(()=>ledger.reverse({id:e.id,note:'double credit attempt'}),/not found/);});
 await test('future-month earnings are never auto-paid',async()=>{
- now=Date.parse('2026-11-17T12:00:00Z');ledger.record({owner,source:'exchange',kind:'earning',cents:5000,reference:'future',note:'future',period:'2026-12'});await svc.run();assert.equal(payouts.get('obp_3').amount.value,2700);assert.equal(ledger.view(owner,'Referrer').balances.exchange,5000);
+ now=Date.parse('2026-11-17T12:00:00Z');ledger.record({owner,source:'exchange',kind:'earning',cents:5000,reference:'future',note:'future',period:'2026-12'});await svc.run();assert.equal(payouts.get('obp_3').amount.value,4500);assert.equal(ledger.view(owner,'Referrer').balances.exchange,5000);
+});
+await test('refund after paid commission creates debt that offsets the next payout once',async()=>{
+ payouts.get('obp_3').status='posted';await svc.run();assert.equal(ledger.view(owner,'Referrer').balances.referral,0);
+ refund=9900;await svc.handleEvent(event('charge.refunded','evt_refund_after_paid',{id:'ch_in_1'}));
+ assert.equal(ledger.view(owner,'Referrer').balances.referral,-900,'the already-paid commission reversal remains a durable negative balance');
+ ledger.record({owner,source:'referral',kind:'earning',cents:2000,reference:'future-referral',note:'verified future referral earnings',period:'2026-11'});
+ now=Date.parse('2026-12-17T12:00:00Z');await svc.run();assert.equal(payouts.get('obp_4').amount.value,1100,'the $900 refund debt offsets $2,000 of eligible later earnings');
 });
 await test('definite recipient validation refusal permits corrected facts with a new key; ambiguous submit retains exact attempt',async()=>{
  const isolated=tmpDir('recipient-retry');
