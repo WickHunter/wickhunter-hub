@@ -58,6 +58,52 @@ await test('older shared referral codes resolve to the current promotion after d
  assert.equal(calls.filter(c=>c.endpoint==='/v1/checkout/sessions').length,count+2);
 });
 svc.configure({mode:'live'});assert.throws(()=>svc.configure({payoutKey:'sk_live_fixture'}),/restricted/);svc.configure({payoutKey:'rk_live_fixture'});assert.ok(!JSON.stringify(svc.admin()).includes('rk_live_fixture'));await svc.activate(owner);
+await test('manual payout destination blocks new Stripe admission but preserves existing job reconciliation',async()=>{
+ const isolated=tmpDir('earn-manual-destination'),at=Date.parse('2026-10-17T12:00:00Z');
+ try {
+  const localLedger=new EarnService(isolated,()=>at),manual=earnOwner('email:manual-destination@example.com'),automatic=earnOwner('email:auto-destination@example.com'),racing=earnOwner('email:race-destination@example.com');
+  localLedger.member(manual,'Manual destination');localLedger.member(automatic,'Automatic destination');localLedger.member(racing,'Race destination');
+  localLedger.savePayoutPreference(manual,{method:'usdt-polygon',address:'0x1234567890abcdef1234567890abcdef12345678',expectedRevision:null});
+  const posts=[],outcomes=new Map([['obp_historic',{id:'obp_historic',amount:{value:100,currency:'usd'},to:{recipient:'acct_manual'},livemode:false,status:'posted'}]]);
+  const localFetch=async(url,init)=>{
+   const endpoint=new URL(url).pathname,ok=(body,status=200)=>new Response(JSON.stringify(body),{status});
+   if(endpoint.startsWith('/v2/money_management/financial_accounts/fa_'))return ok({status:'open',livemode:false});
+   if(endpoint.startsWith('/v2/core/accounts/')){
+    if(endpoint.endsWith('/acct_race'))payoutLedger.savePayoutPreference(racing,{method:'paypal',address:'race@example.com',expectedRevision:null});
+    return ok({id:endpoint.split('/').at(-1),defaults:{payout_methods:{usd:'ba_test'}},configuration:{recipient:{capabilities:{bank_accounts:{local:{status:'active'}}}}}});
+   }
+   if(endpoint==='/v2/money_management/outbound_payments'&&init.method==='POST'){
+    const body=JSON.parse(init.body);posts.push(body);const created={id:'obp_new',amount:body.amount,to:body.to,livemode:false,status:'processing'};outcomes.set(created.id,created);return ok(created);
+   }
+   if(endpoint.startsWith('/v2/money_management/outbound_payments/'))return ok(outcomes.get(endpoint.split('/').at(-1)));
+   throw Error('Unexpected fake request '+endpoint);
+  };
+  const local=new EarnStripeService(isolated,localLedger,()=>cfg,'https://hub.example',()=>at,localFetch);
+  const payoutLedger=local.ledger('test');
+  payoutLedger.copyMember(localLedger.admin().members.find(m=>m.id===manual));
+  payoutLedger.copyMember(localLedger.admin().members.find(m=>m.id===automatic));
+  payoutLedger.copyMember(localLedger.admin().members.find(m=>m.id===racing));
+  for(const [who,reference] of [[manual,'manual-earned'],[automatic,'automatic-earned'],[racing,'racing-earned']])payoutLedger.record({owner:who,source:'referral',kind:'earning',cents:5000,period:'2026-09',reference,note:'Completed earning'});
+  const historic={id:'job_historic',owner:manual,cycle:'2026-09',recipient:'acct_manual',financialAccount:'fa_test_fixture',amount:100,
+    allocations:[{source:'referral',cents:100}],status:'processing',created:at-7_200_000,stripeId:'obp_historic'};
+  const unresolved={id:'job_current',owner:manual,cycle:'2026-10',recipient:'acct_manual',financialAccount:'fa_test_fixture',amount:200,
+    allocations:[{source:'referral',cents:200}],status:'submitting',created:at-60_000};
+  payoutLedger.transaction(s=>{s.stripe={profiles:{[manual]:{recipient:'acct_manual'},[automatic]:{recipient:'acct_automatic'},[racing]:{recipient:'acct_race'}},invoices:{},jobs:[historic,unresolved],seen:{}};});
+  try{
+   local.configure({enabled:true,automatic:true,financialAccount:'fa_test_fixture'});await local.run();
+   const state=payoutLedger.admin(),jobs=state.stripe.jobs;
+   assert.equal(posts.length,1,'only the member without a manual destination is submitted to Stripe');
+   assert.equal(posts[0].to.recipient,'acct_automatic');
+   assert.deepEqual(jobs.find(j=>j.id==='job_current'),unresolved,'an ambiguous current-cycle submission stays preserved and is not retried');
+   assert.equal(jobs.find(j=>j.id==='job_historic').status,'posted','saved destination does not block reconciliation of an existing accepted Stripe payout');
+   assert.equal(jobs.filter(j=>j.owner===automatic&&j.cycle==='2026-10').length,1);
+   assert.equal(jobs.some(j=>j.owner===racing&&j.cycle==='2026-10'),false,'preference saved while recipient lookup was in flight blocks atomic payout admission');
+   assert.equal(payoutLedger.view(racing,'Race destination').member.payoutPreference.address,'race@example.com');
+   assert.equal(state.entries.filter(e=>e.reference==='stripe:payout:job_historic:referral').length,1);
+   assert.equal(state.entries.filter(e=>e.kind==='hold'&&e.owner===manual).length,0,'choosing a destination does not reserve new earnings');
+  }finally{local.stop();}
+ }finally{fs.rmSync(isolated,{recursive:true,force:true});}
+});
 await test('renewals credit once per invoice, even with two event types and restarts',async()=>{
  await svc.handleEvent(event('invoice.paid','evt_paid',{id:'in_1'}));await svc.handleEvent(event('invoice.payment_succeeded','evt_other',{id:'in_1'}));
  svc=new EarnStripeService(dir,ledger,()=>cfg,'https://hub.example',()=>now,fake);await svc.handleEvent(event('invoice.paid','evt_retry',{id:'in_1'}));assert.equal(ledger.view(owner,'Referrer').balances.referral,1800);

@@ -1,3 +1,17 @@
+## v0.4.80 — Member-selected Earn payout destinations
+
+Earn members can save or update a payout destination preference for USDT on
+BEP-20, USDT on Polygon, or PayPal. Saves are revision-checked and audited;
+they do not move funds, alter Earn balances, or create payout history. Automatic
+Stripe payout admission skips members with a saved manual preference while
+continuing to reconcile existing Stripe payouts. Manually processed payments
+are scheduled 3–5 business days after month end. New members receive 35% of WH
+commission as the default share; finalized months and entries remain unchanged.
+An explicit audited operator migration is available for untouched legacy 50%
+defaults and is never run automatically. Review candidates with
+`node dist/bin/migrate-earn-rebate-default.js --data-dir <hub-data-dir>`;
+apply only after review by adding `--apply`.
+
 ## v0.4.79 — Binance coin market-cap coverage and expanded liquidation percentiles
 
 The market-cap producer supports explicitly configured Binance USD-M USDT perpetuals using native instrument identity and CoinMarketCap's Binance derivatives mapping (exchange id 270). Multiplier contracts retain the underlying asset's unscaled capitalisation; unresolved identities and missing market caps remain unknown. Binance production remains off unless included in MARKET_CAP_VENUES, and existing paid-provider budget limits remain in force. Liquidation tables carry additive full-range statistics while preserving legacy display and trading stops.
@@ -1871,6 +1885,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 ## Changelog
 
 - v0.4.79 — Add explicitly configured Binance coin market-cap coverage and full-range liquidation statistics; preserve legacy percentile thresholds and unknown-cap refusals.
+- v0.4.80 — Add audited member-selected Earn payout destinations, suppress automatic Stripe payout admission for opted-in members, and set prospective default WH commission share to 35%; provide an explicit audited migration for untouched legacy defaults.
 - v0.4.78 — Re-verify edited Earn UIDs with claim-revision checks and show credited monthly exchange rebates clearly.
 - v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
 - v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.

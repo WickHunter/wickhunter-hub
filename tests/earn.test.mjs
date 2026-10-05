@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { JSDOM } from 'jsdom';
-import { EarnService, EXCHANGES, tierPercent, csvRows, usdCents } from '../dist/src/earn.js';
+import { EarnService, EarnConflictError, EXCHANGES, tierPercent, csvRows, usdCents } from '../dist/src/earn.js';
 import { tmpDir, test, summary, freshHub } from './helpers.mjs';
 const dir=tmpDir('earn'), now=()=>Date.parse('2026-09-17T12:00:00Z'), svc=new EarnService(dir,now);
 function setVerified(book,owner,exchange,uid,verified){const revision=book.view(owner,'Owner').member.uids.find(u=>u.exchange===exchange&&u.uid===uid)?.revision;return book.configure({owner,exchange,uid,verified,expectedRevision:revision});}
@@ -11,6 +11,71 @@ try {
 await test('tier boundaries include 20 and 40 in the lower tier',()=>{assert.deepEqual([0,19,20,21,40,41].map(tierPercent),[20,20,20,30,30,40]);});
 await test('only four approved exchanges; no Aster',()=>assert.deepEqual(EXCHANGES.map(e=>e.id),['bybit','bitget','bitunix','weex']));
 svc.member('alice','Alice');svc.member('bob','Bob');
+assert.equal(svc.view('alice','Alice').member.rebatePercent,35,'new members receive the current WH share default');
+svc.configure({owner:'alice',rebatePercent:50}); // legacy fixtures below model a reviewed custom rate
+await test('payout preference validates explicit destination, persists by revision, and leaves ledger untouched',()=>{
+ const isolated=tmpDir('earn-payout-preference'),book=new EarnService(isolated,now),owner='preference-owner';
+ try {
+  book.member(owner,'Preference owner');
+  book.record({owner,source:'marketplace',kind:'earning',cents:4200,period:'2026-08',reference:'preference-earning',note:'Settled'});
+  const legacy=book.admin();delete legacy.members[0].payoutPreference;book.transaction(s=>{s.members[0]=legacy.members[0];});
+  assert.equal(book.view(owner,'Preference owner').member.payoutPreference,null,'legacy members read as no preference');
+  const before=book.admin(),balance=book.view(owner,'Preference owner').balances,entries=structuredClone(before.entries),stripe=structuredClone(before.stripe);
+  const address='0xAbCdEf0123456789aBCDef0123456789abCDef01';
+  const first=book.savePayoutPreference(owner,{method:'usdt-polygon',address,expectedRevision:null});
+  assert.deepEqual(book.view(owner,'Preference owner').member.payoutPreference,first);
+  assert.deepEqual(book.adminView().members[0].payoutPreference,first);
+  assert.equal(book.admin().audit.at(-1).actor,'member');
+  assert.equal(book.admin().audit.at(-1).owner,owner);
+  assert.equal(book.admin().audit.at(-1).before.payoutPreference,null);
+  assert.deepEqual(book.admin().audit.at(-1).after.payoutPreference,first);
+  const savedVersion=book.fileVersion();
+  assert.equal(book.savePayoutPreference(owner,{method:'usdt-polygon',address,expectedRevision:first.revision}).revision,first.revision,'retry with current revision is idempotent');
+  assert.equal(book.fileVersion(),savedVersion,'identical retry does not rewrite the durable ledger');
+  assert.throws(()=>book.savePayoutPreference(owner,{method:'usdt-bep20',address,expectedRevision:null}),EarnConflictError);
+  const second=book.savePayoutPreference(owner,{method:'usdt-bep20',address,expectedRevision:first.revision});
+  assert.notEqual(second.revision,first.revision);assert.equal(second.address,address,'wallet case is preserved');
+  assert.deepEqual(book.view(owner,'Preference owner').balances,balance);
+  assert.deepEqual(book.admin().entries,entries,'destination selection cannot create payout history or alter earnings');
+  assert.deepEqual(book.admin().stripe,stripe,'destination selection cannot create Stripe payout state');
+  for(const invalid of [
+   {method:'usdt',address,expectedRevision:second.revision},
+   {method:'usdt-polygon',address:'0x'+'0'.repeat(40),expectedRevision:second.revision},
+   {method:'usdt-bep20',address:'0x'+'A'.repeat(39),expectedRevision:second.revision},
+   {method:'paypal',address:'no-at-sign',expectedRevision:second.revision},
+   {method:'paypal',address:'a'.repeat(65)+'@example.com',expectedRevision:second.revision},
+   {method:'paypal',address:'pay\u0000pal@example.com',expectedRevision:second.revision},
+   {method:'paypal',address:'user@example.com'},
+  ]) assert.throws(()=>book.savePayoutPreference(owner,invalid));
+  assert.deepEqual(book.view(owner,'Preference owner').member.payoutPreference,second,'invalid or stale saves preserve the existing preference');
+  assert.throws(()=>book.savePayoutPreference('missing',{method:'paypal',address:'bad',expectedRevision:null}),/valid PayPal/);
+  assert.equal(book.admin().members.some(m=>m.id==='missing'),false,'invalid first save does not create an empty member');
+  assert.throws(()=>book.savePayoutPreference('missing',{method:'paypal',address:'payee@example.com',expectedRevision:'stale'}),EarnConflictError);
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
+});
+await test('new member share is 35%; audited one-time migration changes only untouched 50% defaults',()=>{
+ const isolated=tmpDir('earn-share-migration'),book=new EarnService(isolated,now);
+ try {
+  const legacy='legacy-default',custom='custom-share';book.member(legacy,'Legacy default');book.member(custom,'Custom share');
+  book.addUid(legacy,{exchange:'bitunix',uid:'3210',accountType:'main'});setVerified(book,legacy,'bitunix','3210',true);
+  book.transaction(state=>{state.members.find(m=>m.id===legacy).rebatePercent=50;state.members.find(m=>m.id===custom).rebatePercent=50;});
+  book.configure({owner:custom,rebatePercent:60});book.configure({owner:custom,rebatePercent:50});
+  assert.equal(book.member('fresh','Fresh').rebatePercent,35);
+  const csv='exchange,uid,commission_usd\nbitunix,3210,100.00',preview=book.previewCsv({period:'2026-08',csv});
+  assert.equal(preview.rows[0].rate,50);book.importCsv({period:'2026-08',csv,digest:preview.digest});
+  const frozenMonths=structuredClone(book.admin().months),frozenEntries=structuredClone(book.admin().entries);
+  assert.deepEqual(book.migrateDefaultRebateShare(),{applied:false,count:1},'dry run reports eligible untouched legacy defaults only');
+  const result=book.migrateDefaultRebateShare(true);
+  assert.equal(result.count,1);assert.deepEqual(result.owners,[legacy]);
+  assert.equal(book.view(legacy,'Legacy default').member.rebatePercent,35);
+  assert.equal(book.view(custom,'Custom share').member.rebatePercent,50,'a member with audited override history is preserved');
+  assert.equal(book.view('fresh','Fresh').member.rebatePercent,35);
+  assert.deepEqual(book.admin().months,frozenMonths,'finalized month snapshots remain unchanged');
+  assert.deepEqual(book.admin().entries,frozenEntries,'historical balances and ledger entries remain unchanged');
+  assert.match(book.admin().audit.at(-1).actor,/default WH share 50% to 35%/);
+  assert.deepEqual(book.migrateDefaultRebateShare(true).owners,[],'rerunning migration is idempotent');
+ } finally {fs.rmSync(isolated,{recursive:true,force:true});}
+});
 await test('main UID required; one pending claim per exchange and globally exclusive verification',()=>{
  assert.throws(()=>svc.addUid('alice',{exchange:'bybit',uid:'1001'}),/main account/);
  svc.addUid('alice',{exchange:'bybit',uid:'1001',accountType:'main'});
@@ -49,7 +114,7 @@ await test('UID replacement re-verifies future imports without changing finalize
  const isolated=tmpDir('earn-uid-replacement');let clock=Date.parse('2026-09-17T12:00:00Z');
  const book=new EarnService(isolated,()=>clock);
  try {
-  book.member('owner','Owner');book.member('other','Other');
+  book.member('owner','Owner');book.member('other','Other');book.configure({owner:'owner',rebatePercent:50});
   book.addUid('owner',{exchange:'bitunix',uid:'1223',accountType:'main'});
   setVerified(book,'owner','bitunix','1223',true);
   const importMonth=(period,uid,amount)=>{
@@ -236,6 +301,24 @@ const h=await freshHub();try{
  const r=await fetch(h.origin+'/api/hub/earn',{headers});assert.equal(r.status,200);const member=(await r.json()).member;
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9001',accountType:'main'})})).status,200);
  const own=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(own.member.id,member.id);assert.equal(own.member.uids[0].uid,'9001');
+ assert.equal(own.member.payoutPreference,null,'legacy/member GET remains compatible');
+ const destination={method:'usdt-bep20',address:'0xabcdef0123456789abcdef0123456789abcdef01',expectedRevision:null,owner:'attacker-selected-owner'};
+ const badOrigin=await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers:{...headers,'sec-fetch-site':'cross-site'},body:JSON.stringify(destination)});
+ assert.equal(badOrigin.status,403);
+ const savedResponse=await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers,body:JSON.stringify(destination)});
+ assert.equal(savedResponse.status,200);const saved=(await savedResponse.json()).payoutPreference;
+ assert.equal(saved.method,'usdt-bep20');assert.equal(saved.address,destination.address);assert.equal(typeof saved.revision,'string');
+ const preferenceGet=await (await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(preferenceGet.member.id,member.id);assert.deepEqual(preferenceGet.member.payoutPreference,saved);
+ const adminAfterPreference=await (await fetch(h.origin+'/admin/api/earn',{headers:adminHeaders})).json();
+ assert.equal(adminAfterPreference.payoutTiming,'3–5 business days after month end');
+ assert.deepEqual(adminAfterPreference.members.find(m=>m.id===member.id).payoutPreference,saved);
+ assert.equal(adminAfterPreference.audit.at(-1).owner,member.id);assert.equal(adminAfterPreference.audit.at(-1).actor,'member');
+ const stalePreference=await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers,body:JSON.stringify({...destination,method:'usdt-polygon',expectedRevision:null})});
+ assert.equal(stalePreference.status,409);
+ const invalidPreference=await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers,body:JSON.stringify({...destination,method:'usdt'})});
+ assert.equal(invalidPreference.status,400);
+ const unauthPreference=await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers:{'content-type':'application/json','x-wh-earn':'1'},body:JSON.stringify(destination)});
+ assert.equal(unauthPreference.status,401);
  const adminInitial=await (await fetch(h.origin+'/admin/api/earn',{headers:adminHeaders})).json();
  assert.equal(adminInitial.members.find(m=>m.id===member.id).uids[0].revision,own.member.uids[0].revision);
  assert.equal((await fetch(h.origin+'/api/hub/earn/uid',{method:'POST',headers,body:JSON.stringify({owner:'someoneelse',exchange:'bybit',uid:'9002',expectedUid:'9001',expectedRevision:own.member.uids[0].revision,accountType:'main'})})).status,200);

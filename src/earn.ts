@@ -13,13 +13,17 @@ export const EXCHANGES = [
   { id: 'weex', name: 'WEEX', whPercent: 50, url: 'https://www.weex.com/en/register?vipCode=9fcy' },
 ];
 export const BYBIT_HELP = 'https://www.bybit.com/en/help-center/article/How-to-Transfer-Your-Identity-to-Another-Account';
+export const EARN_PAYOUT_TIMING = '3–5 business days after month end';
 export type EarnSource = 'referral' | 'exchange' | 'marketplace';
 type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string; revision?: string };
-export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
+export type EarnPayoutMethod = 'usdt-bep20' | 'usdt-polygon' | 'paypal';
+export type EarnPayoutPreference = { method: EarnPayoutMethod; address: string; revision: string };
+export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string; payoutPreference?: EarnPayoutPreference | null };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
 export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
+export class EarnConflictError extends Error { constructor(message='Payout preference changed; refresh and review it before saving') { super(message); this.name='EarnConflictError'; } }
 /** Historical claims predate revisions. Their stable view token changes as soon
  * as any replacement or verification writes a fresh stored revision. */
 function uidRevision(owner: string, claim: UID): string {
@@ -68,7 +72,7 @@ export class EarnService {
   private date() { return new Date(this.now()).toISOString(); }
   member(owner: string, name: string) {
     const s=this.read(); let m=s.members.find(x=>x.id===owner);
-    if(!m) {m={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:50,createdAt:this.date()};s.members.push(m);this.save(s);}
+    if(!m) {m={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:35,createdAt:this.date(),payoutPreference:null};s.members.push(m);this.save(s);}
     return m;
   }
   admin() { return this.read(); }
@@ -76,7 +80,7 @@ export class EarnService {
    * member view, without rewriting historical claims in the ledger. */
   adminView() {
     const state=this.read();
-    return {...state,members:state.members.map(m=>({...m,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))}))};
+    return {...state,payoutTiming:EARN_PAYOUT_TIMING,members:state.members.map(m=>({...m,payoutPreference:m.payoutPreference??null,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))}))};
   }
   /** Rename-on-save changes inode, including on filesystems with coarse mtimes.
    * A missing file is a distinct version and is still read on first use. */
@@ -94,6 +98,26 @@ export class EarnService {
   /** Reconciliation may prove the provider has not changed any durable fact. */
   transactionIfChanged(fn: (state: EarnState) => boolean): boolean {
     const state=this.read();const changed=fn(state);if(changed)this.save(state);return changed;
+  }
+  /** One-time operator migration for untouched historical default shares.
+   * Explicitly audited rebate-rate changes are treated as overrides, even if
+   * the admin later set the value back to the old 50% default. */
+  migrateDefaultRebateShare(apply=false) {
+    const state=this.read();
+    const candidates=state.members.filter(member=>member.rebatePercent===50
+      && !(state.audit??[]).some(a=>a.owner===member.id&&a.before?.rebatePercent!==a.after?.rebatePercent));
+    if(!apply)return {applied:false,count:candidates.length};
+    const migrated:string[]=[];
+    this.transactionIfChanged(current=>{
+      for(const member of current.members){
+        if(member.rebatePercent!==50||(current.audit??[]).some(a=>a.owner===member.id&&a.before?.rebatePercent!==a.after?.rebatePercent))continue;
+        const before=structuredClone(member);member.rebatePercent=35;
+        (current.audit??=[]).push({at:this.date(),actor:'hub-admin-migration: default WH share 50% to 35%',owner:member.id,before,after:structuredClone(member)});
+        migrated.push(member.id);
+      }
+      return migrated.length>0;
+    });
+    return {applied:true,count:migrated.length,owners:migrated};
   }
   copyMember(member: Member) { this.transaction(s=>{const i=s.members.findIndex(m=>m.id===member.id);if(i<0)s.members.push(structuredClone(member));else s.members[i]=structuredClone(member);}); }
 
@@ -132,7 +156,7 @@ export class EarnService {
   view(owner: string, name: string) {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);
     const active=s.referrals.filter(r=>r.code===m.code && r.active && (r.paidThrough===undefined || r.paidThrough>this.now())).length;
-    const member={...m,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))};
+    const member={...m,payoutPreference:m.payoutPreference??null,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))};
     return { member, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
@@ -140,6 +164,39 @@ export class EarnService {
       entries:entries.slice().reverse(), months:s.months.flatMap(mo=>mo.rows.filter(r=>r.owner===owner).map(r=>({
         ...r, period:mo.period, earnedCents:r.qualified?r.rebateCents:0,
       }))) };
+  }
+  /** Store only a member-selected destination. This does not create a payout,
+   * Stripe recipient, ledger entry, or balance mutation. Revision comparison
+   * and audit append share the same synchronous durable Earn transaction. */
+  savePayoutPreference(owner: string, input: Record<string,unknown>, name='WH member'): EarnPayoutPreference {
+    const method=input.method;
+    if(method!=='usdt-bep20'&&method!=='usdt-polygon'&&method!=='paypal')throw new Error('Choose an explicit USDT network or PayPal');
+    if(typeof input.address!=='string'||!input.address||input.address.length>254||/[\x00-\x1f\x7f]/.test(input.address))throw new Error('Enter a valid payout address');
+    const address=input.address.trim();
+    if(!address)throw new Error('Enter a valid payout address');
+    if(method==='usdt-bep20'||method==='usdt-polygon'){
+      if(!/^0x[a-fA-F0-9]{40}$/.test(address)||/^0x0{40}$/i.test(address))throw new Error('Enter a valid nonzero EVM wallet address');
+    }else if(address.length>254||! /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/.test(address)){
+      throw new Error('Enter a valid PayPal email address');
+    }
+    if(!Object.prototype.hasOwnProperty.call(input,'expectedRevision'))throw new Error('Refresh and include the payout preference revision');
+    const expected=input.expectedRevision;
+    if(expected!==null&&(typeof expected!=='string'||expected.length<1||expected.length>100))throw new Error('Invalid payout preference revision');
+    let result:EarnPayoutPreference|undefined;
+    this.transactionIfChanged(state=>{
+      let member=state.members.find(m=>m.id===owner);
+      if(!member&&expected!==null)throw new EarnConflictError();
+      if(!member){member={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:35,createdAt:this.date(),payoutPreference:null};state.members.push(member);}
+      const current=member.payoutPreference??null;
+      if(expected===null?current!==null:current?.revision!==expected)throw new EarnConflictError();
+      if(current?.method===method&&current.address===address){result=current;return false;}
+      const before=structuredClone({...member,payoutPreference:current});
+      const preference:EarnPayoutPreference={method,address,revision:randomUUID()};
+      member.payoutPreference=preference;
+      (state.audit??=[]).push({at:this.date(),actor:'member',owner:member.id,before,after:structuredClone(member)});
+      result=preference;return true;
+    });
+    return result!;
   }
   addUid(owner: string, input: Record<string,unknown>) {
     if(input.accountType !== 'main')throw new Error('Only main account UIDs are accepted; subaccounts are not eligible');

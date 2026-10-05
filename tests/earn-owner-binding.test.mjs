@@ -50,9 +50,20 @@ try {
     assert.equal(after.balances.marketplace,1200);
     const newIdentity=h.hub.customerSessions.store.ensureIdentity('changed@example.com');
     const newSession=h.hub.customerSessions.store.createSession(newIdentity.id,'127.0.0.1');
-    const portalAfter=await (await fetch(h.origin+'/api/customer/earn',{headers:{cookie:`wh_customer_session=${newSession}`}})).json();
+    const portalHeaders={cookie:`wh_customer_session=${newSession}`};
+    const portalAfter=await (await fetch(h.origin+'/api/customer/earn',{headers:portalHeaders})).json();
     assert.equal(portalAfter.member.id,before.member.id);
     assert.equal(portalAfter.balances.marketplace,1200);
+    const preferenceResponse=await fetch(h.origin+'/api/customer/earn/payout-preference',{method:'POST',
+      headers:{...portalHeaders,'content-type':'application/json','x-wh-earn':'1'},
+      body:JSON.stringify({owner:'untrusted-body-owner',method:'paypal',address:'Jane.Payee+Wh@example.com',expectedRevision:null})});
+    assert.equal(preferenceResponse.status,200);
+    const saved=(await preferenceResponse.json()).payoutPreference;
+    assert.deepEqual(saved,{method:'paypal',address:'Jane.Payee+Wh@example.com',revision:saved.revision});
+    const sessionView=await (await fetch(h.origin+'/api/customer/earn',{headers:portalHeaders})).json();
+    assert.equal(sessionView.member.id,before.member.id,'owner comes from the authenticated stable billing identity');
+    assert.deepEqual(sessionView.member.payoutPreference,saved);
+    assert.equal(new EarnService(h.dataDir).admin().members.length,1,'request body cannot create a second owner');
   });
 } finally { await h.close(); }
 

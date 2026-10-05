@@ -4,7 +4,7 @@ import { readReleaseControlState, countUnresolvedHubBugs, DEFAULT_PRODUCTION_SOA
 import { MarketingSettings } from './marketing-settings.js';
 import { MarketingCustomerSync, type MarketingCustomerSyncResult } from './marketing-customer-sync.js';
 import { EarnStripeService } from "./earn-stripe.js";
-import { EarnService, earnOwner } from "./earn.js";
+import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 // src/server.ts
 // The hub's HTTP server: node:http, no framework, no runtime dependencies.
 //
@@ -942,7 +942,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     // ── customer sessions (H2) ──────────────────────────────────────────
     if (m === "GET" && p === "/earn") return earnCustomer(req, res, url);
-    if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh))?$/.test(p)) return earnCustomer(req, res, url);
+    if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh|payout-preference))?$/.test(p)) return earnCustomer(req, res, url);
     if (m === "GET" && p === "/customer") return customerPage(res);
     if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
@@ -1609,13 +1609,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 4096);
       if (!body) return sendJson(res, 400, { ok: false, error: "Invalid request" });
+      if(url.pathname.endsWith('/payout-preference')) {
+        const payoutPreference=earn.savePayoutPreference(owner,body,name);
+        return sendJson(res,200,{ok:true,payoutPreference},{'cache-control':'no-store'});
+      }
       earn.member(owner, name);
       if(url.pathname.endsWith('/activate')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.activate(owner) });
       if(url.pathname.endsWith('/onboard')) return sendJson(res, 200, { ok:true, ...await earnStripe.onboard(owner,body) });
       if(url.pathname.endsWith('/refresh')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.refresh(owner) });
       earn.addUid(owner, body);
       return sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
-    } catch (error) { return sendJson(res, 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
+    } catch (error) { return sendJson(res, error instanceof EarnConflictError ? 409 : 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
   }
 
   function customerState(req: IncomingMessage, res: ServerResponse): void {
