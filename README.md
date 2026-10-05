@@ -1,3 +1,9 @@
+## v0.4.79 — Binance coin market-cap coverage and expanded liquidation percentiles
+
+The market-cap producer supports explicitly configured Binance USD-M USDT perpetuals using native instrument identity and CoinMarketCap's Binance derivatives mapping (exchange id 270). Multiplier contracts retain the underlying asset's unscaled capitalisation; unresolved identities and missing market caps remain unknown. Binance production remains off unless included in MARKET_CAP_VENUES, and existing paid-provider budget limits remain in force. Liquidation tables carry additive full-range statistics while preserving legacy display and trading stops.
+
+This source candidate starts from the exact live Hub v0.4.78 source, 44ee9274a7c277134c15a6b40f6aaa55c28de883. Runtime rollout requires separate current authorization. It does not publish or promote customer application releases.
+
 ## v0.4.78 — Verified Earn UIDs and clear monthly statements
 
 Members can update their main UID for an exchange. A changed UID needs a new Hub verification before it qualifies for future exchange rebates; claim revisions prevent stale member edits and admin approvals. The customer statement labels WH commission received and shows the amount actually credited, including $0 below the existing $15 combined monthly minimum. Finalized months, payout history and rebate rates are unchanged.
@@ -1864,6 +1870,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.79 — Add explicitly configured Binance coin market-cap coverage and full-range liquidation statistics; preserve legacy percentile thresholds and unknown-cap refusals.
 - v0.4.78 — Re-verify edited Earn UIDs with claim-revision checks and show credited monthly exchange rebates clearly.
 - v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
 - v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.

@@ -19,7 +19,7 @@ import {
 } from "../dist/src/marketcap/identity.js";
 import {
   catalogueSanity, parseAsterInstruments, parseBitgetInstruments, parseBitunixInstruments,
-  parseBybitInstruments, parseWeexInstruments,
+  parseBybitInstruments, parseWeexInstruments, parseBinanceInstruments,
 } from "../dist/src/marketcap/exchanges.js";
 import { CMC_ENDPOINT_CLAIM, parseDerivativeExchanges, parseMarketPairs } from "../dist/src/marketcap/cmc.js";
 import { DEFAULT_EXCHANGE_IDS, DEFAULT_EXCHANGE_SLUGS } from "../dist/src/marketcap/service.js";
@@ -328,6 +328,18 @@ await test("a NULL market_pair label does not cost us the mapping", () => {
     { slugOf: () => "aster-pro", index: buildPairIndex(pairs), overrides: {} },
   );
   assert.equal(r.cryptoId, 5426);
+});
+
+await test("Binance catalogue uses exact USD-M perpetual identities and preserves multiplier bases", () => {
+  const native = (symbol, base, over = {}) => ({ symbol, baseAsset: base, quoteAsset: "USDT", marginAsset: "USDT", status: "TRADING", contractType: "PERPETUAL", ...over });
+  const r = parseBinanceInstruments({ symbols: [native("BTCUSDT", "BTC"), native("1000PEPEUSDT", "1000PEPE"),
+    native("OFFUSDT", "OFF", { status: "SETTLING" }), native("BTCUSDC", "BTC", { quoteAsset: "USDC", marginAsset: "USDC" }),
+    native("BTC_261225", "BTC", { contractType: "CURRENT_QUARTER" }), native("BADUSDT", "BAD", { marginAsset: "" }), null] });
+  assert.deepEqual(r.instruments.map(x => [x.venue, x.symbol, x.base, x.active]), [["binance", "BTCUSDT", "BTC", true], ["binance", "1000PEPEUSDT", "1000PEPE", true], ["binance", "OFFUSDT", "OFF", false]]);
+  assert.equal(r.unparsed, 2);
+  const resolved = resolveIdentity(r.instruments[1], { slugOf: v => DEFAULT_EXCHANGE_SLUGS[v], index: buildPairIndex([pair("1000PEPE", 24478, { exchangeSlug: "binance", cryptoSymbol: "PEPE" })]), overrides: {} });
+  assert.equal(resolved.cryptoId, 24478);
+  assert.equal(DEFAULT_EXCHANGE_IDS.binance, 270);
 });
 
 summary("marketcap-identity");

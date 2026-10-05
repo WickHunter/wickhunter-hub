@@ -437,4 +437,27 @@ await test("a restart serves the same bytes it was serving a second earlier", as
   assert.equal(second.health().credits.used, 3, "and the credit ledger came back with it");
 });
 
+await test("Binance gets signed coverage with exact provider IDs, unscaled caps and unknown refusals", async () => {
+  const w = world(); w.exchangeId = 270;
+  const { svc, signer: sign } = makeService(w, { venues: ["binance"] }, {
+    venueFetch: async url => {
+      w.calls.push(url); assert.equal(url, "https://fapi.binance.com/fapi/v1/exchangeInfo");
+      return json({ symbols: w.instruments.map(r => ({ symbol: r.symbol, baseAsset: r.baseCoin, quoteAsset: "USDT", marginAsset: "USDT", status: "TRADING", contractType: "PERPETUAL" })) });
+    },
+    http: async url => {
+      const result = await baseHttp(w, url);
+      const b = await result.json();
+      if (new URL(url).pathname === "/v5/exchange/derivatives/list") for (const e of b.data.exchanges) { e.exchange_slug = "binance"; e.exchange_name = "Binance"; }
+      return json(b);
+    },
+  });
+  await svc.tick();
+  const p = svc.snapshot()?.payload; assert.ok(p);
+  assert.equal(p.instruments.length, 3);
+  assert.ok(p.instruments.every(r => r.venue === "binance"));
+  assert.equal(p.instruments.find(r => r.symbol === "1000PEPEUSDT").marketCapUsd, "4206900000");
+  assert.equal(p.instruments.find(r => r.symbol === "NEWUSDT").identity, "provider_untracked");
+  assert.deepEqual(verifySnapshot(p, { keys: { "market-data-1": publicKeyRawB64u(sign) }, now: w.now }), { ok: true });
+});
+
 summary("marketcap-service");

@@ -164,15 +164,13 @@ await test("Binance store state survives restart, stays separate from Bybit, and
   assert.deepEqual(restarted.days("bybit", "BTCUSDT"), [old, fresh], "another venue's retention partition is untouched");
 });
 
-await test("Binance candle support cannot silently enter the paid market-cap producer", () => {
-  const cfg = marketCapConfigFromEnv({
-    MARKET_CAP_VENUES: "binance,bybit",
-    MARKET_CAP_SLUGS: "binance:binance,bybit:bybit",
-    MARKET_CAP_EXCHANGE_IDS: "binance:270,bybit:521",
-  }, tmpDir("binance-marketcap-isolation"));
-  assert.deepEqual(cfg.venues, ["bybit"]);
-  assert.equal(Object.hasOwn(cfg.slugs, "binance"), false);
-  assert.equal(Object.hasOwn(cfg.exchangeIds, "binance"), false);
+await test("Binance market-cap production requires explicit venue configuration", () => {
+  const off = marketCapConfigFromEnv({ MARKET_CAP_VENUES: "bybit" }, tmpDir("binance-marketcap-off"));
+  assert.deepEqual(off.venues, ["bybit"], "adding candle support never starts paid Binance queries");
+  const cfg = marketCapConfigFromEnv({ MARKET_CAP_VENUES: "binance,bybit" }, tmpDir("binance-marketcap-on"));
+  assert.deepEqual(cfg.venues, ["binance", "bybit"]);
+  assert.equal(cfg.slugs.binance, "binance");
+  assert.equal(cfg.exchangeIds.binance, 270);
 });
 
 summary("binance");
