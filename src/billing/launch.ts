@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readJson, writeJsonAtomic } from '../jsonfile.js';
@@ -33,6 +33,7 @@ export interface LaunchIntent {
   stripeParams: StripeObject;
   sessionId?: string;
   url?: string;
+  hostingTokenHash?: string;
 }
 const blankMode = (): LaunchMode => ({ enabled: false, cryptoEnabled: false, cryptoCapable: false, promotionId: '', prices: {} });
 const configPath = (dir: string) => path.join(dir, 'billing-launch.v1.json');
@@ -120,7 +121,8 @@ export class LaunchBilling {
     const mode = this.modeConfig();
     return { active: mode.enabled && this.now() < LAUNCH_REDEEM_UNTIL_MS,
       firstPaymentAtMs: LAUNCH_FIRST_PAYMENT_MS,
-      redeemUntilMs: LAUNCH_REDEEM_UNTIL_MS, cryptoEnabled: mode.enabled && mode.cryptoEnabled };
+      redeemUntilMs: LAUNCH_REDEEM_UNTIL_MS, cryptoEnabled: mode.enabled && mode.cryptoEnabled,
+      hostingCheckoutEnabled: mode.enabled };
   }
   publicPlans(): Record<string, unknown> {
     const result = this.billing.publicPlans(), mode = this.modeConfig();
@@ -182,11 +184,14 @@ export class LaunchBilling {
     return this.status();
   }
 
-  checkout(input: { plan?: unknown; payment?: unknown; attemptId?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown }): Promise<{ ok: true; url: string }> {
+  checkout(input: { plan?: unknown; payment?: unknown; attemptId?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown; hosting?: unknown }): Promise<{ ok: true; url: string }> {
+    if (input.hosting !== undefined && typeof input.hosting !== 'boolean') return Promise.reject(Error('Invalid hosting selection'));
     if (typeof input.attemptId !== 'string' || !/^[a-f0-9-]{36}$/i.test(input.attemptId)) return Promise.reject(Error('A checkout attempt ID is required'));
     const mode = this.billing.config().mode, id = sha(`${mode}:${input.attemptId}`);
     // Requests sharing a network retry identity must also share all inputs.
-    const requestHash = sha(JSON.stringify([input.plan, input.payment, input.licenseId ?? null, input.token ? sha(String(input.token)) : null, input.referral ?? null]));
+    const identity = [input.plan, input.payment, input.licenseId ?? null, input.token ? sha(String(input.token)) : null, input.referral ?? null];
+    if (input.hosting === true) identity.push('hosting-monthly');
+    const requestHash = sha(JSON.stringify(identity));
     const prior = readJson<LaunchIntent | null>(intentPath(this.dataDir,id), null);
     if (prior && prior.requestHash !== requestHash) return Promise.reject(Error('Checkout attempt already belongs to another request'));
     const flight = this.flights.get(id);
@@ -195,7 +200,7 @@ export class LaunchBilling {
     this.flights.set(id, { requestHash, promise: run }); return run;
   }
 
-  private async createCheckout(input: { plan?: unknown; payment?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown }, id: string, requestHash: string): Promise<{ ok: true; url: string }> {
+  private async createCheckout(input: { plan?: unknown; payment?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown; hosting?: unknown }, id: string, requestHash: string): Promise<{ ok: true; url: string }> {
     const cfg = this.billing.config(), mode = cfg.mode, launch = this.modeConfig(mode), now = this.now();
     if (!launch.enabled) throw Error('Launch checkout is not enabled yet');
     const plan = cfg.plans.find(p => p.key === input.plan && BASE_PLANS.includes(p.key) && p.role === 'software') as Plan | undefined;
@@ -223,6 +228,7 @@ export class LaunchBilling {
           fs.unlinkSync(file);
           claim = null;
         } else if (old?.url && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
+          !!old.hostingTokenHash === (input.hosting === true) &&
           now - old.createdAtMs < 23 * 3600_000) return { ok: true, url: old.url };
         else if (old?.sessionId && now - old.createdAtMs >= 24 * 3600_000) {
           const priorSession = await this.api(mode).call('GET', `/v1/checkout/sessions/${old.sessionId}`);
@@ -265,6 +271,8 @@ export class LaunchBilling {
         success_url: `${this.origin}/customer?checkout=complete`, cancel_url: 'https://www.wickhunterunleashed.com/unleashed/#pricing',
         'payment_method_types[0]': crypto ? 'crypto' : 'card', 'line_items[0][quantity]': 1,
         'consent_collection[terms_of_service]': 'required' };
+      const hostingToken = input.hosting === true ? randomBytes(32).toString('hex') : null;
+      if (hostingToken) params.success_url = `${this.origin}/checkout/hosting#intent=${id}&token=${hostingToken}`;
       const cutoff = firstPayment ?? LAUNCH_REDEEM_UNTIL_MS;
       if (cutoff - now >= 30 * 60_000 && cutoff - now <= 24 * 3600_000) params.expires_at = cutoff / 1000;
       const customer = licenseId ? this.billing.store.findByLicense(licenseId) : null;
@@ -285,9 +293,10 @@ export class LaunchBilling {
         if (subscription) params[`subscription_data[metadata][${key}]`] = value;
       }
       params['custom_text[submit][message]'] = subscription ? `${firstPayment ? 'Free until October 15, 2026 (Eastern Time). First charge then. ' : ''}${discount ? `${discount}% off the base subscription price on every renewal while this subscription remains active. ` : ''}Automatically renews ${plan.interval === 'year' ? 'yearly' : 'monthly'} until canceled. Cancel in Manage subscription.` : `One payment. No automatic renewal.${crypto && plan.key === 'yearly' && now < LAUNCH_FIRST_PAYMENT_MS ? ' Access through October 15, 2027.' : ''}`;
+      if (hostingToken) params['custom_text[submit][message]'] += ' Next: confirm VPS hosting in a separate card checkout. Hosting starts billing immediately and renews monthly.';
       intent = { id, mode, plan: plan.key, payment: input.payment as 'card'|'crypto', licenseId, requestHash, createdAtMs: now,
         firstPaymentAtMs: firstPayment, accessUntilMs: crypto && plan.key === 'yearly' && now < LAUNCH_FIRST_PAYMENT_MS ? LAUNCH_YEARLY_END_MS : null,
-        discountPercent: discount, stripeParams: params };
+        discountPercent: discount, stripeParams: params, ...(hostingToken ? { hostingTokenHash: sha(hostingToken) } : {}) };
       writeJsonAtomic(intentPath(this.dataDir,id), intent);
     }
     const session = await this.api(mode).call('POST', '/v1/checkout/sessions', intent.stripeParams, { key: `wh-launch-checkout-${id}` });
@@ -295,5 +304,32 @@ export class LaunchBilling {
     if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.username || url.password || !/^cs_/.test(session.id)) throw Error('Stripe returned an invalid checkout session');
     intent.sessionId = session.id; intent.url = url.href; writeJsonAtomic(intentPath(this.dataDir,id), intent);
     return { ok: true, url: url.href };
+  }
+
+  /** The return link authorizes only the selected hosting checkout. Stripe
+   * verifies payment; the normal webhook must grant software before hosting. */
+  async hostingCustomer(input: { intent?: unknown; token?: unknown }): Promise<{ ownerId: string; email: string } | null> {
+    if (typeof input.intent !== 'string' || !/^[a-f0-9]{64}$/.test(input.intent)
+      || typeof input.token !== 'string' || !/^[a-f0-9]{64}$/.test(input.token)) throw Error('Invalid hosting checkout link');
+    const intent = readJson<LaunchIntent | null>(intentPath(this.dataDir, input.intent), null);
+    if (!intent?.hostingTokenHash || intent.hostingTokenHash !== sha(input.token)
+      || intent.mode !== this.billing.config().mode) throw Error('Invalid hosting checkout link');
+    if (this.now() - intent.createdAtMs > 48 * 3600_000) throw Error('This checkout link expired. Add hosting from your customer dashboard.');
+    if (!intent.sessionId) return null;
+    const session = await this.api(intent.mode).call('GET', `/v1/checkout/sessions/${intent.sessionId}`);
+    if (session.id !== intent.sessionId || session.client_reference_id !== intent.id
+      || session.metadata?.wh_launch_intent !== intent.id || session.metadata?.plan !== intent.plan
+      || session.livemode !== (intent.mode === 'live') || session.mode !== intent.stripeParams.mode) throw Error('Software checkout could not be verified');
+    if (session.status === 'expired') throw Error('Software checkout expired. Start again from the plans page.');
+    if (session.status !== 'complete' || !['paid', 'no_payment_required'].includes(session.payment_status)
+      || (session.mode === 'payment' && session.payment_status !== 'paid')) return null;
+    if (typeof session.customer !== 'string' || !/^cus_[A-Za-z0-9_]+$/.test(session.customer)) throw Error('Software checkout has no customer');
+    const customer = this.billing.store.findByStripeCustomer(session.customer);
+    if (!customer || customer.livemode !== (intent.mode === 'live')) return null;
+    const fulfilled = session.mode === 'payment'
+      ? this.billing.store.getCheckoutSession(intent.sessionId)?.status === 'applied'
+      : customer.subscriptionId === session.subscription && customer.chargeIds.includes(`cs:${intent.sessionId}`);
+    if (!fulfilled) return null;
+    return { ownerId: session.customer, email: customer.email };
   }
 }

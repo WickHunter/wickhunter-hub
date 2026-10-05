@@ -508,7 +508,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // generous against an honest retry (the token itself lasts 15 minutes)
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
-  const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 30, windowMs: 15 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
@@ -685,7 +685,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
-        || p === "/api/billing/plans" || p === "/billing"
+        || p === "/api/billing/plans" || p === "/billing" || p === "/checkout/hosting"
         || p === "/api/hub/liq-percentiles"
         || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
         || p === "/api/hosting/options" || p === "/api/hosting") return true;
@@ -695,7 +695,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST") {
       if (p === '/api/marketing/brevo/webhook') return true;
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
-      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout") return true;
+      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout" || p === "/api/billing/hosting-continuation") return true;
       // /api/customer/signin also spends the dedicated per-email bucket
       // (`customerSigninEmailLimiter`) inside its own handler — this is the
       // per-IP half, the same "everything else public" bucket every other
@@ -773,6 +773,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // other unauthenticated-or-bearer public route shares the general "rest
     // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
     if (m === "POST" && p === "/api/hosting/bundle-checkout") {
+      res.setHeader("access-control-allow-origin", "*");
       const rate = hostingBundleIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "hosted bundle checkout"); }
     } else if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
@@ -919,8 +920,29 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
       const body = await readJsonBody(req, 8 * 1024);
       if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a checkout request' });
-      try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
+      try {
+        if (body.hosting === true) {
+          const issue = hosting.hostingOfferIssue();
+          if (issue) throw Error(issue);
+        }
+        return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' });
+      }
       catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+    }
+    if (m === 'GET' && p === '/checkout/hosting') {
+      return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, 'hosting-checkout.html'), 'utf8'));
+    }
+    if (m === 'POST' && p === '/api/billing/hosting-continuation') {
+      const headers = { 'cache-control': 'no-store' };
+      const body = await readJsonBody(req, 1024);
+      if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a hosting checkout link' }, headers);
+      try {
+        const customer = await launchBilling.hostingCustomer(body);
+        if (!customer) return sendJson(res, 202, { ok: true, pending: true }, headers);
+        const result = await hosting.checkoutUrl(customer.ownerId, customer.email);
+        if (!result.ok) return sendJson(res, 409, { ok: false, error: result.error }, headers);
+        return sendJson(res, 200, { ok: true, url: result.value.url }, headers);
+      } catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, headers); }
     }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
     if (m === 'POST' && p === '/api/marketing/brevo/webhook') {
@@ -1702,7 +1724,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const plan = body?.plan;
     const checkoutAttemptId = body?.checkoutAttemptId;
     if ((plan !== "monthly" && plan !== "yearly") || typeof checkoutAttemptId !== "string") return sendJson(res, 400, { ok: false, error: "expected {plan: monthly|yearly, checkoutAttemptId}" }, headers);
-    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId);
+    const offer = launchBilling.offer();
+    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId,
+      undefined, offer.active ? Number(offer.firstPaymentAtMs) : null);
     if (!r.ok) return sendJson(res, r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, headers);
     sendJson(res, 200, { ok: true, url: r.value.url, pricing: r.value.pricing }, headers);
   }

@@ -103,6 +103,27 @@ async function provisionedInstance(ctx, customerId, email) {
   return fresh;
 }
 
+await test("deletion hold preserves a bootstrapping VPS during region replacement", async () => {
+  const c = await newHub();
+  try {
+    const row = await provisionedInstance(c, "cus_hold_bootstrap", "hold@example.com");
+    c.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => {
+      d.deletionHold = { by: "admin", atMs: c.getClock(), reason: "retain test VPS" };
+    }, c.getClock());
+    c.h.hub.hosting.store.enqueue({
+      hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation,
+      jobType: "readiness_recheck", dedupeKey: `held-replacement:${row.id}`,
+      availableAtMs: c.getClock(), payload: { kind: "replace-region", nextRegionId: "itm" },
+    }, c.getClock());
+    await c.h.hub.hosting.tick(c.getClock());
+    assert.ok(await c.provider.getInstance(row.providerInstanceId));
+    const fresh = c.h.hub.hosting.store.getInstance(row.id);
+    assert.equal(fresh.providerInstanceId, row.providerInstanceId);
+    assert.equal(fresh.generation, row.generation);
+    assert.equal(c.provider.createCalls.length, 1);
+  } finally { await c.h.close(); }
+});
+
 /** Exactly hosting-service.test.mjs's own nonpayment sequence, stopped at
  *  `suspended` — an admin hold is placed on instances that are already
  *  suspended in the real product ("it stays suspended with the hold

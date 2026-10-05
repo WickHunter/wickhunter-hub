@@ -43,7 +43,6 @@ export const CHECKOUT_SESSIONS_FILE = "billing-checkout-sessions.v1.json";
  *  is years of a small shop's events, and the ledger keeps the full history. */
 const MAX_SEEN_EVENTS = 5000;
 const EVENTS_TAIL_BYTES = 2 * 1024 * 1024;
-export const INSTALL_TOKEN_TTL_MS = 24 * 60 * 60_000;
 /** Unused install tokens a customer may hold at once (each page view mints one). */
 const MAX_OPEN_INSTALL_TOKENS = 20;
 
@@ -91,7 +90,7 @@ export interface TokenRecord {
   licenseId: string;
   customerKey: string;
   createdAtMs: number;
-  /** null = until rotated (page tokens); install tokens expire. */
+  /** null = no time limit; use and revocation still invalidate tokens. */
   expiresAtMs: number | null;
   usedAtMs: number | null;
   revokedAtMs: number | null;
@@ -577,7 +576,7 @@ export class BillingStore {
       licenseId,
       customerKey,
       createdAtMs: now,
-      expiresAtMs: kind === "install" ? now + INSTALL_TOKEN_TTL_MS : null,
+      expiresAtMs: null,
       usedAtMs: null,
       revokedAtMs: null,
     };

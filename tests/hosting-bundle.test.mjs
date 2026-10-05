@@ -2,16 +2,18 @@ import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { signStripePayload } from "../dist/src/billing/stripe.js";
 import { FakeProvider } from "../dist/src/hosting/provider.js";
+import { LAUNCH_FIRST_PAYMENT_MS } from "../dist/src/billing/launch.js";
 
 const WHSEC = "whsec_test_bundle_0123456789";
 const RELEASE = "b".repeat(64);
 
 async function setup(overrides = {}) {
-  let clock = Math.floor(Date.now() / 1000) * 1000;
+  let clock = overrides.now ?? Math.floor(Date.now() / 1000) * 1000;
   const calls = [];
   const provider = new FakeProvider({ now: () => clock });
   const h = await freshHub({}, {
     billingNow: () => clock, hostingNow: () => clock,
+    ...(overrides.fixedRateLimitClock ? {rateLimitNow: () => clock} : {}),
     billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
     hostingProvider: provider,
     hostingFetch: async (url, init) => {
@@ -38,7 +40,7 @@ async function setup(overrides = {}) {
       { key: "yearly-hosted", name: "Yearly + VPS", amountCents: 93900, currency: "usd", interval: "year", role: "software", checkout: "hosted-bundle" },
     ],
   });
-  await admin("/admin/api/hosting/policy", { policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "2284", releaseRef: RELEASE, maximumProjectedMonthlyProviderCostCents: 10000 } });
+  await admin("/admin/api/hosting/policy", { policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "2284", releaseRef: RELEASE, maximumProjectedMonthlyProviderCostCents: overrides.costCeilingCents ?? 10000 } });
   const event = (id, type, object) => ({ id, object: "event", type, livemode: false, created: Math.floor(clock / 1000), data: { object } });
   async function post(ev) {
     const body = JSON.stringify(ev);
@@ -47,6 +49,93 @@ async function setup(overrides = {}) {
   }
   return { h, calls, provider, event, post, advance: (ms) => { clock += ms; }, now: () => clock };
 }
+
+await test("free combined checkout preserves the exact annual/monthly price and billing anchor", async () => {
+  for (const interval of ['month', 'year']) {
+    const c = await setup({ now: Date.parse('2026-10-04T12:00:00Z') });
+    try {
+      const r = await c.h.hub.hosting.bundleCheckout(interval, 'free-bundle-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(r.ok, true);
+      const request = new URLSearchParams(c.calls.find(x => x.url.endsWith('/v1/checkout/sessions')).init.body);
+      assert.equal(request.get('mode'), 'subscription');
+      assert.equal(request.get('line_items[0][price]'), interval === 'year' ? 'price_bundle_year' : 'price_bundle_month');
+      assert.equal(request.get('subscription_data[billing_cycle_anchor]'), String(LAUNCH_FIRST_PAYMENT_MS / 1000));
+      assert.equal(request.get('subscription_data[proration_behavior]'), 'none');
+      assert.equal(request.get('payment_method_collection'), 'always');
+      assert.equal(request.get('allow_promotion_codes'), 'true');
+      assert.equal(request.get('metadata[first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
+      assert.equal(request.get('subscription_data[metadata][first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
+      assert.match(request.get('success_url'), /customer\?checkout=complete#hostingCard$/);
+      assert.match(request.get('custom_text[submit][message]'), /\$0 today/);
+      assert.equal(c.provider.createCalls.length, 0, 'opening checkout does not create a VPS');
+      const again = await c.h.hub.hosting.bundleCheckout(interval, 'free-bundle-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(again.value.url, r.value.url);
+      assert.equal(c.calls.filter(x => x.url.endsWith('/v1/checkout/sessions')).length, 1);
+    } finally { await c.h.close(); }
+  }
+});
+
+await test("regular monthly and yearly bundles allow promo entry and preserve it on checkout retry", async () => {
+  for (const interval of ['month', 'year']) {
+    const c = await setup({ now: LAUNCH_FIRST_PAYMENT_MS + 86400000 });
+    try {
+      const attempt = `promo-checkout-${interval}-123456789`;
+      const first = await c.h.hub.hosting.bundleCheckout(interval, attempt, c.now());
+      assert.equal(first.ok, true);
+      const row = c.h.hub.hosting.store.instances()[0];
+      const originalBody = row.checkoutRequestBody;
+      const request = new URLSearchParams(originalBody);
+      assert.equal(request.get('allow_promotion_codes'), 'true');
+      assert.equal(request.get('line_items[0][price]'), interval === 'year' ? 'price_bundle_year' : 'price_bundle_month');
+      assert.equal(request.has('subscription_data[billing_cycle_anchor]'), false);
+      assert.equal([...request.keys()].some(key => key.startsWith('discounts[')), false);
+      c.h.hub.hosting.store.updateInstance(row.id, row.version, d => { d.checkoutUrl = null; }, c.now());
+      assert.equal((await c.h.hub.hosting.bundleCheckout(interval, attempt, c.now())).ok, true);
+      const checkouts = c.calls.filter(x => x.url.endsWith('/v1/checkout/sessions'));
+      assert.equal(checkouts.length, 2);
+      assert.equal(checkouts[1].init.body, originalBody);
+      assert.equal(checkouts[1].init.headers['idempotency-key'], checkouts[0].init.headers['idempotency-key']);
+      assert.equal(c.provider.createCalls.length, 0);
+    } finally { await c.h.close(); }
+  }
+});
+
+await test("free bundle cancellation suspends at access end and permanently deletes the provider VPS", async () => {
+  for (const status of ['active', 'trialing']) {
+    const c = await setup({ now: Date.parse('2026-10-04T12:00:00Z') });
+    try {
+      await c.h.hub.hosting.bundleCheckout('year', 'free-cancel-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      const reservation = c.h.hub.hosting.store.instances()[0];
+      const metadata = { plan: 'yearly-hosted', bundle: 'software-hosting-v1', reservation: reservation.id, first_payment_at_ms: String(LAUNCH_FIRST_PAYMENT_MS) };
+      const checkout = c.event('evt_free_checkout', 'checkout.session.completed', { id: 'cs_free', mode: 'subscription', payment_status: 'no_payment_required', customer: 'cus_free', customer_details: { email: 'free@example.com' }, subscription: 'sub_free', metadata });
+      assert.equal((await c.post(checkout)).body.outcome, 'applied');
+      const customer = c.h.hub.billing.store.getCustomer('cus_free');
+      assert.equal(customer.firstPaymentAtMs, LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(customer.firstActualPaymentAtMs ?? null, null, 'free checkout is not a payment');
+      assert.equal(c.h.hub.billing.store.getRoleSubscription('cus_free', 'hosting').periodEndMs, LAUNCH_FIRST_PAYMENT_MS);
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.provider.createCalls.length, 1, 'confirmed free bundle provisions immediately');
+      const cancel = c.event('evt_free_cancel', 'customer.subscription.updated', { id: 'sub_free', customer: 'cus_free', status, cancel_at_period_end: true, current_period_end: LAUNCH_FIRST_PAYMENT_MS / 1000, metadata, items: { data: [{ price: { id: 'price_bundle_year' } }] } });
+      assert.equal((await c.post(cancel)).body.outcome, 'applied');
+      const row = c.h.hub.hosting.store.getInstance(reservation.id);
+      assert.equal(row.cancellationReason, 'intentional_cancellation');
+      assert.equal(row.suspendAtMs, LAUNCH_FIRST_PAYMENT_MS);
+      assert.ok(row.deleteAtMs > row.suspendAtMs, 'configured retention is respected');
+      c.advance(row.suspendAtMs - c.now());
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal((await c.provider.getInstance(row.providerInstanceId)).status, 'stopped');
+      c.advance(row.deleteAtMs - c.now() + 1000);
+      await c.h.hub.hosting.tick(c.now());
+      c.advance(60_000);
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.h.hub.hosting.store.getInstance(row.id).stage, 'deleted');
+      assert.equal(await c.provider.getInstance(row.providerInstanceId), null);
+      assert.equal((await c.post(checkout)).body.outcome, 'duplicate');
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.provider.createCalls.length, 1, 'replayed checkout never recreates a cancelled VPS');
+    } finally { await c.h.close(); }
+  }
+});
 
 await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable through /buy", async () => {
   const c = await setup();
@@ -66,17 +155,49 @@ await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable
   await c.h.close();
 });
 
+await test('bundle rate limiting remains readable by the cross-origin website', async () => {
+  const c = await setup({fixedRateLimitClock:true});
+  try {
+    let response;
+    for (let i=0; i<31; i++) {
+      response = await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
+      method:'POST',headers:{origin:'https://www.wickhunterunleashed.com','content-type':'application/json'},body:'{}',
+      });
+      if (i < 30) assert.equal(response.status,400,'first 30 requests reach validation');
+    }
+    assert.equal(response.status,429);
+    assert.equal(response.headers.get('access-control-allow-origin'),'*');
+    const body = await response.json();
+    assert.ok(body.retryAfterSeconds > 0);
+    c.advance(15 * 60_000 + 1);
+    assert.equal((await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
+      method:'POST',headers:{'content-type':'application/json'},body:'{}',
+    })).status,400,'checkout limit resets after the window');
+    assert.equal(c.provider.createCalls.length,0);
+  } finally { await c.h.close(); }
+});
+
 await test("anonymous bundle reservations are bounded and expired reservations release capacity", async () => {
-  const c = await setup();
+  const c = await setup({ costCeilingCents: 100000 });
   const checkout = (suffix) => jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: `123e4567-e89b-12d3-a456-42661417${suffix}` }) });
-  assert.equal((await checkout("4101")).status, 200);
-  assert.equal((await checkout("4102")).status, 200);
-  assert.equal((await checkout("4103")).status, 200);
-  assert.equal((await checkout("4104")).status, 503);
+  for (let i=1; i<=25; i++) assert.equal((await checkout(String(4100+i))).status,200);
+  assert.equal((await checkout("4126")).status, 503);
   c.advance(31 * 60_000);
-  assert.equal((await checkout("4104")).status, 200);
+  assert.equal((await checkout("4126")).status, 200);
   assert.equal(c.h.hub.hosting.store.instances().filter((x) => x.ownerId.startsWith("bundle:") && x.stage === "ordered").length, 1);
   await c.h.close();
+});
+
+await test("increased pending limit still respects the provider spend ceiling", async () => {
+  const c = await setup({ costCeilingCents: 4000 });
+  try {
+    for (let i=0; i<4; i++) assert.equal((await c.h.hub.hosting.bundleCheckout('month',`cost-guard-attempt-${i}`,c.now())).ok,true);
+    const refused=await c.h.hub.hosting.bundleCheckout('month','cost-guard-attempt-extra',c.now());
+    assert.equal(refused.ok,false);
+    assert.match(refused.error,/cost ceiling/);
+    assert.equal(c.h.hub.hosting.store.instances().length,4);
+    assert.equal(c.provider.createCalls.length,0);
+  } finally { await c.h.close(); }
 });
 
 await test("bundle checkout fails closed before reservation when Stripe price is stale", async () => {

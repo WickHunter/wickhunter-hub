@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>VPS checkout | Wick Hunter Unleashed</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0a0c12;color:#e9ecf5}
+    body{margin:0}main{max-width:520px;margin:12vh auto;padding:24px}h1{font-size:26px;line-height:1.2}
+    p{line-height:1.6;color:#b8c0d1}a{color:#72dfbb}button{font:inherit;background:#72dfbb;color:#091710;border:0;border-radius:6px;padding:12px 18px;cursor:pointer}
+    button:disabled{opacity:.5;cursor:wait}[hidden]{display:none!important}
+  </style>
+</head>
+<body><main>
+  <p>Wick Hunter Unleashed</p>
+  <h1>Complete your VPS checkout</h1>
+  <p>Your hosting subscription starts billing when you confirm the next checkout and renews monthly. Software keeps its own billing schedule.</p>
+  <p id="status" role="status">Confirming your software checkout...</p>
+  <button id="retry" type="button" hidden>Retry hosting checkout</button>
+  <p><a href="/customer#hostingCard">Go to customer dashboard</a></p>
+</main>
+<script>
+(function () {
+  var params = new URLSearchParams(location.hash.slice(1));
+  var request = { intent: params.get('intent'), token: params.get('token') };
+  var status = document.getElementById('status');
+  var retry = document.getElementById('retry');
+  var active = false;
+  async function openHosting() {
+    if (active) return;
+    active = true;
+    retry.hidden = true;
+    status.textContent = 'Confirming your software checkout...';
+    try {
+      var deadline = Date.now() + 90000;
+      while (true) {
+        var controller = new AbortController();
+        var timer = setTimeout(function () { controller.abort(); }, 20000);
+        var response, data;
+        try {
+          response = await fetch('/api/billing/hosting-continuation', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(request), signal: controller.signal
+          });
+          data = await response.json();
+        } finally { clearTimeout(timer); }
+        if (!response.ok || !data.ok) throw Error(data.error || 'Hosting checkout could not be opened.');
+        if (data.pending) {
+          if (Date.now() >= deadline) throw Error('Software payment is still being confirmed. Retry shortly, or add hosting from your customer dashboard once confirmation arrives.');
+          status.textContent = 'Waiting for software payment confirmation before opening hosting checkout...';
+          await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+          continue;
+        }
+        var url = new URL(data.url);
+        if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.username || url.password) throw Error('Invalid hosting checkout address.');
+        status.textContent = 'Opening secure hosting checkout...';
+        var link = document.createElement('a');
+        link.href = url.href; link.rel = 'noreferrer'; link.click();
+        return;
+      }
+    } catch (error) {
+      status.textContent = error.name === 'AbortError' ? 'The connection timed out. Retry hosting checkout.' : error.message;
+      retry.hidden = false;
+    } finally { active = false; }
+  }
+  retry.addEventListener('click', openHosting);
+  if (/^[a-f0-9]{64}$/.test(request.intent || '') && /^[a-f0-9]{64}$/.test(request.token || '')) openHosting();
+  else status.textContent = 'This checkout link is incomplete. Add hosting from your customer dashboard.';
+})();
+</script></body></html>
