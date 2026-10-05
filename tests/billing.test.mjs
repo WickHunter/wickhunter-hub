@@ -206,9 +206,9 @@ await test("checkout.session.completed (test) mints a bootstrap licence and emai
   const command = /curl -q -fsSL "https:\/\/hub\.test\/hub\/install\/([A-Za-z0-9_-]+)" \| sudo bash/.exec(mail.text);
   assert.ok(command, 'purchase email includes the installer command');
   assert.ok(mail.html.includes(command[1]), 'HTML email contains the same one-time token');
-  assert.match(mail.text, /expires after 24 hours/);
+  assert.match(mail.text, /works once and has no time limit/);
+  assert.match(mail.html, /works once and has no time limit/);
   assert.match(mail.text, /Installation is automatic/);
-  assert.equal(h.hub.billing.store.consumeInstall(command[1], clock + DAY).reason, 'expired');
   assert.equal(h.hub.billing.installByToken(command[1]).ok, true);
   assert.equal(h.hub.billing.installByToken(command[1]).ok, false, 'email command is single-use');
   pageTokenA = pageTokenFromEmail();
@@ -279,15 +279,31 @@ await test("/install/<token> serves the personalised installer ONCE, with the cu
   assert.equal(bogus.status, 403);
 });
 
-await test("an expired install token is refused; a reloaded page mints a fresh one", async () => {
+await test("an unused install command still works after 24 hours and remains single-use", async () => {
   const page = await (await fetch(`${h.origin}/welcome/${pageTokenA}`)).text();
   const tok = /\/install\/([A-Za-z0-9_-]+)&quot;/.exec(page)[1];
   const saved = clock;
-  clock += 25 * 3_600_000; // past the 24h token life
+  clock += 25 * 3_600_000;
   const res = await fetch(`${h.origin}/install/${tok}`);
-  assert.equal(res.status, 403);
-  assert.match(await res.text(), /expired/);
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /KEY="LHK1\./);
+  assert.equal((await fetch(`${h.origin}/install/${tok}`)).status,403);
   clock = saved;
+});
+
+await test("install tokens have no timer while revocation and the outstanding-command bound still apply", () => {
+  const store=h.hub.billing.store;
+  const old=store.mint('install','test-token-license','token-timer-test',clock);
+  const result=store.consumeInstall(old,clock+365*DAY);
+  assert.equal(result.ok,true);
+  assert.equal(result.rec.expiresAtMs,null);
+  assert.equal(store.consumeInstall(old,clock+365*DAY).reason,'used');
+  const revoked=store.mint('install','test-token-license','token-timer-test',clock);
+  store.revokeTokens('token-timer-test','all',clock+1);
+  assert.equal(store.consumeInstall(revoked,clock+365*DAY).reason,'revoked');
+  const first=store.mint('install','test-token-license','token-bound-test',clock);
+  for(let i=1;i<=20;i++) store.mint('install','test-token-license','token-bound-test',clock+i);
+  assert.equal(store.consumeInstall(first,clock+365*DAY).reason,'revoked');
 });
 
 await test("Manage billing opens a Customer Portal session through the secret key", async () => {

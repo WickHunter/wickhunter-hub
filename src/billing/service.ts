@@ -1579,7 +1579,7 @@ export class BillingService {
       const text = {
         unknown: "this install link is not valid — open your install page and copy the command again",
         used: "this install command was already used — reload your install page for a fresh one",
-        expired: "this install command has expired (they last 24 hours) — reload your install page for a fresh one",
+        expired: "this older install command has expired — reload your install page for a fresh one with no time limit",
         revoked: "this install command is no longer valid — reload your install page for a fresh one",
       }[r.reason];
       return { ok: false, status: 403, text };

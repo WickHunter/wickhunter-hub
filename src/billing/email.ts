@@ -151,7 +151,7 @@ const GOOD_TO_KNOW: readonly string[] = [
   "If your subscription lapses, the bot keeps closing and protecting positions but opens nothing new until it is renewed.",
 ];
 
-/** Email the private page plus a short-lived, single-use installer command.
+/** Email the private page plus a single-use installer command with no time limit.
  * The long-lived licence key stays out of email; resends rotate both links. */
 export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage {
   const first = input.name.trim().split(/\s+/)[0] || "there";
@@ -190,7 +190,7 @@ export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage
     `Your page issues a fresh one-time install command each time you open it. Keep the link private — anyone who has it can install with your licence.`,
     ...(input.installCommand ? [
       ``, `YOUR INSTALL COMMAND (SELF-HOSTING)`, ``, input.installCommand, ``,
-      `Run this in an SSH terminal on your own Ubuntu VPS. It works once and expires after 24 hours. Open your install page for a fresh command afterward. Keep this command private.`,
+      `Run this in an SSH terminal on your own Ubuntu VPS. It works once and has no time limit. An active license is still required. Open your install page for a fresh command after use or revocation. Keep this command private.`,
       `Using managed VPS hosting? Installation is automatic; wait for your dashboard email instead of running this command.`,
     ] : []),
     input.starterPack ? `Your Liquidation Bot + Hedge Bot starter pack is ready on that same private page. Copy the bundle or each bot separately, then preview each import in your app before enabling it.` : null,
@@ -314,7 +314,7 @@ ${noticeHtml}
     ${input.installCommand ? `<tr><td style="padding:0 0 20px">
       <div style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding-bottom:10px">Your install command (self-hosting)</div>
       <div style="font-family:${MONO};font-size:12px;line-height:1.6;color:${INK};background-color:${INSET};padding:14px;border:1px solid ${BORDER_SOFT};border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all">${escapeHtml(input.installCommand)}</div>
-      <p style="font-family:${FONT};font-size:12.5px;line-height:1.5;color:${MUTED};margin:10px 0 0">Run this in an SSH terminal on your own Ubuntu VPS. It works once and expires after 24 hours. Open your install page for a fresh command afterward. Keep this command private.</p>
+      <p style="font-family:${FONT};font-size:12.5px;line-height:1.5;color:${MUTED};margin:10px 0 0">Run this in an SSH terminal on your own Ubuntu VPS. It works once and has no time limit. An active license is still required. Open your install page for a fresh command after use or revocation. Keep this command private.</p>
       <p style="font-family:${FONT};font-size:12.5px;line-height:1.5;color:${MUTED};margin:10px 0 0"><strong>Using managed VPS hosting?</strong> Installation is automatic; wait for your dashboard email instead of running this command.</p>
     </td></tr>` : ''}
     ${input.starterPack ? `<tr><td style="font-family:${FONT};font-size:13px;color:${INK};line-height:1.5;padding:0 0 20px"><strong>Your Liquidation Bot + Hedge Bot starter pack is ready.</strong> Open the same private page to copy the bundle or either bot, then preview the import in your app before enabling it.</td></tr>` : ""}
