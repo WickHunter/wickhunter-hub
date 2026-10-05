@@ -374,11 +374,36 @@ fi
 
 PACKAGE_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' "$src/package.json")
 [ "$PACKAGE_VERSION" = "$REL_VERSION" ] || die "signed release version $REL_VERSION does not match package version $PACKAGE_VERSION"
-if [ -n "${LIQHUNTER_BOOTSTRAP_PASSWORD:-}" ]; then
-  [ -x "$src/bin/wh-core-linux-amd64" ] || die "hosted release is missing the protected native core"
-  CORE_VERSION=$("$src/bin/wh-core-linux-amd64" -version 2>/dev/null || true)
-  case "$CORE_VERSION" in "wh-core "*) ;; *) die "hosted release native core did not identify as wh-core" ;; esac
-fi
+# Preflight the authenticated archive before replacing any installed files.
+# Every customer runs the protected native core, including manually installed
+# hosts. Capture child errors: they may include URLs or credentials.
+preflight_artifact() {
+  node - "$1" <<'PREFLIGHT_ARTIFACT'
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const root = process.argv[2];
+const fail = (message) => { console.error(message); process.exit(1); };
+let pkg;
+try { pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")); }
+catch { fail("unreadable signed package metadata"); }
+const entries = { "node server.js": "server.js", "node dist/server/index.js": "dist/server/index.js" };
+const entry = entries[pkg.scripts?.start];
+if (!entry || !fs.statSync(path.join(root, entry), { throwIfNoEntry: false })?.isFile()) fail("signed package has no supported server entry");
+try { execFileSync(process.execPath, ["--check", path.join(root, entry)], { timeout: 10000, maxBuffer: 65536, stdio: "pipe" }); }
+catch { fail("signed server entry failed the Node syntax preflight"); }
+if (process.arch !== "x64") fail("protected native core currently requires Linux x64");
+const core = path.join(root, "bin/wh-core-linux-amd64");
+try { fs.accessSync(core, fs.constants.X_OK); }
+catch { fail("signed release is missing its executable protected native core"); }
+let version;
+try { version = execFileSync(core, ["-version"], { cwd: root, timeout: 5000, maxBuffer: 4096, stdio: "pipe", encoding: "utf8" }); }
+catch { fail("protected native core could not execute on this host"); }
+if (!/^wh-core \S+ protocol=\d+ algorithm=\d+$/m.test(version)) fail("protected native core did not identify as the production wh-core");
+process.stdout.write(entry);
+PREFLIGHT_ARTIFACT
+}
+ENTRY=$(preflight_artifact "$src") || die "signed artifact startup preflight failed; installed files were not replaced"
 rsync -a --checksum --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
 if [ "$CHANNEL_AWARE" = "1" ]; then
@@ -436,18 +461,73 @@ say "Configuring"
 mkdir -p "$(dirname "$ENV_FILE")"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 
-get_env() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -n1; }
-set_env() { # set_env NAME VALUE — replace-or-append, keep the file mode 600
-  local tmp; tmp=$(mktemp)
-  grep -v "^$1=" "$ENV_FILE" > "$tmp" || true
-  printf '%s=%s\n' "$1" "$2" >> "$tmp"
-  install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"
+# EnvironmentFile is data, never shell code. Write one double-quoted value
+# with systemd's escaping, and decode previous quoted/unquoted assignments on
+# reruns. Values travel on fd 3, never in a command argument or error message.
+env_file() { # env_file get|set|unset NAME
+  node - "$ENV_FILE" "$1" "$2" <<'ENV_FILE_CODEC'
+const fs = require("node:fs");
+const [file, mode, name] = process.argv.slice(2);
+const fail = () => { console.error("invalid EnvironmentFile assignment; inspect the root-only environment file locally"); process.exit(1); };
+if (!/^[A-Z_][A-Z0-9_]*$/.test(name) || !["get", "set", "unset"].includes(mode)) fail();
+const text = fs.readFileSync(file, "utf8");
+// Parse records, including multiline quoted values and backslash continuations.
+// Comments and unrelated assignments remain byte-for-byte unchanged.
+const records = [];
+let pos = 0;
+while (pos < text.length) {
+  const start = pos;
+  const match = /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t\r]*/.exec(text.slice(pos));
+  if (!match) { const end = text.indexOf("\n", pos); pos = end < 0 ? text.length : end + 1; records.push({ raw: text.slice(start, pos) }); continue; }
+  pos += match[0].length;
+  let value = "", quote = null, trailing = "";
+  if (text[pos] === '"' || text[pos] === "'") quote = text[pos++];
+  let closed = !quote;
+  while (pos < text.length) {
+    const c = text[pos++];
+    if (quote && c === quote) { closed = true; break; }
+    if (!quote && c === "\n") break;
+    if (c === "\\" && quote !== "'") {
+      if (pos === text.length) { value += "\\"; break; }
+      const next = text[pos++];
+      if (next === "\n") continue;
+      if (!quote || ['\\', '"', '$', '`'].includes(next)) value += next;
+      else value += "\\" + next;
+    } else value += c;
+  }
+  if (quote) {
+    while (pos < text.length && text[pos] !== "\n") trailing += text[pos++];
+    if (text[pos] === "\n") pos++;
+  } else value = value.replace(/[ \t\r]+$/, "");
+  if (match[1] === name && (!closed || trailing.trim())) fail();
+  records.push({ name: match[1], value, raw: text.slice(start, pos) });
 }
-unset_env() { # unset_env NAME
-  local tmp; tmp=$(mktemp)
-  grep -v "^$1=" "$ENV_FILE" > "$tmp" || true
-  install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"
+if (mode === "get") {
+  process.stdout.write(records.filter((r) => r.name === name).at(-1)?.value ?? "");
+} else {
+  let output = records.filter((r) => r.name !== name).map((r) => r.raw).join("");
+  if (mode === "set") {
+    const value = fs.readFileSync(3, "utf8");
+    if (/[\0\r\n]/.test(value)) fail();
+    const encoded = '"' + value.replace(/[\\"$`]/g, (c) => "\\" + c) + '"';
+    if (output && !output.endsWith("\n")) output += "\n";
+    output += name + "=" + encoded + "\n";
+  }
+  // Same-directory atomic replacement retains mode 0600 even on a rerun.
+  const tmp = file + ".tmp-" + process.pid;
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try { fs.writeFileSync(fd, output); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  fs.renameSync(tmp, file);
 }
+ENV_FILE_CODEC
+}
+get_env() { env_file get "$1"; }
+set_env() {
+  env_file set "$1" 3< <(printf '%s' "$2")
+  [ "$(get_env "$1")" = "$2" ] || die "EnvironmentFile value did not round-trip; configuration is incomplete"
+}
+unset_env() { env_file unset "$1"; }
 
 SECRET=$(get_env LIQHUNTER_SECRET)
 if [ -z "$SECRET" ]; then
@@ -464,6 +544,7 @@ fi
 # stripped symbols) landed at ~15 chars and crash-looped a real tester box.
 BOOTSTRAP_PW=${LIQHUNTER_BOOTSTRAP_PASSWORD:-$(get_env LIQHUNTER_BOOTSTRAP_PASSWORD)}
 LOGIN_PW=$(get_env LIQHUNTER_LOGIN_PASSWORD)
+LOGIN_HASH=$(get_env LIQHUNTER_LOGIN_PASSWORD_HASH)
 DURABLE_CREDENTIAL=""
 [ -s "$APP_DIR/data/app-credential.json" ] && DURABLE_CREDENTIAL=1
 if [ -n "$BOOTSTRAP_PW" ]; then
@@ -477,7 +558,7 @@ if [ -z "$BOOTSTRAP_PW" ] && [ -n "$LOGIN_PW" ] && [ "${#LOGIN_PW}" -lt 8 ]; the
   warn "existing login password is under the bot's 8-character minimum — replacing it"
   LOGIN_PW=""
 fi
-if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -z "$LOGIN_PW" ]; then
+if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -z "$LOGIN_PW" ] && [ -z "$LOGIN_HASH" ]; then
   while :; do
     ask LOGIN_PW "Choose a dashboard login password (8+ characters; Enter to auto-generate): " --secret
     if [ -z "$LOGIN_PW" ] || [ "${#LOGIN_PW}" -ge 8 ]; then break; fi
@@ -493,7 +574,7 @@ if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -z "$LOGIN_PW" ];
     ok "login password configured"
   fi
 elif [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ]; then
-  ok "keeping existing login password"
+  ok "keeping existing login password or password hash"
 elif [ -z "$BOOTSTRAP_PW" ]; then
   ok "keeping the application's durable login credential"
 fi
@@ -512,12 +593,8 @@ ok "license key installed"
 
 # ── systemd ─────────────────────────────────────────────────────────────────
 say "Installing the systemd service"
-# The beta artifact is one bundled server.js at the app root (its package.json
-# start script is `node server.js`); the full-tree layout is dist/server/index.js.
-# Detect which this build is — pointing systemd at the wrong one is a crash loop.
-ENTRY="server.js"
-[ -f "$APP_DIR/server.js" ] || ENTRY="dist/server/index.js"
-[ -f "$APP_DIR/$ENTRY" ] || die "no server entry found in the unpacked build (looked for server.js and dist/server/index.js)"
+# ENTRY was selected from the signed package start script and syntax-checked
+# before rsync; stale files on a rerun cannot select a different entry.
 unit_tmp=$(mktemp)
 printf '%s\n' \
   '[Unit]' \
@@ -538,21 +615,61 @@ printf '%s\n' \
 install -m 644 "$unit_tmp" "$UNIT_FILE"; rm -f "$unit_tmp"
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-systemctl restart "$SERVICE"
-
-# Retry the health check — `systemctl restart` returns before Node has bound
-# its port; a single immediate curl races the boot and cries wolf.
-wait_for_signed_version() {
-  health=""
-  for _try in 1 2 3 4 5 6 7 8 9; do
-    health=$(curl -q -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null) && break
-    sleep 5
-  done
-  [ -n "$health" ] || die "the bot did not answer on 127.0.0.1:$PORT after 45s; inspect: journalctl -u $SERVICE -n 50"
-  node -e 'const [raw,want]=process.argv.slice(1); let x; try{x=JSON.parse(raw)}catch{process.exit(1)}; if(x.ok!==true||x.version!==want)process.exit(1)' "$health" "$REL_VERSION" \
-    || die "the health responder is not the signed release v$REL_VERSION"
-  ok "bot v$REL_VERSION is healthy"
+# Keep every health attempt inside one elapsed-time budget. Detect a failed
+# process or restart loop before waiting for the full budget. Diagnostic output
+# is allowlisted metadata/codes; raw journals and health bodies stay private.
+HEALTH_DEADLINE_SECONDS=45
+startup_diagnostics() {
+  warn "startup diagnostics for $SERVICE (credentials and raw logs omitted)"
+  timeout 3s systemctl show "$SERVICE" \
+    --property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,OOMPolicy \
+    2>/dev/null | sed -n '/^\(ActiveState\|SubState\|Result\|OOMPolicy\)=[a-z-]*$/p; /^\(MainPID\|ExecMainCode\|ExecMainStatus\|NRestarts\|MemoryCurrent\|MemoryPeak\)=[0-9]*$/p' >&2 || true
+  # Output only recognized diagnostic labels, never a matching log line.
+  timeout 3s journalctl -u "$SERVICE" --since "@$STARTUP_SINCE" -n 80 --no-pager -o cat 2>/dev/null \
+    | node -e 'let s=""; process.stdin.on("data",x=>{if(s.length<131072)s+=x});process.stdin.on("end",()=>{for(const [label,re] of [["Bybit denied this VPS request (HTTP 403; check venue restrictions and response body)",/bybit.*(?:HTTP 403|\b403\b)/i],["port already in use",/EADDRINUSE/],["missing runtime dependency",/MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/],["server syntax error",/SyntaxError/],["memory exhaustion",/out of memory|oom-kill|oom-killed/i],["native core startup failure",/native core.*(?:failed|missing|not found|refus)/i],["invalid login configuration",/password.*(?:minimum|at least|too short)|LIQHUNTER_SECRET.*(?:required|missing)/i]])if(re.test(s))console.error("   ! journal signal: "+label)})' || true
+  if command -v ss >/dev/null; then
+    # Only the listening address and numeric PID are shown, not process names.
+    timeout 3s ss -H -ltnp "sport = :$PORT" 2>/dev/null \
+      | node -e 'let s="";process.stdin.on("data",x=>{if(s.length<16384)s+=x});process.stdin.on("end",()=>{for(const line of s.split("\n")){const address=line.trim().split(/\s+/)[3];if(!address||!/^[a-fA-F0-9.*:[\]]+$/.test(address))continue;const pid=/pid=(\d+)/.exec(line)?.[1];console.error("   ! port listener: "+address+(pid?" pid="+pid:""))}})' || true
+  fi
+  warn "inspect locally: journalctl -u $SERVICE -n 80 --no-pager (do not share credentials or license URLs)"
 }
+startup_failed() { startup_diagnostics; die "$1"; }
+wait_for_signed_version() {
+  local deadline=$((SECONDS + HEALTH_DEADLINE_SECONDS)) remaining budget status restarts baseline="" active sub result pid health
+  while :; do
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -gt 0 ] || startup_failed "the bot did not serve signed v$REL_VERSION on 127.0.0.1:$PORT within ${HEALTH_DEADLINE_SECONDS}s"
+    budget=$remaining; [ "$budget" -le 2 ] || budget=2
+    status=$(timeout "${budget}s" systemctl show "$SERVICE" --property=ActiveState,SubState,Result,MainPID,NRestarts 2>/dev/null) \
+      || startup_failed "could not read the bot service state"
+    active=$(printf '%s\n' "$status" | sed -n 's/^ActiveState=//p')
+    sub=$(printf '%s\n' "$status" | sed -n 's/^SubState=//p')
+    result=$(printf '%s\n' "$status" | sed -n 's/^Result=//p')
+    pid=$(printf '%s\n' "$status" | sed -n 's/^MainPID=//p')
+    restarts=$(printf '%s\n' "$status" | sed -n 's/^NRestarts=//p')
+    case "$restarts:$pid" in *[!0-9:]*|:*|*:) startup_failed "the bot service returned invalid process metadata" ;; esac
+    [ -n "$baseline" ] || baseline=$restarts
+    case "$active:$sub:$result" in failed:*|inactive:*|*:auto-restart:*|*:*:oom-kill|*:*:exit-code|*:*:signal|*:*:core-dump)
+      startup_failed "the bot service exited or is restarting before health became ready" ;; esac
+    [ "$restarts" -eq "$baseline" ] || startup_failed "the bot service restarted before health became ready"
+    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+    budget=$remaining; [ "$budget" -le 3 ] || budget=3
+    if health=$(curl -q -fsS --noproxy '*' --connect-timeout "$budget" --max-time "$budget" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | head -c 65537); then
+      [ "${#health}" -le 65536 ] || startup_failed "the local health responder exceeded the response limit"
+      printf '%s' "$health" | node -e 'const fs=require("node:fs");const want=process.argv[1];let x;try{x=JSON.parse(fs.readFileSync(0,"utf8"))}catch{process.exit(1)};if(x.ok!==true||x.version!==want)process.exit(1)' "$REL_VERSION" \
+        || startup_failed "the local health responder is not signed v$REL_VERSION (check for a port conflict)"
+      [ "$active" = active ] && [ "$pid" -gt 0 ] || startup_failed "health answered without an active bot service"
+      ok "bot v$REL_VERSION is healthy"
+      return 0
+    fi
+    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+    budget=$remaining; [ "$budget" -le 2 ] || budget=2
+    sleep "$budget"
+  done
+}
+STARTUP_SINCE=$(date +%s)
+systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot"
 say "Waiting for the bot to come up"
 wait_for_signed_version
 
@@ -569,7 +686,8 @@ VERIFY_BOOTSTRAP_CREDENTIAL
   unset_env LIQHUNTER_BOOTSTRAP_PASSWORD
   unset BOOTSTRAP_PW
   unset LIQHUNTER_BOOTSTRAP_PASSWORD
-  systemctl restart "$SERVICE"
+  STARTUP_SINCE=$(date +%s)
+  systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot after credential seeding"
   wait_for_signed_version
   ok "temporary hosted login was seeded and removed from the restarted service environment"
 fi
