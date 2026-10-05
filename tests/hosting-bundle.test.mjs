@@ -62,6 +62,7 @@ await test("free combined checkout preserves the exact annual/monthly price and 
       assert.equal(request.get('subscription_data[billing_cycle_anchor]'), String(LAUNCH_FIRST_PAYMENT_MS / 1000));
       assert.equal(request.get('subscription_data[proration_behavior]'), 'none');
       assert.equal(request.get('payment_method_collection'), 'always');
+      assert.equal(request.get('allow_promotion_codes'), 'true');
       assert.equal(request.get('metadata[first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
       assert.equal(request.get('subscription_data[metadata][first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
       assert.match(request.get('success_url'), /customer\?checkout=complete#hostingCard$/);
@@ -70,6 +71,31 @@ await test("free combined checkout preserves the exact annual/monthly price and 
       const again = await c.h.hub.hosting.bundleCheckout(interval, 'free-bundle-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
       assert.equal(again.value.url, r.value.url);
       assert.equal(c.calls.filter(x => x.url.endsWith('/v1/checkout/sessions')).length, 1);
+    } finally { await c.h.close(); }
+  }
+});
+
+await test("regular monthly and yearly bundles allow promo entry and preserve it on checkout retry", async () => {
+  for (const interval of ['month', 'year']) {
+    const c = await setup({ now: LAUNCH_FIRST_PAYMENT_MS + 86400000 });
+    try {
+      const attempt = `promo-checkout-${interval}-123456789`;
+      const first = await c.h.hub.hosting.bundleCheckout(interval, attempt, c.now());
+      assert.equal(first.ok, true);
+      const row = c.h.hub.hosting.store.instances()[0];
+      const originalBody = row.checkoutRequestBody;
+      const request = new URLSearchParams(originalBody);
+      assert.equal(request.get('allow_promotion_codes'), 'true');
+      assert.equal(request.get('line_items[0][price]'), interval === 'year' ? 'price_bundle_year' : 'price_bundle_month');
+      assert.equal(request.has('subscription_data[billing_cycle_anchor]'), false);
+      assert.equal([...request.keys()].some(key => key.startsWith('discounts[')), false);
+      c.h.hub.hosting.store.updateInstance(row.id, row.version, d => { d.checkoutUrl = null; }, c.now());
+      assert.equal((await c.h.hub.hosting.bundleCheckout(interval, attempt, c.now())).ok, true);
+      const checkouts = c.calls.filter(x => x.url.endsWith('/v1/checkout/sessions'));
+      assert.equal(checkouts.length, 2);
+      assert.equal(checkouts[1].init.body, originalBody);
+      assert.equal(checkouts[1].init.headers['idempotency-key'], checkouts[0].init.headers['idempotency-key']);
+      assert.equal(c.provider.createCalls.length, 0);
     } finally { await c.h.close(); }
   }
 });

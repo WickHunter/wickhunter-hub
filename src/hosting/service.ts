@@ -336,6 +336,7 @@ export class HostingService {
     const expiresAtMs = Math.min(nowMs + 31 * 60_000, freeUntil ?? Infinity);
     const body = new URLSearchParams({
       mode: "subscription", client_reference_id: reservation.id,
+      allow_promotion_codes: "true",
       payment_method_collection: "always", "payment_method_types[0]": "card",
       "consent_collection[terms_of_service]": "required",
       "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
