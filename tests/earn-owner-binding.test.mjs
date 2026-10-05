@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EarnService, earnOwner } from '../dist/src/earn.js';
+import { existingEarnMemberForVerifiedEmail } from '../dist/src/earn-registration-owner.js';
 import { setFlag } from '../dist/src/flags.js';
 import { freshHub, tmpDir, test, summary } from './helpers.mjs';
 
@@ -23,6 +24,35 @@ await test('conflicting historical owners are held instead of merged', () => {
   earn.member(first,'First');earn.member(second,'Second');
   assert.throws(()=>earn.bindOwner(['stripe:live:cus_conflict','license:lic_second'],[first,second],first),/Conflicting historical/);
   assert.equal(earn.boundOwner(['stripe:live:cus_conflict']),null);
+});
+
+await test('the partner registrar resolves only existing live bound or legacy email owners without binding', () => {
+  const dir=tmpDir('registration-owner'),earn=new EarnService(dir),owner=earnOwner('stripe:live:cus_partner');
+  earn.member(owner,'Verified partner');
+  const customer=(key,stripeCustomerId,licenseId,email='partner@example.com')=>({key,stripeCustomerId,licenseId,email,name:'Partner',livemode:true});
+  const records=[customer('cus_partner','cus_partner','lic_partner'),customer('cus_partner_2','cus_partner_2','lic_partner_2')];
+  earn.bindOwner(['stripe:live:cus_partner','license:lic_partner','stripe:live:cus_partner_2','license:lic_partner_2'],[],owner);
+  const before=earn.fileVersion();
+  const bound=existingEarnMemberForVerifiedEmail(earn,records,' Partner@Example.com ');
+  assert.equal(bound.owner,owner);assert.equal(bound.member.name,'Verified partner');assert.equal(bound.customerCount,2);assert.equal(bound.source,'billing-binding');
+  assert.equal(earn.fileVersion(),before,'registrar resolution is read-only');
+
+  const legacy=earnOwner('email:legacy@example.com');earn.member(legacy,'Legacy verified member');
+  const legacyBefore=earn.fileVersion();
+  const resolved=existingEarnMemberForVerifiedEmail(earn,[customer('email:legacy@example.com','email:legacy@example.com','lic_legacy','legacy@example.com')],'legacy@example.com');
+  assert.equal(resolved.owner,legacy);assert.equal(resolved.source,'legacy-email');assert.equal(earn.fileVersion(),legacyBefore);
+
+  const unbound=customer('cus_unbound','cus_unbound','lic_unbound');
+  const noOwnerBefore=earn.fileVersion();
+  assert.throws(()=>existingEarnMemberForVerifiedEmail(earn,[unbound],'partner@example.com'),/No existing bound or legacy Earn member/);
+  assert.equal(earn.fileVersion(),noOwnerBefore,'no new member or owner binding is created');
+  earn.member(earnOwner('email:partner@example.com'),'Legacy partner');
+  assert.throws(()=>existingEarnMemberForVerifiedEmail(earn,[records[0],unbound],'partner@example.com'),/Some matching billing customers are unbound/);
+
+  const other=earnOwner('email:other@example.com');earn.member(other,'Other');
+  earn.bindOwner(['stripe:live:cus_other','license:lic_other'],[],other);
+  assert.throws(()=>existingEarnMemberForVerifiedEmail(earn,[records[0],customer('cus_other','cus_other','lic_other')],'partner@example.com'),/conflicting immutable Earn owners/);
+  assert.throws(()=>existingEarnMemberForVerifiedEmail(earn,[],'test@example.com'),/No live billing customer/);
 });
 
 const h=await freshHub();
@@ -68,13 +98,25 @@ try {
 } finally { await h.close(); }
 
 const payer={email:'j.a.n.e.d.o.e+own@googlemail.com'};
+let ownerCoupon=null,ownerPromo=null;
 const stripeFetch=async(url,init)=>{
   const u=new URL(url),ep=u.pathname;
   const ok=(body,status=200)=>new Response(JSON.stringify(body),{status});
   if(ep==='/v1/prices/price_month')return ok({id:'price_month',active:true,recurring:{interval:'month'},currency:'usd',product:'prod_wh'});
-  if(ep.startsWith('/v1/coupons/')&&init.method==='GET')return ok({error:{code:'resource_missing'}},404);
-  if(ep==='/v1/coupons')return ok({id:'wh_coupon',percent_off:10,duration:'forever',metadata:{managed_by:'wh-earn'}});
-  if(ep==='/v1/promotion_codes')return init.method==='GET'?ok({data:[]}):ok({id:'promo_bound'});
+  if(ep.startsWith('/v1/coupons/')&&init.method==='GET')return ownerCoupon?ok(ownerCoupon):ok({error:{code:'resource_missing'}},404);
+  if(ep==='/v1/coupons'){
+    if(init.method==='GET')return ok({data:[]});
+    const body=Object.fromEntries(new URLSearchParams(init.body));
+    ownerCoupon={id:'wh_coupon',percent_off:Number(body.percent_off),duration:'forever',valid:true,applies_to:{products:Object.entries(body).filter(([k])=>k.startsWith('applies_to[products][' )).map(([,v])=>v)},metadata:{managed_by:'wh-earn'}};
+    return ok(ownerCoupon);
+  }
+  if(ep==='/v1/promotion_codes'){
+    if(init.method==='GET')return ok({data:[]});
+    const body=Object.fromEntries(new URLSearchParams(init.body));
+    ownerPromo={id:'promo_bound',code:body.code,coupon:'wh_coupon',active:true,livemode:true,expires_at:null,max_redemptions:null,metadata:{managed_by:body['metadata[managed_by]'],wh_earn_owner:body['metadata[wh_earn_owner]']}};
+    return ok(ownerPromo);
+  }
+  if(ep==='/v1/promotion_codes/promo_bound')return ownerPromo?ok(ownerPromo):ok({error:{code:'resource_missing'}},404);
   if(ep.startsWith('/v1/invoices/')){
     const id=ep.split('/').at(-1);
     return ok({id,customer:'cus_payer',status:'paid',currency:'usd',livemode:true,amount_paid:9900,total_excluding_tax:9000,
@@ -82,7 +124,7 @@ const stripeFetch=async(url,init)=>{
       lines:{data:[{pricing:{price_details:{price:'price_month'}},period:{end:1790000000}}]},
       status_transitions:{paid_at:1780000000}});
   }
-  if(ep.startsWith('/v1/subscriptions/sub_'))return ok({id:ep.split('/').at(-1),status:'active',metadata:{wh_earn_code:refMember.code},items:{data:[{price:'price_month'}]}});
+  if(ep.startsWith('/v1/subscriptions/sub_'))return ok({id:ep.split('/').at(-1),status:'active',metadata:{wh_earn_code:refMember.code},discounts:ownerPromo?[{promotion_code:ownerPromo.id}]:[],items:{data:[{price:'price_month'}]}});
   if(ep==='/v1/customers/cus_payer')return ok({email:payer.email});
   if(ep==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}]});
   if(ep.startsWith('/v1/charges/ch_'))return ok({amount_refunded:0,disputed:false,livemode:true});

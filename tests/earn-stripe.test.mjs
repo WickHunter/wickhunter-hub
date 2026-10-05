@@ -1,18 +1,26 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {EarnService,earnOwner} from '../dist/src/earn.js';
 import {EarnStripeService} from '../dist/src/earn-stripe.js';
+import {BillingService} from '../dist/src/billing/service.js';
+import {BillingStore} from '../dist/src/billing/store.js';
+import {AfterCommitOutbox} from '../dist/src/billing/after-commit-outbox.js';
 import {test,tmpDir,summary} from './helpers.mjs';
 const dir=tmpDir('earn-stripe');let now=Date.parse('2026-09-17T12:00:00Z');
+const templates=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../templates');
 const ledger=new EarnService(dir,()=>now),owner=earnOwner('email:referrer@example.com');const member=ledger.member(owner,'Referrer');
 const cfg={plans:[{key:'monthly',role:'software',checkout:'payment-link',interval:'month',currency:'usd'}],stripe:{test:{secretKey:'sk_test_fixture',priceIds:{monthly:'price_month'}},live:{secretKey:'sk_live_fixture',priceIds:{monthly:'price_month'}}}};
 let calls=[],refund=0,dispute=false,disputeStatus='needs_response',subStatus='active',failSubmit=false,postReadFailure=false;
-let invoiceId='in_1',email='friend@example.com',priceId='price_month',currency='usd',paid=9900,total=9000,subscriptionCode=member.code,cancelAtPeriodEnd=false;
+let invoiceId='in_1',email='friend@example.com',priceId='price_month',currency='usd',paid=9900,total=9000,subscriptionCode=member.code,cancelAtPeriodEnd=false,refundChargeId='ch_in_1';
+let failingEndpoint='',failingCount=0,failingStatus=500;
 const coupons=new Map(),promos=new Map(),subscriptionPromos={test:null,live:null};let promoSerial=0;
 const payouts=new Map(),idempotency=new Map();let sends=0;
 const fake=async (url,init)=>{
  const u=new URL(url),endpoint=u.pathname,mode=init.headers.authorization.includes('live')?'live':'test',live=mode==='live';const body=init.method==='POST'?(endpoint.startsWith('/v2')?JSON.parse(init.body):Object.fromEntries(new URLSearchParams(init.body))):{};
  calls.push({endpoint,body,headers:init.headers,method:init.method});const ok=(v,status=200)=>new Response(JSON.stringify(v),{status});
+ if(endpoint===failingEndpoint&&failingCount>0){failingCount--;return ok({error:{code:'api_error'}},failingStatus);}
  if(endpoint==='/v1/prices/price_month')return ok({id:'price_month',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
  if(endpoint==='/v1/prices/price_legacy')return ok({id:'price_legacy',active:false,currency:'usd',recurring:{interval:'month'},product:'prod_wh'});
  if(endpoint==='/v1/prices/price_hosting')return ok({id:'price_hosting',active:true,currency:'usd',recurring:{interval:'month'},product:'prod_hosting'});
@@ -27,7 +35,7 @@ const fake=async (url,init)=>{
  if(endpoint==='/v1/subscriptions/sub_friend')return ok({id:'sub_friend',status:subStatus,cancel_at_period_end:cancelAtPeriodEnd,metadata:subscriptionCode?{wh_earn_code:subscriptionCode}:{},discounts:subscriptionPromos[mode]?[{promotion_code:subscriptionPromos[mode]}]:[],items:{data:[{price:'price_month'}]}});
  if(endpoint==='/v1/customers/cus_friend')return ok({email});
  if(endpoint==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'payment_intent',payment_intent:{latest_charge:'ch_'+u.searchParams.get('invoice')}}}]});
- if(endpoint.startsWith('/v1/charges/'))return ok({amount_refunded:endpoint.endsWith('/ch_in_1')?refund:0,disputed:endpoint.endsWith('/ch_in_1')&&dispute,livemode:live});
+ if(endpoint.startsWith('/v1/charges/'))return ok({amount_refunded:endpoint.endsWith('/'+refundChargeId)?refund:0,disputed:endpoint.endsWith('/'+refundChargeId)&&dispute,livemode:live});
  if(endpoint==='/v1/disputes')return ok({data:[{status:disputeStatus}]});
  if(endpoint==='/v2/core/accounts'&&init.method==='POST')return ok({id:'acct_'+mode});
  if(endpoint.startsWith('/v2/core/accounts/'))return ok({id:'acct_'+mode,defaults:{payout_methods:{usd:'usba_test_fixture'}},configuration:{recipient:{capabilities:{bank_accounts:{local:{status:'active'}}}}}});
@@ -60,6 +68,40 @@ await test('Oskaras one-time setup registers only the three reviewed reusable fo
  const result=await svc.registerOskarasOffers(owner);assert.deepEqual(result.offers.map(o=>[o.code,o.percent,o.duration]),[['OskarasTrading10K7',10,'forever'],['OskarasTrading20M4',20,'forever'],['OskarasTrading25R8',25,'forever']]);
  for(const offer of result.offers){const promo=promos.get(offer.promotion),coupon=coupons.get('test:'+promo.coupon);assert.equal(promo.active,true);assert.equal(promo.max_redemptions,null);assert.equal(promo.expires_at,null);assert.equal(coupon.duration,'forever');assert.equal(coupon.percent_off,offer.percent);assert.deepEqual(coupon.applies_to.products,['prod_wh']);assert.equal(svc.launchReferral(offer.code,'test').discountPercent,offer.percent);assert.equal(svc.launchReferral(offer.code,'test').code,member.code);}
  await svc.checkout('OskarasTrading20M4','monthly');const checkout=calls.filter(c=>c.endpoint==='/v1/checkout/sessions').at(-1);assert.equal(checkout.body['discounts[0][promotion_code]'],result.offers[1].promotion);assert.equal(checkout.body['subscription_data[metadata][wh_earn_code]'],member.code);
+});
+await test('partner-only offers admit first invoice, retry transient proof reads, renew and reconcile refunds',async()=>{
+ const isolated=path.join(dir,'partner-only'),partnerLedger=new EarnService(isolated,()=>now);partnerLedger.copyMember(member);
+ const offers=structuredClone(svc.admin().profiles[owner].partnerPromotions);assert.ok(offers.length);
+ const only=new EarnStripeService(isolated,partnerLedger,()=>cfg,'https://hub.example',()=>now,fake);only.configure({enabled:true});
+ only.ledger('test').transaction(s=>{s.stripe??={profiles:{},invoices:{},jobs:[],seen:{}};s.stripe.profiles[owner]={partnerPromotions:offers};});
+ assert.equal(only.admin().profiles[owner].promotion,undefined,'the isolated profile contains no standard promotion');
+ const outbox=new AfterCommitOutbox(isolated),billing=new BillingService(isolated,new BillingStore(isolated),'https://hub.example',templates,{now:()=>now,onVerifiedEvent:ev=>only.handleEvent(ev),log:()=>{}});
+ const throughOutbox=async ev=>{outbox.stage(ev,now);outbox.commit(ev.id);return billing.drainAfterCommit();};
+ const offer=offers.find(x=>x.code==='OskarasTrading10K7');assert.ok(offer);
+ const previous={invoiceId,subscriptionCode,email,priceId,currency,paid,total,refund,refundChargeId,subStatus,promo:subscriptionPromos.test};
+ try {
+  subscriptionPromos.test=offer.promotion;subscriptionCode=member.code;email='friend@example.com';priceId='price_month';currency='usd';paid=9900;total=9000;subStatus='active';refund=0;
+  const first={...event('invoice.paid','evt_partner_first',{id:'in_partner_first'}),livemode:false};invoiceId='in_partner_first';refundChargeId='ch_in_partner_first';
+  failingEndpoint='/v1/promotion_codes/'+offer.promotion;failingCount=1;
+  assert.deepEqual(await throughOutbox(first),{completed:0,failed:1});assert.equal(outbox.pending().length,1);
+  assert.equal(only.ledger('test').admin().stripe.invoices.in_partner_first,undefined);
+  const ignoredFile=path.join(isolated,'earn-stripe-ignored-test.v1.json');assert.ok(!fs.existsSync(ignoredFile)||!fs.readFileSync(ignoredFile,'utf8').includes(first.id),'transient promotion lookup was not permanently sidecar-acknowledged');
+  failingEndpoint='';assert.deepEqual(await throughOutbox(first),{completed:1,failed:0});assert.equal(outbox.pending().length,0);
+  assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,1800,'the recovered original event credits exactly once');
+  const renewal={...event('invoice.paid','evt_partner_renewal',{id:'in_partner_renewal'}),livemode:false};invoiceId='in_partner_renewal';refundChargeId='ch_in_partner_renewal';
+  failingEndpoint='/v1/coupons/'+offer.proof.coupon;failingCount=1;
+  assert.deepEqual(await throughOutbox(renewal),{completed:0,failed:1});assert.equal(outbox.pending().length,1);
+  assert.equal(only.ledger('test').admin().stripe.invoices.in_partner_renewal,undefined);
+  assert.ok(!fs.existsSync(ignoredFile)||!fs.readFileSync(ignoredFile,'utf8').includes(renewal.id),'transient coupon lookup was not permanently sidecar-acknowledged');
+  failingEndpoint='';refund=0;assert.deepEqual(await throughOutbox(renewal),{completed:1,failed:0});assert.equal(outbox.pending().length,0);
+  assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,3600);
+  refund=4950;refundChargeId='ch_in_partner_first';
+  await only.handleEvent({...event('charge.refunded','evt_partner_refund',{id:refundChargeId}),livemode:false});
+  assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,2700,'partial refund reduces only its invoice commission');
+  await only.handleEvent({...event('charge.refunded','evt_partner_refund_again',{id:refundChargeId}),livemode:false});
+  assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,2700,'refund webhook replay does not duplicate the clawback');
+  assert.equal(Object.keys(only.ledger('test').admin().stripe.invoices).length,2);
+ } finally {invoiceId=previous.invoiceId;subscriptionCode=previous.subscriptionCode;email=previous.email;priceId=previous.priceId;currency=previous.currency;paid=previous.paid;total=previous.total;refund=previous.refund;refundChargeId=previous.refundChargeId;subStatus=previous.subStatus;subscriptionPromos.test=previous.promo;failingEndpoint='';failingCount=0;}
 });
 await test('test recipient and referral money stay out of real earnings',async()=>{
  await svc.onboard(owner,{country:'US',email:'referrer@example.com'});await svc.handleEvent({...event('invoice.paid','evt_test',{id:'in_test'}),livemode:false});assert.equal(ledger.view(owner,'Referrer').balances.referral,0);assert.equal(svc.ledger('test').view(owner,'Referrer').balances.referral,1800);

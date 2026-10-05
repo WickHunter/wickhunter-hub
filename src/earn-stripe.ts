@@ -122,12 +122,20 @@ export class EarnStripeService {
    // Old deployments stored legacy public codes but did not retain retired promo IDs.
    // Recover only when the actual Stripe discount points to a managed promo whose
    // customer-facing code is a locally recorded alias for this exact Earn owner.
-   let promo:StripeObject;try{promo=await this.api(mode).call('GET','/v1/promotion_codes/'+promotion);}catch{return null;}
+   let promo:StripeObject;try{promo=await this.api(mode).call('GET','/v1/promotion_codes/'+promotion);}catch(error){
+    // A genuinely absent promo with no local owner record is unrelated. Any
+    // transport, rate-limit or server failure must escape so the durable
+    // billing outbox can retry this invoice instead of permanently ignoring it.
+    if(error instanceof EarnStripeError&&error.status===404&&error.code==='resource_missing'&&!offer)return null;
+    throw error;
+   }
    if(!offer){const actualCode=String(promo.code||'');if((p.code===actualCode||Array.isArray(p.legacyCodes)&&p.legacyCodes.includes(actualCode))&&promo.metadata?.wh_earn_owner===owner&&promo.metadata?.managed_by==='wh-earn')offer={promotion,code:actualCode,percent:Number(id(promo.coupon)?NaN:promo.coupon?.percent_off),products:p.products};}
    if(!offer)continue;
    if(promo.id!==promotion||promo.livemode!==(mode==='live')||promo.code!==offer.code||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner)return null;
    const couponId=id(promo.coupon);if(!couponId)return null;
-   let coupon:StripeObject;try{coupon=await this.api(mode).call('GET','/v1/coupons/'+couponId);}catch{return null;}
+   // We have a candidate registered offer at this point. Failure to prove its
+   // coupon is an operational review/retry condition, never proof the invoice was unrelated.
+   const coupon:StripeObject=await this.api(mode).call('GET','/v1/coupons/'+couponId);
    const products=[...new Set((coupon.applies_to?.products||[]).filter((x:unknown)=>typeof x==='string'))].sort(),expected=[...new Set((offer.products||[]).filter((x:unknown)=>typeof x==='string'))].sort();
    if(coupon.id!==couponId||coupon.valid!==true||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||!Number.isFinite(coupon.percent_off)||coupon.percent_off<=0||coupon.percent_off>100||JSON.stringify(products)!==JSON.stringify(expected))return null;
    if(Number.isFinite(offer.percent)&&coupon.percent_off!==offer.percent)return null;
@@ -242,7 +250,7 @@ export class EarnStripeService {
   if(!['invoice.paid','invoice.payment_succeeded','customer.subscription.updated','customer.subscription.deleted','charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type))return;
   const ledger=this.ledger(mode),b=book(ledger.admin());if(b.seen[ev.id]||this.ignoredEvents(mode)[ev.id])return;
   // An unconfigured private program must not add Stripe dependencies to ordinary billing.
-  if(!Object.values(b.profiles).some((p:any)=>p.promotion)&&!Object.keys(b.invoices).length)return;
+  if(!Object.values(b.profiles).some((p:any)=>p.promotion||(Array.isArray(p.partnerPromotions)&&p.partnerPromotions.length>0))&&!Object.keys(b.invoices).length)return;
   const before=ledger.fileVersion(),api=this.api(mode),o=ev.object;
   if(['invoice.paid','invoice.payment_succeeded'].includes(ev.type))await this.invoice(mode,id(o));
   else if(ev.type.startsWith('customer.subscription.')){
