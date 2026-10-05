@@ -1,3 +1,12 @@
+## v0.4.82 — Verified recurring referral coupons
+
+Stripe coupon requests now explicitly include product restrictions. Referral
+activation and invoice attribution verify the returned restrictions against the
+registered software offer. Missing or inconsistent proof leaves billing events
+available for retry and review. Retired promotions and already-applied forever
+discounts retain their verified renewal attribution, including older plan prices.
+New redemptions still require a valid, active promotion with the correct owner.
+
 ## v0.4.81 — Member-selected Earn payout destinations
 
 Earn members can save or update a payout destination preference for USDT on
