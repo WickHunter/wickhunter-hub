@@ -1723,7 +1723,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const plan = body?.plan;
     const checkoutAttemptId = body?.checkoutAttemptId;
     if ((plan !== "monthly" && plan !== "yearly") || typeof checkoutAttemptId !== "string") return sendJson(res, 400, { ok: false, error: "expected {plan: monthly|yearly, checkoutAttemptId}" }, headers);
-    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId);
+    const offer = launchBilling.offer();
+    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId,
+      undefined, offer.active ? Number(offer.firstPaymentAtMs) : null);
     if (!r.ok) return sendJson(res, r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, headers);
     sendJson(res, 200, { ok: true, url: r.value.url, pricing: r.value.pricing }, headers);
   }

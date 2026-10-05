@@ -43,7 +43,7 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
-import { launchGrant, reconcileLaunchSession } from "./launch.js";
+import { launchGrant, reconcileLaunchSession, LAUNCH_FIRST_PAYMENT_MS } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
@@ -781,6 +781,8 @@ export class BillingService {
         const rec = this.ensureHostingCustomer(f.customerId, f.email, ev.livemode, now);
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
         rec.subscriptionStatus = rec.subscriptionStatus ?? "active";
+        const freeUntil = this.bundleFreeUntil(f.metadata, this.config());
+        if (freeUntil && (rec.periodEndMs === null || rec.periodEndMs < freeUntil)) rec.periodEndMs = freeUntil;
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting checkout recorded; software licence untouched" };
@@ -814,7 +816,7 @@ export class BillingService {
         const rec = this.findHostingCustomer(f.customerId, "");
         if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
-        rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
+        rec.subscriptionStatus = f.cancelAtPeriodEnd && (f.status === "active" || f.status === "trialing") ? `${f.status} (cancels at period end)` : f.status || rec.subscriptionStatus;
         if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null && (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs)) rec.periodEndMs = f.currentPeriodEndMs;
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
@@ -1073,9 +1075,14 @@ export class BillingService {
     const now = this.now();
     const planKey = this.planKeyOf(f.metadata, cfg);
     const grant = launchGrant(this.dataDir, f.metadata, ev.livemode, f.sessionId);
-    const bootstrapExp = Math.max(now + cfg.policy.bootstrapDays * DAY_MS, grant?.firstPaymentAtMs ?? 0);
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: starterPackGrantAt(grant, ev, true) }, cfg, bootstrapExp, now);
+    const bundleFreeUntil = this.bundleFreeUntil(f.metadata, cfg);
+    const bootstrapExp = Math.max(now + cfg.policy.bootstrapDays * DAY_MS, grant?.firstPaymentAtMs ?? 0, bundleFreeUntil ?? 0);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: starterPackGrantAt(grant, ev, true) ?? this.bundleStarterPackAt(f.metadata, cfg, ev) }, cfg, bootstrapExp, now);
     if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
+    if (bundleFreeUntil) {
+      this.extendLicense(rec, bundleFreeUntil, cfg, now);
+      rec.periodEndMs = Math.max(rec.periodEndMs ?? 0, bundleFreeUntil);
+    }
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
     if (f.paymentStatus === 'paid') this.noteFirstActualPayment(rec, ev.createdMs);
@@ -1138,7 +1145,7 @@ export class BillingService {
     if ((current?.launchManaged || f.metadata.wh_launch_intent) && current?.subscriptionId && f.subscriptionId && current.subscriptionId !== f.subscriptionId) {
       return { outcome: 'unclassified', note: 'Paid invoice belongs to a different subscription on this customer; reconcile both charges in Stripe' };
     }
-    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: f.billingReason === 'subscription_create' ? starterPackGrantAt(launchInvoice, ev, true) : null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
+    const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: f.billingReason === 'subscription_create' ? starterPackGrantAt(launchInvoice, ev, true) ?? this.bundleStarterPackAt(f.metadata, cfg, ev) : null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
     if (paidThrough !== null) {
       if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;
@@ -1180,7 +1187,7 @@ export class BillingService {
     const now = this.now();
     rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
     rec.cancelAtPeriodEnd = f.cancelAtPeriodEnd;
-    rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
+    rec.subscriptionStatus = f.cancelAtPeriodEnd && (f.status === "active" || f.status === "trialing") ? `${f.status} (cancels at period end)` : f.status || rec.subscriptionStatus;
     let note = `status ${rec.subscriptionStatus}`;
     if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null) {
       if (this.extendLicense(rec, f.currentPeriodEndMs + cfg.policy.graceDays * DAY_MS, cfg, now)) note += "; licence extended";
@@ -1325,6 +1332,7 @@ export class BillingService {
    *  continues, so a crash later cannot orphan the freshly issued licence. */
   private ensureCustomer(facts: CustomerFacts, cfg: BillingConfig, initialExp: number, now: number): { rec: CustomerRecord; created: boolean } {
     const grant = launchGrant(this.dataDir, facts.metadata ?? {}, facts.livemode);
+    const bundleFreeUntil = this.bundleFreeUntil(facts.metadata ?? {}, cfg);
     const direct = facts.customerId ? this.store.getCustomer(facts.customerId) ?? this.store.findByStripeCustomer(facts.customerId) : null;
     if (grant?.licenseId && direct && direct.licenseId !== grant.licenseId) throw Error('Stripe customer is already bound to another license');
     const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
@@ -1342,13 +1350,14 @@ export class BillingService {
       if (facts.subscriptionId) existing.subscriptionId = facts.subscriptionId;
       if (facts.planKey) existing.planKey = facts.planKey;
       if (grant) { existing.launchManaged = true; existing.firstPaymentAtMs = grant.firstPaymentAtMs; existing.discountPercent = grant.discountPercent; existing.nonRenewing = grant.payment === 'crypto' || grant.plan === 'lifetime'; }
+      if (bundleFreeUntil) { existing.launchManaged = true; existing.firstPaymentAtMs = bundleFreeUntil; }
       return { rec: existing, created: false };
     }
     const key = facts.customerId || `email:${facts.email}`;
     if (this.store.getCustomer(key)) throw Error("Customer identity conflicts across Stripe modes");
     const name = facts.name || facts.email || "Customer";
     const plan = [cfg.policy.plan, facts.planKey, facts.livemode ? null : "test"].filter(Boolean).join("-");
-    const exp = this.capExp({ livemode: facts.livemode, createdAtMs: now }, initialExp, cfg);
+    const exp = this.capExp({ livemode: facts.livemode, createdAtMs: now }, Math.max(initialExp, bundleFreeUntil ?? 0), cfg);
     const bound = grant?.licenseId ? this.licenses.get(grant.licenseId) : null;
     if (grant?.licenseId && (!bound || this.licenses.isRevoked(grant.licenseId) || this.store.findByLicense(grant.licenseId))) throw Error('Checkout license is unavailable or already bound');
     const issuedId = bound?.id ?? this.licenses.issueUntil(name, exp, plan, now).payload.id;
@@ -1374,11 +1383,22 @@ export class BillingService {
       lastEventType: null,
       lastEventAtMs: null,
       ...(grant ? { launchManaged: true, firstPaymentAtMs: grant.firstPaymentAtMs, discountPercent: grant.discountPercent, nonRenewing: grant.payment === 'crypto' || grant.plan === 'lifetime' } : {}),
-      ...(grant && facts.starterPackCandidateAtMs ? { starterPackGrantedAtMs: facts.starterPackCandidateAtMs } : {}),
+      ...((grant || bundleFreeUntil) && facts.starterPackCandidateAtMs ? { starterPackGrantedAtMs: facts.starterPackCandidateAtMs } : {}),
+      ...(bundleFreeUntil ? { launchManaged: true, firstPaymentAtMs: bundleFreeUntil, discountPercent: 0, nonRenewing: false } : {}),
     };
     this.store.putCustomer(rec);
     this.log(`[billing] ${bound ? 'bound' : 'issued'} ${plan} licence ${issuedId} for ${facts.email || key} until ${new Date(exp).toISOString().slice(0, 10)}`);
     return { rec, created: true };
+  }
+
+  private bundleFreeUntil(metadata: Record<string, string>, cfg: BillingConfig): number | null {
+    return metadata.bundle === "software-hosting-v1" && planByKey(cfg, metadata.plan)?.checkout === "hosted-bundle"
+      && metadata.first_payment_at_ms === String(LAUNCH_FIRST_PAYMENT_MS) ? LAUNCH_FIRST_PAYMENT_MS : null;
+  }
+
+  private bundleStarterPackAt(metadata: Record<string, string>, cfg: BillingConfig, ev: StripeEvent): number | null {
+    return this.bundleFreeUntil(metadata, cfg) && ev.livemode && Number.isSafeInteger(ev.createdMs)
+      && ev.createdMs >= Date.parse('2026-10-01T00:00:00-04:00') && ev.createdMs < LAUNCH_FIRST_PAYMENT_MS ? ev.createdMs : null;
   }
 
   /** Move the registry expiry FORWARD to `target` (capped for test licences

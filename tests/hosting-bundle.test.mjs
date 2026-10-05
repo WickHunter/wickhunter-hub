@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { signStripePayload } from "../dist/src/billing/stripe.js";
 import { FakeProvider } from "../dist/src/hosting/provider.js";
+import { LAUNCH_FIRST_PAYMENT_MS } from "../dist/src/billing/launch.js";
 
 const WHSEC = "whsec_test_bundle_0123456789";
 const RELEASE = "b".repeat(64);
 
 async function setup(overrides = {}) {
-  let clock = Math.floor(Date.now() / 1000) * 1000;
+  let clock = overrides.now ?? Math.floor(Date.now() / 1000) * 1000;
   const calls = [];
   const provider = new FakeProvider({ now: () => clock });
   const h = await freshHub({}, {
@@ -47,6 +48,67 @@ async function setup(overrides = {}) {
   }
   return { h, calls, provider, event, post, advance: (ms) => { clock += ms; }, now: () => clock };
 }
+
+await test("free combined checkout preserves the exact annual/monthly price and billing anchor", async () => {
+  for (const interval of ['month', 'year']) {
+    const c = await setup({ now: Date.parse('2026-10-04T12:00:00Z') });
+    try {
+      const r = await c.h.hub.hosting.bundleCheckout(interval, 'free-bundle-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(r.ok, true);
+      const request = new URLSearchParams(c.calls.find(x => x.url.endsWith('/v1/checkout/sessions')).init.body);
+      assert.equal(request.get('mode'), 'subscription');
+      assert.equal(request.get('line_items[0][price]'), interval === 'year' ? 'price_bundle_year' : 'price_bundle_month');
+      assert.equal(request.get('subscription_data[billing_cycle_anchor]'), String(LAUNCH_FIRST_PAYMENT_MS / 1000));
+      assert.equal(request.get('subscription_data[proration_behavior]'), 'none');
+      assert.equal(request.get('payment_method_collection'), 'always');
+      assert.equal(request.get('metadata[first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
+      assert.equal(request.get('subscription_data[metadata][first_payment_at_ms]'), String(LAUNCH_FIRST_PAYMENT_MS));
+      assert.match(request.get('success_url'), /customer\?checkout=complete#hostingCard$/);
+      assert.match(request.get('custom_text[submit][message]'), /\$0 today/);
+      assert.equal(c.provider.createCalls.length, 0, 'opening checkout does not create a VPS');
+      const again = await c.h.hub.hosting.bundleCheckout(interval, 'free-bundle-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(again.value.url, r.value.url);
+      assert.equal(c.calls.filter(x => x.url.endsWith('/v1/checkout/sessions')).length, 1);
+    } finally { await c.h.close(); }
+  }
+});
+
+await test("free bundle cancellation suspends at access end and permanently deletes the provider VPS", async () => {
+  for (const status of ['active', 'trialing']) {
+    const c = await setup({ now: Date.parse('2026-10-04T12:00:00Z') });
+    try {
+      await c.h.hub.hosting.bundleCheckout('year', 'free-cancel-attempt-123456789', c.now(), LAUNCH_FIRST_PAYMENT_MS);
+      const reservation = c.h.hub.hosting.store.instances()[0];
+      const metadata = { plan: 'yearly-hosted', bundle: 'software-hosting-v1', reservation: reservation.id, first_payment_at_ms: String(LAUNCH_FIRST_PAYMENT_MS) };
+      const checkout = c.event('evt_free_checkout', 'checkout.session.completed', { id: 'cs_free', mode: 'subscription', payment_status: 'no_payment_required', customer: 'cus_free', customer_details: { email: 'free@example.com' }, subscription: 'sub_free', metadata });
+      assert.equal((await c.post(checkout)).body.outcome, 'applied');
+      const customer = c.h.hub.billing.store.getCustomer('cus_free');
+      assert.equal(customer.firstPaymentAtMs, LAUNCH_FIRST_PAYMENT_MS);
+      assert.equal(customer.firstActualPaymentAtMs ?? null, null, 'free checkout is not a payment');
+      assert.equal(c.h.hub.billing.store.getRoleSubscription('cus_free', 'hosting').periodEndMs, LAUNCH_FIRST_PAYMENT_MS);
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.provider.createCalls.length, 1, 'confirmed free bundle provisions immediately');
+      const cancel = c.event('evt_free_cancel', 'customer.subscription.updated', { id: 'sub_free', customer: 'cus_free', status, cancel_at_period_end: true, current_period_end: LAUNCH_FIRST_PAYMENT_MS / 1000, metadata, items: { data: [{ price: { id: 'price_bundle_year' } }] } });
+      assert.equal((await c.post(cancel)).body.outcome, 'applied');
+      const row = c.h.hub.hosting.store.getInstance(reservation.id);
+      assert.equal(row.cancellationReason, 'intentional_cancellation');
+      assert.equal(row.suspendAtMs, LAUNCH_FIRST_PAYMENT_MS);
+      assert.ok(row.deleteAtMs > row.suspendAtMs, 'configured retention is respected');
+      c.advance(row.suspendAtMs - c.now());
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal((await c.provider.getInstance(row.providerInstanceId)).status, 'stopped');
+      c.advance(row.deleteAtMs - c.now() + 1000);
+      await c.h.hub.hosting.tick(c.now());
+      c.advance(60_000);
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.h.hub.hosting.store.getInstance(row.id).stage, 'deleted');
+      assert.equal(await c.provider.getInstance(row.providerInstanceId), null);
+      assert.equal((await c.post(checkout)).body.outcome, 'duplicate');
+      await c.h.hub.hosting.tick(c.now());
+      assert.equal(c.provider.createCalls.length, 1, 'replayed checkout never recreates a cancelled VPS');
+    } finally { await c.h.close(); }
+  }
+});
 
 await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable through /buy", async () => {
   const c = await setup();

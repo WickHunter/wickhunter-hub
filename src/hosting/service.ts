@@ -290,13 +290,17 @@ export class HostingService {
 
   /** Anonymous bundle checkout uses a browser-stable attempt id, never an
    * email lookup. Stripe supplies the customer id in its signed webhook. */
-  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now()): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
+  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now(), freeUntilMs: number | null = null): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
     const issue = this.bundleOfferIssue();
     if (issue) return { ok: false, code: "PROVISIONING_DISABLED", error: issue };
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(attemptId)) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkoutAttemptId is malformed" };
     const cfg = this.billing.config();
     const policy = this.policy();
     const plan = cfg.plans.find((p) => p.checkout === "hosted-bundle" && p.interval === interval)!;
+    const freeUntil = freeUntilMs && freeUntilMs > nowMs ? freeUntilMs : null;
+    // Checkout needs at least 30 minutes before expiry. Do not reserve a
+    // server for an offer that cannot safely reach its billing anchor.
+    if (freeUntil && freeUntil - nowMs < 30 * 60_000) return { ok: false, code: "PROVISIONING_DISABLED", error: "The free period is ending; please return after October 15 at 12:00 a.m. Eastern Time" };
     const priceId = cfg.stripe[cfg.mode].priceIds[plan.key]!;
     const ownerId = `bundle:${hashBootstrapToken(`${cfg.mode}:${attemptId}`).slice(0, 48)}`;
     const pricing = { amountCents: plan.amountCents, currency: plan.currency, interval, softwareDays: interval === "month" ? 30 : 365, maximumConnectedAccounts: policy.maximumConnectedAccounts };
@@ -329,14 +333,23 @@ export class HostingService {
     if (this.costCeilingRefusalWithQuote(quote, policy)) return { ok: false, code: "PROVISIONING_DISABLED", error: "the provider cost ceiling has been reached" };
     const reservation = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment: cfg.mode, region: policy.regions[0]?.id ?? "nrt", planId: policy.planId, stripeCustomerId: "", nowMs });
     if (!reservation) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt already exists" };
-    const expiresAtMs = nowMs + 31 * 60_000;
+    const expiresAtMs = Math.min(nowMs + 31 * 60_000, freeUntil ?? Infinity);
     const body = new URLSearchParams({
       mode: "subscription", client_reference_id: reservation.id,
+      payment_method_collection: "always", "payment_method_types[0]": "card",
+      "consent_collection[terms_of_service]": "required",
       "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
-      success_url: `${cfg.siteOrigin || this.origin}/thanks/?hosting=bundle-success`,
-      cancel_url: `${cfg.siteOrigin || this.origin}/pricing/?hosting=bundle-cancelled`,
+      success_url: `${this.origin}/customer?checkout=complete#hostingCard`,
+      cancel_url: `${cfg.siteOrigin || this.origin}/unleashed/#pricing`,
       "metadata[plan]": plan.key, "metadata[bundle]": "software-hosting-v1", "metadata[reservation]": reservation.id,
       "subscription_data[metadata][plan]": plan.key, "subscription_data[metadata][bundle]": "software-hosting-v1", "subscription_data[metadata][reservation]": reservation.id,
+      ...(freeUntil ? {
+        "subscription_data[billing_cycle_anchor]": String(Math.floor(freeUntil / 1000)),
+        "subscription_data[proration_behavior]": "none",
+        "metadata[first_payment_at_ms]": String(freeUntil),
+        "subscription_data[metadata][first_payment_at_ms]": String(freeUntil),
+      } : {}),
+      "custom_text[submit][message]": `${interval === "year" ? "$699 software + $240 VPS per year" : "$99 software + $20 VPS per month"}. ${freeUntil ? "$0 today; first combined payment October 15, 2026 at 12:00 a.m. Eastern Time. " : ""}Cancel before renewal to stop both services. VPS shuts down when access ends and is permanently deleted after the retention period.`,
       expires_at: String(Math.floor(expiresAtMs / 1000)),
     }).toString();
     const held = this.store.updateInstance(reservation.id, reservation.version, (d) => {
@@ -538,7 +551,7 @@ export class HostingService {
     }
 
     const paidThroughAdvanced = signal.periodEndMs !== null && (instance.paidThroughMs === null || signal.periodEndMs > instance.paidThroughMs);
-    const scheduledCancel = signal.subscriptionStatus === "active (cancels at period end)";
+    const scheduledCancel = signal.subscriptionStatus === "active (cancels at period end)" || signal.subscriptionStatus === "trialing (cancels at period end)";
     const nonpaying = signal.subscriptionStatus === "past_due";
     const ended = signal.subscriptionStatus === "canceled";
     const recovering = RECOVERABLE_STAGES.has(instance.stage);
@@ -550,7 +563,7 @@ export class HostingService {
       this.notifyLatePayment(instance, nowMs);
       return;
     }
-    if (paidThroughAdvanced && recovering) {
+    if (paidThroughAdvanced && recovering && !scheduledCancel && !ended) {
       this.restore(instance, signal.periodEndMs!, nowMs);
       return;
     }
@@ -573,6 +586,9 @@ export class HostingService {
         this.store.obsoletePendingJobsOlderThan(instance.id, fresh.lifecycleVersion, fresh.generation, nowMs);
         if (fresh.stage === "ordered" && !fresh.providerInstanceId) this.enqueueProvisionJob(fresh, nowMs);
       }
+      if (fresh && (scheduledCancel || ended) && !TERMINAL_ISH.has(fresh.stage)) {
+        this.scheduleEnd(fresh, "intentional_cancellation", signal.periodEndMs!, policy, nowMs);
+      }
       return;
     }
     if (scheduledCancel && instance.cancellationReason !== "intentional_cancellation" && !TERMINAL_ISH.has(instance.stage)) {
@@ -593,10 +609,7 @@ export class HostingService {
       return;
     }
     if (ended && instance.cancellationReason === null && !TERMINAL_ISH.has(instance.stage)) {
-      // A hard/immediate cancellation with no prior notice from either
-      // branch above — treat it the safe (customer-favoring) way: as
-      // nonpayment-shaped grace, never an instant suspend.
-      this.scheduleEnd(instance, "renewal_unpaid", instance.paidThroughMs ?? nowMs, policy, nowMs);
+      this.scheduleEnd(instance, "intentional_cancellation", instance.paidThroughMs ?? nowMs, policy, nowMs);
     }
   }
 
