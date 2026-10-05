@@ -17,6 +17,13 @@ const defaults:Settings={mode:'test',enabled:false,automatic:false,payoutDay:1,f
 const id=(v:unknown)=>typeof v==='string'?v:typeof v==='object'&&v!==null?String((v as StripeObject).id||''):'';
 const money=(n:unknown)=>Number.isSafeInteger(n)&&Number(n)>=0&&Number(n)<=100_000_000?Number(n):null;
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex').slice(0,40);
+/** Stripe's Basil Coupon.applies_to is includable, so it is absent unless the
+ *  caller explicitly expands it. Missing/malformed scope is not an empty list. */
+function couponProducts(coupon:StripeObject):string[]{
+ const raw=coupon.applies_to?.products;
+ if(!Array.isArray(raw)||raw.some((value:unknown)=>typeof value!=='string'||!value.trim()))throw Error('Stripe did not return a complete expanded coupon product scope');
+ return [...new Set(raw as string[])].sort();
+}
 const payoutIdentity=(j:Job)=>JSON.stringify([j.id,j.owner,j.cycle,j.recipient,j.financialAccount,j.amount,j.allocations,j.stripeId,j.created]);
 /** Consumer Gmail alone documents both dotted usernames and plus tags as one
  * inbox. Workspace/custom domains do not share the dot rule. This key is ONLY
@@ -82,15 +89,18 @@ export class EarnStripeService {
  private async verifyPromotion(mode:BillingMode,owner:string,promotion:string,code:string,percent:number,products:string[]){
   const api=this.api(mode),promo=await api.call('GET','/v1/promotion_codes/'+promotion),couponId=id(promo.coupon);
   if(promo.id!==promotion||promo.active!==true||promo.livemode!==(mode==='live')||String(promo.code||'').toUpperCase()!==code.toUpperCase()||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner||promo.expires_at!=null||promo.max_redemptions!=null||!couponId)throw Error('Stripe referral promotion could not be verified');
-  const coupon=await api.call('GET','/v1/coupons/'+couponId),actual=[...new Set((coupon.applies_to?.products||[]).filter((v:unknown)=>typeof v==='string'))].sort(),expected=[...new Set(products)].sort();
+  const coupon=await api.call('GET','/v1/coupons/'+couponId,{'expand[0]':'applies_to'}),actual=couponProducts(coupon),expected=[...new Set(products)].sort();
   if(coupon.id!==couponId||coupon.valid!==true||coupon.percent_off!==percent||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||JSON.stringify(actual)!==JSON.stringify(expected))throw Error('Stripe referral coupon does not match the recurring software offer');
   return {promotion,code,percent,duration:'forever',coupon:couponId,products:expected,verifiedAt:this.now()};
  }
  private async verifyHistoricalPromotion(mode:BillingMode,owner:string,promotion:string,code:string,products:string[]){
   const api=this.api(mode),promo=await api.call('GET','/v1/promotion_codes/'+promotion),couponId=id(promo.coupon);
   if(promo.id!==promotion||promo.livemode!==(mode==='live')||String(promo.code||'').toUpperCase()!==code.toUpperCase()||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner||!couponId)throw Error('Existing Stripe referral promotion could not be verified');
-  const coupon=await api.call('GET','/v1/coupons/'+couponId),actual=[...new Set((coupon.applies_to?.products||[]).filter((v:unknown)=>typeof v==='string'))].sort(),expected=[...new Set(products)].sort();
-  if(coupon.id!==couponId||coupon.valid!==true||!Number.isFinite(coupon.percent_off)||coupon.percent_off<=0||coupon.percent_off>100||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||JSON.stringify(actual)!==JSON.stringify(expected))throw Error('Existing Stripe referral coupon is not a verified recurring software offer');
+  const coupon=await api.call('GET','/v1/coupons/'+couponId,{'expand[0]':'applies_to'}),actual=couponProducts(coupon),expected=[...new Set(products)].sort();
+  // This path preserves an offer already attached to an existing subscription;
+  // Coupon.valid only controls new redemptions. Actual invoice attribution still
+  // requires the matching promotion to be present on the subscription itself.
+  if(coupon.id!==couponId||(coupon.valid!==true&&coupon.valid!==false)||!Number.isFinite(coupon.percent_off)||coupon.percent_off<=0||coupon.percent_off>100||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||JSON.stringify(actual)!==JSON.stringify(expected))throw Error('Existing Stripe referral coupon is not a verified recurring software offer');
   return {promotion,code,percent:coupon.percent_off,duration:'forever',coupon:couponId,products:expected,verifiedAt:this.now()};
  }
  private offerForCode(mode:BillingMode,code:string){
@@ -117,7 +127,7 @@ export class EarnStripeService {
    const p=value as StripeObject,member=members.find(x=>x.id===owner);if(!member||metadataCode&&metadataCode!==member.code)continue;
    const candidates:StripeObject[]=[];
    if(p.promotion)candidates.push({promotion:p.promotion,code:p.code,percent:p.appliedDiscountPercent,products:p.products,proof:p.verifiedPromotion});
-   if(Array.isArray(p.promotionHistory))candidates.push(...p.promotionHistory);
+   if(Array.isArray(p.promotionHistory))candidates.push(...p.promotionHistory.map((row:StripeObject)=>({...row,proof:row.proof||row,history:true})));
    if(Array.isArray(p.partnerPromotions))candidates.push(...p.partnerPromotions);
    let offer=candidates.find(x=>x.promotion===promotion);
    // Old deployments stored legacy public codes but did not retain retired promo IDs.
@@ -132,16 +142,27 @@ export class EarnStripeService {
    }
    if(!offer){const actualCode=String(promo.code||'');if((p.code===actualCode||Array.isArray(p.legacyCodes)&&p.legacyCodes.includes(actualCode))&&promo.metadata?.wh_earn_owner===owner&&promo.metadata?.managed_by==='wh-earn')offer={promotion,code:actualCode,percent:Number(id(promo.coupon)?NaN:promo.coupon?.percent_off),products:p.products};}
    if(!offer)continue;
-   if(promo.id!==promotion||promo.livemode!==(mode==='live')||promo.code!==offer.code||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner)return null;
-   const couponId=id(promo.coupon);if(!couponId)return null;
+   if(promo.id!==promotion||promo.livemode!==(mode==='live')||promo.code!==offer.code||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner)throw Error('Registered Stripe referral promotion no longer matches its durable offer');
+   const couponId=id(promo.coupon);if(!couponId)throw Error('Registered Stripe referral promotion has no coupon');
    // We have a candidate registered offer at this point. Failure to prove its
    // coupon is an operational review/retry condition, never proof the invoice was unrelated.
-   const coupon:StripeObject=await this.api(mode).call('GET','/v1/coupons/'+couponId);
-   const products=[...new Set((coupon.applies_to?.products||[]).filter((x:unknown)=>typeof x==='string'))].sort(),expected=[...new Set((offer.products||[]).filter((x:unknown)=>typeof x==='string'))].sort();
-   if(coupon.id!==couponId||coupon.valid!==true||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||!Number.isFinite(coupon.percent_off)||coupon.percent_off<=0||coupon.percent_off>100||JSON.stringify(products)!==JSON.stringify(expected))return null;
-   if(Number.isFinite(offer.percent)&&coupon.percent_off!==offer.percent)return null;
+   const coupon:StripeObject=await this.api(mode).call('GET','/v1/coupons/'+couponId,{'expand[0]':'applies_to'});
+   const products=couponProducts(coupon),expected=[...new Set((offer.products||[]).filter((x:unknown)=>typeof x==='string'))].sort();
+   if(coupon.valid!==true&&coupon.valid!==false)throw Error('Stripe did not return coupon redemption validity for an attributed referral');
+   if(coupon.id!==couponId||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||!Number.isFinite(coupon.percent_off)||coupon.percent_off<=0||coupon.percent_off>100||JSON.stringify(products)!==JSON.stringify(expected))throw Error('Registered Stripe referral coupon no longer matches its durable product offer');
+   // Expiry/redemption caps block new checkout, but an existing forever
+   // discount remains applied. Credit renewals only when durable proof matches
+   // the exact coupon actually attached to the subscription.
+   if(coupon.valid===false){
+    const prior=offer.proof as StripeObject|undefined,priorProducts=Array.isArray(prior?.products)?[...new Set(prior.products.filter((x:unknown)=>typeof x==='string'))].sort():[];
+    if(prior?.promotion!==promotion||prior?.code!==offer.code||prior?.coupon!==couponId||prior?.percent!==coupon.percent_off||prior?.duration!=='forever'||!Number.isFinite(prior?.verifiedAt)||JSON.stringify(priorProducts)!==JSON.stringify(products))throw Error('Applied Stripe coupon is no longer valid and has no matching durable offer proof; manual review is required');
+   }
+   if(Number.isFinite(offer.percent)&&coupon.percent_off!==offer.percent)throw Error('Registered Stripe referral coupon percentage no longer matches its durable offer');
    const proof={promotion,code:offer.code,percent:coupon.percent_off,duration:'forever',coupon:couponId,products,verifiedAt:this.now()};
-   const saved=offer.proof;if(p.promotion===promotion&&(!saved||saved.promotion!==promotion||saved.coupon!==couponId||saved.percent!==proof.percent||JSON.stringify(saved.products)!==JSON.stringify(products)))this.updateProfile(mode,owner,{verifiedPromotion:proof,appliedDiscountPercent:proof.percent});
+   const saved=offer.proof;if(saved?.promotion!==promotion||saved?.coupon!==couponId||saved?.percent!==proof.percent||JSON.stringify(saved?.products)!==JSON.stringify(products)){
+    if(p.promotion===promotion)this.updateProfile(mode,owner,{verifiedPromotion:proof,appliedDiscountPercent:proof.percent});
+    else if(offer.history){const history=(Array.isArray(p.promotionHistory)?p.promotionHistory:[]).map((row:StripeObject)=>row.promotion===promotion?{...row,proof}:row);this.updateProfile(mode,owner,{promotionHistory:history});}
+   }
    return {owner,member,profile:p,offer:{...offer,percent:proof.percent,proof}};
   }
   return null;
@@ -151,10 +172,11 @@ export class EarnStripeService {
  activate(owner:string){return this.serial(async()=>{
   const c=this.settings();if(!c.enabled)throw Error('Earnings are not enabled');const m=this.syncMember(c.mode,owner),p=this.profile(c.mode,owner);
   if(m.discountPercent===0){
-   let priorProof=p.verifiedPromotion;if(p.promotion&&!priorProof){try{let products=Array.isArray(p.products)?p.products:[];if(!products.length){const api=this.api(c.mode),plans=this.billing().plans.filter(plan=>plan.role==='software'&&plan.interval&&plan.checkout==='payment-link'&&plan.currency==='usd');for(const plan of plans){const priceId=this.billing().stripe[c.mode].priceIds[plan.key];if(!priceId)continue;const price=await api.call('GET','/v1/prices/'+priceId);if(price.active===true&&price.recurring?.interval===plan.interval&&price.currency==='usd')products.push(id(price.product));}}priorProof=await this.verifyHistoricalPromotion(c.mode,owner,String(p.promotion),String(p.code||m.code),products);}catch{/* Retiring remains possible; an unproved legacy promo will not be used for attribution. */}}
+   let priorProducts=Array.isArray(p.products)?p.products:[];if(p.promotion&&!priorProducts.length){const api=this.api(c.mode),plans=this.billing().plans.filter(plan=>plan.role==='software'&&plan.interval&&plan.checkout==='payment-link'&&plan.currency==='usd');for(const plan of plans){const priceId=this.billing().stripe[c.mode].priceIds[plan.key];if(!priceId)continue;const price=await api.call('GET','/v1/prices/'+priceId);if(price.active===true&&price.recurring?.interval===plan.interval&&price.currency==='usd')priorProducts.push(id(price.product));}}
+   let priorProof=p.verifiedPromotion;if(p.promotion&&!priorProof){try{priorProof=await this.verifyHistoricalPromotion(c.mode,owner,String(p.promotion),String(p.code||m.code),priorProducts);}catch{/* Preserve the old offer as an unresolved history candidate; an applied but unprovable renewal must stay retryable for review. */}}
    if(p.promotion)await this.api(c.mode).call('POST','/v1/promotion_codes/'+p.promotion,{active:false},{key:'retire_'+p.promotion});
    const legacyCodes=[...new Set([...(Array.isArray(p.legacyCodes)?p.legacyCodes:[]),p.code].filter((v):v is string=>typeof v==='string'))];
-   const promotionHistory=[...(Array.isArray(p.promotionHistory)?p.promotionHistory:[])];if(p.promotion&&priorProof&&!promotionHistory.some((x:StripeObject)=>x.promotion===p.promotion))promotionHistory.push({...priorProof});
+   const promotionHistory=[...(Array.isArray(p.promotionHistory)?p.promotionHistory:[])];if(p.promotion&&!promotionHistory.some((x:StripeObject)=>x.promotion===p.promotion))promotionHistory.push(priorProof?{...priorProof}:{promotion:p.promotion,code:String(p.code||m.code),percent:p.appliedDiscountPercent,products:[...new Set(priorProducts)].sort(),proof:null});
    this.updateProfile(c.mode,owner,{code:m.code,promotion:null,signature:null,legacyCodes,promotionHistory,appliedDiscountPercent:0,verifiedPromotion:null,everActivated:!!p.promotion||p.everActivated===true});
    return this.view(owner);
   }
@@ -170,8 +192,8 @@ export class EarnStripeService {
   }
   if(m.discountPercent<1)throw Error('Referral discounts must be at least 1% to create a promotion code');
   const couponId='wh_earn_'+signature;
-  let coupon:StripeObject;try{coupon=await api.call('GET','/v1/coupons/'+couponId);}catch(e){if(!(e instanceof EarnStripeError)||e.status!==404)throw e;coupon=await api.call('POST','/v1/coupons',{id:couponId,duration:'forever',percent_off:m.discountPercent,'metadata[managed_by]':'wh-earn',...Object.fromEntries([...new Set(products)].map((v,i)=>[`applies_to[products][${i}]`,v]))},{key:couponId});}
-  if(coupon.percent_off!==m.discountPercent||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn')throw Error('Existing Stripe coupon does not match this referral');
+  let coupon:StripeObject;try{coupon=await api.call('GET','/v1/coupons/'+couponId,{'expand[0]':'applies_to'});}catch(e){if(!(e instanceof EarnStripeError)||e.status!==404)throw e;coupon=await api.call('POST','/v1/coupons',{id:couponId,duration:'forever',percent_off:m.discountPercent,'metadata[managed_by]':'wh-earn','expand[0]':'applies_to',...Object.fromEntries([...new Set(products)].map((v,i)=>[`applies_to[products][${i}]`,v]))},{key:couponId});}
+  if(coupon.id!==couponId||coupon.valid!==true||coupon.percent_off!==m.discountPercent||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||JSON.stringify(couponProducts(coupon))!==JSON.stringify(uniqueProducts))throw Error('Existing Stripe coupon does not match this referral');
   // Changed discounts create a new public code; existing subscribers retain the discount they accepted.
   const code=p.promotion?m.code+signature.slice(0,6).toUpperCase():m.code;
   const existing=await api.call('GET','/v1/promotion_codes',{code,active:true,limit:100});let promo=(existing.data||[]).find((x:StripeObject)=>x.code?.toUpperCase()===code);
@@ -195,8 +217,8 @@ export class EarnStripeService {
   const uniqueProducts=[...new Set(products)].sort();if(!uniqueProducts.length)throw Error('Create the recurring WH software plans in Stripe first');
   const specs=[['OskarasTrading10K7',10],['OskarasTrading20M4',20],['OskarasTrading25R8',25]] as const,registered:StripeObject[]=[];
   for(const [code,percent] of specs){const signature=hash(JSON.stringify([owner,code,percent,uniqueProducts])),couponId='wh_osk_'+signature.slice(0,28);let coupon:StripeObject;
-   try{coupon=await api.call('GET','/v1/coupons/'+couponId);}catch(error){if(!(error instanceof EarnStripeError)||error.status!==404)throw error;coupon=await api.call('POST','/v1/coupons',{id:couponId,name:code,duration:'forever',percent_off:percent,'metadata[managed_by]':'wh-earn','metadata[wh_earn_owner]':owner,'metadata[wh_earn_code]':code,...Object.fromEntries(uniqueProducts.map((v,i)=>[`applies_to[products][${i}]`,v]))},{key:couponId});}
-   const couponProducts=[...new Set((coupon.applies_to?.products||[]).filter((v:unknown)=>typeof v==='string'))].sort();if(coupon.id!==couponId||coupon.valid!==true||coupon.percent_off!==percent||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||coupon.metadata?.wh_earn_owner!==owner||JSON.stringify(couponProducts)!==JSON.stringify(uniqueProducts))throw Error(`Existing Stripe coupon for ${code} does not match the reviewed offer`);
+   try{coupon=await api.call('GET','/v1/coupons/'+couponId,{'expand[0]':'applies_to'});}catch(error){if(!(error instanceof EarnStripeError)||error.status!==404)throw error;coupon=await api.call('POST','/v1/coupons',{id:couponId,name:code,duration:'forever',percent_off:percent,'metadata[managed_by]':'wh-earn','metadata[wh_earn_owner]':owner,'metadata[wh_earn_code]':code,'expand[0]':'applies_to',...Object.fromEntries(uniqueProducts.map((v,i)=>[`applies_to[products][${i}]`,v]))},{key:couponId});}
+   const couponProductScope=couponProducts(coupon);if(coupon.id!==couponId||coupon.valid!==true||coupon.percent_off!==percent||coupon.duration!=='forever'||coupon.metadata?.managed_by!=='wh-earn'||coupon.metadata?.wh_earn_owner!==owner||JSON.stringify(couponProductScope)!==JSON.stringify(uniqueProducts))throw Error(`Existing Stripe coupon for ${code} does not match the reviewed offer`);
    const listed=await api.call('GET','/v1/promotion_codes',{code,active:true,limit:100}),existing=(listed.data||[]).find((x:StripeObject)=>String(x.code||'').toUpperCase()===code.toUpperCase());let promo=existing;
    if(promo&&(id(promo.coupon)!==couponId||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner))throw Error(`Promotion code ${code} already belongs to another offer`);
    promo??=await api.call('POST','/v1/promotion_codes',{coupon:couponId,code,'metadata[managed_by]':'wh-earn','metadata[wh_earn_owner]':owner,'metadata[wh_earn_code]':code},{key:'wh_osk_'+signature});
@@ -251,7 +273,7 @@ export class EarnStripeService {
   if(!['invoice.paid','invoice.payment_succeeded','customer.subscription.updated','customer.subscription.deleted','charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type))return;
   const ledger=this.ledger(mode),b=book(ledger.admin());if(b.seen[ev.id]||this.ignoredEvents(mode)[ev.id])return;
   // An unconfigured private program must not add Stripe dependencies to ordinary billing.
-  if(!Object.values(b.profiles).some((p:any)=>p.promotion||(Array.isArray(p.partnerPromotions)&&p.partnerPromotions.length>0))&&!Object.keys(b.invoices).length)return;
+  if(!Object.values(b.profiles).some((p:any)=>p.promotion||(Array.isArray(p.promotionHistory)&&p.promotionHistory.length>0)||(Array.isArray(p.partnerPromotions)&&p.partnerPromotions.length>0))&&!Object.keys(b.invoices).length)return;
   const before=ledger.fileVersion(),api=this.api(mode),o=ev.object;
   if(['invoice.paid','invoice.payment_succeeded'].includes(ev.type))await this.invoice(mode,id(o));
   else if(ev.type.startsWith('customer.subscription.')){
@@ -277,7 +299,7 @@ export class EarnStripeService {
   const inv=await api.call('GET','/v1/invoices/'+invoiceId,{'expand[0]':'payments.data.payment.payment_intent'});
   const subscription=id(inv.parent?.subscription_details?.subscription)||id(inv.subscription);if(!subscription||inv.status!=='paid'||inv.currency!=='usd'||inv.livemode!==(mode==='live'))return;
   const sub=await api.call('GET','/v1/subscriptions/'+subscription,{'expand[0]':'discounts'}),attribution=await this.appliedReferral(mode,sub);if(!attribution)return;
-  const {member}=attribution,p=this.profile(mode,member.id);
+  const {member}=attribution;
   const cfg=this.billing(),allowed=new Set(cfg.plans.filter(p=>p.role==='software'&&p.interval&&p.checkout==='payment-link').map(p=>cfg.stripe[mode].priceIds[p.key]).filter(Boolean));
   const items=sub.items?.data||[];if(!items.length||sub.items?.has_more)return;
   const lines=inv.lines?.data||[];if(!lines.length||inv.lines?.has_more)return;
@@ -285,8 +307,8 @@ export class EarnStripeService {
   const historical=prices.filter(price=>price&&!allowed.has(price));
   if(prices.some(price=>!price)||historical.length>4)return;
   if(historical.length){
-   const products=new Set(Array.isArray(p.products)?p.products.filter((v:unknown)=>typeof v==='string'):[]);
-   if(!products.size)return; // A legacy profile needs a proved activation/catalogue before admitting old prices.
+   const products=new Set(Array.isArray(attribution.offer.proof?.products)?attribution.offer.proof.products.filter((v:unknown)=>typeof v==='string'):[]);
+   if(!products.size)return; // Grandfathered prices must fit the exact product scope proved for this applied offer.
    for(const priceId of historical){
     const price=await api.call('GET','/v1/prices/'+priceId);
     if(!products.has(id(price.product))||price.currency!=='usd'||!['month','year'].includes(price.recurring?.interval))return;

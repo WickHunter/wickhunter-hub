@@ -103,17 +103,17 @@ const stripeFetch=async(url,init)=>{
   const u=new URL(url),ep=u.pathname;
   const ok=(body,status=200)=>new Response(JSON.stringify(body),{status});
   if(ep==='/v1/prices/price_month')return ok({id:'price_month',active:true,recurring:{interval:'month'},currency:'usd',product:'prod_wh'});
-  if(ep.startsWith('/v1/coupons/')&&init.method==='GET')return ownerCoupon?ok(ownerCoupon):ok({error:{code:'resource_missing'}},404);
+  if(ep.startsWith('/v1/coupons/')&&init.method==='GET'){if(!ownerCoupon)return ok({error:{code:'resource_missing'}},404);return ok(u.searchParams.get('expand[0]')==='applies_to'?ownerCoupon:Object.fromEntries(Object.entries(ownerCoupon).filter(([k])=>k!=='applies_to')));}
   if(ep==='/v1/coupons'){
     if(init.method==='GET')return ok({data:[]});
     const body=Object.fromEntries(new URLSearchParams(init.body));
-    ownerCoupon={id:'wh_coupon',percent_off:Number(body.percent_off),duration:'forever',valid:true,applies_to:{products:Object.entries(body).filter(([k])=>k.startsWith('applies_to[products][' )).map(([,v])=>v)},metadata:{managed_by:'wh-earn'}};
-    return ok(ownerCoupon);
+    ownerCoupon={id:body.id,percent_off:Number(body.percent_off),duration:'forever',valid:true,applies_to:{products:Object.entries(body).filter(([k])=>k.startsWith('applies_to[products][' )).map(([,v])=>v)},metadata:{managed_by:'wh-earn'}};
+    return ok(body['expand[0]']==='applies_to'?ownerCoupon:Object.fromEntries(Object.entries(ownerCoupon).filter(([k])=>k!=='applies_to')));
   }
   if(ep==='/v1/promotion_codes'){
     if(init.method==='GET')return ok({data:[]});
     const body=Object.fromEntries(new URLSearchParams(init.body));
-    ownerPromo={id:'promo_bound',code:body.code,coupon:'wh_coupon',active:true,livemode:true,expires_at:null,max_redemptions:null,metadata:{managed_by:body['metadata[managed_by]'],wh_earn_owner:body['metadata[wh_earn_owner]']}};
+    ownerPromo={id:'promo_bound',code:body.code,coupon:ownerCoupon.id,active:true,livemode:true,expires_at:null,max_redemptions:null,metadata:{managed_by:body['metadata[managed_by]'],wh_earn_owner:body['metadata[wh_earn_owner]']}};
     return ok(ownerPromo);
   }
   if(ep==='/v1/promotion_codes/promo_bound')return ownerPromo?ok(ownerPromo):ok({error:{code:'resource_missing'}},404);
