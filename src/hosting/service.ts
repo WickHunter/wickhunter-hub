@@ -1068,6 +1068,7 @@ export class HostingService {
       return;
     }
     if (kind !== "replace-region") return;
+    if (row.deletionHold) throw new Error("region replacement blocked by admin deletion hold");
     const nextRegionId = typeof job.payload.nextRegionId === "string" ? job.payload.nextRegionId : null;
     const refusals = Array.isArray(job.payload.refusals) ? job.payload.refusals.map(String) : ["bootstrap did not report readiness"];
     const provider = this.provider();
