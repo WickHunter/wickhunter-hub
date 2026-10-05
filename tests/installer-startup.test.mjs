@@ -67,6 +67,13 @@ await test("existing quoted, escaped, duplicate, multiline and hash credentials 
     const invalid = run(codec + '\nget_env LIQHUNTER_SECRET', { ENV_FILE: file });
     assert.notEqual(invalid.status, 0); assert.doesNotMatch(invalid.stderr, /never-wh-secret/);
     assert.equal(fs.readFileSync(file, "utf8"), malformed);
+    fs.writeFileSync(file, 'UNRELATED="unterminated\nLIQHUNTER_SECRET=preserved\n');
+    const unrelated = run(codec + '\nset_env LIQHUNTER_HUB_ORIGIN https://hub.example.test', { ENV_FILE: file });
+    assert.notEqual(unrelated.status, 0);
+    assert.equal(fs.readFileSync(file, "utf8"), 'UNRELATED="unterminated\nLIQHUNTER_SECRET=preserved\n');
+    fs.writeFileSync(file, 'LIQHUNTER_SECRET=existing\\  \n');
+    const escaped = run(codec + '\nget_env LIQHUNTER_SECRET', { ENV_FILE: file });
+    assert.equal(escaped.status, 0, escaped.stderr); assert.equal(escaped.stdout, 'existing ');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -158,7 +165,9 @@ await test("a hung health call stays inside the single readiness deadline", () =
     const result = run(readiness.replace("HEALTH_DEADLINE_SECONDS=45", "HEALTH_DEADLINE_SECONDS=2") + '\nwait_for_signed_version', readinessFixture(dir, "hung"));
     assert.notEqual(result.status, 0); assert.match(result.stderr, /within 2s/);
     assert.ok(Date.now() - started < 4000, "hung curl cannot repeat the full deadline for nine attempts");
-    assert.deepEqual(fs.readFileSync(path.join(dir, "budgets"), "utf8").trim().split("\n"), ["2"]);
+    const budgets = fs.readFileSync(path.join(dir, "budgets"), "utf8").trim().split("\n").map(Number);
+    assert.equal(budgets.length, 1);
+    assert.ok(budgets[0] >= 1 && budgets[0] <= 2, "service-state time consumes the same deadline before curl starts");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

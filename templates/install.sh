@@ -480,7 +480,7 @@ while (pos < text.length) {
   const match = /^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t\r]*/.exec(text.slice(pos));
   if (!match) { const end = text.indexOf("\n", pos); pos = end < 0 ? text.length : end + 1; records.push({ raw: text.slice(start, pos) }); continue; }
   pos += match[0].length;
-  let value = "", quote = null, trailing = "";
+  let value = "", quote = null, trailing = "", whitespace = "";
   if (text[pos] === '"' || text[pos] === "'") quote = text[pos++];
   let closed = !quote;
   while (pos < text.length) {
@@ -491,15 +491,19 @@ while (pos < text.length) {
       if (pos === text.length) { value += "\\"; break; }
       const next = text[pos++];
       if (next === "\n") continue;
-      if (!quote || ['\\', '"', '$', '`'].includes(next)) value += next;
+      if (!quote) { value += whitespace + next; whitespace = ""; }
+      else if (['\\', '"', '$', '`'].includes(next)) value += next;
       else value += "\\" + next;
-    } else value += c;
+    } else if (!quote && /[ \t\r]/.test(c)) whitespace += c;
+    else { value += whitespace + c; whitespace = ""; }
   }
   if (quote) {
     while (pos < text.length && text[pos] !== "\n") trailing += text[pos++];
     if (text[pos] === "\n") pos++;
-  } else value = value.replace(/[ \t\r]+$/, "");
-  if (match[1] === name && (!closed || trailing.trim())) fail();
+  }
+  // Refuse malformed unrelated records too: an unterminated quote can absorb
+  // every later credential, so appending another value would corrupt the file.
+  if (!closed || trailing.trim()) fail();
   records.push({ name: match[1], value, raw: text.slice(start, pos) });
 }
 if (mode === "get") {

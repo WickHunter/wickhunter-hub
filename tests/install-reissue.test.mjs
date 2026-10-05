@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { createHub } from "../dist/src/server.js";
@@ -51,7 +51,18 @@ const rawFromMail = (mail) => /\/install\/([A-Za-z0-9_-]+)/.exec(mail.text)[1];
 await test("verified admin reissue invalidates only old customer links and preserves license/seat/account data", async () => {
   const f = await fixture();
   try {
-    for (const file of ["roster.json", "customer-account-sentinel.json", "license-lease-state-sentinel.json"]) fs.writeFileSync(path.join(f.h.dataDir, file), '{"preserved":"fixture"}');
+    const checkin = await jsonReq(f.url("/api/license/checkin"), { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ licenseId: f.issued.payload.id, installId: "same-customer-vps", version: "0.90.135", ts: Date.now(), token: f.issued.token }) });
+    assert.equal(checkin.status, 200);
+    const pair = generateKeyPairSync("ed25519");
+    const headers = { "content-type": "application/json", "x-license": f.issued.token };
+    const challenge = await jsonReq(f.url("/api/license/lease/challenge"), { method: "POST", headers,
+      body: JSON.stringify({ purpose: "activate", installId: "same-customer-vps", installPublicKey: pair.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("base64url") }) });
+    assert.equal(challenge.status, 200);
+    const lease = await jsonReq(f.url("/api/license/lease/activate"), { method: "POST", headers,
+      body: JSON.stringify({ nonce: challenge.body.challenge.nonce, signature: sign(null, Buffer.from(challenge.body.challenge.proofBytesB64u, "base64url"), pair.privateKey).toString("base64url") }) });
+    assert.equal(lease.status, 200);
+    fs.writeFileSync(path.join(f.h.dataDir, "customer-account-sentinel.json"), '{"preserved":"fixture"}');
     const preserved = Object.fromEntries(fs.readdirSync(f.h.dataDir).filter((n) => !n.startsWith("billing-")).map((n) => [n, fs.readFileSync(path.join(f.h.dataDir, n))]));
     const customerBefore = JSON.stringify(f.store.getCustomer(f.customer.key));
     const result = await f.reissue();
