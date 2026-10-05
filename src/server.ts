@@ -773,6 +773,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // other unauthenticated-or-bearer public route shares the general "rest
     // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
     if (m === "POST" && p === "/api/hosting/bundle-checkout") {
+      res.setHeader("access-control-allow-origin", "*");
       const rate = hostingBundleIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "hosted bundle checkout"); }
     } else if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {

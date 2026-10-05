@@ -13,6 +13,7 @@ async function setup(overrides = {}) {
   const provider = new FakeProvider({ now: () => clock });
   const h = await freshHub({}, {
     billingNow: () => clock, hostingNow: () => clock,
+    ...(overrides.fixedRateLimitClock ? {rateLimitNow: () => clock} : {}),
     billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
     hostingProvider: provider,
     hostingFetch: async (url, init) => {
@@ -126,6 +127,21 @@ await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable
   assert.equal(c.calls.filter((x) => x.url.endsWith("/v1/checkout/sessions")).length, 1);
   assert.equal((await fetch(`${c.h.origin}/buy?plan=monthly-hosted`)).status, 403);
   await c.h.close();
+});
+
+await test('bundle rate limiting remains readable by the cross-origin website', async () => {
+  const c = await setup({fixedRateLimitClock:true});
+  try {
+    let response;
+    for (let i=0; i<6; i++) response = await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
+      method:'POST',headers:{origin:'https://www.wickhunterunleashed.com','content-type':'application/json'},body:'{}',
+    });
+    assert.equal(response.status,429);
+    assert.equal(response.headers.get('access-control-allow-origin'),'*');
+    const body = await response.json();
+    assert.ok(body.retryAfterSeconds > 0);
+    assert.equal(c.provider.createCalls.length,0);
+  } finally { await c.h.close(); }
 });
 
 await test("anonymous bundle reservations are bounded and expired reservations release capacity", async () => {
