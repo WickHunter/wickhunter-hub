@@ -316,7 +316,7 @@ export class HostingService {
       return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already in use" };
     }
     const pendingAnonymous = this.store.instances().filter((row) => row.ownerId.startsWith("bundle:") && row.stage === "ordered" && row.checkoutExpiresAtMs != null && row.checkoutExpiresAtMs > nowMs).length;
-    if (pendingAnonymous >= 3) return { ok: false, code: "PROVISIONING_DISABLED", error: "too many hosted checkouts are pending; retry shortly" };
+    if (pendingAnonymous >= 25) return { ok: false, code: "PROVISIONING_DISABLED", error: "too many hosted checkouts are pending; retry shortly" };
     const provider = this.provider()!;
     let quote: number;
     try {

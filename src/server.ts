@@ -508,7 +508,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // generous against an honest retry (the token itself lasts 15 minutes)
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
-  const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 30, windowMs: 15 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);

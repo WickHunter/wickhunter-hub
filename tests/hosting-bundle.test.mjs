@@ -40,7 +40,7 @@ async function setup(overrides = {}) {
       { key: "yearly-hosted", name: "Yearly + VPS", amountCents: 93900, currency: "usd", interval: "year", role: "software", checkout: "hosted-bundle" },
     ],
   });
-  await admin("/admin/api/hosting/policy", { policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "2284", releaseRef: RELEASE, maximumProjectedMonthlyProviderCostCents: 10000 } });
+  await admin("/admin/api/hosting/policy", { policy: { provisioningEnabled: true, monthlyPriceCents: 2000, osId: "2284", releaseRef: RELEASE, maximumProjectedMonthlyProviderCostCents: overrides.costCeilingCents ?? 10000 } });
   const event = (id, type, object) => ({ id, object: "event", type, livemode: false, created: Math.floor(clock / 1000), data: { object } });
   async function post(ev) {
     const body = JSON.stringify(ev);
@@ -159,28 +159,45 @@ await test('bundle rate limiting remains readable by the cross-origin website', 
   const c = await setup({fixedRateLimitClock:true});
   try {
     let response;
-    for (let i=0; i<6; i++) response = await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
+    for (let i=0; i<31; i++) {
+      response = await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
       method:'POST',headers:{origin:'https://www.wickhunterunleashed.com','content-type':'application/json'},body:'{}',
-    });
+      });
+      if (i < 30) assert.equal(response.status,400,'first 30 requests reach validation');
+    }
     assert.equal(response.status,429);
     assert.equal(response.headers.get('access-control-allow-origin'),'*');
     const body = await response.json();
     assert.ok(body.retryAfterSeconds > 0);
+    c.advance(15 * 60_000 + 1);
+    assert.equal((await fetch(c.h.origin+'/api/hosting/bundle-checkout', {
+      method:'POST',headers:{'content-type':'application/json'},body:'{}',
+    })).status,400,'checkout limit resets after the window');
     assert.equal(c.provider.createCalls.length,0);
   } finally { await c.h.close(); }
 });
 
 await test("anonymous bundle reservations are bounded and expired reservations release capacity", async () => {
-  const c = await setup();
+  const c = await setup({ costCeilingCents: 100000 });
   const checkout = (suffix) => jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: `123e4567-e89b-12d3-a456-42661417${suffix}` }) });
-  assert.equal((await checkout("4101")).status, 200);
-  assert.equal((await checkout("4102")).status, 200);
-  assert.equal((await checkout("4103")).status, 200);
-  assert.equal((await checkout("4104")).status, 503);
+  for (let i=1; i<=25; i++) assert.equal((await checkout(String(4100+i))).status,200);
+  assert.equal((await checkout("4126")).status, 503);
   c.advance(31 * 60_000);
-  assert.equal((await checkout("4104")).status, 200);
+  assert.equal((await checkout("4126")).status, 200);
   assert.equal(c.h.hub.hosting.store.instances().filter((x) => x.ownerId.startsWith("bundle:") && x.stage === "ordered").length, 1);
   await c.h.close();
+});
+
+await test("increased pending limit still respects the provider spend ceiling", async () => {
+  const c = await setup({ costCeilingCents: 4000 });
+  try {
+    for (let i=0; i<4; i++) assert.equal((await c.h.hub.hosting.bundleCheckout('month',`cost-guard-attempt-${i}`,c.now())).ok,true);
+    const refused=await c.h.hub.hosting.bundleCheckout('month','cost-guard-attempt-extra',c.now());
+    assert.equal(refused.ok,false);
+    assert.match(refused.error,/cost ceiling/);
+    assert.equal(c.h.hub.hosting.store.instances().length,4);
+    assert.equal(c.provider.createCalls.length,0);
+  } finally { await c.h.close(); }
 });
 
 await test("bundle checkout fails closed before reservation when Stripe price is stale", async () => {
