@@ -64,7 +64,10 @@ await test('manual payout destination blocks new Stripe admission but preserves 
   const localLedger=new EarnService(isolated,()=>at),manual=earnOwner('email:manual-destination@example.com'),automatic=earnOwner('email:auto-destination@example.com'),racing=earnOwner('email:race-destination@example.com');
   localLedger.member(manual,'Manual destination');localLedger.member(automatic,'Automatic destination');localLedger.member(racing,'Race destination');
   localLedger.savePayoutPreference(manual,{method:'usdt-polygon',address:'0x1234567890abcdef1234567890abcdef12345678',expectedRevision:null});
-  const posts=[],outcomes=new Map([['obp_historic',{id:'obp_historic',amount:{value:100,currency:'usd'},to:{recipient:'acct_manual'},livemode:false,status:'posted'}]]);
+  const posts=[],accepted=new Map([['wh_payout_job_current','obp_previously_accepted']]),outcomes=new Map([
+   ['obp_historic',{id:'obp_historic',amount:{value:100,currency:'usd'},to:{recipient:'acct_manual'},livemode:false,status:'posted'}],
+   ['obp_previously_accepted',{id:'obp_previously_accepted',amount:{value:200,currency:'usd'},to:{recipient:'acct_manual'},livemode:false,status:'processing'}]
+  ]);
   const localFetch=async(url,init)=>{
    const endpoint=new URL(url).pathname,ok=(body,status=200)=>new Response(JSON.stringify(body),{status});
    if(endpoint.startsWith('/v2/money_management/financial_accounts/fa_'))return ok({status:'open',livemode:false});
@@ -73,7 +76,9 @@ await test('manual payout destination blocks new Stripe admission but preserves 
     return ok({id:endpoint.split('/').at(-1),defaults:{payout_methods:{usd:'ba_test'}},configuration:{recipient:{capabilities:{bank_accounts:{local:{status:'active'}}}}}});
    }
    if(endpoint==='/v2/money_management/outbound_payments'&&init.method==='POST'){
-    const body=JSON.parse(init.body);posts.push(body);const created={id:'obp_new',amount:body.amount,to:body.to,livemode:false,status:'processing'};outcomes.set(created.id,created);return ok(created);
+    const body=JSON.parse(init.body),key=init.headers['Idempotency-Key'];posts.push({body,key});
+    if(accepted.has(key))return ok(outcomes.get(accepted.get(key)));
+    const created={id:'obp_new',amount:body.amount,to:body.to,livemode:false,status:'processing'};accepted.set(key,created.id);outcomes.set(created.id,created);return ok(created);
    }
    if(endpoint.startsWith('/v2/money_management/outbound_payments/'))return ok(outcomes.get(endpoint.split('/').at(-1)));
    throw Error('Unexpected fake request '+endpoint);
@@ -92,9 +97,13 @@ await test('manual payout destination blocks new Stripe admission but preserves 
   try{
    local.configure({enabled:true,automatic:true,financialAccount:'fa_test_fixture'});await local.run();
    const state=payoutLedger.admin(),jobs=state.stripe.jobs;
-   assert.equal(posts.length,1,'only the member without a manual destination is submitted to Stripe');
-   assert.equal(posts[0].to.recipient,'acct_automatic');
-   assert.deepEqual(jobs.find(j=>j.id==='job_current'),unresolved,'an ambiguous current-cycle submission stays preserved and is not retried');
+   assert.equal(posts.length,2,'new automatic job plus recovery of the already accepted ambiguous job');
+   assert.equal(posts.find(p=>p.key==='wh_payout_job_current').body.to.recipient,'acct_manual');
+   const recovered=jobs.find(j=>j.id==='job_current');
+   assert.equal(recovered.stripeId,'obp_previously_accepted');assert.equal(recovered.status,'processing');
+   for(const key of ['owner','cycle','recipient','financialAccount','amount','allocations','created'])assert.deepEqual(recovered[key],unresolved[key],'recovery preserves the original reservation');
+   assert.equal(outcomes.size,3,'recovery creates no duplicate provider payment');
+   assert.equal(posts.find(p=>p.key!=='wh_payout_job_current').body.to.recipient,'acct_automatic');
    assert.equal(jobs.find(j=>j.id==='job_historic').status,'posted','saved destination does not block reconciliation of an existing accepted Stripe payout');
    assert.equal(jobs.filter(j=>j.owner===automatic&&j.cycle==='2026-10').length,1);
    assert.equal(jobs.some(j=>j.owner===racing&&j.cycle==='2026-10'),false,'preference saved while recipient lookup was in flight blocks atomic payout admission');

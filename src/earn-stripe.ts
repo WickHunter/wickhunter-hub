@@ -290,10 +290,9 @@ export class EarnStripeService {
   const fa=await this.payoutApi(mode).call('GET','/v2/money_management/financial_accounts/'+c.financialAccount);if(fa.status!=='open'||fa.livemode!==(mode==='live'))throw Error('The payout financial account is not open in this mode');
   for(const m of ledger.admin().members){
    jobs=book(ledger.admin()).jobs as Job[];const old=jobs.find(j=>j.owner===m.id&&j.cycle===cycle);
-   // Existing Stripe jobs are still reconciled above. A destination saved by
-   // the member blocks only new Stripe admission, including an unresolved
-   // submission retry; keep that legacy job/reservation intact for review.
-   if(old){if(!m.payoutPreference&&!old.stripeId&&old.status==='submitting')await this.submit(mode,old,c);continue;}
+   // A saved destination blocks new admission. An existing ambiguous job
+   // still needs its original idempotency key to recover an accepted payment.
+   if(old){if(!old.stripeId&&old.status==='submitting')await this.submit(mode,old,c);continue;}
    if(m.payoutPreference)continue;
    let recipient:string|null;try{recipient=await this.recipient(mode,m.id);}catch{continue;}if(!recipient)continue;
    const job=ledger.transaction(s=>{const b=book(s);if(s.members.find(member=>member.id===m.id)?.payoutPreference||b.jobs.some((j:Job)=>j.owner===m.id&&j.cycle===cycle))return null;
