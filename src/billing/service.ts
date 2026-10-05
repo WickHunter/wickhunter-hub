@@ -40,8 +40,8 @@ import {
   type StripeModeConfig,
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
-import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
-import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { escapeHtml, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
+import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { launchGrant, reconcileLaunchSession } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
@@ -168,6 +168,7 @@ export class BillingService {
    * event ids can describe the same paid session, and different paid sessions
    * for one customer must calculate their target from the latest expiry. */
   private readonly checkoutLocks = new Map<string, Promise<void>>();
+  private readonly installReissues = new Set<string>();
 
   constructor(
     readonly dataDir: string,
@@ -1471,6 +1472,54 @@ export class BillingService {
     return { ok: true, sentTo: rec.email };
   }
 
+  /** Admin-only support action. Never mutates the licence, seat or customer
+   * account, and sends only to the stored verified billing email. */
+  async reissueInstall(customerKey: string, expectedEmail: string): Promise<
+    { ok: true; sentTo: string; expiresAtMs: number; revoked: { page: number; install: number } }
+    | { ok: false; status: number; error: string }
+  > {
+    if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    const rec = this.store.getCustomer(customerKey);
+    if (!rec) return { ok: false, status: 404, error: "unknown customer" };
+    const now = this.now();
+    const lic = this.licenses.get(rec.licenseId);
+    const key = lic && this.licenses.tokenFor(lic.id);
+    if (!rec.livemode || rec.refunded || rec.disputed || !lic || lic.exp <= now || !key || !this.licenses.verify(key, now).ok) {
+      return { ok: false, status: 409, error: "an active live customer licence without a refund or dispute is required" };
+    }
+    if (!rec.email.includes("@") || /[\r\n]/.test(rec.email) || expectedEmail.trim().toLowerCase() !== rec.email.trim().toLowerCase()) {
+      return { ok: false, status: 409, error: "the confirmed email must match the stored billing customer" };
+    }
+    const cfg = this.config();
+    if (!emailReady(cfg.email)) return { ok: false, status: 503, error: "email provider is not configured; existing links were not changed" };
+    this.installReissues.add(customerKey);
+    let raw = "";
+    try {
+      const revoked = { page: this.store.revokeTokens(rec.key, "page", now), install: this.store.revokeTokens(rec.key, "install", now) };
+      raw = this.store.mint("install", lic.id, rec.key, now, { reusable: true });
+      const expiresAtMs = now + INSTALL_TOKEN_TTL_MS;
+      const audit = (stage: "prepared" | "sent" | "failed") => this.store.appendEvent({
+        id: `admin-install-reissue:${rec.key}:${now}:${stage}`, type: "admin.install.reissue", livemode: true,
+        receivedAtMs: this.now(), outcome: stage === "failed" ? "error" : "applied",
+        note: JSON.stringify({ actor: "admin", customerKey: rec.key, licenseId: lic.id, stage, revoked, reusable: true, expiresAtMs, issue: "bybit-us-ip" }),
+      });
+      audit("prepared");
+      const result = await sendEmail(cfg.email, reissuedInstallEmail(rec.email, { name: rec.name, installUrl: `${this.origin}/install/${raw}`, expiresAtMs }), this.fetchLike);
+      if (!result.ok) {
+        this.store.revokeInstall(raw, this.now());
+        audit("failed");
+        // Provider bodies can reflect the submitted message. Never return or
+        // log that body, which contains the private opaque link.
+        return { ok: false, status: 502, error: "install email delivery failed; the newly issued link was revoked" };
+      }
+      audit("sent");
+      return { ok: true, sentTo: rec.email, expiresAtMs, revoked };
+    } catch {
+      if (raw) this.store.revokeInstall(raw, this.now());
+      return { ok: false, status: 500, error: "install reissue failed; review the billing audit before retrying" };
+    } finally { this.installReissues.delete(customerKey); }
+  }
+
   async sendTestEmail(to: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const address = to.trim();
     if (!address.includes("@") || /[\r\n]/.test(address)) return { ok: false, error: "enter an email address" };
@@ -1560,6 +1609,12 @@ export class BillingService {
         revoked: "this install command is no longer valid — reload your install page for a fresh one",
       }[r.reason];
       return { ok: false, status: 403, text };
+    }
+    if (r.rec.reusable === true) {
+      const customer = this.store.getCustomer(r.rec.customerKey);
+      if (!customer || !customer.livemode || customer.refunded || customer.disputed || customer.licenseId !== r.rec.licenseId) {
+        return { ok: false, status: 403, text: "this customer install command is no longer authorized — contact support" };
+      }
     }
     const lic = this.licenses.get(r.rec.licenseId);
     if (!lic) return { ok: false, status: 403, text: "this licence has been revoked — contact support" };

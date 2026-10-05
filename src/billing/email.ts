@@ -349,3 +349,24 @@ export function testEmail(to: string, hubOrigin: string): EmailMessage {
     html: `<p>This is a test message from the Wick Hunter Hub at <code>${escapeHtml(hubOrigin)}</code>.</p><p>If you can read this, the email provider is configured correctly.</p>`,
   };
 }
+
+/** Only the explicit, verified support reissue calls this. The licence key is
+ * absent; the revocable opaque command expires after 24 hours. */
+export function reissuedInstallEmail(to: string, input: { name: string; installUrl: string; expiresAtMs: number }): EmailMessage {
+  const quotedUrl = "'" + input.installUrl.replace(/'/g, "'\\''") + "'";
+  // A failed HTTP request prints its safe response body and cannot execute it.
+  // The subshell and trap also clean up after an installer failure.
+  const command = `(wh_installer_tmp=$(mktemp) || exit; trap 'rm -f "$wh_installer_tmp"' EXIT; if curl -q --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 ${quotedUrl} -o "$wh_installer_tmp"; then sudo bash "$wh_installer_tmp"; else wh_install_status=$?; cat "$wh_installer_tmp" >&2; exit "$wh_install_status"; fi)`;
+  const paragraphs = [
+    `Hi ${input.name.trim().split(/\s+/)[0] || "there"},`,
+    "Here is your replacement Wick Hunter installation command. Your previous install-page and opaque install links have been revoked.",
+    `This replacement command can be run again until ${new Date(input.expiresAtMs).toISOString()} (24 hours from issue). It uses your existing licence and preserves its expiry and server seat. Re-running on the same VPS keeps your application data and accounts.`,
+    "Paste this command into your Ubuntu VPS terminal:",
+    command,
+    "Your log shows Bybit HTTP 403 stopped the current public Beta before the dashboard started, and you confirmed that the VPS used a US IP address. Bybit documents HTTP 403 for US IPs as well as other causes. The replacement link does not remove an exchange restriction or fix that runtime startup behavior. The currently published build can still fail to start on a Bybit-restricted IP. Verify the VPS location and your eligibility with Bybit before retrying.",
+    "Bybit's HTTP error documentation: https://bybit-exchange.github.io/docs/v5/error",
+    "If setup fails, retain the error and contact support. Do not share the install link, licence key or dashboard password publicly.",
+  ];
+  return { to, subject: "Your replacement Wick Hunter install command", text: paragraphs.join("\n\n"),
+    html: paragraphs.map((p) => p === command ? `<pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(p)}</pre>` : `<p>${escapeHtml(p)}</p>`).join("\n") };
+}

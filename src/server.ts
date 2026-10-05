@@ -3026,6 +3026,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const r = await billing.resendWelcome(body.customerId);
       return r.ok ? sendJson(res, 200, { ok: true, sentTo: r.sentTo }) : sendJson(res, r.status, { ok: false, error: r.error });
     }
+    if (m === "POST" && p === "/admin/api/billing/reissue-install") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.customerId !== "string" || !body.customerId || typeof body.email !== "string" || !body.email || body.issue !== "bybit-us-ip") {
+        return sendJson(res, 400, { ok: false, error: "expected {customerId,email,issue:'bybit-us-ip'}" }, { "cache-control": "no-store" });
+      }
+      if (!readLatest()) return sendJson(res, 503, { ok: false, error: "no authenticated release is available; existing links were not changed" }, { "cache-control": "no-store" });
+      const r = await billing.reissueInstall(body.customerId, body.email);
+      return r.ok ? sendJson(res, 200, r, { "cache-control": "no-store" }) : sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    }
     if (m === "POST" && p === "/admin/api/billing/test-email") {
       const body = await readJsonBody(req);
       if (body === null || typeof body.to !== "string") return sendJson(res, 400, { ok: false, error: "expected {to}" });
