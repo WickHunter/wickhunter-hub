@@ -22,6 +22,7 @@ const run = (script, env = {}, timeout = 12000) => spawnSync("bash", ["-c", base
   env: { PATH: process.env.PATH, HOME: os.homedir(), ...env },
 });
 const executable = (file, body) => fs.writeFileSync(file, "#!/usr/bin/env bash\nset -eu\n" + body, { mode: 0o755 });
+const validHash = `scrypt$16384$8$1$${Buffer.alloc(16, 1).toString("base64url")}$${Buffer.alloc(32, 2).toString("base64url")}`;
 
 await test("typed eight-character login and punctuation secret survive systemd-compatible encoding and rerun", () => {
   const dir = sandbox();
@@ -57,11 +58,11 @@ await test("existing quoted, escaped, duplicate, multiline and hash credentials 
   const dir = sandbox();
   try {
     const file = path.join(dir, "env"); fs.mkdirSync(path.join(dir, "data"));
-    fs.writeFileSync(file, '# comment\nLIQHUNTER_SECRET=old\nLIQHUNTER_SECRET="new \\"secret\\" \\\\ path"\nLIQHUNTER_LOGIN_PASSWORD_HASH=opaque-existing-hash\nMULTI=\'first\nsecond\'\nRAW=literal$HOME`id`\n');
+    fs.writeFileSync(file, '# comment\nLIQHUNTER_SECRET=old\nLIQHUNTER_SECRET="new \\"secret\\" \\\\ path"\nLIQHUNTER_LOGIN_PASSWORD_HASH=' + validHash + '\nMULTI=\'first\nsecond\'\nRAW=literal$HOME`id`\n');
     const result = run(codec + '\nask() { exit 99; }\n' + config + '\n[ "$(get_env LIQHUNTER_SECRET)" = \'new "secret" \\ path\' ]\n[ "$(get_env MULTI)" = $\'first\\nsecond\' ]\n[ "$(get_env RAW)" = \'literal$HOME`id`\' ]\n', { ENV_FILE: file, APP_DIR: dir, HUB: "https://hub.example.test" });
     assert.equal(result.status, 0, result.stderr);
     const text = fs.readFileSync(file, "utf8");
-    assert.match(text, /LIQHUNTER_LOGIN_PASSWORD_HASH=opaque-existing-hash/);
+    assert.ok(text.includes(`LIQHUNTER_LOGIN_PASSWORD_HASH=${validHash}`));
     assert.doesNotMatch(text, /^LIQHUNTER_LOGIN_PASSWORD=/m);
     const malformed = 'LIQHUNTER_SECRET="never-wh-secret\n'; fs.writeFileSync(file, malformed);
     const invalid = run(codec + '\nget_env LIQHUNTER_SECRET', { ENV_FILE: file });
@@ -74,6 +75,28 @@ await test("existing quoted, escaped, duplicate, multiline and hash credentials 
     fs.writeFileSync(file, 'LIQHUNTER_SECRET=existing\\  \n');
     const escaped = run(codec + '\nget_env LIQHUNTER_SECRET', { ENV_FILE: file });
     assert.equal(escaped.status, 0, escaped.stderr); assert.equal(escaped.stdout, 'existing ');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test("a valid login hash outranks both short and valid legacy plaintext without a password reset", () => {
+  const dir = sandbox();
+  try {
+    const file = path.join(dir, "env"); fs.mkdirSync(path.join(dir, "data"));
+    const env = { ENV_FILE: file, APP_DIR: dir, HUB: "https://hub.example.test", EXPECTED_HASH: validHash };
+    for (const password of ["short", "valid-plaintext-123"]) {
+      fs.writeFileSync(file, `# preserve\nLIQHUNTER_SECRET=existing-secret\nLIQHUNTER_LOGIN_PASSWORD=${password}\nLIQHUNTER_LOGIN_PASSWORD_HASH=${validHash}\n`);
+      const result = run(codec + '\nask() { exit 99; }\n' + config + '\n[ -z "$(get_env LIQHUNTER_LOGIN_PASSWORD)" ]\n[ "$(get_env LIQHUNTER_LOGIN_PASSWORD_HASH)" = "$EXPECTED_HASH" ]\n', env);
+      assert.equal(result.status, 0, result.stderr);
+      const text = fs.readFileSync(file, "utf8");
+      assert.doesNotMatch(text, /^LIQHUNTER_LOGIN_PASSWORD=/m); assert.ok(text.includes(validHash)); assert.match(text, /^# preserve/m);
+    }
+    for (const hash of ["opaque-invalid", validHash.replace("16384", "32768"), validHash.slice(0, -10)]) {
+      const original = `LIQHUNTER_SECRET=existing-secret\nLIQHUNTER_LOGIN_PASSWORD=valid-plaintext-123\nLIQHUNTER_LOGIN_PASSWORD_HASH=${hash}\n`;
+      fs.writeFileSync(file, original);
+      const result = run(codec + '\nask() { exit 99; }\n' + config, env);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /hash is malformed/);
+      assert.equal(fs.readFileSync(file, "utf8"), original, "malformed hash never silently rotates a credential");
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -558,8 +558,21 @@ if [ -n "$BOOTSTRAP_PW" ]; then
   set_env LIQHUNTER_BOOTSTRAP_PASSWORD "$BOOTSTRAP_PW"
   ok "temporary hosted login configured; the application will require a password change"
 fi
+if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -n "$LOGIN_HASH" ]; then
+  # Match AppAuth's accepted scrypt parameters and decoded byte lengths.
+  # Prefer an existing valid hash over competing plaintext; never replace it
+  # with a newly generated password, and never guess at a malformed hash.
+  printf '%s' "$LOGIN_HASH" | node -e 'const s=require("node:fs").readFileSync(0,"utf8").split("$");process.exit(s.length===6&&s[0]==="scrypt"&&s[1]==="16384"&&s[2]==="8"&&s[3]==="1"&&Buffer.from(s[4],"base64url").length===16&&Buffer.from(s[5],"base64url").length===32?0:1)' \
+    || die "existing login password hash is malformed; credential values were preserved for local repair"
+  if [ -n "$LOGIN_PW" ]; then
+    unset_env LIQHUNTER_LOGIN_PASSWORD
+    LOGIN_PW=""
+    ok "keeping the existing login password hash; removed competing plaintext password"
+  fi
+fi
 if [ -z "$BOOTSTRAP_PW" ] && [ -n "$LOGIN_PW" ] && [ "${#LOGIN_PW}" -lt 8 ]; then
   warn "existing login password is under the bot's 8-character minimum — replacing it"
+  unset_env LIQHUNTER_LOGIN_PASSWORD
   LOGIN_PW=""
 fi
 if [ -z "$BOOTSTRAP_PW" ] && [ -z "$DURABLE_CREDENTIAL" ] && [ -z "$LOGIN_PW" ] && [ -z "$LOGIN_HASH" ]; then
