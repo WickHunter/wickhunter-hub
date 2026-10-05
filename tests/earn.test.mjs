@@ -265,8 +265,23 @@ await test('Earn page labels editable main UID and shows credited rather than ca
   const mobile=[...page.querySelectorAll('#months .monthCard')];
   assert.equal(mobile.length,2);
   assert.match(mobile[0].textContent,/WH commission received\$100.00Earned\$50.00Qualified/);
-  assert.match(mobile[1].textContent,/WH commission received\$10.00Earned\$0.00Below \$15 combined monthly minimum/);
+  assert.match(mobile[1].textContent,/WH commission received\$10.00Earned\$0.00\$5.00 calculated at 50%; below \$15.00 combined monthly minimum/);
  } finally {dom.window.close();}
+});
+await test('admin displays the exact saved withdrawal network and address safely',()=>{
+ const html=fs.readFileSync(new URL('../public/admin.html',import.meta.url),'utf8');
+ const source=html.split('\n').find(line=>line.startsWith('function earnPayoutRender('));
+ const dom=new JSDOM('<div id="earnPayoutDestination"></div>',{runScripts:'outside-only'});
+ try{dom.window.eval(`const earnEl=id=>document.getElementById(id);${source}`);
+  for(const [method,label] of [['usdt-bep20','BEP-20'],['usdt-polygon','Polygon'],['paypal','PayPal']]){
+   const address=method==='paypal'?'operator@example.com':'0x1234567890abcdef1234567890abcdef12345678';
+   dom.window.earnPayoutRender({payoutPreference:{method,address,revision:'r1'}});
+   assert.match(dom.window.document.body.textContent,new RegExp(label));assert.equal(dom.window.document.querySelector('code').textContent,address);
+  }
+  dom.window.earnPayoutRender({payoutPreference:{method:'paypal',address:'<img src=x onerror=alert(1)>',revision:'r2'}});
+  assert.equal(dom.window.document.querySelector('img'),null);assert.match(dom.window.document.body.textContent,/3–5 business days after month end/);
+  dom.window.earnPayoutRender({});assert.match(dom.window.document.body.textContent,/No destination saved/);assert.equal(dom.window.document.querySelector('code'),null);
+ }finally{dom.window.close();}
 });
 await test('admin verification button sends the claim revision shown in its row',async()=>{
  const adminHtml=fs.readFileSync(new URL('../public/admin.html',import.meta.url),'utf8');
@@ -280,7 +295,7 @@ await test('admin verification button sends the claim revision shown in its row'
    const earnEl=id=>document.getElementById(id),earnEsc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
    function earnTable(head,rows){return '<table><tbody>'+rows.map(row=>'<tr>'+row.map(value=>'<td>'+value+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
    async function earnCall(action,body){window.__requests.push({action,body});}async function earnRefresh(){}
-   ${selectSource};earnSelect();`);
+   ${adminHtml.split('\n').find(line=>line.startsWith('function earnPayoutRender('))};${selectSource};earnSelect();`);
   const button=dom.window.document.querySelector('#earnUids button');
   assert.equal(button.dataset.revision,'current-r1');
   button.click();await new Promise(resolve=>dom.window.setTimeout(resolve,0));
