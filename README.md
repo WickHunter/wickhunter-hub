@@ -1,3 +1,7 @@
+## v0.4.80 — Installer retries and clear startup diagnostics
+
+v0.4.80 — Customer installer retry hotfix: verified support reissues revoke previous customer links and issue a reusable 24-hour command on the existing licence. Installer preflights the signed server/native core, preserves valid login hashes, detects restart failures within a bounded readiness budget, and names possible US-IP restrictions in Bybit HTTP 403 diagnostics. The public Beta runtime startup limitation is stated explicitly in the support email.
+
 ## v0.4.79 — Binance coin market-cap coverage and expanded liquidation percentiles
 
 The market-cap producer supports explicitly configured Binance USD-M USDT perpetuals using native instrument identity and CoinMarketCap's Binance derivatives mapping (exchange id 270). Multiplier contracts retain the underlying asset's unscaled capitalisation; unresolved identities and missing market caps remain unknown. Binance production remains off unless included in MARKET_CAP_VENUES, and existing paid-provider budget limits remain in force. Liquidation tables carry additive full-range statistics while preserving legacy display and trading stops.
@@ -1870,6 +1874,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.80 — Customer installer retry hotfix: verified support reissues revoke previous customer links and issue a reusable 24-hour command on the existing licence. Installer preflights the signed server/native core, preserves valid login hashes, detects restart failures within a bounded readiness budget, and names possible US-IP restrictions in Bybit HTTP 403 diagnostics. The public Beta runtime startup limitation is stated explicitly in the support email.
 - v0.4.79 — Add explicitly configured Binance coin market-cap coverage and full-range liquidation statistics; preserve legacy percentile thresholds and unknown-cap refusals.
 - v0.4.78 — Re-verify edited Earn UIDs with claim-revision checks and show credited monthly exchange rebates clearly.
 - v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
