@@ -1434,13 +1434,16 @@ export class BillingService {
       this.store.putCustomer(rec);
       return "; welcome NOT sent (email not configured)";
     }
-    // A fresh page link every time we send; older links stop working.
-    this.store.revokeTokens(rec.key, "page", now);
+    // Resending replaces both the private page and its emailed install command.
+    this.store.revokeTokens(rec.key, "all", now);
     const pageToken = this.store.mint("page", rec.licenseId, rec.key, now);
     const exp = this.licenseExp(rec) ?? now;
+    const installToken = exp > now && !this.licenses.isRevoked(rec.licenseId)
+      ? this.store.mint("install", rec.licenseId, rec.key, now) : null;
     const msg = welcomeEmail(rec.email, {
       name: rec.name,
       pageUrl: `${this.origin}/welcome/${pageToken}`,
+      installCommand: installToken ? `curl -q -fsSL "${this.origin}/install/${installToken}" | sudo bash` : undefined,
       expiresAtMs: exp,
       subscription: !!rec.subscriptionId,
       lifetime: rec.lifetimeAccess === true,

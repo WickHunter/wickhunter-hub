@@ -203,6 +203,14 @@ await test("checkout.session.completed (test) mints a bootstrap licence and emai
   assert.match(mail.subject, /^\[TEST\] /);
   assert.match(mail.text, /https:\/\/hub\.test\/hub\/welcome\/[A-Za-z0-9_-]{40,}/);
   assert.ok(!mail.text.includes("LHK1."), "the licence key itself is never emailed");
+  const command = /curl -q -fsSL "https:\/\/hub\.test\/hub\/install\/([A-Za-z0-9_-]+)" \| sudo bash/.exec(mail.text);
+  assert.ok(command, 'purchase email includes the installer command');
+  assert.ok(mail.html.includes(command[1]), 'HTML email contains the same one-time token');
+  assert.match(mail.text, /expires after 24 hours/);
+  assert.match(mail.text, /Installation is automatic/);
+  assert.equal(h.hub.billing.store.consumeInstall(command[1], clock + DAY).reason, 'expired');
+  assert.equal(h.hub.billing.installByToken(command[1]).ok, true);
+  assert.equal(h.hub.billing.installByToken(command[1]).ok, false, 'email command is single-use');
   pageTokenA = pageTokenFromEmail();
   tokenA_v1 = h.store.tokenFor(licenseA.id);
 });
@@ -511,6 +519,7 @@ await test("subscription lifecycle events update status without touching the exp
 
 await test("resend welcome rotates the page link; the old one stops working", async () => {
   const n = emailCalls().length;
+  const oldInstall = h.hub.billing.store.mint('install', licenseA.id, 'cus_A', clock);
   const r = await admin("/admin/api/billing/resend-welcome", { method: "POST", body: JSON.stringify({ customerId: "cus_A" }) });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.sentTo, "ada@example.com");
@@ -519,6 +528,8 @@ await test("resend welcome rotates the page link; the old one stops working", as
   assert.notEqual(fresh, pageTokenA);
   assert.equal((await fetch(`${h.origin}/welcome/${pageTokenA}`)).status, 404);
   assert.equal((await fetch(`${h.origin}/welcome/${fresh}`)).status, 200);
+  assert.equal(h.hub.billing.store.consumeInstall(oldInstall, clock).ok, false, 'resend also replaces old install commands');
+  assert.match(lastEmail().text, /YOUR INSTALL COMMAND/);
   const missing = await admin("/admin/api/billing/resend-welcome", { method: "POST", body: JSON.stringify({ customerId: "cus_nobody" }) });
   assert.equal(missing.status, 404);
 });
