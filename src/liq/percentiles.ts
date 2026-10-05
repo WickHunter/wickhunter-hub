@@ -35,6 +35,8 @@ export interface LiqSizeSample {
 // bot percentile keeps its exact stop and older bots interpolate the same.
 export const LIQ_PCTL_STOPS = [20, 40, 50, 60, 75, 80, 90, 95, 99] as const;
 export type LiqPctlStop = (typeof LIQ_PCTL_STOPS)[number];
+/** Integer quantiles retained for requests outside the legacy lookup range. */
+export const LIQ_PCTL_EXTENDED_STOPS = Array.from({ length: 101 }, (_, i) => i) as readonly number[];
 
 /** Below this many samples for a (source, symbol, side), the caller should
  *  refuse to threshold on it rather than compute on a thin, noisy sample. The
@@ -65,6 +67,7 @@ export interface LiqSizePercentileRow {
   /** USD size at each of `LIQ_PCTL_STOPS`, nearest-rank on sizes sorted
    *  ascending. Keyed by the stop number (e.g. `usd[90]`). */
   usd: Record<number, number>;
+  extendedUsd?: Record<number, number>;
 }
 
 export interface LiqSizePercentileTable {
@@ -74,6 +77,7 @@ export interface LiqSizePercentileTable {
   targetPrints?: number;
   generatedAtMs: number;
   stops: readonly number[];
+  extendedStops?: readonly number[];
   /** src → symbol → side ("long"|"short") → row. */
   rows: Record<string, Record<string, Record<string, LiqSizePercentileRow>>>;
 }
@@ -133,7 +137,8 @@ export function buildLiqSizePercentiles(
     arr.push({ ts: r.ts, sizeUsd: r.sizeUsd });
   }
 
-  const out: LiqSizePercentileTable = { windowDays: days, targetPrints, generatedAtMs: now, stops, rows: {} };
+  const extendedStops = [...LIQ_PCTL_EXTENDED_STOPS];
+  const out: LiqSizePercentileTable = { windowDays: days, targetPrints, generatedAtMs: now, stops, extendedStops, rows: {} };
   for (const [src, bySymbol] of buckets) {
     const symRows: Record<string, Record<string, LiqSizePercentileRow>> = {};
     for (const [symbol, bySide] of bySymbol) {
@@ -145,7 +150,9 @@ export function buildLiqSizePercentiles(
         const sizes = taken.map((s) => s.sizeUsd).sort((a, b) => a - b);
         const usd: Record<number, number> = {};
         for (const p of stops) usd[p] = nearestRank(sizes, p);
-        sideRows[side] = { count: sizes.length, usd };
+        const extendedUsd: Record<number, number> = {};
+        for (const p of extendedStops) extendedUsd[p] = nearestRank(sizes, p);
+        sideRows[side] = { count: sizes.length, usd, extendedUsd };
       }
       symRows[symbol] = sideRows;
     }
@@ -218,8 +225,37 @@ export function liqPercentileTableLooksValid(t: unknown): t is LiqSizePercentile
   const table = t as LiqSizePercentileTable;
   if (typeof table.windowDays !== "number" || !Number.isFinite(table.windowDays)) return false;
   if (typeof table.generatedAtMs !== "number" || !Number.isFinite(table.generatedAtMs)) return false;
-  if (!Array.isArray(table.stops) || !table.stops.every((s) => typeof s === "number")) return false;
+  const validStops = (stops: unknown): stops is number[] => Array.isArray(stops)
+    && stops.every((s, i) => typeof s === "number" && Number.isFinite(s) && s >= 0 && s <= 100
+      && (i === 0 || s > stops[i - 1]));
+  if (!validStops(table.stops)) return false;
+  if (table.extendedStops !== undefined && (!validStops(table.extendedStops)
+    || table.extendedStops.length !== 101 || table.extendedStops[0] !== 0 || table.extendedStops[100] !== 100
+    || table.extendedStops.some((value, index) => value !== index))) return false;
   if (!table.rows || typeof table.rows !== "object") return false;
+  for (const bySymbol of Object.values(table.rows)) {
+    if (!bySymbol || typeof bySymbol !== "object") return false;
+    for (const bySide of Object.values(bySymbol)) {
+      if (!bySide || typeof bySide !== "object") return false;
+      for (const row of Object.values(bySide)) {
+        if (!row || typeof row !== "object" || !Number.isSafeInteger(row.count) || row.count < 0) return false;
+        const validValues = (stops: readonly number[], values: unknown, monotone = false): boolean => {
+          if (!values || typeof values !== "object") return false;
+          const map = values as Record<number, unknown>;
+          let prior = -Infinity;
+          for (const stop of stops) {
+            const value = map[stop];
+            if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (monotone && value < prior)) return false;
+            prior = value;
+          }
+          return true;
+        };
+        if (!validValues(table.stops, row.usd)) return false;
+        if ((table.extendedStops !== undefined) !== (row.extendedUsd !== undefined)) return false;
+        if (table.extendedStops && !validValues(table.extendedStops, row.extendedUsd, true)) return false;
+      }
+    }
+  }
   return true;
 }
 
