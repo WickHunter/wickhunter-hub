@@ -95,6 +95,8 @@ export interface TokenRecord {
   expiresAtMs: number | null;
   usedAtMs: number | null;
   revokedAtMs: number | null;
+  /** Explicit support reissue only. Historical/missing flags remain single-use. */
+  reusable?: true;
 }
 
 // "unclassified" is its OWN outcome, distinct from "ignored": an ignored
@@ -555,7 +557,8 @@ export class BillingStore {
   }
 
   /** Mint a token; returns the RAW value (shown once) and stores its hash. */
-  mint(kind: TokenKind, licenseId: string, customerKey: string, now = Date.now()): string {
+  mint(kind: TokenKind, licenseId: string, customerKey: string, now = Date.now(), options: { reusable?: true } = {}): string {
+    if (options.reusable && kind !== "install") throw new Error("only install tokens can be reusable");
     const raw = this.randomBytes(32).toString("base64url");
     const all = this.tokens();
     if (kind === "install") {
@@ -563,7 +566,7 @@ export class BillingStore {
       // one customer holds — a page reloaded in a loop must not grow the file.
       const open: string[] = [];
       for (const [h, t] of Object.entries(all)) {
-        const dead = t.revokedAtMs !== null || t.usedAtMs !== null || (t.expiresAtMs !== null && t.expiresAtMs <= now);
+        const dead = t.revokedAtMs !== null || (t.reusable !== true && t.usedAtMs !== null) || (t.expiresAtMs !== null && t.expiresAtMs <= now);
         if (dead && t.kind === "install" && (t.usedAtMs === null || now - t.usedAtMs > 30 * 86_400_000)) delete all[h];
         else if (t.kind === "install" && t.customerKey === customerKey && !dead) open.push(h);
       }
@@ -580,6 +583,7 @@ export class BillingStore {
       expiresAtMs: kind === "install" ? now + INSTALL_TOKEN_TTL_MS : null,
       usedAtMs: null,
       revokedAtMs: null,
+      ...(options.reusable ? { reusable: true as const } : {}),
     };
     writeJsonAtomic(this.tokensFile, all);
     return raw;
@@ -593,8 +597,9 @@ export class BillingStore {
     return t && t.kind === "page" && t.revokedAtMs === null ? t : null;
   }
 
-  /** Burn an install token. Exactly one caller ever gets `ok:true` for a
-   *  given token; the second sees `used`. */
+  /** Historical commands burn on first fetch. An explicitly reusable support
+   * command records first use and stays valid until its same 24h expiry or
+   * revocation; every fetch still checks the current licence in the service. */
   consumeInstall(raw: string, now = Date.now()): ConsumeResult {
     if (!/^[A-Za-z0-9_-]{20,128}$/.test(raw)) return { ok: false, reason: "unknown" };
     const all = this.tokens();
@@ -602,12 +607,22 @@ export class BillingStore {
     const t = all[h];
     if (!t || t.kind !== "install") return { ok: false, reason: "unknown" };
     if (t.revokedAtMs !== null) return { ok: false, reason: "revoked" };
-    if (t.usedAtMs !== null) return { ok: false, reason: "used" };
+    if (t.usedAtMs !== null && t.reusable !== true) return { ok: false, reason: "used" };
     if (t.expiresAtMs !== null && t.expiresAtMs <= now) return { ok: false, reason: "expired" };
-    const used: TokenRecord = { ...t, usedAtMs: now };
+    const used: TokenRecord = { ...t, usedAtMs: t.usedAtMs ?? now };
     all[h] = used;
     writeJsonAtomic(this.tokensFile, all);
     return { ok: true, rec: used };
+  }
+
+  /** Revoke a newly prepared command after an email failure, without racing
+   * another customer's or newer command's revocation. Never expose its hash. */
+  revokeInstall(raw: string, now = Date.now()): void {
+    const all = this.tokens();
+    const t = all[hashToken(raw)];
+    if (!t || t.kind !== "install" || t.revokedAtMs !== null) return;
+    t.revokedAtMs = now;
+    writeJsonAtomic(this.tokensFile, all);
   }
 
   /** Revoke every token of one kind for a customer (page rotation, or a
