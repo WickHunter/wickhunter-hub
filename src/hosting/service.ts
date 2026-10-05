@@ -255,8 +255,8 @@ export class HostingService {
     const body = new URLSearchParams({
       mode: "subscription", customer: ownerId, client_reference_id: ownerId,
       "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
-      success_url: `${this.origin}/customer?hosting=checkout-success#hosting`,
-      cancel_url: `${this.origin}/customer?hosting=checkout-cancelled#hosting`,
+      success_url: `${this.origin}/customer?hosting=checkout-success#hostingCard`,
+      cancel_url: `${this.origin}/customer?hosting=checkout-cancelled#hostingCard`,
       "metadata[plan]": planKey, "metadata[role]": "hosting", "metadata[owner]": ownerId,
       "subscription_data[metadata][plan]": planKey, "subscription_data[metadata][role]": "hosting",
       expires_at: String(Math.floor(expiresAtMs / 1000)),

@@ -64,7 +64,7 @@ await test('launch is opt-in and exact plan prices are prepared without activati
 });
 await test('catalog advertises timing and full base prices without a promotion', () => {
   const catalog = launch.publicPlans();
-  assert.deepEqual(Object.keys(catalog.launch).sort(), ['active', 'cryptoEnabled', 'firstPaymentAtMs', 'redeemUntilMs']);
+  assert.deepEqual(Object.keys(catalog.launch).sort(), ['active', 'cryptoEnabled', 'firstPaymentAtMs', 'hostingCheckoutEnabled', 'redeemUntilMs']);
   assert.equal(JSON.stringify(catalog).includes('UNLEASHED25'), false);
   for (const plan of catalog.plans) assert.equal('discountedAmountCents' in plan, false);
 });
@@ -387,6 +387,37 @@ await test('referrals retain attribution and free access without stacking a priv
   assert.equal(params.get('allow_promotion_codes'), null);
   assert.equal(params.get('metadata[launch_discount_percent]'), '40');
   assert.equal(params.get('discounts[1][promotion_code]'), null);
+});
+await test('VPS selection survives checkout, payment confirmation and webhook delay for every plan', async () => {
+  for (const [plan, payment] of [['monthly','card'], ['yearly','card'], ['lifetime','card'], ['yearly','crypto']]) {
+    const request = input({ plan, payment, hosting: true });
+    await launch.checkout(request);
+    const call = checkoutCalls().at(-1), session = sessions.get(call.key);
+    const target = new URL(call.params.get('success_url'));
+    assert.equal(target.pathname, '/checkout/hosting');
+    assert.equal(target.search, '', 'return credential stays out of access-log query strings');
+    const continuation = Object.fromEntries(new URLSearchParams(target.hash.slice(1)));
+    assert.match(continuation.token, /^[a-f0-9]{64}$/);
+    assert.match(call.params.get('custom_text[submit][message]'), /hosting.*immediately/);
+    assert.equal(call.params.get('line_items[1][price]'), null, 'software checkout never silently charges for VPS');
+    assert.equal((await launch.checkout(request)).url, session.url);
+    await assert.rejects(launch.checkout({ ...request, hosting: false }), /another request/);
+    await assert.rejects(launch.hostingCustomer({ ...continuation, token: 'a'.repeat(64) }), /Invalid/);
+    assert.equal(await launch.hostingCustomer(continuation), null);
+    Object.assign(session, paidSession(session.metadata, { id: session.id, mode: session.mode,
+      payment_status: session.mode === 'payment' ? 'paid' : 'no_payment_required',
+      subscription: session.mode === 'payment' ? null : `sub_${session.id}` }));
+    assert.equal(await launch.hostingCustomer(continuation), null, 'waits for webhook fulfillment');
+    await billing.applyEvent(event('checkout.session.completed', session));
+    assert.deepEqual(await launch.hostingCustomer(continuation), { ownerId: session.customer, email: session.customer_details.email });
+    const restarted = new LaunchBilling(dataDir, billing, store, 'https://hub.example.test', fake, () => clock);
+    assert.deepEqual(await restarted.hostingCustomer(continuation), { ownerId: session.customer, email: session.customer_details.email });
+    const originalLive = session.livemode;
+    session.livemode = false;
+    await assert.rejects(launch.hostingCustomer(continuation), /could not be verified/);
+    session.livemode = originalLive;
+  }
+  await assert.rejects(launch.checkout(input({ hosting: 'true' })), /Invalid hosting/);
 });
 fs.rmSync(dataDir, { recursive: true, force: true });
 summary('Launch billing');

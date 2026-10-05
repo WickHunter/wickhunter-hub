@@ -685,7 +685,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
-        || p === "/api/billing/plans" || p === "/billing"
+        || p === "/api/billing/plans" || p === "/billing" || p === "/checkout/hosting"
         || p === "/api/hub/liq-percentiles"
         || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
         || p === "/api/hosting/options" || p === "/api/hosting") return true;
@@ -695,7 +695,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST") {
       if (p === '/api/marketing/brevo/webhook') return true;
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
-      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout") return true;
+      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout" || p === "/api/billing/hosting-continuation") return true;
       // /api/customer/signin also spends the dedicated per-email bucket
       // (`customerSigninEmailLimiter`) inside its own handler — this is the
       // per-IP half, the same "everything else public" bucket every other
@@ -919,8 +919,29 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
       const body = await readJsonBody(req, 8 * 1024);
       if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a checkout request' });
-      try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
+      try {
+        if (body.hosting === true) {
+          const issue = hosting.hostingOfferIssue();
+          if (issue) throw Error(issue);
+        }
+        return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' });
+      }
       catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+    }
+    if (m === 'GET' && p === '/checkout/hosting') {
+      return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, 'hosting-checkout.html'), 'utf8'));
+    }
+    if (m === 'POST' && p === '/api/billing/hosting-continuation') {
+      const headers = { 'cache-control': 'no-store' };
+      const body = await readJsonBody(req, 1024);
+      if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a hosting checkout link' }, headers);
+      try {
+        const customer = await launchBilling.hostingCustomer(body);
+        if (!customer) return sendJson(res, 202, { ok: true, pending: true }, headers);
+        const result = await hosting.checkoutUrl(customer.ownerId, customer.email);
+        if (!result.ok) return sendJson(res, 409, { ok: false, error: result.error }, headers);
+        return sendJson(res, 200, { ok: true, url: result.value.url }, headers);
+      } catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, headers); }
     }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
     if (m === 'POST' && p === '/api/marketing/brevo/webhook') {
