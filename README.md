@@ -1949,6 +1949,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.86 — Verify signed installed releases, service ownership, fresh readiness and release locks on installer reruns; preserve active installations and customer data. Empty systemd command hooks remain compatible, and captured unit properties stay out of verifier process arguments.
+
 - v0.4.85 — Direct, credential-free browser CORS for canonical website Checkout, with early errors readable and cookie-authenticated customer actions unchanged.
 - v0.4.84 — Checkout-only IP allowance and pending combined VPS checkout capacity increase to 30 for shared website traffic; provider cost ceilings and immutable payment/provisioning guards are retained, with explicit bounded capacity refusals.
 - v0.4.83 — Six software/optional VPS choices in one checkout, immediate hosted billing, software-only coupons and referral earnings, independent Lifetime access, and hosted email guidance.
