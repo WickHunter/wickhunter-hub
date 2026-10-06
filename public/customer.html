@@ -170,6 +170,7 @@
       <span class="k">Connected accounts</span><span class="v-account-limit"></span>
       <span class="k">Next renewal</span><span class="v-renewal"></span>
     </div>
+    <p class="fine v-ready-access-note" hidden role="status" style="margin:12px 0 0">Check the email address used for this hosting purchase for your VPS IP address and temporary Unleashed password. Check spam or promotions if you do not see it. You will choose a new Unleashed password when you first sign in.</p>
     <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
     <p class="err v-delete-note" hidden style="margin:6px 0 0"></p>
     <p class="err v-fail-note" hidden style="margin:10px 0 0"></p>
@@ -374,6 +375,7 @@
     node.querySelector(".v-account-limit").textContent = "Up to " + inst.maximumConnectedAccounts;
     node.querySelector(".v-renewal").textContent = fmtDateTime(inst.paidThroughMs);
     node.querySelector(".v-backup").textContent = inst.managedBackupsIncluded ? "Backups are included." : "No managed backups are included — export your settings while the server is active.";
+    node.querySelector(".v-ready-access-note").hidden = !["ready", "active", "past_due", "cancel_scheduled", "suspended", "restoring", "deleting"].includes(inst.stage);
 
     var nowMs = Date.now();
     if (inst.suspendAtMs && inst.stage !== "suspended" && inst.stage !== "deleted") {
