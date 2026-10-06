@@ -13,7 +13,7 @@ const templates=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../te
 const ledger=new EarnService(dir,()=>now),owner=earnOwner('email:referrer@example.com');const member=ledger.member(owner,'Referrer');
 const cfg={plans:[{key:'monthly',role:'software',checkout:'payment-link',interval:'month',currency:'usd'}],stripe:{test:{secretKey:'sk_test_fixture',priceIds:{monthly:'price_month'}},live:{secretKey:'sk_live_fixture',priceIds:{monthly:'price_month'}}}};
 let calls=[],refund=0,dispute=false,disputeStatus='needs_response',subStatus='active',failSubmit=false,postReadFailure=false;
-let invoiceId='in_1',email='friend@example.com',priceId='price_month',subscriptionPriceId='price_month',currency='usd',paid=9900,total=9000,subscriptionCode=member.code,cancelAtPeriodEnd=false,refundChargeId='ch_in_1';
+let invoiceId='in_1',email='friend@example.com',priceId='price_month',subscriptionPriceId='price_month',currency='usd',paid=9900,total=9000,subscriptionCode=member.code,cancelAtPeriodEnd=false,refundChargeId='ch_in_1',invoiceOverride=null,subscriptionOverride=null;
 let failingEndpoint='',failingCount=0,failingStatus=500,omitExpandedCouponOnce=0,omitExpandedCouponCreateOnce=0;
 const coupons=new Map(),promos=new Map(),subscriptionPromos={test:null,live:null};let promoSerial=0;
 const payouts=new Map(),idempotency=new Map();let sends=0;
@@ -31,8 +31,8 @@ const fake=async (url,init)=>{
  }
  if(endpoint.startsWith('/v1/promotion_codes/')){const p=promos.get(endpoint.split('/').at(-1));if(init.method==='POST'&&p)p.active=body.active!=='false';return p?ok(p):ok({error:{code:'resource_missing'}},404);}
  if(endpoint==='/v1/checkout/sessions'){subscriptionPromos[mode]=body['discounts[0][promotion_code]'];return ok({url:'https://checkout.stripe.com/test-session'});}
- if(endpoint.startsWith('/v1/invoices/'))return ok({id:endpoint.split('/').at(-1),customer:'cus_friend',status:'paid',currency,livemode:live,amount_paid:paid,total_excluding_tax:total,total_taxes:[{amount:900}],parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[{pricing:{price_details:{price:priceId}},period:{end:now/1000+86400}}]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}});
- if(endpoint==='/v1/subscriptions/sub_friend')return ok({id:'sub_friend',status:subStatus,cancel_at_period_end:cancelAtPeriodEnd,metadata:subscriptionCode?{wh_earn_code:subscriptionCode}:{},discounts:subscriptionPromos[mode]?[{promotion_code:subscriptionPromos[mode]}]:[],items:{data:[{price:subscriptionPriceId}]}});
+ if(endpoint.startsWith('/v1/invoices/'))return ok(invoiceOverride||{id:endpoint.split('/').at(-1),customer:'cus_friend',status:'paid',currency,livemode:live,amount_paid:paid,total_excluding_tax:total,total_taxes:[{amount:900}],parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[{pricing:{price_details:{price:priceId}},period:{end:now/1000+86400}}]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}});
+ if(endpoint==='/v1/subscriptions/sub_friend')return ok(subscriptionOverride||{id:'sub_friend',status:subStatus,cancel_at_period_end:cancelAtPeriodEnd,metadata:subscriptionCode?{wh_earn_code:subscriptionCode}:{},discounts:subscriptionPromos[mode]?[{promotion_code:subscriptionPromos[mode]}]:[],items:{data:[{price:subscriptionPriceId}]}});
  if(endpoint==='/v1/customers/cus_friend')return ok({email});
  if(endpoint==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'payment_intent',payment_intent:{latest_charge:'ch_'+u.searchParams.get('invoice')}}}]});
  if(endpoint.startsWith('/v1/charges/'))return ok({amount_refunded:endpoint.endsWith('/'+refundChargeId)?refund:0,disputed:endpoint.endsWith('/'+refundChargeId)&&dispute,livemode:live});
@@ -70,6 +70,46 @@ await test('Oskaras one-time setup registers only the three reviewed reusable fo
  const result=await svc.registerOskarasOffers(owner);assert.deepEqual(result.offers.map(o=>[o.code,o.percent,o.duration]),[['OskarasTrading10K7',10,'forever'],['OskarasTrading20M4',20,'forever'],['OskarasTrading25R8',25,'forever']]);
  for(const offer of result.offers){const promo=promos.get(offer.promotion),coupon=coupons.get('test:'+promo.coupon);assert.equal(promo.active,true);assert.equal(promo.max_redemptions,null);assert.equal(promo.expires_at,null);assert.equal(coupon.duration,'forever');assert.equal(coupon.percent_off,offer.percent);assert.deepEqual(coupon.applies_to.products,['prod_wh']);assert.equal(svc.launchReferral(offer.code,'test').discountPercent,offer.percent);assert.equal(svc.launchReferral(offer.code,'test').code,member.code);}
  await svc.checkout('OskarasTrading20M4','monthly');const checkout=calls.filter(c=>c.endpoint==='/v1/checkout/sessions').at(-1);assert.equal(checkout.body['discounts[0][promotion_code]'],result.offers[1].promotion);assert.equal(checkout.body['subscription_data[metadata][wh_earn_code]'],member.code);
+});
+await test('hosted monthly and yearly invoices earn on net software and refund against the full bundle payment',async()=>{
+ const offers=structuredClone(svc.admin().profiles[owner].partnerPromotions),offer=offers.find(x=>x.code==='OskarasTrading10K7');assert.ok(offer);
+ const previous={invoiceId,subscriptionCode,email,priceId,subscriptionPriceId,currency,paid,total,refund,refundChargeId,subStatus,promo:subscriptionPromos.test,invoiceOverride,subscriptionOverride};
+ try {
+  for(const plan of ['monthly','yearly']){
+   const isolated=path.join(dir,'hosted-'+plan),localLedger=new EarnService(isolated,()=>now);localLedger.copyMember(member);
+   const only=new EarnStripeService(isolated,localLedger,()=>cfg,'https://hub.example',()=>now,fake);only.configure({enabled:true});
+   only.ledger('test').transaction(s=>{s.stripe??={profiles:{},invoices:{},jobs:[],seen:{}};s.stripe.profiles[owner]={partnerPromotions:offers};});
+   const softwarePriceId=plan==='yearly'?'price_yearly':'price_month',softwareAmountCents=plan==='yearly'?69900:9900;
+   const hostingPriceId=plan==='yearly'?'price_hosting_year':'price_hosting',hostingAmountCents=plan==='yearly'?24000:2000,hostingInterval=plan==='yearly'?'year':'month';
+   const intentId=(plan==='yearly'?'b':'a').repeat(64),reservationId='res_'+plan;
+   const intent={id:intentId,mode:'test',plan,payment:'card',licenseId:null,requestHash:'fixture',createdAtMs:now,firstPaymentAtMs:null,accessUntilMs:null,discountPercent:10,sessionId:'cs_'+plan,
+    hosting:{softwarePriceId,softwareProductId:'prod_wh',softwareAmountCents,hostingPriceId,hostingProductId:'prod_hosting',hostingAmountCents,hostingInterval,reservationId,expiresAtMs:now+60000},
+    stripeParams:{'metadata[bundle]':'software-hosting-v2','metadata[reservation]':reservationId,'line_items[0][price]':softwarePriceId,'line_items[1][price]':hostingPriceId}};
+   const intentDir=path.join(isolated,'billing-launch-intents.v1');fs.mkdirSync(intentDir,{recursive:true});fs.writeFileSync(path.join(intentDir,intentId+'.json'),JSON.stringify(intent));
+   new BillingStore(isolated).putBundleSubscription({subscriptionId:'sub_friend',reservationId,customerId:'cus_friend',planKey:plan,priceId:softwarePriceId,launchIntentId:intentId,latestEventCreatedMs:now,pendingStatus:null,terminal:false,updatedAtMs:now});
+   const discount=Math.round(softwareAmountCents*.1),softwareLine={pricing:{price_details:{price:softwarePriceId,product:'prod_wh'}},quantity:1,amount:softwareAmountCents,amount_excluding_tax:softwareAmountCents,pretax_credit_amounts:[{amount:discount}],taxes:[],period:{end:now/1000+86400}};
+   const hostingLine={pricing:{price_details:{price:hostingPriceId,product:'prod_hosting'}},quantity:1,amount:hostingAmountCents,amount_excluding_tax:hostingAmountCents,pretax_credit_amounts:[],taxes:[],period:{end:now/1000+86400}};
+   invoiceId='in_hosted_'+plan;refundChargeId='ch_'+invoiceId;refund=0;email='friend@example.com';currency='usd';subStatus='active';subscriptionCode=member.code;paid=plan==='yearly'?90000:12001;total=paid;
+   invoiceOverride={id:invoiceId,customer:'cus_friend',status:'paid',currency:'usd',livemode:false,amount_paid:paid,total_excluding_tax:paid,parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[softwareLine,hostingLine]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}};
+   subscriptionOverride={id:'sub_friend',status:'active',metadata:{bundle:'software-hosting-v2',reservation:reservationId,wh_launch_intent:intentId,plan,wh_earn_code:member.code},discounts:[{promotion_code:offer.promotion}],items:{data:[{price:softwarePriceId,quantity:1},{price:hostingPriceId,quantity:1}]}};subscriptionPromos.test=offer.promotion;
+   await only.handleEvent({...event('invoice.paid','evt_hosted_'+plan,{id:invoiceId}),livemode:false});
+   const record=only.ledger('test').admin().stripe.invoices[invoiceId];assert.ok(record);assert.equal(record.basis,softwareAmountCents-discount,'Earn basis includes only discounted software revenue');assert.equal(record.paid,paid,'refund denominator preserves complete software, hosting, and tax collection');assert.equal(record.commission,Math.floor(record.basis*20/100));
+   if(plan==='monthly'){
+    refund=6000;await only.handleEvent({...event('charge.refunded','evt_hosted_partial',{id:refundChargeId}),livemode:false});
+    assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,record.commission-Math.floor(record.commission*refund/paid),'partial clawback uses the aggregate collected bundle amount');
+   }
+  }
+ } finally {invoiceId=previous.invoiceId;subscriptionCode=previous.subscriptionCode;email=previous.email;priceId=previous.priceId;subscriptionPriceId=previous.subscriptionPriceId;currency=previous.currency;paid=previous.paid;total=previous.total;refund=previous.refund;refundChargeId=previous.refundChargeId;subStatus=previous.subStatus;subscriptionPromos.test=previous.promo;invoiceOverride=previous.invoiceOverride;subscriptionOverride=previous.subscriptionOverride;}
+});
+await test('Lifetime hosted invoices never create recurring software referral earnings',async()=>{
+ const previous={invoiceId,invoiceOverride,subscriptionOverride,refundChargeId,promo:subscriptionPromos.test};
+ try {
+  invoiceId='in_hosted_lifetime';refundChargeId='ch_'+invoiceId;subscriptionPromos.test=null;
+  invoiceOverride={id:invoiceId,customer:'cus_friend',status:'paid',currency:'usd',livemode:false,amount_paid:2000,parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[{pricing:{price_details:{price:'price_hosting',product:'prod_hosting'}},quantity:1,amount:2000,amount_excluding_tax:2000,period:{end:now/1000+86400}}]},status_transitions:{paid_at:now/1000}};
+  subscriptionOverride={id:'sub_friend',status:'active',metadata:{bundle:'software-hosting-v2',plan:'lifetime'},discounts:[],items:{data:[{price:'price_hosting',quantity:1}]}};
+  const before=Object.keys(svc.ledger('test').admin().stripe.invoices).length;await svc.handleEvent({...event('invoice.paid','evt_hosted_lifetime',{id:invoiceId}),livemode:false});
+  assert.equal(svc.ledger('test').admin().stripe.invoices[invoiceId],undefined);assert.equal(Object.keys(svc.ledger('test').admin().stripe.invoices).length,before);
+ } finally {invoiceId=previous.invoiceId;invoiceOverride=previous.invoiceOverride;subscriptionOverride=previous.subscriptionOverride;refundChargeId=previous.refundChargeId;subscriptionPromos.test=previous.promo;}
 });
 await test('missing expanded coupon scope aborts before creating an active referral promotion',async()=>{
  const isolated=path.join(dir,'missing-create-scope'),localLedger=new EarnService(isolated,()=>now),localOwner=earnOwner('email:scope-review@example.com');localLedger.member(localOwner,'Scope review');

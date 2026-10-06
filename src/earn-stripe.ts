@@ -4,6 +4,9 @@ import {EarnService,earnOwner,boundOwnerFromBindings,tierPercent,type EarnState,
 import {EarnStripeApi,EarnStripeError,type StripeObject} from './earn-stripe-api.js';
 import {readJson,writeJsonAtomic} from './jsonfile.js';
 import type {BillingConfig,BillingMode} from './billing/config.js';
+import {launchGrant} from './billing/launch.js';
+import {BillingStore} from './billing/store.js';
+import {componentPriceId,invoiceLineNet} from './billing/software-component.js';
 import type {StripeEvent} from './billing/stripe.js';
 
 type Settings={mode:BillingMode; enabled:boolean; automatic:boolean; payoutDay:number; financialAccount:string};
@@ -294,19 +297,57 @@ export class EarnStripeService {
    }
   });
  });}
+ private hostedSoftwareBasis(mode:BillingMode,subscription:string,customer:string,sub:StripeObject,inv:StripeObject,offer:StripeObject):number {
+  const metadata=sub.metadata||{},plan=String(metadata.plan||''),intentId=String(metadata.wh_launch_intent||'');
+  if(metadata.bundle!=='software-hosting-v2'||!intentId||!['monthly','yearly'].includes(plan))throw Error('Mixed software/VPS subscription metadata is incomplete');
+  const record=new BillingStore(this.dir).getBundleSubscription(subscription) as (StripeObject|null);
+  if(!record||record.subscriptionId!==subscription||record.launchIntentId!==intentId||record.planKey!==plan||record.customerId!==customer||record.reservationId!==metadata.reservation)throw Error('Mixed subscription lacks its durable checkout binding');
+  const grant=launchGrant(this.dir,{wh_launch_intent:intentId,plan},mode==='live') as (StripeObject|null);
+  const hosting=grant?.hosting as (StripeObject|undefined);
+  if(!grant||typeof grant.sessionId!=='string'||!/^cs_[A-Za-z0-9_]+$/.test(grant.sessionId)||!hosting||grant.mode!==mode||grant.plan!==plan||hosting.reservationId!==record.reservationId||
+    grant.stripeParams['metadata[bundle]']!=='software-hosting-v2'||grant.stripeParams['metadata[reservation]']!==record.reservationId||
+    grant.stripeParams['line_items[0][price]']!==hosting.softwarePriceId||grant.stripeParams['line_items[1][price]']!==hosting.hostingPriceId||
+    hosting.softwareProductId===hosting.hostingProductId||hosting.hostingInterval!==(plan==='yearly'?'year':'month')||
+    record.priceId!==hosting.softwarePriceId)throw Error('Mixed subscription differs from its persisted software/VPS offer');
+  if(!Number.isSafeInteger(hosting.softwareAmountCents)||hosting.softwareAmountCents<=0||!Number.isSafeInteger(hosting.hostingAmountCents)||hosting.hostingAmountCents<=0||
+    !Array.isArray(sub.items?.data)||sub.items.has_more||sub.items.data.length!==2)throw Error('Mixed subscription items are incomplete');
+  const itemPrices=sub.items.data.map((item:StripeObject)=>id(item.price)).sort();
+  if(JSON.stringify(itemPrices)!==JSON.stringify([hosting.softwarePriceId,hosting.hostingPriceId].sort())||sub.items.data.some((item:StripeObject)=>item.quantity!==1))throw Error('Mixed subscription items differ from the persisted offer');
+  const lines=inv.lines?.data;
+  if(!Array.isArray(lines)||inv.lines.has_more||lines.length!==2)throw Error('Mixed invoice line history is incomplete');
+  const software=lines.filter((line:StripeObject)=>componentPriceId(line)===hosting.softwarePriceId),vps=lines.filter((line:StripeObject)=>componentPriceId(line)===hosting.hostingPriceId);
+  if(software.length!==1||vps.length!==1||lines.some((line:StripeObject)=>!['software','hosting'].includes(componentPriceId(line)===hosting.softwarePriceId?'software':componentPriceId(line)===hosting.hostingPriceId?'hosting':''))||
+    lines.some((line:StripeObject)=>line.quantity!==1))throw Error('Mixed invoice lines differ from the persisted offer');
+  const softwareProduct=id(software[0].pricing?.price_details?.product)||id(software[0].price?.product);
+  const hostingProduct=id(vps[0].pricing?.price_details?.product)||id(vps[0].price?.product);
+  if((softwareProduct&&softwareProduct!==hosting.softwareProductId)||(hostingProduct&&hostingProduct!==hosting.hostingProductId))throw Error('Mixed invoice products differ from the persisted offer');
+  const couponProducts=Array.isArray(offer.proof?.products)?offer.proof.products:[];
+  if(!couponProducts.includes(hosting.softwareProductId)||couponProducts.includes(hosting.hostingProductId))throw Error('Applied referral does not cover only the software product');
+  const softwareNet=invoiceLineNet(software[0]),hostingNet=invoiceLineNet(vps[0]);
+  if(hostingNet!==hosting.hostingAmountCents||softwareNet<=0||softwareNet>hosting.softwareAmountCents)throw Error('Mixed invoice amounts differ from the persisted offer');
+  return softwareNet;
+ }
  private async invoice(mode:BillingMode,invoiceId:string){
   const ledger=this.ledger(mode),api=this.api(mode);if(book(ledger.admin()).invoices[invoiceId]){await this.adjustInvoice(mode,invoiceId);return;}
   const inv=await api.call('GET','/v1/invoices/'+invoiceId,{'expand[0]':'payments.data.payment.payment_intent'});
   const subscription=id(inv.parent?.subscription_details?.subscription)||id(inv.subscription);if(!subscription||inv.status!=='paid'||inv.currency!=='usd'||inv.livemode!==(mode==='live'))return;
-  const sub=await api.call('GET','/v1/subscriptions/'+subscription,{'expand[0]':'discounts'}),attribution=await this.appliedReferral(mode,sub);if(!attribution)return;
+  const sub=await api.call('GET','/v1/subscriptions/'+subscription,{'expand[0]':'discounts'});
+  const bundleRecord=new BillingStore(this.dir).getBundleSubscription(subscription) as (StripeObject|null);
+  const mixed=sub.metadata?.bundle==='software-hosting-v2'||!!bundleRecord?.launchIntentId;
+  // Lifetime software is a one-time purchase. Its recurring VPS invoice must
+  // never create software referral commission.
+  if(mixed&&(sub.metadata?.plan==='lifetime'||bundleRecord?.planKey==='lifetime'))return;
+  const attribution=await this.appliedReferral(mode,sub);if(!attribution)return;
   const {member}=attribution;
   const cfg=this.billing(),allowed=new Set(cfg.plans.filter(p=>p.role==='software'&&p.interval&&p.checkout==='payment-link').map(p=>cfg.stripe[mode].priceIds[p.key]).filter(Boolean));
   const items=sub.items?.data||[];if(!items.length||sub.items?.has_more)return;
   const lines=inv.lines?.data||[];if(!lines.length||inv.lines?.has_more)return;
+  const customerId=id(inv.customer);
+  const mixedBasis=mixed?this.hostedSoftwareBasis(mode,subscription,customerId,sub,inv,attribution.offer):null;
   const prices=[...new Set([...items.map((i:StripeObject)=>id(i.price)),...lines.map((l:StripeObject)=>id(l.pricing?.price_details?.price)||id(l.price))])];
   const historical=prices.filter(price=>price&&!allowed.has(price));
-  if(prices.some(price=>!price)||historical.length>4)return;
-  if(historical.length){
+  if(!mixed&&(prices.some(price=>!price)||historical.length>4))return;
+  if(!mixed&&historical.length){
    const products=new Set(Array.isArray(attribution.offer.proof?.products)?attribution.offer.proof.products.filter((v:unknown)=>typeof v==='string'):[]);
    if(!products.size)return; // Grandfathered prices must fit the exact product scope proved for this applied offer.
    for(const priceId of historical){
@@ -314,7 +355,6 @@ export class EarnStripeService {
     if(!products.has(id(price.product))||price.currency!=='usd'||!['month','year'].includes(price.recurring?.interval))return;
    }
   }
-  const customerId=id(inv.customer);
   const cust=await api.call('GET','/v1/customers/'+customerId);
   // A changed customer email cannot turn the member's own subscription into
   // a payable referral. The durable binding is the authority when present;
@@ -332,9 +372,15 @@ export class EarnStripeService {
   // domains and payment-method similarities are not identity evidence.
   const mailbox=consumerGmailMailbox(cust.email);
   if(mailbox && this.boundReferrerEmails?.(mode,member.id,bindings).some(email=>consumerGmailMailbox(email)===mailbox))return;
-  const paid=money(inv.amount_paid),total=money(inv.total_excluding_tax);if(paid===null||total===null||paid===0)return;
-  const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
-  const basis=Math.min(total,Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)));if(!basis)return;
+  const paid=money(inv.amount_paid);if(paid===null||paid===0)return;
+  let basis:number;
+  if(mixed){if(mixedBasis===null)throw Error('Mixed invoice software basis is unavailable');basis=mixedBasis;}
+  else {
+   const total=money(inv.total_excluding_tax);if(total===null)return;
+   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
+   basis=Math.min(total,Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)));
+  }
+  if(!basis)return;
   // Retrieve every invoice payment rather than assuming the first charge is the whole invoice.
   const paymentRows=await api.call('GET','/v1/invoice_payments',{invoice:invoiceId,status:'paid',limit:100,'expand[0]':'data.payment.payment_intent'});if(paymentRows.has_more)throw Error('Invoice payment history requires manual review');
   const charges:string[]=[];for(const row of paymentRows.data||[]){if(row.status!=='paid')continue;const payment=row.payment;if(payment?.type==='payment_intent'){let pi=payment.payment_intent;if(typeof pi==='string')pi=await api.call('GET','/v1/payment_intents/'+pi);if(id(pi?.latest_charge))charges.push(id(pi.latest_charge));}else if(payment?.type==='charge'&&id(payment.charge))charges.push(id(payment.charge));}
