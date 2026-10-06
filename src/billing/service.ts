@@ -43,7 +43,10 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
-import { launchGrant, reconcileLaunchSession } from "./launch.js";
+import { EarnStripeApi } from "../earn-stripe-api.js";
+import { softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
+import { readJson } from "../jsonfile.js";
+import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
@@ -72,6 +75,7 @@ const STRIPE_PORTAL_SESSIONS_URL = "https://api.stripe.com/v1/billing_portal/ses
  *  event outside this set is "ignored — event type not handled" without
  *  ever reaching the role dispatcher: there is nothing here to classify. */
 const DISPATCHED_EVENT_TYPES = new Set([
+  "checkout.session.expired",
   "checkout.session.completed",
   "checkout.session.async_payment_succeeded",
   "invoice.paid",
@@ -115,6 +119,7 @@ export interface BillingServiceDeps {
   onHostingEvent?: (customerKey: string, livemode: boolean) => void;
   /** Atomically adopts the anonymous VPS reservation to the Stripe customer
    * proved by a bundle webhook. Returning false makes Stripe retry. */
+  onExpiredCheckout?: (sessionId: string) => Promise<{ released: boolean }>;
   onBundleEvent?: (input: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; livemode: boolean; terminal: boolean }) => boolean;
 }
 
@@ -160,6 +165,7 @@ export class BillingService {
   private drainingAfterCommit: Promise<{ completed: number; failed: number }> | null = null;
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
+  private readonly onExpiredCheckout: BillingServiceDeps["onExpiredCheckout"];
   private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
   /** Prevent concurrent deliveries of the same event from both entering the
    * licence mutation before the durable seen marker is written. */
@@ -169,6 +175,7 @@ export class BillingService {
    * for one customer must calculate their target from the latest expiry. */
   private readonly checkoutLocks = new Map<string, Promise<void>>();
   private readonly installReissues = new Set<string>();
+  private readonly bundleLocks = new Map<string, Promise<void>>();
 
   constructor(
     readonly dataDir: string,
@@ -187,6 +194,7 @@ export class BillingService {
     this.onRevoke = deps.onRevoke ?? (() => {});
     this.onHostingEvent = deps.onHostingEvent ?? (() => {});
     this.onBundleEvent = deps.onBundleEvent;
+    this.onExpiredCheckout = deps.onExpiredCheckout;
   }
 
   /** Run at startup and on a timer, outside the Stripe request. An Earn
@@ -299,7 +307,8 @@ export class BillingService {
     if (!m.secretKey) return { ok: false, status: 400, error: `no ${mode} secret key is saved — paste one in the Stripe · ${mode} card first` };
     let result: ProvisionResult;
     try {
-      result = await provisionPlans({ secretKey: m.secretKey, siteOrigin: cfg.siteOrigin, productName: "Wick Hunter Unleashed", plans: cfg.plans }, this.fetchLike);
+      const launch = readJson<any>(path.join(this.dataDir, "billing-launch.v1.json"), {});
+      result = await provisionPlans({ secretKey: m.secretKey, siteOrigin: cfg.siteOrigin, productName: "Wick Hunter Unleashed", plans: cfg.plans, skipPaymentLinkKeys: launch[mode]?.enabled ? ["monthly", "yearly"] : [] }, this.fetchLike);
     } catch (err) {
       if (err instanceof StripeApiError) {
         const hint = err.status === 401 || err.status === 403
@@ -313,7 +322,8 @@ export class BillingService {
     const priceIds: Record<string, string> = {};
     for (const p of result.plans) {
       priceIds[p.key] = p.priceId;
-      links[p.key] = p.paymentLinkUrl || null;
+      if (p.paymentLinkUrl) links[p.key] = p.paymentLinkUrl;
+      else if (cfg.plans.find(plan => plan.key === p.key)?.checkout === "hosted-bundle") links[p.key] = null;
     }
     const first = cfg.plans[0]?.key;
     this.updateConfig({ stripe: { [mode]: { paymentLinks: links, priceIds, ...(!m.paymentLinkUrl && first && links[first] ? { paymentLinkUrl: links[first] } : {}) } } });
@@ -421,6 +431,15 @@ export class BillingService {
     const foreignFamilyNote = this.foreignProductFamilyNote(ev);
     if (foreignFamilyNote) return { outcome: "ignored", note: foreignFamilyNote };
 
+    if (ev.type === "checkout.session.expired") {
+      const f = checkoutFacts(ev.object);
+      if (f.metadata.bundle !== "software-hosting-v2") return { outcome: "ignored", note: "unowned checkout expiry" };
+      if (!this.onExpiredCheckout) throw Error("Hosted expiry reconciler unavailable");
+      await this.onExpiredCheckout(f.sessionId);
+      return { outcome: "applied", note: "unused expired hosted reservation released" };
+    }
+    const split = this.splitBundleIdentity(ev);
+    if (split.matched && split.identity) return this.withBundleLock(split.identity.launchIntentId, () => this.applyBundleEvent(ev, cfg, this.splitBundleIdentity(ev).identity!));
     const bundle = this.bundleIdentity(ev, cfg);
     if (bundle) return this.applyBundleEvent(ev, cfg, bundle);
 
@@ -474,6 +493,39 @@ export class BillingService {
       default:
         return { outcome: "ignored", note: "event type not handled" };
     }
+  }
+
+  private async withBundleLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prior = this.bundleLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = prior.then(() => new Promise<void>(resolve => { release = resolve; }));
+    this.bundleLocks.set(key, turn);
+    await prior;
+    try { return await fn(); } finally { release(); if (this.bundleLocks.get(key) === turn) this.bundleLocks.delete(key); }
+  }
+
+  private splitBundleIdentity(ev: StripeEvent): { matched: boolean; identity: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string; launchIntentId: string; hosting: NonNullable<LaunchIntent['hosting']> } | null } {
+    let metadata: Record<string,string> = {}, customerId = '', subscriptionId = '', chargeId = '', observed: string[] = [];
+    if (ev.type.startsWith('checkout.session.')) { const f = checkoutFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; }
+    else if (ev.type.startsWith('invoice.')) { const f = invoiceFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; observed = f.priceIds; }
+    else if (ev.type.startsWith('customer.subscription.')) { const f = subscriptionFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; observed = f.priceIds; }
+    else if (ev.type === 'charge.dispute.created') { const f = disputeFacts(ev.object); chargeId = f.chargeId || f.paymentIntentId; }
+    else if (ev.type.startsWith('charge.')) { const f = chargeFacts(ev.object); customerId = f.customerId; chargeId = f.chargeId || f.paymentIntentId; }
+    if (!subscriptionId && chargeId) subscriptionId = this.store.findRoleSubscriptionByCharge('hosting', chargeId)?.subscriptionId ?? '';
+    const bound = subscriptionId ? this.store.getBundleSubscription(subscriptionId) : null;
+    const candidate = metadata.wh_launch_intent ? launchGrant(this.dataDir, metadata, ev.livemode) : null;
+    const marked = metadata.bundle === 'software-hosting-v2' || !!bound?.launchIntentId || !!candidate?.hosting;
+    if (!marked) return { matched: false, identity: null };
+    const fail = (): never => { throw Error("Mixed checkout identity awaits review or durable reconciliation"); };
+    if (bound?.launchIntentId && ((customerId && customerId !== bound.customerId) || (metadata.plan && metadata.plan !== bound.planKey) || (metadata.wh_launch_intent && metadata.wh_launch_intent !== bound.launchIntentId))) return fail();
+    const grant = launchGrant(this.dataDir, bound?.launchIntentId ? { wh_launch_intent: bound.launchIntentId, plan: bound.planKey } : metadata, ev.livemode);
+    const proof = grant?.hosting;
+    if (!grant || !proof || grant.stripeParams['metadata[bundle]'] !== 'software-hosting-v2' || proof.softwarePriceId !== grant.stripeParams['line_items[0][price]'] || proof.hostingPriceId !== grant.stripeParams['line_items[1][price]'] || proof.softwareProductId === proof.hostingProductId || grant.firstPaymentAtMs !== null) return fail();
+    if (metadata.bundle && metadata.bundle !== 'software-hosting-v2' || metadata.reservation && metadata.reservation !== proof.reservationId) return fail();
+    if (grant.expiredAtMs) throw Error('Expired hosted checkout received a conflicting lifecycle event; review required');
+    if (observed.length && (observed.some(p => ![proof.softwarePriceId,proof.hostingPriceId].includes(p)) || !observed.includes(proof.hostingPriceId) || grant.plan !== 'lifetime' && !observed.includes(proof.softwarePriceId))) return fail();
+    if (ev.type.startsWith('invoice.') && !grant.sessionId) throw Error('Mixed checkout awaits its durable session reconciliation');
+    return { matched: true, identity: { reservationId: proof.reservationId, customerId: customerId || bound?.customerId || '', subscriptionId, planKey: grant.plan, priceId: proof.softwarePriceId, launchIntentId: grant.id, hosting: proof } };
   }
 
   private bundleIdentity(ev: StripeEvent, cfg: BillingConfig): { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string } | null {
@@ -534,7 +586,8 @@ export class BillingService {
     return null;
   }
 
-  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string }): Promise<ApplyResult> {
+  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string; launchIntentId?: string; hosting?: NonNullable<LaunchIntent['hosting']> }): Promise<ApplyResult> {
+    if (bundle.launchIntentId && (!bundle.subscriptionId || !bundle.customerId)) throw Error("Mixed checkout awaits complete durable subscription identity");
     if (!bundle.subscriptionId || !bundle.customerId || !bundle.planKey || !bundle.priceId) return { outcome: "unclassified", note: "bundle event did not carry a complete subscription identity" };
     const prior = this.store.getBundleSubscription(bundle.subscriptionId);
     if (prior && (
@@ -543,8 +596,10 @@ export class BillingService {
       || prior.priceId !== bundle.priceId
       || (bundle.reservationId && prior.reservationId && prior.reservationId !== bundle.reservationId)
     )) return { outcome: "unclassified", note: "bundle event conflicts with the subscription's durable identity" };
+    const lifetimeHosting = !!bundle.hosting && bundle.planKey === "lifetime";
+    const lifetimeInitialPaid = lifetimeHosting && (ev.type === "checkout.session.completed" || ev.type === "checkout.session.async_payment_succeeded" || ["invoice.paid","invoice.payment_succeeded"].includes(ev.type) && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).priceIds.includes(bundle.priceId));
     const terminal = ev.type === "customer.subscription.deleted";
-    if (prior?.terminal && !terminal) return { outcome: "ignored", note: "bundle subscription already ended; later events cannot reactivate it" };
+    if (prior?.terminal && !terminal && !lifetimeInitialPaid && !["charge.refunded","charge.dispute.created"].includes(ev.type)) return { outcome: "ignored", note: "bundle subscription already ended; later events cannot reactivate it" };
     const confirmed = ev.type === "checkout.session.async_payment_succeeded"
       || (ev.type === "checkout.session.completed" && checkoutFacts(ev.object).paymentStatus !== "unpaid")
       || ((ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded") && invoiceFacts(ev.object).paid);
@@ -559,7 +614,15 @@ export class BillingService {
     // the initial term. Allow that one activation, then restore the newer
     // past-due state; once records exist, stale paid events are inert.
     const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
-    if (stale && !activatingBehindFailure) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+
+    let softwareEvent = ev;
+    if (bundle.hosting && ev.type.startsWith('invoice.')) softwareEvent = { ...ev, object: softwareInvoiceProjection(ev.object, bundle.hosting) };
+    if (bundle.hosting && ev.type.startsWith('checkout.session.') && confirmed) {
+      const api = new EarnStripeApi(cfg.stripe[ev.livemode ? 'live' : 'test'].secretKey, this.launchFetch);
+      const lines = await api.call('GET', '/v1/checkout/sessions/' + checkoutFacts(ev.object).sessionId + '/line_items', { limit: 3 });
+      softwareEvent = { ...ev, object: { ...ev.object, ...softwareCheckoutProjection(lines, bundle.hosting) } };
+    }
 
     const ledger = {
       subscriptionId: bundle.subscriptionId,
@@ -567,6 +630,7 @@ export class BillingService {
       customerId: bundle.customerId,
       planKey: bundle.planKey,
       priceId: bundle.priceId,
+      ...(bundle.launchIntentId ? { launchIntentId: bundle.launchIntentId } : {}),
       latestEventCreatedMs: orderingRelevant ? Math.max(prior?.latestEventCreatedMs ?? 0, ev.createdMs) : (prior?.latestEventCreatedMs ?? 0),
       pendingStatus: failed ? "past_due" as const : (confirmed && !activatingBehindFailure ? null : prior?.pendingStatus ?? null),
       terminal: terminal || prior?.terminal === true,
@@ -576,30 +640,68 @@ export class BillingService {
     // prevents a paid event delivered after deletion (even with a later
     // event id or timestamp) from creating either entitlement.
     if (terminal) this.store.putBundleSubscription(ledger);
-    if (ledger.reservationId && (confirmed || terminal)) {
+    if (bundle.hosting && ev.type.startsWith("checkout.session.") && confirmed) {
+      const f = checkoutFacts(ev.object);
+      if (f.mode !== "subscription" || f.paymentStatus !== "paid") throw Error("Mixed checkout payment is not confirmed");
+      await reconcileLaunchSession(this.dataDir, f.metadata, ev.livemode, f.sessionId, cfg.stripe[ev.livemode ? "live" : "test"].secretKey, this.launchFetch, this.now());
+    }
+    if (ledger.reservationId && (confirmed || terminal) && !prior?.terminal) {
       if (!this.onBundleEvent?.({ reservationId: ledger.reservationId, customerId: ledger.customerId, subscriptionId: ledger.subscriptionId, planKey: ledger.planKey, livemode: ev.livemode, terminal })) throw new Error("hosted bundle reservation could not be bound to the confirmed Stripe customer");
     }
     if (terminal && !this.store.findBySubscription(bundle.subscriptionId) && !this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId)) {
       return { outcome: "applied", note: "bundle ended before activation; reservation closed and no entitlement issued" };
     }
     let software: ApplyResult;
-    switch (ev.type) {
+    // Lifetime software is a one-time durable purchase on the initial mixed
+    // invoice/session. Its hosting-only renewals and cancellation never
+    // modify that software entitlement or index their charges as software.
+    const lifetimeSoftwarePaid = lifetimeHosting && ['invoice.paid','invoice.payment_succeeded'].includes(ev.type) && invoiceFacts(ev.object).paid && (softwareEvent.object.lines as any)?.data?.length > 0;
+    const skipLifetimeSoftware = lifetimeHosting && !ev.type.startsWith('checkout.session.') && !lifetimeSoftwarePaid && !['charge.refunded','charge.dispute.created'].includes(ev.type);
+    if (skipLifetimeSoftware) software = { outcome: 'ignored', note: 'Lifetime software remains independent of VPS renewals/cancellation' };
+    else switch (ev.type) {
       case "checkout.session.completed":
-      case "checkout.session.async_payment_succeeded": software = await this.onCheckout(ev, cfg); break;
+      case "checkout.session.async_payment_succeeded":
+        if (lifetimeHosting) {
+          const f = checkoutFacts(softwareEvent.object);
+          if (f.paymentStatus === 'unpaid') software = { outcome: 'ignored', note: 'mixed payment is not confirmed' };
+          else {
+            await reconcileLaunchSession(this.dataDir, f.metadata, ev.livemode, f.sessionId, cfg.stripe[ev.livemode ? 'live' : 'test'].secretKey, this.launchFetch, this.now());
+            software = await this.withCheckoutLocks([f.customerId], () => this.onPaymentCheckout(softwareEvent, cfg, { ...f, mode: 'payment', subscriptionId: '' }));
+          }
+        } else software = await this.onCheckout(softwareEvent, cfg);
+        break;
       case "invoice.paid":
-      case "invoice.payment_succeeded": software = await this.onInvoicePaid(ev, cfg); break;
-      case "invoice.payment_failed": software = this.onInvoiceFailed(ev); break;
-      case "customer.subscription.updated": software = this.onSubscriptionUpdated(ev, cfg); break;
+      case "invoice.payment_succeeded":
+        if (lifetimeSoftwarePaid) {
+          const grant = launchGrant(this.dataDir, { wh_launch_intent: bundle.launchIntentId!, plan: bundle.planKey }, ev.livemode)!;
+          const f = invoiceFacts(ev.object);
+          const synthetic = { ...ev, object: { amount_subtotal: softwareEvent.object.amount_subtotal, total_details: softwareEvent.object.total_details, amount_total: softwareEvent.object.amount_paid, id: grant.sessionId, mode: 'payment', payment_status: 'paid', customer: bundle.customerId, customer_details: { email: f.email, name: f.name }, payment_intent: f.paymentIntentId, metadata: { wh_launch_intent: grant.id, plan: grant.plan, non_renewing: 'true', license_days: String(this.plan('lifetime')?.licenseDays ?? cfg.policy.oneOffDays) } } };
+          software = await this.withCheckoutLocks([bundle.customerId], () => this.onPaymentCheckout(synthetic, cfg, checkoutFacts(synthetic.object)));
+          const rec = this.store.getCustomer(bundle.customerId); if (rec) { this.noteCharge(rec, f.chargeId); this.noteCharge(rec, f.paymentIntentId); this.store.putCustomer(rec); }
+        } else software = await this.onInvoicePaid(softwareEvent, cfg);
+        break;
+      case "invoice.payment_failed": software = this.onInvoiceFailed(softwareEvent); break;
+      case "customer.subscription.updated": software = this.onSubscriptionUpdated(softwareEvent, cfg); break;
       case "customer.subscription.deleted": software = this.onSubscriptionDeleted(ev); break;
       case "charge.succeeded": software = this.onChargeSucceeded(ev); break;
-      case "charge.refunded": software = this.onRefund(ev, cfg); break;
-      case "charge.dispute.created": software = this.onDispute(ev, cfg); break;
+      case "charge.refunded":
+      case "charge.dispute.created": {
+        const f = ev.type === 'charge.refunded' ? chargeFacts(ev.object) : disputeFacts(ev.object);
+        const rec = this.store.getCustomer(bundle.customerId);
+        const softwareCharge = !lifetimeHosting || !!rec && [f.chargeId,f.paymentIntentId].some(id => !!id && rec.chargeIds.includes(id));
+        software = softwareCharge ? ev.type === 'charge.refunded' ? this.onRefund(ev, cfg) : this.onDispute(ev, cfg) : { outcome: 'ignored', note: 'VPS-only charge does not change Lifetime software' };
+        break;
+      }
       default: return { outcome: "ignored", note: "bundle event type not handled" };
     }
-    const hosting = this.applyHostingEvent(ev);
+    if (bundle.hosting && confirmed && (ev.type.startsWith('checkout.session.') || ev.type.startsWith('invoice.'))) {
+      const rec = this.store.getCustomer(bundle.customerId), discount = checkoutDiscountPercent(softwareEvent.object);
+      if (rec && discount !== null) { rec.discountPercent = discount; this.store.putCustomer(rec); }
+    }
+    const hosting = prior?.terminal && !["charge.refunded","charge.dispute.created"].includes(ev.type) ? { outcome: "ignored" as const, note: "ended VPS stays ended" } : this.applyHostingEvent(ev);
     if (activatingBehindFailure) {
       const softwareRec = this.store.findBySubscription(bundle.subscriptionId);
-      if (softwareRec) { softwareRec.subscriptionStatus = "past_due"; softwareRec.updatedAtMs = this.now(); this.store.putCustomer(softwareRec); }
+      if (softwareRec && !lifetimeHosting) { softwareRec.subscriptionStatus = "past_due"; softwareRec.updatedAtMs = this.now(); this.store.putCustomer(softwareRec); }
       const hostingRec = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
       if (hostingRec) { hostingRec.subscriptionStatus = "past_due"; hostingRec.updatedAtMs = this.now(); this.saveHostingRecord(hostingRec); }
     }
@@ -953,7 +1055,7 @@ export class BillingService {
     // clears after observing the missing marker.
     this.store.putPendingCheckout(customerKey, f.sessionId);
     const starterPackGrantAtMs = starterPackGrantAt(grant, ev, newCustomer);
-    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id } : {}), ...(starterPackGrantAtMs !== null ? { starterPackGrantAtMs } : {}) });
+    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id, ...(grant.hosting ? { softwarePaid: Number(ev.object.amount_total) > 0 } : {}) } : {}), ...(starterPackGrantAtMs !== null ? { starterPackGrantAtMs } : {}) });
     const marker = claimed.record;
     if (!claimed.created && marker.status === "applied") {
       this.assertAppliedCheckout(marker);
@@ -973,6 +1075,8 @@ export class BillingService {
           this.store.putCustomer(applied);
         }
       }
+      const applied = this.store.getCustomer(marker.customerKey);
+      if (applied) { this.noteCharge(applied, f.paymentIntentId); this.store.putCustomer(applied); }
       this.store.clearPendingCheckout(customerKey, f.sessionId);
       return { outcome: "duplicate", note: "checkout session was already applied" };
     }
@@ -1008,7 +1112,7 @@ export class BillingService {
       if (verifiedDiscount !== null) rec.discountPercent = verifiedDiscount;
     }
     if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
-    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
+    if (marker.paidAtMs && (!grant?.hosting || Number(ev.object.amount_total) > 0)) this.noteFirstActualPayment(rec, marker.paidAtMs);
     this.noteCharge(rec, checkoutMarker);
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -1057,7 +1161,7 @@ export class BillingService {
       this.extendLicense(rec, marker.targetExpMs, cfg, now);
     }
     this.noteCharge(rec, `cs:${sessionId}`);
-    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
+    if (marker.paidAtMs && marker.softwarePaid !== false) this.noteFirstActualPayment(rec, marker.paidAtMs);
     if (planByKey(cfg, marker.planKey)?.lifetime && marker.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
     if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
     this.noteCharge(rec, marker.paymentIntentId ?? "");
@@ -1079,7 +1183,7 @@ export class BillingService {
     if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
-    if (f.paymentStatus === 'paid') this.noteFirstActualPayment(rec, ev.createdMs);
+    if (f.paymentStatus === 'paid' && (!grant?.hosting || Number(ev.object.amount_total) > 0)) this.noteFirstActualPayment(rec, ev.createdMs);
     this.noteCharge(rec, f.sessionId ? `cs:${f.sessionId}` : "");
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);

@@ -118,6 +118,7 @@ import {
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
 import { LaunchBilling } from "./billing/launch.js";
+import { HostedOffer } from "./billing/hosted-offer.js";
 import { LaunchBillingReporting } from "./billing/reporting.js";
 import { loadStarterPack, starterPackEligible } from "./billing/starter-pack.js";
 import { FirstPaymentReminders } from "./billing/reminders.js";
@@ -414,7 +415,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   catch { console.warn('[marketing] Saved marketing settings need repair; imports remain unavailable.'); }
   try { notifications = new Notifications(cfg.dataDir, deps.notificationFetch, deps.billingNow); }
   catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
-  const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+  const billing: BillingService = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
     launchFetch,
@@ -430,10 +431,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       await reporting.handleVerifiedEvent(ev);
     },
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
+    onExpiredCheckout: (sessionId): Promise<{released:boolean}> => launchBilling.expireSession(sessionId),
     onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode, input.terminal) ?? false,
   });
+  const hostedOffer = new HostedOffer(cfg.dataDir, billing, launchFetch);
   const launchBilling = new LaunchBilling(cfg.dataDir, billing, store, cfg.publicOrigin.replace(/\/+$/, ''), launchFetch, deps.billingNow,
-    (code, mode) => earnStripe.launchReferral(code, mode));
+    (code, mode) => earnStripe.launchReferral(code, mode), {
+      ready: () => hostedOffer.ready() && hosting.hostingOfferIssue() === null,
+      prepare: async (plan, id, customer) => hosting.reserveSplitCheckout(id, await hostedOffer.prove(plan), customer),
+      bind: (proof, params) => hosting.bindSplitCheckout(proof, params),
+      release: (proof, id) => hosting.releaseSplitReservation(proof.reservationId, id),
+    });
   const marketingSync = new MarketingCustomerSync({
     dataDir: cfg.dataDir,
     readApiKey: () => marketing?.getApiKeyForSync() ?? null,
@@ -477,8 +485,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       maximumConnectedAccounts: policy.maximumConnectedAccounts,
       managedBackupsIncluded: policy.managedBackupsIncluded,
       purchasable: hosting.hostingOfferIssue() === null,
-      bundleEnabled: hosting.bundleOfferIssue() === null,
-      bundles: hosting.bundlePlans(),
+      bundleEnabled: false,
+      bundles: [],
+      combinedCheckoutEnabled: hostedOffer.ready() && hosting.hostingOfferIssue() === null,
     };
   }
   hostingRef = hosting;
@@ -639,7 +648,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans(), publicHostingOptions: () => {
     const options=publicHostingOptions();
-    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,regions:options.regions,planLabel:options.planLabel,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
+    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,regions:options.regions,planLabel:options.planLabel,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,combinedCheckoutEnabled:options.combinedCheckoutEnabled,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
   }}, undefined, undefined, event => {
     if (!notifications) throw Error('Notifications need repair');
     const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };
@@ -870,9 +879,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p.startsWith("/download/")) return download(req, url, res);
     // ── billing (public) ────────────────────────────────────────────────
     if (m === "GET" && p === "/buy") {
-      const planKey = url.searchParams.get("plan");
+      const requestedPlan = url.searchParams.get('plan');
+      const baseCardAvailable = ["monthly","yearly","lifetime"].includes(requestedPlan || "monthly") && !!billing.config().stripe[billing.config().mode].priceIds[requestedPlan || "monthly"];
+      const hostedAlias = /^(monthly|yearly|lifetime)-hosted$/.exec(requestedPlan || '') || /^hosted-(monthly|yearly|lifetime)$/.exec(requestedPlan || '');
+      const planKey = hostedAlias ? hostedAlias[1]! : requestedPlan;
       const plan = planKey ? billing.plan(planKey) : null;
       if (planKey && !plan) return sendText(res, 404, "unknown plan");
+      if (hostedAlias || url.searchParams.get('hosting') === 'true') {
+        const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
+        if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
+        const referral = url.searchParams.get('ref');
+        try {
+          const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), hosting: true, ...(referral ? { referral } : {}) });
+          return billingRedirect(res, checkout.url, 'checkout');
+        } catch (e) {
+          if ((e as Error).message === 'Referral discount is not active') {
+            const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: 'card', attemptId: randomUUID(), hosting: true });
+            return billingRedirect(res, checkout.url, 'checkout');
+          }
+          return sendText(res, 400, (e as Error).message);
+        }
+      }
       if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
       if (plan?.checkout === "hosted-bundle") return sendText(res, 403, "hosted bundles require a reserved Checkout Session");
       const referral = url.searchParams.get("ref");
@@ -882,7 +909,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         const codeRate = referralCheckoutCodeLimiter.take(referral.slice(0, 128), rateLimitNow());
         if (!codeRate.ok) return sendRateLimited(res, codeRate, "referral checkout attempts");
         try {
-          if (launchBilling.status().enabled) {
+          if (launchBilling.status().enabled || baseCardAvailable) {
             const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), referral });
             return billingRedirect(res, checkout.url, 'checkout');
           }
@@ -890,7 +917,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         }
         catch (e) {
           if ((e as Error).message === 'Referral discount is not active') {
-            if (launchBilling.status().enabled) {
+            if (launchBilling.status().enabled || baseCardAvailable) {
               const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID() });
               return billingRedirect(res, checkout.url, 'checkout');
             }
@@ -899,7 +926,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           return sendText(res, 400, (e as Error).message);
         }
       }
-      if (launchBilling.status().enabled) {
+      if (launchBilling.status().enabled || baseCardAvailable) {
         const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
         if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
         try {
@@ -1706,7 +1733,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const plan = body?.plan;
     const checkoutAttemptId = body?.checkoutAttemptId;
     if ((plan !== "monthly" && plan !== "yearly") || typeof checkoutAttemptId !== "string") return sendJson(res, 400, { ok: false, error: "expected {plan: monthly|yearly, checkoutAttemptId}" }, headers);
-    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId);
+    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId, undefined, false);
     if (!r.ok) return sendJson(res, r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, headers);
     sendJson(res, 200, { ok: true, url: r.value.url, pricing: r.value.pricing }, headers);
   }
@@ -2990,6 +3017,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, ...billing.adminConfigView(readLatest() !== null) }, { "cache-control": "no-store" });
     }
     if (m === 'GET' && p === '/admin/api/billing/launch') return sendJson(res, 200, { ok: true, ...launchBilling.status() }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/billing/hosted-checkout/reconcile-expired') {
+      const body = await readJsonBody(req, 4096);
+      try { return sendJson(res, 200, { ok: true, ...await launchBilling.expireSession(typeof body?.sessionId === 'string' ? body.sessionId : '') }, { 'cache-control': 'no-store' }); }
+      catch (error) { return sendJson(res, 409, { ok: false, error: (error as Error).message }, { 'cache-control': 'no-store' }); }
+    }
+    if (m === 'GET' && p === '/admin/api/billing/hosted-offer') return sendJson(res, 200, { ok: true, ...hostedOffer.status() }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/billing/hosted-offer') {
+      const body = await readJsonBody(req, 4096);
+      try { return sendJson(res, 200, { ok: true, ...await hostedOffer.verify(body ?? {}) }, { 'cache-control': 'no-store' }); }
+      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+    }
     if (m === 'GET' && p === '/admin/api/billing/report') return sendJson(res, 200, { ...(reporting?.snapshot() ?? { ok: false, error: 'Reporting state needs repair' }), refreshing: reportRefreshRunning, reminders: reminders.status() }, { 'cache-control': 'no-store' });
     if (m === 'POST' && p === '/admin/api/billing/report/refresh') { refreshReport(); return sendJson(res, 202, { ok: true, refreshing: reportRefreshRunning }, { 'cache-control': 'no-store' }); }
     if (m === 'GET' && p === '/admin/api/notifications') return sendJson(res, 200, notifications ? { ok: true, ...notifications.status() } : { ok: false, error: 'Notification state needs repair' }, { 'cache-control': 'no-store' });

@@ -148,6 +148,8 @@ export interface BundleSubscriptionRecord {
   customerId: string;
   planKey: string;
   priceId: string;
+  /** v2 mixed checkout identity; absent on historical one-price bundles. */
+  launchIntentId?: string;
   latestEventCreatedMs: number;
   pendingStatus: "past_due" | null;
   terminal: boolean;
@@ -181,6 +183,7 @@ export interface CheckoutSessionRecord {
   paymentIntentId?: string;
   launchIntentId?: string;
   paidAtMs?: number;
+  softwarePaid?: boolean;
   /** Verified first-purchase qualification, persisted before issuing a license. */
   starterPackGrantAtMs?: number;
 }
@@ -244,6 +247,7 @@ export class BillingStore {
       (rec.subscriptionId !== undefined && typeof rec.subscriptionId !== "string") ||
       (rec.paymentIntentId !== undefined && typeof rec.paymentIntentId !== "string") ||
       (rec.launchIntentId !== undefined && !/^[a-f0-9]{64}$/.test(rec.launchIntentId)) ||
+      (rec.softwarePaid !== undefined && typeof rec.softwarePaid !== "boolean") ||
       (rec.paidAtMs !== undefined && (!Number.isSafeInteger(rec.paidAtMs) || rec.paidAtMs <= 0)) ||
       (rec.starterPackGrantAtMs !== undefined && (!Number.isSafeInteger(rec.starterPackGrantAtMs) || rec.starterPackGrantAtMs <= 0 || !rec.newCustomer || !rec.launchIntentId)) ||
       (rec.status === "applied" && !rec.licenseId)
@@ -294,6 +298,7 @@ export class BillingStore {
       paymentIntentId: input.paymentIntentId,
       launchIntentId: input.launchIntentId,
       paidAtMs: input.paidAtMs,
+      softwarePaid: input.softwarePaid,
       starterPackGrantAtMs: input.starterPackGrantAtMs,
     };
     writeJsonAtomic(this.checkoutSessionPath(input.sessionId), record);

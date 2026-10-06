@@ -21,7 +21,7 @@ const fake = async (url, init) => {
   let result;
   if (p.startsWith('/v1/prices/')) {
     const key = p.slice('/v1/prices/price_'.length), plan = billing.plan(key);
-    result = { id: `price_${key}`, active: true, currency: plan.currency, unit_amount: plan.amountCents, product: 'prod_software', recurring: plan.interval ? { interval: plan.interval, interval_count: 1 } : null };
+    result = { id: `price_${key}`, active: true, livemode: true, type: plan.interval ? "recurring" : "one_time", currency: plan.currency, unit_amount: plan.amountCents, product: 'prod_software', recurring: plan.interval ? { interval: plan.interval, interval_count: 1 } : null };
   } else if (p === '/v1/account') result = { capabilities: { crypto_payments: 'active' } };
   else if (p.startsWith('/v1/checkout/sessions/') && init.method === 'GET') {
     const parts = p.split('/'), session = [...sessions.values()].find(s => s.id === parts[4]);
@@ -49,8 +49,9 @@ const metadata = params => Object.fromEntries([...params].filter(([k]) => /^meta
 const event = (type, object, id = randomUUID()) => ({ id: `evt_${id}`, type, livemode: true, createdMs: clock, object });
 const paidSession = (meta, over = {}) => ({ id: `cs_fixture${number}`, mode: 'subscription', status: 'complete', payment_status: 'no_payment_required', customer: `cus_${number}`, customer_details: { email: `customer${number}@example.test`, name: 'Buyer' }, subscription: `sub_${number}`, metadata: meta, ...over });
 
-await test('launch is opt-in and exact plan prices are prepared without activating checkout', async () => {
-  await assert.rejects(launch.checkout(input()), /not enabled/);
+await test('free launch is opt-in while generic card checkout remains available', async () => {
+  await launch.checkout(input());
+  assert.equal(checkoutCalls().at(-1).params.has('subscription_data[billing_cycle_anchor]'), false);
   const prepared = await launch.prepare();
   assert.equal(prepared.prepared, true); assert.equal(prepared.enabled, false);
   assert.equal(prepared.cryptoCapable, true); assert.equal(prepared.cryptoEnabled, false);
@@ -64,7 +65,7 @@ await test('launch is opt-in and exact plan prices are prepared without activati
 });
 await test('catalog advertises timing and full base prices without a promotion', () => {
   const catalog = launch.publicPlans();
-  assert.deepEqual(Object.keys(catalog.launch).sort(), ['active', 'cryptoEnabled', 'firstPaymentAtMs', 'redeemUntilMs']);
+  assert.deepEqual(Object.keys(catalog.launch).sort(), ['active', 'cryptoEnabled', 'firstPaymentAtMs', 'hostingCheckoutEnabled', 'redeemUntilMs']);
   assert.equal(JSON.stringify(catalog).includes('UNLEASHED25'), false);
   for (const plan of catalog.plans) assert.equal('discountedAmountCents' in plan, false);
 });

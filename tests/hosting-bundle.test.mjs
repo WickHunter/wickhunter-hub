@@ -48,27 +48,36 @@ async function setup(overrides = {}) {
   return { h, calls, provider, event, post, advance: (ms) => { clock += ms; }, now: () => clock };
 }
 
+// These fixtures preserve already-created v1 obligations. Fresh public
+// admissions are covered by billing-six-plan; only the historical service
+// creates their durable seed, then lifecycle runs through signed HTTP events.
+async function legacyCheckout(c, request) {
+  const r = await c.h.hub.hosting.bundleCheckout(request.plan === 'monthly' ? 'month' : 'year', request.checkoutAttemptId);
+  return r.ok ? { status: 200, body: {ok:true,...r.value} } : { status:r.code==='HOSTING_ALREADY_EXISTS'?409:503,body:r };
+}
+
 await test("bundle checkout is CORS-safe, reserved, idempotent and not reachable through /buy", async () => {
   const c = await setup();
   const options = await fetch(`${c.h.origin}/api/hosting/options`).then((r) => r.json());
-  assert.equal(options.bundleEnabled, true);
+  assert.equal(options.bundleEnabled, false);
   const preflight = await fetch(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "OPTIONS", headers: { origin: "https://www.wickhunterunleashed.com", "access-control-request-method": "POST", "access-control-request-headers": "content-type" } });
   assert.equal(preflight.status, 204);
   const request = { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174000" };
-  const first = await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
-  const second = await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
-  const changedPlan = await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, plan: "yearly" }) });
+  const first = await legacyCheckout(c, request);
+  const second = await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(request)});
+  assert.equal((await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({...request,checkoutAttemptId:"123e4567-e89b-12d3-a456-426614174999"})})).status,503);
+  const changedPlan = await legacyCheckout(c, { ...request, plan: "yearly" });
   assert.equal(first.status, 200); assert.deepEqual(first.body.pricing, { amountCents: 11900, currency: "usd", interval: "month", softwareDays: 30, maximumConnectedAccounts: 5 });
   assert.equal(second.body.url, first.body.url);
   assert.equal(changedPlan.status, 409); assert.match(changedPlan.body.error, /different plan/);
   assert.equal(c.calls.filter((x) => x.url.endsWith("/v1/checkout/sessions")).length, 1);
-  assert.equal((await fetch(`${c.h.origin}/buy?plan=monthly-hosted`)).status, 403);
+  assert.equal((await fetch(`${c.h.origin}/buy?plan=monthly-hosted`)).status, 400);
   await c.h.close();
 });
 
 await test("anonymous bundle reservations are bounded and expired reservations release capacity", async () => {
   const c = await setup();
-  const checkout = (suffix) => jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: `123e4567-e89b-12d3-a456-42661417${suffix}` }) });
+  const checkout = (suffix) => legacyCheckout(c, { plan: "monthly", checkoutAttemptId: `123e4567-e89b-12d3-a456-42661417${suffix}` });
   assert.equal((await checkout("4101")).status, 200);
   assert.equal((await checkout("4102")).status, 200);
   assert.equal((await checkout("4103")).status, 200);
@@ -81,7 +90,7 @@ await test("anonymous bundle reservations are bounded and expired reservations r
 
 await test("bundle checkout fails closed before reservation when Stripe price is stale", async () => {
   const c = await setup({ staleMonthlyPrice: true });
-  const r = await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174999" }) });
+  const r = await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174999" });
   assert.equal(r.status, 503);
   assert.equal(c.h.hub.hosting.store.instances().length, 0);
   assert.equal(c.calls.filter((x) => x.url.endsWith("/v1/checkout/sessions")).length, 0);
@@ -90,7 +99,7 @@ await test("bundle checkout fails closed before reservation when Stripe price is
 
 await test("bundle metadata with a non-configured invoice price grants neither licence nor VPS", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174998" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174998" });
   const row = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: row.id };
   const bad = c.event("evt_wrong_bundle_price", "invoice.paid", { id: "in_wrong", paid: true, customer: "cus_wrong", customer_email: "wrong@example.com", subscription: "sub_wrong", subscription_details: { metadata }, lines: { data: [{ period: { end: Math.floor((c.now() + 30 * 86400000) / 1000) }, price: { id: "price_unclassified" } }] } });
@@ -102,7 +111,7 @@ await test("bundle metadata with a non-configured invoice price grants neither l
 
 await test("bundle webhooks atomically bind one VPS and renew/cancel software and hosting together", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174111" }) });
+  await legacyCheckout(c, { plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174111" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "yearly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const checkout = c.event("evt_bundle_checkout", "checkout.session.completed", { id: "cs_bundle", mode: "subscription", payment_status: "paid", customer: "cus_bundle", customer_details: { email: "bundle@example.com" }, subscription: "sub_bundle", metadata });
@@ -134,7 +143,7 @@ await test("bundle webhooks atomically bind one VPS and renew/cancel software an
 
 await test("checkout then initial paid invoice before the worker preserves one current provision job and one create", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174112" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174112" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const checkout = c.event("evt_order_checkout", "checkout.session.completed", { id: "cs_order", mode: "subscription", payment_status: "paid", customer: "cus_order", customer_details: { email: "order@example.com" }, subscription: "sub_order", metadata });
@@ -179,7 +188,7 @@ await test("checkout then initial paid invoice before the worker preserves one c
 
 await test("an initial paid invoice during the provider create does not obsolete the in-flight job or create twice", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174114" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174114" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const checkout = c.event("evt_inflight_checkout", "checkout.session.completed", { id: "cs_inflight", mode: "subscription", payment_status: "paid", customer: "cus_inflight", customer_details: { email: "inflight@example.com" }, subscription: "sub_inflight", metadata });
@@ -215,7 +224,7 @@ await test("an initial paid invoice during the provider create does not obsolete
 
 await test("initial paid invoice before checkout completion converges to one create and later paid-through preserves a ready email", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174113" }) });
+  await legacyCheckout(c, { plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174113" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "yearly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const periodEnd = Math.floor((c.now() + 365 * 86400000) / 1000);
@@ -248,7 +257,7 @@ await test("initial paid invoice before checkout completion converges to one cre
 
 await test("a paid bundle invoice arriving before Checkout completion converges without another licence or VPS", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174222" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174222" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const end = Math.floor((c.now() + 30 * 86400000) / 1000);
@@ -264,7 +273,7 @@ await test("a paid bundle invoice arriving before Checkout completion converges 
 
 await test("a deletion delivered before payment permanently closes that subscription without granting either entitlement", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174333" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174333" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const deleted = c.event("evt_deleted_first", "customer.subscription.deleted", { id: "sub_deleted_first", customer: "cus_deleted_first", status: "canceled", metadata, items: { data: [{ price: { id: "price_bundle_month" } }] } });
@@ -282,7 +291,7 @@ await test("a deletion delivered before payment permanently closes that subscrip
 
 await test("a terminal bundle event beats older and equal-second paid events and preserves paid-through", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174444" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174444" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const end = Math.floor((c.now() + 30 * 86400000) / 1000);
@@ -304,7 +313,7 @@ await test("a terminal bundle event beats older and equal-second paid events and
 
 await test("a bound bundle subscription cannot renew through a different price", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174555" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174555" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const end = Math.floor((c.now() + 30 * 86400000) / 1000);
@@ -324,7 +333,7 @@ await test("a bound bundle subscription cannot renew through a different price",
 
 await test("an older paid event cannot undo a newer failed-payment state", async () => {
   const c = await setup();
-  await jsonReq(`${c.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174666" }) });
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174666" });
   const reserved = c.h.hub.hosting.store.instances()[0];
   const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const end = Math.floor((c.now() + 30 * 86400000) / 1000);
@@ -343,7 +352,7 @@ await test("an older paid event cannot undo a newer failed-payment state", async
 
 await test("pre-activation status events cannot strand a paid customer, and a newer failure remains authoritative", async () => {
   const activeFirst = await setup();
-  await jsonReq(`${activeFirst.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174777" }) });
+  await legacyCheckout(activeFirst, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174777" });
   let reserved = activeFirst.h.hub.hosting.store.instances()[0];
   let metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const oldEnd = Math.floor((activeFirst.now() + 30 * 86400000) / 1000);
@@ -356,7 +365,7 @@ await test("pre-activation status events cannot strand a paid customer, and a ne
   await activeFirst.h.close();
 
   const failedFirst = await setup();
-  await jsonReq(`${failedFirst.h.origin}/api/hosting/bundle-checkout`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174778" }) });
+  await legacyCheckout(failedFirst, { plan: "yearly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174778" });
   reserved = failedFirst.h.hub.hosting.store.instances()[0];
   metadata = { plan: "yearly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
   const yearEnd = Math.floor((failedFirst.now() + 365 * 86400000) / 1000);
