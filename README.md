@@ -1,3 +1,18 @@
+## v0.4.83 — One checkout for software and optional VPS
+
+Monthly, Yearly and Lifetime each support software-only or software with VPS,
+using the same plan choices and one Checkout Session. VPS plans bill immediately
+due to VPS provider fees. Monthly and Yearly software-only card plans retain
+the verified October 15 offer. Hosted Monthly and Yearly renew software and VPS
+together; Lifetime software is paid once and remains independent of VPS renewal
+and cancellation. Software promotion codes exclude the separate VPS product.
+
+Paid fulfillment and unused reservation release require durable checkout and
+provider proofs. Mixed invoice earnings use collected software revenue only;
+refund and dispute adjustments preserve the full invoice payment denominator.
+Hosted customers see provisioning status and guidance to check their purchase
+email for their IP address and temporary dashboard password when ready.
+
 ## v0.4.82 — Verified recurring referral coupons
 
 Stripe coupon requests now explicitly include product restrictions. Referral
@@ -1897,6 +1912,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.83 — Six software/optional VPS choices in one checkout, immediate hosted billing, software-only coupons and referral earnings, independent Lifetime access, and hosted email guidance.
 - v0.4.82 — Explicit Stripe coupon product proof, safe retry of referral verification, and preserved credit for verified retired offers and existing subscription renewals.
 
 - v0.4.81 — Earn with WH: saved manual withdrawal destinations, 35% default exchange share, verified forever referral discounts, typed-code attribution, and audited payout/refund reconciliation.
