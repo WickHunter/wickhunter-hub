@@ -1,3 +1,12 @@
+## v0.4.85 — Direct website Checkout API
+
+The canonical browser checkout endpoint accepts credential-free CORS requests
+from the Wick Hunter website origins and the Hub's own configured origin.
+Preflight and checkout responses, including rate-limit, validation, and hosted
+capacity errors, remain readable with Retry-After exposed. Foreign origins are
+refused before checkout work; customer cookie actions keep their existing
+same-origin CSRF guard.
+
 ## v0.4.84 — Checkout allowance for shared website proxy IPs
 
 Checkout entry shares a 300-request allowance per source IP per rolling minute
@@ -1935,6 +1944,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.85 — Direct, credential-free browser CORS for canonical website Checkout, with early errors readable and cookie-authenticated customer actions unchanged.
 - v0.4.84 — Checkout-only IP allowance and pending combined VPS checkout capacity increase to 30 for shared website traffic; provider cost ceilings and immutable payment/provisioning guards are retained, with explicit bounded capacity refusals.
 - v0.4.83 — Six software/optional VPS choices in one checkout, immediate hosted billing, software-only coupons and referral earnings, independent Lifetime access, and hosted email guidance.
 - v0.4.82 — Explicit Stripe coupon product proof, safe retry of referral verification, and preserved credit for verified retired offers and existing subscription renewals.

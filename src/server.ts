@@ -776,6 +776,56 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
     }
 
+    // The product site calls this public, credential-free endpoint directly.
+    // Keep this CORS policy path-scoped: the customer dashboard and every
+    // cookie-authenticated action retain their same-origin CSRF contract.
+    // Install response headers before the pre-dispatch limiter so readable
+    // 429s, validation errors, capacity refusals and success all share one
+    // exact-origin policy.
+    const checkoutCors = p === "/api/billing/checkout" && (m === "POST" || m === "OPTIONS");
+    if (checkoutCors) {
+      const allowedOrigins = new Set([
+        "https://wickhunterunleashed.com",
+        "https://www.wickhunterunleashed.com",
+        // Keep the Hub's own public origin working for same-origin browser
+        // clients that post directly without going through the product site.
+        new URL(cfg.publicOrigin).origin,
+      ]);
+      const origin = req.headers.origin;
+      const allowedOrigin = typeof origin === "string" && allowedOrigins.has(origin) ? origin : null;
+      const vary = String(res.getHeader("vary") ?? "").split(",").map(value => value.trim()).filter(Boolean);
+      if (!vary.some(value => value.toLowerCase() === "origin")) vary.push("Origin");
+      res.setHeader("vary", vary.join(", "));
+      res.setHeader("cache-control", "no-store");
+      if (allowedOrigin) {
+        res.setHeader("access-control-allow-origin", allowedOrigin);
+        res.setHeader("access-control-expose-headers", "Retry-After");
+      }
+      if (m === "OPTIONS") {
+        if (!allowedOrigin) {
+          return sendJson(res, 403, { ok: false, error: "Unsupported checkout origin" }, { "cache-control": "no-store" });
+        }
+        const requestedMethod = String(req.headers["access-control-request-method"] ?? "").toUpperCase();
+        const requestedHeaders = String(req.headers["access-control-request-headers"] ?? "")
+          .split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+        if (requestedMethod !== "POST" || requestedHeaders.some(value => value !== "content-type")) {
+          return sendJson(res, 403, { ok: false, error: "Unsupported checkout preflight" }, { "cache-control": "no-store" });
+        }
+        res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+        res.setHeader("access-control-allow-headers", "content-type");
+        res.setHeader("access-control-max-age", "600");
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      // No Origin is the existing non-browser/API-client path. A supplied but
+      // unapproved Origin is refused before either limiter or checkout work.
+      if (origin !== undefined && !allowedOrigin) {
+        req.resume();
+        return sendJson(res, 403, { ok: false, error: "Unsupported checkout origin" }, { "cache-control": "no-store" });
+      }
+    }
+
     if (m === "OPTIONS" && p === "/api/hosting/bundle-checkout") {
       res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "access-control-max-age": "600" });
       res.end();
