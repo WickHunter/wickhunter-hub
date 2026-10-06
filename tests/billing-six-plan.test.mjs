@@ -220,6 +220,58 @@ await test('authenticated hosted claim retains its identity on local expiry and 
   fs.writeFileSync(claim,original);const next=await c.checkout('monthly',true,auth);assert.equal(next.status,200);assert.notEqual(next.body.url,s.url);
   assert.equal(JSON.parse(fs.readFileSync(claim)).id,c.last().metadata.wh_launch_intent);assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
+for (const historicalFlag of [false,true]) await test(`reservation release refusal cannot authorize expiry rotation (${historicalFlag?'historical expiry flag':'new intent'})`,async()=>{
+  const c=await setup(),issued=c.h.store.issue('Release refusal',30),auth={licenseId:issued.payload.id,token:issued.token},attemptId=randomUUID();
+  assert.equal((await c.checkout('monthly',true,{...auth,attemptId})).status,200);const s=c.last();
+  const file=path.join(c.h.dataDir,'billing-launch-intents.v1',s.metadata.wh_launch_intent+'.json');
+  const claim=path.join(c.h.dataDir,'billing-launch-claims.v1','live',hash(issued.payload.id)+'.json'),claimBefore=fs.readFileSync(claim,'utf8');
+  if(historicalFlag){const old=JSON.parse(fs.readFileSync(file));old.expiredAtMs=c.now();fs.writeFileSync(file,JSON.stringify(old));}
+  c.advance(31*60000);s.status='expired';
+  const original=c.h.hub.hosting.releaseSplitReservation.bind(c.h.hub.hosting);
+  c.h.hub.hosting.releaseSplitReservation=()=>false;
+  assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409);
+  const persisted=JSON.parse(fs.readFileSync(file));assert.equal(persisted.reservationReleasedAtMs,undefined);assert.equal(persisted.expiredAtMs!==undefined,historicalFlag);
+  for(const extra of [{...auth,attemptId},auth]){const pending=await c.checkout('monthly',true,extra);assert.equal(pending.status,409);assert.equal(pending.body.code,'HOSTED_CHECKOUT_EXPIRY_PENDING');}
+  assert.equal(fs.readFileSync(claim,'utf8'),claimBefore);assert.equal(c.sessions.size,1);assert.equal(c.h.hub.hosting.store.getInstance(s.metadata.reservation).stage,'ordered');
+  c.h.hub.hosting.releaseSplitReservation=original;
+  // A legacy flag cannot bypass a fresh canonical paid/open/price check.
+  s.payment_status='paid';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409);
+  assert.equal((await c.checkout('monthly',true,auth)).status,409);s.payment_status='unpaid';
+  if(historicalFlag)assert.equal((await c.checkout('monthly',true,{...auth,attemptId})).status,410,'owned historical retry lazily reproves and seals release');
+  else assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,200);
+  assert.equal(typeof JSON.parse(fs.readFileSync(file)).reservationReleasedAtMs,'number');
+  assert.equal((await c.checkout('monthly',true,{...auth,attemptId})).status,410);assert.equal((await c.checkout('monthly',true,auth)).status,200);
+  assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
+await test('a new authenticated attempt lazily reconciles an owned historical claim before rebinding',async()=>{
+  const c=await setup(),issued=c.h.store.issue('Historical claim',30),auth={licenseId:issued.payload.id,token:issued.token},attemptId=randomUUID();
+  assert.equal((await c.checkout('lifetime',true,{...auth,attemptId})).status,200);const s=c.last();
+  const file=path.join(c.h.dataDir,'billing-launch-intents.v1',s.metadata.wh_launch_intent+'.json'),old=JSON.parse(fs.readFileSync(file));
+  old.expiredAtMs=c.now();fs.writeFileSync(file,JSON.stringify(old));s.status='expired';
+  const result=await c.checkout('lifetime',true,auth);assert.equal(result.status,200);assert.notEqual(result.body.url,s.url);
+  assert.equal(c.h.hub.hosting.store.getInstance(s.metadata.reservation).stage,'deleted');assert.equal(typeof JSON.parse(fs.readFileSync(file)).reservationReleasedAtMs,'number');
+  const claim=path.join(c.h.dataDir,'billing-launch-claims.v1','live',hash(issued.payload.id)+'.json');assert.equal(JSON.parse(fs.readFileSync(claim)).id,c.last().metadata.wh_launch_intent);
+  assert.equal((await c.checkout('lifetime',true,{...auth,attemptId})).status,410);assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
+await test('a crash after exact reservation release keeps rotation blocked until canonical idempotent replay seals release',async()=>{
+  const c=await setup(),issued=c.h.store.issue('Release crash',30),auth={licenseId:issued.payload.id,token:issued.token},attemptId=randomUUID();
+  assert.equal((await c.checkout('yearly',true,{...auth,attemptId})).status,200);const s=c.last();
+  const file=path.join(c.h.dataDir,'billing-launch-intents.v1',s.metadata.wh_launch_intent+'.json');
+  const claim=path.join(c.h.dataDir,'billing-launch-claims.v1','live',hash(issued.payload.id)+'.json'),before=fs.readFileSync(claim,'utf8');
+  c.advance(31*60000);s.status='expired';
+  const original=c.h.hub.hosting.releaseSplitReservation.bind(c.h.hub.hosting);
+  c.h.hub.hosting.releaseSplitReservation=(...args)=>{assert.equal(original(...args),true);throw Error('fixture crash after release before durable seal');};
+  assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409);
+  assert.equal(c.h.hub.hosting.store.getInstance(s.metadata.reservation).stage,'deleted');
+  let intent=JSON.parse(fs.readFileSync(file));assert.equal(intent.expiredAtMs,undefined);assert.equal(intent.reservationReleasedAtMs,undefined);
+  assert.equal((await c.checkout('yearly',true,{...auth,attemptId})).status,409);assert.equal((await c.checkout('yearly',true,auth)).status,409);
+  assert.equal(fs.readFileSync(claim,'utf8'),before);assert.equal(c.sessions.size,1);
+  c.h.hub.hosting.releaseSplitReservation=original;
+  assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,200);
+  intent=JSON.parse(fs.readFileSync(file));assert.equal(typeof intent.expiredAtMs,'number');assert.equal(typeof intent.reservationReleasedAtMs,'number');assert.equal(fs.existsSync(claim),false);
+  assert.equal((await c.checkout('yearly',true,{...auth,attemptId})).status,410);assert.equal((await c.checkout('yearly',true,auth)).status,200);
+  assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
 await test('lost hosted create response retains retry identity until canonical expiry proof',async()=>{
   const c=await setup({loseResponse:true}),attemptId=randomUUID();assert.equal((await c.checkout('yearly',true,{attemptId})).status,400);const s=c.last();
   c.advance(31*60000);const pending=await c.checkout('yearly',true,{attemptId});assert.equal(pending.status,409);assert.equal(pending.body.code,'HOSTED_CHECKOUT_EXPIRY_PENDING');assert.equal(c.sessions.size,1);

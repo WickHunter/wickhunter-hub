@@ -37,6 +37,7 @@ export interface LaunchIntent {
   sessionId?: string;
   url?: string;
   expiredAtMs?: number;
+  reservationReleasedAtMs?: number;
 }
 
 export class HostedCheckoutExpiryError extends Error {
@@ -52,10 +53,10 @@ export class HostedCheckoutExpiryError extends Error {
 
 function assertHostedCheckoutRetryable(intent: LaunchIntent | null, now: number): void {
   if (!intent?.hosting) return;
-  // Only expireSession's canonical unpaid Stripe proof sets this flag. A local
-  // deadline, including a lost-create response, never authorizes rotation.
-  if (intent.expiredAtMs !== undefined) throw new HostedCheckoutExpiryError(true);
-  if (now >= intent.hosting.expiresAtMs) throw new HostedCheckoutExpiryError(false);
+  // Older expiry flags were written before reservation release. Rotation
+  // requires the new durable proof written only after exact release succeeds.
+  if (intent.expiredAtMs !== undefined && intent.reservationReleasedAtMs !== undefined) throw new HostedCheckoutExpiryError(true);
+  if (intent.expiredAtMs !== undefined || now >= intent.hosting.expiresAtMs) throw new HostedCheckoutExpiryError(false);
 }
 const blankMode = (): LaunchMode => ({ enabled: false, cryptoEnabled: false, cryptoCapable: false, promotionId: '', prices: {} });
 const configPath = (dir: string) => path.join(dir, 'billing-launch.v1.json');
@@ -137,13 +138,26 @@ export class LaunchBilling {
     const expected = new Set([intent.hosting.softwarePriceId, intent.hosting.hostingPriceId]);
     if (lines.has_more || lines.data?.length !== 2 || lines.data.some((l: StripeObject) => l.quantity !== 1 || !expected.delete(l.price?.id)) || expected.size) throw Error('Expired checkout prices differ from its durable proof');
     if (this.billing.config().mode !== mode) throw Error('Billing mode changed during expiry reconciliation');
-    intent.sessionId = sessionId; intent.expiredAtMs ??= this.now(); writeJsonAtomic(intentPath(this.dataDir, intent.id), intent);
     if (!this.hosted?.release?.(intent.hosting, intent.id)) throw Error('Expired reservation has changed; review required');
+    // Release is idempotent for the exact already-deleted reservation. A crash
+    // before this seal leaves rotation blocked until canonical reconciliation
+    // proves the Session again and confirms that release completed.
+    intent.sessionId = sessionId; intent.expiredAtMs ??= this.now(); intent.reservationReleasedAtMs ??= this.now();
+    writeJsonAtomic(intentPath(this.dataDir, intent.id), intent);
     if (intent.licenseId) {
       const claim = claimPath(this.dataDir, mode, intent.licenseId), current = readJson<{id:string}|null>(claim, null);
       if (current?.id === intent.id) fs.rmSync(claim);
     }
     return { released: true };
+  }
+
+  private async confirmHistoricalExpiry(intent: LaunchIntent | null): Promise<LaunchIntent | null> {
+    if (!intent?.hosting || intent.expiredAtMs === undefined || intent.reservationReleasedAtMs !== undefined || !intent.sessionId) return intent;
+    // Existing v83 flags may precede a failed release. Only the owned stable
+    // attempt/claim reaches this path; reprove Stripe and release, never create.
+    try { await this.expireSession(intent.sessionId); }
+    catch { throw new HostedCheckoutExpiryError(false); }
+    return readJson<LaunchIntent | null>(intentPath(this.dataDir, intent.id), null);
   }
 
 
@@ -289,18 +303,21 @@ export class LaunchBilling {
       if (customer && customer.livemode !== (mode === 'live')) throw Error('This license is already bound in another Stripe mode');
       if (!intent && customer?.subscriptionId && customer.subscriptionStatus !== 'canceled') throw Error('Use Manage subscription for your existing subscription');
       if (!intent && customer?.lifetimeAccess) throw Error('This license already has Lifetime access');
+      intent = await this.confirmHistoricalExpiry(intent);
       assertHostedCheckoutRetryable(intent, now);
       const file = claimPath(this.dataDir, mode, licenseId);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       let claim = readJson<{ id: string; createdAtMs: number } | null>(file, null);
       if (claim && claim.id !== id) {
-        const old = readJson<LaunchIntent | null>(intentPath(this.dataDir, claim.id), null);
+        let old = readJson<LaunchIntent | null>(intentPath(this.dataDir, claim.id), null);
+        if (old?.id === claim.id && old.mode === mode && old.licenseId === licenseId) old = await this.confirmHistoricalExpiry(old);
         if (old?.sessionId && customer?.chargeIds.includes(`cs:${old.sessionId}`)) {
           fs.unlinkSync(file);
           claim = null;
-        } else if (old?.hosting && old.expiredAtMs !== undefined && old.id === claim.id && old.mode === mode && old.licenseId === licenseId) {
-          fs.unlinkSync(file);
-          claim = null;
+        } else if (old?.hosting && old.expiredAtMs !== undefined && old.reservationReleasedAtMs !== undefined && old.id === claim.id && old.mode === mode && old.licenseId === licenseId) {
+          const current = readJson<{ id: string; createdAtMs: number } | null>(file, null);
+          if (current?.id === old.id) fs.rmSync(file);
+          claim = readJson<{ id: string; createdAtMs: number } | null>(file, null);
         } else {
           assertHostedCheckoutRetryable(old, now);
           if (old?.url && (old.requestHash === requestHash || old.hostingRequested === undefined && old.requestHash === legacyRequestHash) && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
@@ -323,6 +340,7 @@ export class LaunchBilling {
       }
       if (!claim || claim.id !== id) throw Error('A checkout is already pending for this license; continue that checkout or contact support');
     }
+    intent = await this.confirmHistoricalExpiry(intent);
     assertHostedCheckoutRetryable(intent, now);
     if (intent?.url) {
       if (intent.expiredAtMs) throw Error('This hosted checkout expired; start a new attempt');
