@@ -91,12 +91,31 @@ await test('hosted monthly and yearly invoices earn on net software and refund a
    const hostingLine={pricing:{price_details:{price:hostingPriceId,product:'prod_hosting'}},quantity:1,amount:hostingAmountCents,amount_excluding_tax:hostingAmountCents,pretax_credit_amounts:[],taxes:[],period:{end:now/1000+86400}};
    invoiceId='in_hosted_'+plan;refundChargeId='ch_'+invoiceId;refund=0;email='friend@example.com';currency='usd';subStatus='active';subscriptionCode=member.code;paid=plan==='yearly'?90000:12001;total=paid;
    invoiceOverride={id:invoiceId,customer:'cus_friend',status:'paid',currency:'usd',livemode:false,amount_paid:paid,total_excluding_tax:paid,parent:{subscription_details:{subscription:'sub_friend'}},lines:{data:[softwareLine,hostingLine]},status_transitions:{paid_at:Date.parse('2026-08-15T00:00:00Z')/1000}};
-   subscriptionOverride={id:'sub_friend',status:'active',metadata:{bundle:'software-hosting-v2',reservation:reservationId,wh_launch_intent:intentId,plan,wh_earn_code:member.code},discounts:[{promotion_code:offer.promotion}],items:{data:[{price:softwarePriceId,quantity:1},{price:hostingPriceId,quantity:1}]}};subscriptionPromos.test=offer.promotion;
+   subscriptionOverride={id:'sub_friend',customer:'cus_friend',livemode:false,status:'active',metadata:{bundle:'software-hosting-v2',reservation:reservationId,wh_launch_intent:intentId,plan,wh_earn_code:member.code},discounts:[{promotion_code:offer.promotion}],items:{data:[{price:softwarePriceId,quantity:1},{price:hostingPriceId,quantity:1}]}};subscriptionPromos.test=offer.promotion;
    await only.handleEvent({...event('invoice.paid','evt_hosted_'+plan,{id:invoiceId}),livemode:false});
    const record=only.ledger('test').admin().stripe.invoices[invoiceId];assert.ok(record);assert.equal(record.basis,softwareAmountCents-discount,'Earn basis includes only discounted software revenue');assert.equal(record.paid,paid,'refund denominator preserves complete software, hosting, and tax collection');assert.equal(record.commission,Math.floor(record.basis*20/100));
    if(plan==='monthly'){
+    const validInvoice=structuredClone(invoiceOverride),validSubscription=structuredClone(subscriptionOverride);
+    const invalidCases=[
+     ['reservation',sub=>{sub.metadata.reservation='res_wrong';},null],
+     ['subscription customer',sub=>{sub.customer='cus_wrong';},null],
+     ['invoice customer',null,inv=>{inv.customer='cus_wrong';}],
+     ['subscription mode',sub=>{sub.livemode=true;},null],
+     ['invoice software price',null,inv=>{inv.lines.data[0].pricing.price_details.price='price_other';}],
+     ['discounted VPS',null,inv=>{inv.lines.data[1].pretax_credit_amounts=[{amount:100,type:'discount',discount:'di_fixture'}];}],
+    ];
+    for(const [label,changeSubscription,changeInvoice] of invalidCases){
+     invoiceId='in_hosted_invalid_'+label.replaceAll(' ','_');refundChargeId='ch_'+invoiceId;subscriptionOverride=structuredClone(validSubscription);invoiceOverride={...structuredClone(validInvoice),id:invoiceId};
+     if(changeSubscription)changeSubscription(subscriptionOverride);if(changeInvoice)changeInvoice(invoiceOverride);
+     await assert.rejects(only.handleEvent({...event('invoice.paid','evt_'+invoiceId,{id:invoiceId}),livemode:false}),undefined,label+' must fail closed');
+     assert.equal(only.ledger('test').admin().stripe.invoices[invoiceId],undefined,label+' cannot create payable attribution');
+    }
+    invoiceOverride=validInvoice;subscriptionOverride=validSubscription;invoiceId=record.id;refundChargeId='ch_'+record.id;
     refund=6000;await only.handleEvent({...event('charge.refunded','evt_hosted_partial',{id:refundChargeId}),livemode:false});
     assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,record.commission-Math.floor(record.commission*refund/paid),'partial clawback uses the aggregate collected bundle amount');
+    invoiceId='in_hosted_customer_credit';refundChargeId='ch_'+invoiceId;refund=0;paid=6000;invoiceOverride={...invoiceOverride,id:invoiceId,amount_paid:paid,total_taxes:[{amount:1000}]};
+    await only.handleEvent({...event('invoice.paid','evt_hosted_customer_credit',{id:invoiceId}),livemode:false});
+    const credited=only.ledger('test').admin().stripe.invoices[invoiceId];assert.equal(credited.basis,3000,'cash basis is capped after tax and the full VPS charge when customer credit reduces collection');assert.equal(credited.paid,6000);assert.equal(credited.commission,600);
    }
   }
  } finally {invoiceId=previous.invoiceId;subscriptionCode=previous.subscriptionCode;email=previous.email;priceId=previous.priceId;subscriptionPriceId=previous.subscriptionPriceId;currency=previous.currency;paid=previous.paid;total=previous.total;refund=previous.refund;refundChargeId=previous.refundChargeId;subStatus=previous.subStatus;subscriptionPromos.test=previous.promo;invoiceOverride=previous.invoiceOverride;subscriptionOverride=previous.subscriptionOverride;}

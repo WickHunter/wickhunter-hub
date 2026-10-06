@@ -6,7 +6,7 @@ import {readJson,writeJsonAtomic} from './jsonfile.js';
 import type {BillingConfig,BillingMode} from './billing/config.js';
 import {launchGrant} from './billing/launch.js';
 import {BillingStore} from './billing/store.js';
-import {componentPriceId,invoiceLineNet} from './billing/software-component.js';
+import {componentPriceId,invoiceLineDiscount,invoiceLineNet} from './billing/software-component.js';
 import type {StripeEvent} from './billing/stripe.js';
 
 type Settings={mode:BillingMode; enabled:boolean; automatic:boolean; payoutDay:number; financialAccount:string};
@@ -297,9 +297,10 @@ export class EarnStripeService {
    }
   });
  });}
- private hostedSoftwareBasis(mode:BillingMode,subscription:string,customer:string,sub:StripeObject,inv:StripeObject,offer:StripeObject):number {
+ private hostedSoftwareBasis(mode:BillingMode,subscription:string,customer:string,sub:StripeObject,inv:StripeObject,offer:StripeObject):{software:number;hosting:number} {
   const metadata=sub.metadata||{},plan=String(metadata.plan||''),intentId=String(metadata.wh_launch_intent||'');
   if(metadata.bundle!=='software-hosting-v2'||!intentId||!['monthly','yearly'].includes(plan))throw Error('Mixed software/VPS subscription metadata is incomplete');
+  if(sub.livemode!==(mode==='live')||id(sub.customer)!==customer)throw Error('Mixed subscription mode/customer differs from its invoice');
   const record=new BillingStore(this.dir).getBundleSubscription(subscription) as (StripeObject|null);
   if(!record||record.subscriptionId!==subscription||record.launchIntentId!==intentId||record.planKey!==plan||record.customerId!==customer||record.reservationId!==metadata.reservation)throw Error('Mixed subscription lacks its durable checkout binding');
   const grant=launchGrant(this.dir,{wh_launch_intent:intentId,plan},mode==='live') as (StripeObject|null);
@@ -323,9 +324,10 @@ export class EarnStripeService {
   if((softwareProduct&&softwareProduct!==hosting.softwareProductId)||(hostingProduct&&hostingProduct!==hosting.hostingProductId))throw Error('Mixed invoice products differ from the persisted offer');
   const couponProducts=Array.isArray(offer.proof?.products)?offer.proof.products:[];
   if(!couponProducts.includes(hosting.softwareProductId)||couponProducts.includes(hosting.hostingProductId))throw Error('Applied referral does not cover only the software product');
+  if(invoiceLineDiscount(vps[0])>0)throw Error('Referral discount unexpectedly applies to the VPS invoice line');
   const softwareNet=invoiceLineNet(software[0]),hostingNet=invoiceLineNet(vps[0]);
-  if(hostingNet!==hosting.hostingAmountCents||softwareNet<=0||softwareNet>hosting.softwareAmountCents)throw Error('Mixed invoice amounts differ from the persisted offer');
-  return softwareNet;
+  if(hostingNet>hosting.hostingAmountCents||softwareNet<=0||softwareNet>hosting.softwareAmountCents)throw Error('Mixed invoice amounts differ from the persisted offer');
+  return {software:softwareNet,hosting:hostingNet};
  }
  private async invoice(mode:BillingMode,invoiceId:string){
   const ledger=this.ledger(mode),api=this.api(mode);if(book(ledger.admin()).invoices[invoiceId]){await this.adjustInvoice(mode,invoiceId);return;}
@@ -343,7 +345,7 @@ export class EarnStripeService {
   const items=sub.items?.data||[];if(!items.length||sub.items?.has_more)return;
   const lines=inv.lines?.data||[];if(!lines.length||inv.lines?.has_more)return;
   const customerId=id(inv.customer);
-  const mixedBasis=mixed?this.hostedSoftwareBasis(mode,subscription,customerId,sub,inv,attribution.offer):null;
+  const mixedAmounts=mixed?this.hostedSoftwareBasis(mode,subscription,customerId,sub,inv,attribution.offer):null;
   const prices=[...new Set([...items.map((i:StripeObject)=>id(i.price)),...lines.map((l:StripeObject)=>id(l.pricing?.price_details?.price)||id(l.price))])];
   const historical=prices.filter(price=>price&&!allowed.has(price));
   if(!mixed&&(prices.some(price=>!price)||historical.length>4))return;
@@ -374,7 +376,15 @@ export class EarnStripeService {
   if(mailbox && this.boundReferrerEmails?.(mode,member.id,bindings).some(email=>consumerGmailMailbox(email)===mailbox))return;
   const paid=money(inv.amount_paid);if(paid===null||paid===0)return;
   let basis:number;
-  if(mixed){if(mixedBasis===null)throw Error('Mixed invoice software basis is unavailable');basis=mixedBasis;}
+  if(mixed){
+   if(mixedAmounts===null)throw Error('Mixed invoice software basis is unavailable');
+   const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
+   // Stripe can mark an invoice paid after applying a customer balance credit,
+   // leaving amount_paid below the invoice total. Reserve tax and the entire
+   // VPS component before attributing the remaining collected cash to software.
+   const available=Math.max(0,paid-taxes.reduce((n:number,t:StripeObject)=>n+t.amount,0)-mixedAmounts.hosting);
+   basis=Math.min(mixedAmounts.software,available);
+  }
   else {
    const total=money(inv.total_excluding_tax);if(total===null)return;
    const taxes=inv.total_taxes||inv.total_tax_amounts||[];if(!Array.isArray(taxes)||taxes.some((t:StripeObject)=>money(t.amount)===null))throw Error('Invoice tax total is unavailable');
