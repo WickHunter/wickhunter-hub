@@ -7,8 +7,10 @@ buyers sharing a proxy edge IP to reach Checkout. Checkout-creating routes retai
 a separate allowance of 30 attempts per source IP per rolling minute.
 Requests above the limit receive 429 with Retry-After. Retries still count
 toward the allowance and reuse their original immutable Checkout Session.
-Referral-code, sign-in, authentication, webhook and general route limits remain
-unchanged, as do price verification, VPS quotes and provider cost checks.
+A shared referral code admits 60 attempts per rolling minute across source IPs;
+each source IP retains the separate 30-attempt creation bound. Sign-in,
+authentication, webhook and general route limits remain unchanged, as do price
+verification, VPS quotes and provider cost checks.
 
 Combined software/VPS checkout supports up to 30 pending reservations while
 the configured provider cost ceiling still counts every retained reservation

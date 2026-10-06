@@ -373,7 +373,7 @@ try {
  await test('referral checkout admits 30 distinct invalid-code attempts per shared IP then refuses attempt31 with Retry-After',async()=>{
   const headers={'x-forwarded-for':'203.0.113.41'};
   const statuses=[];
-  // Each code has an independent 20/minute bucket; only the shared IP bucket
+  // Each code has an independent 60/minute bucket; only the shared IP bucket
   // can refuse this burst. Invalid codes never reach Stripe Session creation.
   for(let i=0;i<30;i++)statuses.push((await fetch(checkoutHub.origin+'/buy?ref=BAD'+i,{headers,redirect:'manual'})).status);
   assert.deepEqual(statuses,Array(30).fill(400));
@@ -381,11 +381,14 @@ try {
   assert.equal(refused.status,429);assert.equal(body.retryAfterSeconds,60);
   assert.equal(refused.headers.get('retry-after'),'60');assert.equal(refused.headers.get('cache-control'),'no-store');
  });
- await test('referral code bucket still refuses attempt21 while the IP has checkout allowance remaining',async()=>{
-  const headers={'x-forwarded-for':'203.0.113.42'};
+ await test('a shared referral code admits 60 attempts across independent IPs then refuses61 without spending unrelated codes',async()=>{
   const statuses=[];
-  for(let i=0;i<20;i++)statuses.push((await fetch(checkoutHub.origin+'/buy?ref=BAD_SHARED',{headers,redirect:'manual'})).status);
-  assert.deepEqual(statuses,Array(20).fill(400));
+  for(let i=0;i<60;i++){
+   const headers={'x-forwarded-for':i<30?'203.0.113.42':'203.0.113.43'};
+   statuses.push((await fetch(checkoutHub.origin+'/buy?ref=BAD_SHARED',{headers,redirect:'manual'})).status);
+  }
+  assert.deepEqual(statuses,Array(60).fill(400));
+  const headers={'x-forwarded-for':'203.0.113.44'};
   const refused=await fetch(checkoutHub.origin+'/buy?ref=BAD_SHARED',{headers,redirect:'manual'}),body=await refused.json();
   assert.equal(refused.status,429);assert.equal(body.retryAfterSeconds,60);assert.equal(refused.headers.get('retry-after'),'60');
   assert.equal((await fetch(checkoutHub.origin+'/buy?ref=BAD_OTHER',{headers,redirect:'manual'})).status,400,'a distinct code still reaches validation from the same IP');
