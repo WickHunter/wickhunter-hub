@@ -183,6 +183,14 @@ await test('provider cost ceiling refuses hosted admission before30 without chan
   assert.deepEqual(c.h.hub.hosting.store.instances(),before);assert.equal(c.sessions.size,5);
   assert.equal((await c.checkout('monthly',true,{attemptId})).body.url,first);assert.equal(c.sessions.size,5);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
+await test('hosted /buy inactive referral fallback retains stable capacity503 and Retry-After',async()=>{
+  const c=await setup({costCeiling:1000});assert.equal((await c.checkout()).status,200);
+  const configured=await jsonReq(c.h.origin+'/admin/api/earn/stripe-configure',{method:'POST',headers:{'x-hub-admin':'test-admin-token','x-wh-earn':'1','content-type':'application/json'},body:JSON.stringify({enabled:true,mode:'live'})});assert.equal(configured.status,200);
+  const response=await fetch(c.h.origin+'/buy?plan=lifetime&hosting=true&ref=INACTIVE_OFFER',{redirect:'manual'}),body=await response.json();
+  assert.equal(response.status,503);assert.equal(body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(body.retryAfterSeconds,60);
+  assert.equal(response.headers.get('retry-after'),'60');assert.equal(response.headers.get('cache-control'),'no-store');
+  assert.equal(c.sessions.size,1);assert.equal(c.h.hub.hosting.store.instances().length,1);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
 await test('owned /buy links and old hosted aliases all use reserved v2 checkout with launch disabled',async()=>{
   const c=await setup();await c.admin('/admin/api/billing/launch',{enabled:false,cryptoEnabled:false});
   for(const suffix of ['?plan=monthly&hosting=true','?plan=hosted-yearly','?plan=lifetime-hosted']) {const r=await fetch(c.h.origin+'/buy'+suffix,{redirect:'manual'});assert.equal(r.status,302);assert.equal(c.last().metadata.bundle,'software-hosting-v2');}

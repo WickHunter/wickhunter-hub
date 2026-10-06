@@ -897,8 +897,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         } catch (e) {
           if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
           if ((e as Error).message === 'Referral discount is not active') {
-            const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: 'card', attemptId: randomUUID(), hosting: true });
-            return billingRedirect(res, checkout.url, 'checkout');
+            try {
+              const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: 'card', attemptId: randomUUID(), hosting: true });
+              return billingRedirect(res, checkout.url, 'checkout');
+            } catch (fallbackError) {
+              if (fallbackError instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, fallbackError);
+              throw fallbackError;
+            }
           }
           return sendText(res, 400, (e as Error).message);
         }
