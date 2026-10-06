@@ -28,6 +28,14 @@ function toast(s){$('toast').textContent=s;$('toast').hidden=false;setTimeout(()
 // refused by an iframe policy or browser. A successful selection alone is not
 // a copy: try the compatibility command and otherwise keep manual help visible.
 let copyPending=false;
+const REFERRAL_COPY_TIMEOUT_MS=2000;
+async function copyReferralModern(value){
+ let timer;
+ try{return await Promise.race([
+  Promise.resolve(navigator.clipboard.writeText(value)).then(()=>true,()=>false),
+  new Promise(resolve=>{timer=setTimeout(()=>resolve(false),REFERRAL_COPY_TIMEOUT_MS);})
+ ]);}catch{return false;}finally{if(timer!==undefined)clearTimeout(timer);}
+}
 function selectReferralLink(){const input=$('refLink');input.focus();input.select();input.setSelectionRange(0,input.value.length);}
 function copyReferralLegacy(){const previous=document.activeElement;try{selectReferralLink();if(typeof document.execCommand==='function'&&document.execCommand('copy')===true){if(previous&&previous!==$('refLink'))previous.focus();return true;}}catch{}return false;}
 async function copyReferral(){
@@ -36,7 +44,7 @@ async function copyReferral(){
  copyPending=true;button.disabled=true;status.hidden=true;let copied=false;
  try{
   if(window.isSecureContext&&navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
-   try{await navigator.clipboard.writeText(input.value);copied=true;}catch{}
+   copied=await copyReferralModern(input.value);
   }
   if(!copied)copied=copyReferralLegacy();
   status.textContent=copied?'Referral link copied.':'Automatic copy was blocked by your browser. Press Ctrl+C or Command+C to copy the selected link, or touch and hold it and choose Copy.';
