@@ -467,6 +467,12 @@ config, editable from the admin page): **Monthly $99**, **Yearly $699**,
 days, the v1 format's maximum). Every plan carries the same software; they
 differ only in how the customer pays.
 
+- `/buy` with no plan or a blank plan redirects to the configured website's
+  `/unleashed/#pricing` chooser. A nonempty `ref` is retained in the query so
+  the buyer can choose Monthly, Yearly or Lifetime, with or without VPS.
+  This landing request creates no checkout or hosting reservation. Missing
+  or invalid `siteOrigin` refuses with 503; explicit plan links retain their
+  existing checkout admission and referral checks.
 - `/buy?plan=<key>` redirects to that plan's Payment Link in the active mode
   (`stripe.<mode>.paymentLinks[key]`; the legacy `paymentLinkUrl` is the
   fallback for the first plan). The website's three Buy buttons use these.

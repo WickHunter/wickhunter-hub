@@ -16,7 +16,7 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   keyed    GET  /install/channels/{beta,production}.sh explicit fresh-install channel bootstrap (feature-gated)
 //   keyed    GET  /api/latest                    authenticated signed release manifest (x-license; legacy ?key=)
 //   keyed    GET  /download/<file>               beta tarballs (x-license; legacy ?key=; "latest" resolves)
-//   public   GET  /buy[?plan=key]                302 -> the ACTIVE mode's Stripe Payment Link for that plan
+//   public   GET  /buy[?plan=key]                plan chooser, or the ACTIVE mode checkout for an explicit plan
 //   public   GET  /api/billing/plans             the plans + prices, for the website (CORS *)
 //   admin    POST /admin/api/billing/plans/provision {mode} -> product/prices/links created or reused in Stripe
 //   public   GET  /billing                       302 -> the active mode's Customer Portal login
@@ -947,6 +947,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // ── billing (public) ────────────────────────────────────────────────
     if (m === "GET" && p === "/buy") {
       const requestedPlan = url.searchParams.get('plan');
+      // An unselected plan is a landing link, never consent to Monthly or a
+      // hosted reservation. The existing website chooser carries the referral
+      // into the buyer's explicit software/VPS choice.
+      if (!requestedPlan?.trim()) {
+        const siteOrigin = billing.config().siteOrigin;
+        let chooser: URL;
+        try {
+          const site = new URL(siteOrigin);
+          if (site.protocol !== 'https:' || site.username || site.password || site.pathname !== '/' || site.search || site.hash) throw Error('Invalid site origin');
+          chooser = new URL('/unleashed/', site);
+        } catch { return billingRedirect(res, '', 'plan chooser'); }
+        const referral = url.searchParams.get('ref');
+        if (referral) chooser.searchParams.set('ref', referral);
+        chooser.hash = 'pricing';
+        return billingRedirect(res, chooser.href, 'plan chooser');
+      }
       const baseCardAvailable = ["monthly","yearly","lifetime"].includes(requestedPlan || "monthly") && !!billing.config().stripe[billing.config().mode].priceIds[requestedPlan || "monthly"];
       const hostedAlias = /^(monthly|yearly|lifetime)-hosted$/.exec(requestedPlan || '') || /^hosted-(monthly|yearly|lifetime)$/.exec(requestedPlan || '');
       const planKey = hostedAlias ? hostedAlias[1]! : requestedPlan;

@@ -144,7 +144,7 @@ await test("GET /api/billing/plans is public, CORS-open and names the three defa
   assert.equal(body.plans[1].buyUrl, "https://hub.test/hub/buy?plan=yearly");
 });
 
-await test("/buy?plan= routes per plan: unknown 404, unconfigured 503, configured 302, no plan = first plan", async () => {
+await test("/buy?plan= routes explicit plans: unknown 404, unconfigured 503, configured 302", async () => {
   assert.equal((await fetch(`${h.origin}/buy?plan=bogus`, { redirect: "manual" })).status, 404);
   assert.equal((await fetch(`${h.origin}/buy?plan=yearly`, { redirect: "manual" })).status, 503);
   const r = await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { test: { paymentLinkUrl: "https://buy.stripe.com/test_m", paymentLinks: { yearly: "https://buy.stripe.com/test_y" } } } }) });
@@ -152,7 +152,6 @@ await test("/buy?plan= routes per plan: unknown 404, unconfigured 503, configure
   assert.deepEqual(r.body.stripe.test.paymentLinks, { yearly: "https://buy.stripe.com/test_y" });
   assert.equal(r.body.endpoints.buyPlans.lifetime, "https://hub.test/hub/buy?plan=lifetime");
   assert.equal((await fetch(`${h.origin}/buy?plan=yearly`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_y");
-  assert.equal((await fetch(`${h.origin}/buy`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_m");
   assert.equal((await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_m");
   const clear = await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { test: { paymentLinks: { yearly: null } } } }) });
   assert.deepEqual(clear.body.stripe.test.paymentLinks, {});

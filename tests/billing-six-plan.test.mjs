@@ -282,7 +282,7 @@ await test('lost hosted create response retains retry identity until canonical e
 await test('owned /buy links and old hosted aliases all use reserved v2 checkout with launch disabled',async()=>{
   const c=await setup();await c.admin('/admin/api/billing/launch',{enabled:false,cryptoEnabled:false});
   for(const suffix of ['?plan=monthly&hosting=true','?plan=hosted-yearly','?plan=lifetime-hosted']) {const r=await fetch(c.h.origin+'/buy'+suffix,{redirect:'manual'});assert.equal(r.status,302);assert.equal(c.last().metadata.bundle,'software-hosting-v2');}
-  assert.equal((await fetch(c.h.origin+'/buy',{redirect:'manual'})).status,302);assert.equal(c.last().lines.length,1);await c.h.close();
+  assert.equal((await fetch(c.h.origin+'/buy?plan=monthly',{redirect:'manual'})).status,302);assert.equal(c.last().lines.length,1);await c.h.close();
 });
 await test('lost create response invoice retries until checkout recovers immutable session, then grants once',async()=>{
   const over={loseResponse:true},c=await setup(over);assert.equal((await c.checkout('lifetime',true)).status,400);const s=c.last();assert.equal((await c.post('invoice.paid',c.invoice(s))).status,500);
