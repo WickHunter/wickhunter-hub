@@ -175,7 +175,7 @@ import {
   readUpgradeStatus,
   writeUpgradeStatus,
 } from "./operations.js";
-import { HostingService, type HostingServiceDeps } from "./hosting/service.js";
+import { HostingService, HostingCheckoutCapacityError, type HostingServiceDeps } from "./hosting/service.js";
 import {
   readHostingPolicy,
   writeHostingPolicy,
@@ -895,6 +895,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), hosting: true, ...(referral ? { referral } : {}) });
           return billingRedirect(res, checkout.url, 'checkout');
         } catch (e) {
+          if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
           if ((e as Error).message === 'Referral discount is not active') {
             const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: 'card', attemptId: randomUUID(), hosting: true });
             return billingRedirect(res, checkout.url, 'checkout');
@@ -949,7 +950,10 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const body = await readJsonBody(req, 8 * 1024);
       if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a checkout request' });
       try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
-      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+      catch (e) {
+        if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
+        return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' });
+      }
     }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
     if (m === 'POST' && p === '/api/marketing/brevo/webhook') {
@@ -3387,6 +3391,11 @@ function sendRateLimited(res: ServerResponse, decision: RateDecision, what: stri
     error: `${what} is temporarily rate limited; try again in ${decision.retryAfterSeconds} seconds`,
     retryAfterSeconds: decision.retryAfterSeconds,
   }, { "retry-after": String(decision.retryAfterSeconds), "cache-control": "no-store" });
+}
+
+function sendCheckoutCapacity(res: ServerResponse, error: HostingCheckoutCapacityError): void {
+  sendJson(res, 503, { ok: false, code: error.code, error: error.message, retryAfterSeconds: error.retryAfterSeconds },
+    { 'retry-after': String(error.retryAfterSeconds), 'cache-control': 'no-store' });
 }
 
 /** The exact bytes of a body, or null when it is too large or the connection

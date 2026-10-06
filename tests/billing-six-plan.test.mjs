@@ -45,7 +45,7 @@ async function setup(over = {}) {
   h=await freshHub({}, {billingNow:()=>clock,hostingNow:()=>clock,launchFetch:fake,hostingFetch:fake,billingFetch:async()=>({ok:true,status:200,text:async()=>JSON.stringify({id:'mail_fixture'})}),hostingProvider:provider});
   const admin=(p,body)=>jsonReq(h.origin+p,{method:'POST',headers:{'x-hub-admin':'test-admin-token','content-type':'application/json'},body:JSON.stringify(body)});
   await admin('/admin/api/billing/config',{mode:'live',plans:[...h.hub.billing.config().plans,{key:'hosting-monthly',name:'Hosting',amountCents:2000,currency:'usd',interval:'month',role:'hosting'},{key:'monthly-hosted',name:'LegacyMonthly',amountCents:11900,currency:'usd',interval:'month',role:'software',checkout:'hosted-bundle'},{key:'yearly-hosted',name:'LegacyYearly',amountCents:93900,currency:'usd',interval:'year',role:'software',checkout:'hosted-bundle'}],stripe:{live:{secretKey:'sk_live_offline_only',webhookSecret:secret,priceIds:{monthly:'price_monthly',yearly:'price_yearly',lifetime:'price_lifetime','hosting-monthly':'price_hostold','monthly-hosted':'price_legacy119','yearly-hosted':'price_legacy939'}}},roles:{live:{hosting:{priceIds:['price_hostold']},software:{priceIds:['price_monthly','price_yearly','price_lifetime'],productIds:['prod_software']}}}});
-  await admin('/admin/api/hosting/policy',{policy:{provisioningEnabled:true,monthlyPriceCents:2000,osId:'2284',releaseRef:'b'.repeat(64),maximumProjectedMonthlyProviderCostCents:10000}});
+  await admin('/admin/api/hosting/policy',{policy:{provisioningEnabled:true,monthlyPriceCents:2000,osId:'2284',releaseRef:'b'.repeat(64),maximumProjectedMonthlyProviderCostCents:over.costCeiling ?? 10000}});
   const prepared=await admin('/admin/api/billing/hosted-offer',{monthlyPriceId:'price_hostmonth',yearlyPriceId:'price_hostyear'});
   if(!over.sharedProduct&&!over.wrongMode&&!over.priceHook)assert.equal(prepared.status,200,JSON.stringify(prepared.body));
   const launchPrepare=await admin('/admin/api/billing/launch',{action:'prepare'});assert.equal(launchPrepare.status,200);
@@ -155,9 +155,33 @@ await test('legacy shared product classification survives reprepare and concurre
   assert.equal((await c.admin('/admin/api/billing/hosted-offer',{monthlyPriceId:'price_hostmonth',yearlyPriceId:'price_hostyear'})).status,200);assert(c.h.hub.billing.config().roles.live.hosting.priceIds.includes('price_manual'));
   over.priceHook=async(h)=>{h.hub.billing.updateConfig({mode:'test'});};assert.equal((await c.admin('/admin/api/billing/hosted-offer',{monthlyPriceId:'price_hostmonth',yearlyPriceId:'price_hostyear'})).status,400);await c.h.close();
 });
-await test('concurrent hosted admission never exceeds three slots and exact expiry enables another customer',async()=>{
-  const c=await setup();const results=await Promise.all(Array.from({length:4},()=>c.checkout()));assert.equal(results.filter(r=>r.status===200).length,3);assert.equal(results.filter(r=>r.status===400).length,1);
-  const first=[...c.sessions.values()][0];first.status='expired';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:first.id})).status,200);assert.equal((await c.checkout()).status,200);await c.h.close();
+await test('concurrent mixed-plan hosted admission permits 30 buyers, refuses31, preserves retries and exact expiry',async()=>{
+  const c=await setup({costCeiling:100000});
+  // All callers pass the initial cap check before the quote resolves, proving
+  // the second check prevents concurrent admission beyond the configured cap.
+  const listPlans=c.provider.listPlans.bind(c.provider);let entered=0,release;
+  const barrier=new Promise(resolve=>release=resolve);
+  c.provider.listPlans=async()=>{const plans=await listPlans();if(++entered===31)release();await barrier;return plans;};
+  const buyers=Array.from({length:31},(_,i)=>({plan:['monthly','yearly','lifetime'][i%3],attemptId:randomUUID()}));
+  const results=await Promise.all(buyers.map(b=>c.checkout(b.plan,true,{attemptId:b.attemptId})));
+  assert.equal(results.filter(r=>r.status===200).length,30);assert.equal(results.filter(r=>r.status===503).length,1);
+  const refused=results.find(r=>r.status===503);assert.equal(refused.body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(refused.body.retryAfterSeconds,60);assert.match(refused.body.error,/temporarily at capacity/);
+  assert.equal(c.sessions.size,30);assert.equal(c.h.hub.hosting.store.instances().length,30);assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:30000});
+  const acceptedIndex=results.findIndex(r=>r.status===200),buyer=buyers[acceptedIndex];
+  assert.equal((await c.checkout(buyer.plan,true,{attemptId:buyer.attemptId})).body.url,results[acceptedIndex].body.url);assert.equal(c.sessions.size,30);
+  const direct=await fetch(c.h.origin+'/buy?plan=lifetime&hosting=true',{redirect:'manual'});assert.equal(direct.status,503);assert.equal(direct.headers.get('retry-after'),'60');assert.equal(direct.headers.get('cache-control'),'no-store');assert.equal((await direct.json()).code,'HOSTED_CHECKOUT_CAPACITY');
+  const first=[...c.sessions.values()][0];first.status='expired';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:first.id})).status,200);
+  const deniedBuyer=buyers[results.findIndex(r=>r.status===503)];assert.equal((await c.checkout(deniedBuyer.plan,true,{attemptId:deniedBuyer.attemptId})).status,200);
+  assert.equal(c.h.hub.hosting.store.instances().filter(r=>r.stage==='ordered').length,30);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
+await test('provider cost ceiling refuses hosted admission before30 without changing or charging existing reservations',async()=>{
+  const c=await setup({costCeiling:5000}),attemptId=randomUUID();let first;
+  for(let i=0;i<5;i++){const r=await c.checkout(['monthly','yearly','lifetime'][i%3],true,i===0?{attemptId}:{});assert.equal(r.status,200);first??=r.body.url;}
+  assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:5000});
+  const before=c.h.hub.hosting.store.instances();const refused=await c.checkout('lifetime',true);
+  assert.equal(refused.status,503);assert.equal(refused.body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(refused.body.retryAfterSeconds,60);
+  assert.deepEqual(c.h.hub.hosting.store.instances(),before);assert.equal(c.sessions.size,5);
+  assert.equal((await c.checkout('monthly',true,{attemptId})).body.url,first);assert.equal(c.sessions.size,5);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
 await test('owned /buy links and old hosted aliases all use reserved v2 checkout with launch disabled',async()=>{
   const c=await setup();await c.admin('/admin/api/billing/launch',{enabled:false,cryptoEnabled:false});
@@ -189,4 +213,3 @@ await test('a deletion racing a held checkout read remains terminal after serial
   assert.equal((await paid).status,200);assert.equal((await deleted).status,200);assert.equal(c.h.hub.billing.store.getBundleSubscription('sub_'+s.id).terminal,true);assert.equal(c.h.hub.billing.store.getCustomer('cus_'+s.id).subscriptionStatus,'canceled');await c.h.close();
 });
 summary('Six-plan billing');
-

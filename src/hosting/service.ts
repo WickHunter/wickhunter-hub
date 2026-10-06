@@ -48,9 +48,18 @@ import * as tmpl from "./emails.js";
 
 const HOUR = 60 * 60 * 1000;
 const MAX_PROVISION_ATTEMPTS = 3;
+// Unpaid v2 checkout reservations are bounded independently of the provider
+// cost ceiling, which includes every retained reservation and live resource.
+const MAX_PENDING_SPLIT_CHECKOUTS = 30;
 const LEASE_TTL_MS = 2 * 60_000;
 const PROVISION_RETRY_BACKOFF_MS = 30_000;
 const PUBLIC_HEALTH_MAX_BYTES = 4096;
+
+export class HostingCheckoutCapacityError extends Error {
+  readonly code = 'HOSTED_CHECKOUT_CAPACITY';
+  readonly retryAfterSeconds = 60;
+  constructor() { super('VPS checkout is temporarily at capacity. Please try again later or choose software only.'); }
+}
 
 const realFetch: EmailFetch = async (url, init) => {
   const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
@@ -297,13 +306,15 @@ export class HostingService {
     }
     if (customerId && this.store.activeInstanceForOwner(customerId, cfg.mode)) throw Error('Manage your existing VPS from the customer dashboard');
     const pending = this.store.instances().filter(r => r.ownerId.startsWith('bundle:') && r.stage === 'ordered' && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now);
-    if (pending.length >= 3) throw Error('Too many hosted checkouts are pending; retry shortly');
+    if (pending.length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
     const provider = this.provider()!;
     const quote = (await provider.listPlans()).find(p => p.id === policy.planId)?.monthlyCostCents;
     if (!Number.isSafeInteger(quote) || !quote || quote <= 0 || quote * 2 !== policy.monthlyPriceCents) throw Error('VPS provider cost differs from the approved price');
     if (this.billing.config().mode !== cfg.mode || JSON.stringify(this.policy()) !== JSON.stringify(policy)) throw Error("Hosting policy changed during price verification");
-    if (this.store.instances().filter(r => r.ownerId.startsWith("bundle:") && r.stage === "ordered" && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now).length >= 3) throw Error("Too many hosted checkouts are pending; retry shortly");
-    const refusal = this.costCeilingRefusalWithQuote(quote, policy); if (refusal) throw Error(refusal);
+    if (this.store.instances().filter(r => r.ownerId.startsWith("bundle:") && r.stage === "ordered" && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now).length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
+    const refusal = this.costCeilingRefusalWithQuote(quote, policy);
+    if (refusal === 'hosting is at its provider cost ceiling') throw new HostingCheckoutCapacityError();
+    if (refusal) throw Error(refusal);
     const row = this.store.reserveInstance({ id: this.store.newId('host'), ownerId, environment: cfg.mode, region: policy.regions[0]?.id ?? 'nrt', planId: policy.planId, stripeCustomerId: '', nowMs: now });
     if (!row) throw Error('Hosted checkout reservation changed; retry the same attempt');
     const expiresAtMs = Math.floor((now + 31 * 60_000) / 1000) * 1000;
