@@ -1,3 +1,7 @@
+## v0.4.86 — Verified installer reruns
+
+Installer reruns verify the signed installed release and service ownership before acting. An active installation stays unchanged; a stopped installation can start its existing release once after its licence, empty service cgroup and release-operation lock are verified. Startup succeeds only with fresh readiness and matching service/listener identity. Failures retain recovery evidence and identify restricted-IP exchange refusals. This does not change the public Beta runtime.
+
 ## v0.4.85 — Direct website Checkout API
 
 The canonical browser checkout endpoint accepts credential-free CORS requests
