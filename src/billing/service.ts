@@ -1183,6 +1183,7 @@ export class BillingService {
     if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
+    if (grant?.hosting) { const discount = checkoutDiscountPercent(ev.object); if (discount !== null) rec.discountPercent = discount; }
     if (f.paymentStatus === 'paid' && (!grant?.hosting || Number(ev.object.amount_total) > 0)) this.noteFirstActualPayment(rec, ev.createdMs);
     this.noteCharge(rec, f.sessionId ? `cs:${f.sessionId}` : "");
     this.noteCharge(rec, f.paymentIntentId);
@@ -1252,6 +1253,7 @@ export class BillingService {
       note += "; invoice had no period end";
     }
     rec.subscriptionStatus = "active";
+    if (launchInvoice?.hosting) { const discount = checkoutDiscountPercent(ev.object); if (discount !== null) rec.discountPercent = discount; }
     const amountPaid = ev.object.amount_paid;
     if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
       const transitions = ev.object.status_transitions as Record<string, unknown> | undefined;
