@@ -1,3 +1,11 @@
+## v0.4.87 — Referral plan chooser and reliable Earn copy
+
+Purchase links with no selected plan now open the existing website chooser,
+carrying the referral into Monthly, Yearly or Lifetime and optional VPS choices.
+Explicit plan links keep their checkout admission. Earn copy acknowledges only
+an actual clipboard operation, with persistent manual instructions when refused;
+exchange cards show the saved share of trading fees earned by WH.
+
 ## v0.4.86 — Verified installer reruns
 
 Installer reruns verify the signed installed release and service ownership before acting. An active installation stays unchanged; a stopped installation can start its existing release once after its licence, empty service cgroup and release-operation lock are verified. Startup succeeds only with fresh readiness and matching service/listener identity. Failures retain recovery evidence and identify restricted-IP exchange refusals. This does not change the public Beta runtime.
@@ -1955,6 +1963,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.87 — Open unselected purchase links on the existing referral-preserving plan chooser; provide truthful Earn copy fallback and the saved WH trading-fee share.
 - v0.4.86 — Verify signed installed releases, service ownership, fresh readiness and release locks on installer reruns; preserve active installations and customer data. Empty systemd command hooks remain compatible, and captured unit properties stay out of verifier process arguments.
 
 - v0.4.85 — Direct, credential-free browser CORS for canonical website Checkout, with early errors readable and cookie-authenticated customer actions unchanged.
