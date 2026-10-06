@@ -370,8 +370,26 @@ const h=await freshHub();try{
 }finally{await h.close();}
 const checkoutHub=await freshHub({}, {rateLimitNow:()=>123456789});
 try {
- const referralCodes=[];for(let i=0;i<4;i++)referralCodes.push((await fetch(checkoutHub.origin+'/buy?ref=BAD'+i,{redirect:'manual'})).status);
- assert.deepEqual(referralCodes,[400,400,400,429]);
+ await test('referral checkout admits 30 distinct invalid-code attempts per shared IP then refuses attempt31 with Retry-After',async()=>{
+  const headers={'x-forwarded-for':'203.0.113.41'};
+  const statuses=[];
+  // Each code has an independent 20/minute bucket; only the shared IP bucket
+  // can refuse this burst. Invalid codes never reach Stripe Session creation.
+  for(let i=0;i<30;i++)statuses.push((await fetch(checkoutHub.origin+'/buy?ref=BAD'+i,{headers,redirect:'manual'})).status);
+  assert.deepEqual(statuses,Array(30).fill(400));
+  const refused=await fetch(checkoutHub.origin+'/buy?ref=BAD31',{headers,redirect:'manual'}),body=await refused.json();
+  assert.equal(refused.status,429);assert.equal(body.retryAfterSeconds,60);
+  assert.equal(refused.headers.get('retry-after'),'60');assert.equal(refused.headers.get('cache-control'),'no-store');
+ });
+ await test('referral code bucket still refuses attempt21 while the IP has checkout allowance remaining',async()=>{
+  const headers={'x-forwarded-for':'203.0.113.42'};
+  const statuses=[];
+  for(let i=0;i<20;i++)statuses.push((await fetch(checkoutHub.origin+'/buy?ref=BAD_SHARED',{headers,redirect:'manual'})).status);
+  assert.deepEqual(statuses,Array(20).fill(400));
+  const refused=await fetch(checkoutHub.origin+'/buy?ref=BAD_SHARED',{headers,redirect:'manual'}),body=await refused.json();
+  assert.equal(refused.status,429);assert.equal(body.retryAfterSeconds,60);assert.equal(refused.headers.get('retry-after'),'60');
+  assert.equal((await fetch(checkoutHub.origin+'/buy?ref=BAD_OTHER',{headers,redirect:'manual'})).status,400,'a distinct code still reaches validation from the same IP');
+ });
 } finally {await checkoutHub.close();}
 summary('earn');
 }finally{fs.rmSync(dir,{recursive:true,force:true});}
