@@ -174,8 +174,11 @@ verify_existing_unit() {
 try {
  const [raw,app,unit,env,entry,node]=process.argv.slice(2),s={};for(const line of raw.split("\n")){if(!line)continue;const i=line.indexOf("=");if(i<1||Object.hasOwn(s,line.slice(0,i)))throw Error();s[line.slice(0,i)]=line.slice(i+1);}
  const m=/^\{ path=([^ ;]+) ; argv\[\]=([^;]+) ;/.exec(s.ExecStart??"");
+ // systemctl prints structured Exec arrays once per command; empty arrays
+ // can be omitted even with --all. Only these four hooks permit omission.
+ const hooksEmpty=["ExecStartPre","ExecStartPost","ExecCondition","ExecStopPost"].every(k=>!Object.hasOwn(s,k)||s[k]==="");
  if(s.LoadState!=="loaded"||s.FragmentPath!==unit||s.WorkingDirectory!==app||s.NeedDaemonReload!=="no"||!["","root"].includes(s.User)
-   ||s.EnvironmentFiles!==env+" (ignore_errors=no)"||s.DropInPaths!==""||s.ExecStartPre!==""||s.ExecStartPost!==""||s.Environment!==""||s.ExecCondition!==""||s.ExecStopPost!==""||!m||m[1]!==node||![node+" "+entry,node+" "+app+"/"+entry].includes(m[2].trim()))throw Error();
+   ||s.EnvironmentFiles!==env+" (ignore_errors=no)"||s.DropInPaths!==""||s.Environment!==""||!hooksEmpty||!m||m[1]!==node||![node+" "+entry,node+" "+app+"/"+entry].includes(m[2].trim()))throw Error();
 } catch {console.error("installed unit does not match the verified server entry; no files changed");process.exit(1);}
 VERIFY_EXISTING_UNIT
 }

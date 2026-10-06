@@ -58,7 +58,7 @@ case "$MOCK_MODE" in changed_owner) echo '{"pid":777,"bootId":"foreign"}' > "$AP
 touch "$STARTED"; exit 0; fi
 [ "$1" = show ] || exit 99
 case "$*" in
- *LoadState*) printf 'LoadState=loaded\\nFragmentPath=%s\\nWorkingDirectory=%s\\nExecStart={ path=%s ; argv[]=%s server.js ; ignore_errors=no ; }\\nEnvironmentFiles=%s (ignore_errors=no)\\nUser=\\nNeedDaemonReload=no\\nDropInPaths=%s\\nExecStartPre=\\nExecStartPost=\\nEnvironment=%s\\nExecCondition=\\nExecStopPost=\\n' "$UNIT_FILE" "$APP_DIR" "$REAL_NODE" "$REAL_NODE" "$ENV_FILE" "\${DROPIN:-}" "\${UNIT_ENV:-}";;
+ *LoadState*) printf 'LoadState=loaded\\nFragmentPath=%s\\nWorkingDirectory=%s\\nExecStart={ path=%s ; argv[]=%s server.js ; ignore_errors=no ; }\\nEnvironmentFiles=%s (ignore_errors=no)\\nUser=\\nNeedDaemonReload=no\\nDropInPaths=%s\\nExecStartPre=%s\\nExecStartPost=%s\\nEnvironment=%s\\nExecCondition=%s\\nExecStopPost=%s\\n' "$UNIT_FILE" "$APP_DIR" "$REAL_NODE" "$REAL_NODE" "$ENV_FILE" "\${DROPIN:-}" "\${EXEC_START_PRE:-}" "\${EXEC_START_POST:-}" "\${UNIT_ENV:-}" "\${EXEC_CONDITION:-}" "\${EXEC_STOP_POST:-}" | while IFS= read -r row; do key="\${row%%=*}"; [ "$key" != "\${OMIT_UNIT_PROPERTY:-}" ] || continue; if [ "\${OMIT_EMPTY_HOOKS:-0}" = 1 ]; then case "$row" in ExecStartPre=|ExecStartPost=|ExecCondition=|ExecStopPost=) continue;; esac; fi; printf '%s\\n' "$row"; done;;
  *ControlPID*) count=0; [ ! -f "$CHECKS" ] || count=$(cat "$CHECKS"); count=$((count+1)); echo "$count" > "$CHECKS"; if [ "$count" -gt 1 ]; then case "$MOCK_MODE" in late_lock) touch "$APP_DIR/data/release-operation.lock";; late_transition) touch "$APP_DIR/data/release-transition.json";; late_license) echo changed-license > "$APP_DIR/data/license.key";; esac; fi; pid=0; [ "$MOCK_MODE" != raced ] || [ "$count" -lt 2 ] || pid=77; printf 'ActiveState=inactive\\nSubState=dead\\nMainPID=%s\\nControlPID=0\\nJob=%s\\nControlGroup=/system.slice/wickhunter.service\\n' "$pid" "\${JOB:-}";;
  *) if [ "$MOCK_MODE" = active ] || [ -f "$STARTED" ]; then printf 'ActiveState=active\\nSubState=running\\nResult=success\\nMainPID=42\\nInvocationID=0123456789abcdef0123456789abcdef\\nNRestarts=0\\n'; else printf 'ActiveState=failed\\nSubState=failed\\nResult=exit-code\\nMainPID=0\\nNRestarts=95\\n'; fi;;
 esac
@@ -87,7 +87,7 @@ await test('the full installer validates an active signed135 installation withou
   full=full.replace('# END_STARTUP_FUNCTIONS','sleep(){ SECONDS=$((SECONDS+$1)); };\n# END_STARTUP_FUNCTIONS');
   const r=spawnSync('bash',['-c',full],{env:f.env,encoding:'utf8',timeout:30000});
   assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/already installed/);assert.deepEqual(f.snapshot(),before);
-  assert.ok(!fs.existsSync(f.env.STARTED));const ops=fs.readFileSync(f.env.OPS,'utf8');assert.doesNotMatch(ops,/restart|stop|start wickhunter|UNSAFE/);assert.ok(ops.split('\n').filter(x=>x.includes('LoadState')).every(x=>x.includes('--all')),'unit empty properties are requested explicitly');
+  assert.ok(!fs.existsSync(f.env.STARTED));const ops=fs.readFileSync(f.env.OPS,'utf8');assert.doesNotMatch(ops,/restart|stop|start wickhunter|UNSAFE/);assert.ok(ops.split('\n').filter(x=>x.includes('LoadState')).every(x=>x.includes('--all')),'unit scalar properties are requested explicitly');
  }finally{f.cleanup();}
 });
 await test('a loaded/masked/unknown service cannot take the fresh path merely because all installer paths are absent',()=>{
@@ -106,7 +106,35 @@ await test('a loaded/masked/unknown service cannot take the fresh path merely be
  }
 });
 await test('same-signed-release stopped recovery performs only start and retains every financial/identity file',()=>{
- const f=fixture('inactive','0.90.172');try{const before=f.snapshot();const r=run(f,f.code,{},true);assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/existing signed release recovered/);assert.deepEqual(f.snapshot(),before);const ops=fs.readFileSync(f.env.OPS,'utf8');assert.equal(ops.split('\n').filter(x=>x==='start wickhunter').length,1);assert.doesNotMatch(ops,/restart|stop|UNSAFE/);assert.ok(ops.split('\n').filter(x=>x.includes('LoadState')||x.includes('ControlPID')).every(x=>x.includes('--all')),'Job and unit hook empty fields use deterministic --all output');}finally{f.cleanup();}
+ const f=fixture('inactive','0.90.172');try{const before=f.snapshot();const r=run(f,f.code,{},true);assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/existing signed release recovered/);assert.deepEqual(f.snapshot(),before);const ops=fs.readFileSync(f.env.OPS,'utf8');assert.equal(ops.split('\n').filter(x=>x==='start wickhunter').length,1);assert.doesNotMatch(ops,/restart|stop|UNSAFE/);assert.ok(ops.split('\n').filter(x=>x.includes('LoadState')||x.includes('ControlPID')).every(x=>x.includes('--all')),'Job and unit scalar empty fields are requested with --all');}finally{f.cleanup();}
+});
+await test('systemctl omitted empty command arrays support read-only135 and start-only172 recovery',()=>{
+ for(const [mode,version] of [['active','0.90.135'],['inactive','0.90.172']]){
+  const f=fixture(mode,version);try{
+   const before=f.snapshot();const r=run(f,f.code,{OMIT_EMPTY_HOOKS:'1'},true);
+   assert.equal(r.status,0,r.stderr);assert.deepEqual(f.snapshot(),before);
+   const ops=fs.readFileSync(f.env.OPS,'utf8');
+   assert.equal(ops.split('\n').filter(x=>x==='start wickhunter').length,mode==='inactive'?1:0);
+   assert.doesNotMatch(ops,/restart|stop|UNSAFE/);
+   assert.ok(ops.split('\n').filter(x=>x.includes('LoadState')).every(x=>x.includes('--all')));
+  }finally{f.cleanup();}
+ }
+});
+await test('populated command hooks and omitted scalar identity fields still fail closed without state changes',()=>{
+ const hooks=['EXEC_START_PRE','EXEC_START_POST','EXEC_CONDITION','EXEC_STOP_POST'];
+ const scalars=['LoadState','FragmentPath','WorkingDirectory','ExecStart','EnvironmentFiles','User','NeedDaemonReload','DropInPaths','Environment'];
+ for(const field of [...hooks,...scalars]){
+  const f=fixture('inactive');try{
+   const before=f.snapshot(),extra={OMIT_EMPTY_HOOKS:'1'};
+   if(hooks.includes(field))extra[field]='{ path=/private/hook ; argv[]=/private/hook --secret=never-wh-secret ; ignore_errors=no ; }';
+   else extra.OMIT_UNIT_PROPERTY=field;
+   const r=run(f,f.code,extra,false,'ENTRY=server.js; verify_existing_unit');
+   assert.notEqual(r.status,0,field);assert.deepEqual(f.snapshot(),before,field);
+   assert.ok(!fs.existsSync(f.env.STARTED),field);assert.ok(!fs.existsSync(path.join(f.app,'data/release-operation.lock')),field);
+   assert.doesNotMatch(r.stderr,/never-wh-secret|private\/hook/);
+   assert.doesNotMatch(fs.readFileSync(f.env.OPS,'utf8'),/start wickhunter|UNSAFE/);
+  }finally{f.cleanup();}
+ }
 });
 await test('changed files, foreign signing key, partial installation and unsafe unit never start',()=>{
  for(const kind of ['tampered','foreign','partial','dropin','licence','unit_env','preload']){
