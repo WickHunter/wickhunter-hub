@@ -355,9 +355,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   const generalIpLimiter = new SlidingWindowLimiter({
     max: rateLimitPolicy.generalIpMax, windowMs: rateLimitPolicy.generalIpWindowMs,
   });
-  // Referral checkout creates a remote Stripe Session on the Earn money
-  // queue. Admit it before that queue, independently of cheap /buy reads.
-  const referralCheckoutIpLimiter = new SlidingWindowLimiter({ max: 3, windowMs: 60_000, maxKeys: 4096 });
+  // Checkout-creating routes share this bounded allowance. The website's
+  // proxy can put independent buyers behind one edge IP; admit 30 attempts
+  // per minute while retaining price, idempotency and hosting capacity guards.
+  // Replays count as attempts, but reuse their original immutable Session.
+  const referralCheckoutIpLimiter = new SlidingWindowLimiter({ max: 30, windowMs: 60_000, maxKeys: 4096 });
   const referralCheckoutCodeLimiter = new SlidingWindowLimiter({ max: 20, windowMs: 60_000, maxKeys: 4096 });
   // Stripe webhooks are signature-verified before anything here trusts them;
   // this exists only to cap a runaway or hostile sender, deliberately

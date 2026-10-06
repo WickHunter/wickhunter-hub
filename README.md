@@ -1,3 +1,12 @@
+## v0.4.84 — Checkout allowance for shared website proxy IPs
+
+Checkout-creating routes now admit 30 attempts per source IP per rolling minute,
+so independent website buyers sharing a proxy edge IP can reach Checkout.
+Requests above the limit receive 429 with Retry-After. Retries still count
+toward the allowance and reuse their original immutable Checkout Session.
+Referral-code, sign-in, authentication, webhook and general route limits remain
+unchanged, as do price verification and VPS quote, cost and pending capacity guards.
+
 ## v0.4.83 — One checkout for software and optional VPS
 
 Monthly, Yearly and Lifetime each support software-only or software with VPS,
@@ -1912,6 +1921,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.84 — Checkout-only IP allowance increases from 3 to 30 attempts per rolling minute for shared website proxy traffic; bounded refusals and payment/provisioning guards are unchanged.
 - v0.4.83 — Six software/optional VPS choices in one checkout, immediate hosted billing, software-only coupons and referral earnings, independent Lifetime access, and hosted email guidance.
 - v0.4.82 — Explicit Stripe coupon product proof, safe retry of referral verification, and preserved credit for verified retired offers and existing subscription renewals.
 
