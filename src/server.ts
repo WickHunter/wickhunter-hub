@@ -348,13 +348,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     max: rateLimitPolicy.leaseIpMax, windowMs: rateLimitPolicy.leaseIpWindowMs,
   });
   // The shared "everything else public" bucket: install.sh, /api/latest,
-  // /download/*, /welcome/*, /install/<token>, /api/billing/plans, /buy,
+  // /download/*, /welcome/*, /install/<token>,
   // /billing, /api/billing/portal-session. One instance, keyed by IP only —
   // these routes carry no licence identity worth a second dimension (a
   // one-time install/welcome token IS its own single-use identity already).
   const generalIpLimiter = new SlidingWindowLimiter({
     max: rateLimitPolicy.generalIpMax, windowMs: rateLimitPolicy.generalIpWindowMs,
   });
+  // Readiness reads and checkout entry share a website edge IP. Keep their
+  // allowance separate from sign-in and all other general public routes.
+  const checkoutEntryIpLimiter = new SlidingWindowLimiter({ max: 300, windowMs: 60_000, maxKeys: 4096 });
   // Checkout-creating routes share this bounded allowance. The website's
   // proxy can put independent buyers behind one edge IP; admit 30 attempts
   // per minute while retaining price, idempotency and hosting capacity guards.
@@ -685,28 +688,32 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   // ── the general "everything else public" rate-limit bucket ───────────────
   // Every unauthenticated-or-bearer route below that is not the check-in, a
-  // lease route, feedback (its own limiter since v0.2.x), or the Stripe
+  // lease route, checkout entry, feedback (its own limiter since v0.2.x), or the Stripe
   // webhook (its own generous bucket, handled separately in `handle`). Named
   // by exact path/prefix rather than folded into the dispatch table itself,
   // so this stays a single readable list to audit against the route table in
   // the README, and a route added to `handle` below is NOT silently
   // rate-limited just by sharing a method — it has to be named here too.
+  function isCheckoutEntryRoute(m: string, p: string): boolean {
+    return (m === "GET" && (p === "/api/billing/plans" || p === "/api/hosting/options" || p === "/buy"))
+      || (m === "POST" && p === "/api/billing/checkout");
+  }
+
   function isGeneralRateLimitedRoute(m: string, p: string): boolean {
     if(p === "/api/support/chat" || p.startsWith("/support/")) return true;
     if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
-      if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
-        || p === "/api/billing/plans" || p === "/billing"
+      if (p === "/install.sh" || p === "/api/latest" || p === "/billing"
         || p === "/api/hub/liq-percentiles"
         || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
-        || p === "/api/hosting/options" || p === "/api/hosting") return true;
+        || p === "/api/hosting") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
     }
     if (m === "POST") {
       if (p === '/api/marketing/brevo/webhook') return true;
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
-      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout") return true;
+      if (p === "/api/billing/portal-session") return true;
       // /api/customer/signin also spends the dedicated per-email bucket
       // (`customerSigninEmailLimiter`) inside its own handler — this is the
       // per-IP half, the same "everything else public" bucket every other
@@ -780,8 +787,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // routes and feedback carry their own dedicated limiters (see `checkin`,
     // `leaseRateLimited`, `feedbackIntake`) and are deliberately not matched
     // here. The signed Stripe webhook gets its own generous allowance so a
-    // burst of Stripe's own retries of one event is never refused; every
-    // other unauthenticated-or-bearer public route shares the general "rest
+    // burst of Stripe's own retries of one event is never refused. The four
+    // checkout entry routes share a bounded allowance of their own; other
+    // unauthenticated-or-bearer public routes share the general "rest
     // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
     if (m === "POST" && p === "/api/hosting/bundle-checkout") {
       const rate = hostingBundleIpLimiter.take(clientIp(req), rateLimitNow());
@@ -789,6 +797,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     } else if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
       const rate = webhookIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "the billing webhook"); }
+    } else if (isCheckoutEntryRoute(m, p)) {
+      const rate = checkoutEntryIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) {
+        if (m !== "GET") req.resume();
+        return sendRateLimited(res, rate, "checkout entry");
+      }
     } else if (isGeneralRateLimitedRoute(m, p)) {
       const rate = generalIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) {

@@ -191,17 +191,17 @@ function leaseSignature(challenge, privateKey) {
   }, { rateLimitNow: () => clock });
   const ip = { "x-forwarded-for": "203.0.113.77" };
 
-  await test("general bucket: /api/billing/plans is refused past its per-IP max", async () => {
-    assert.equal((await jsonReq(`${h.origin}/api/billing/plans`, { headers: ip })).status, 200);
-    assert.equal((await jsonReq(`${h.origin}/api/billing/plans`, { headers: ip })).status, 200);
-    const third = await jsonReq(`${h.origin}/api/billing/plans`, { headers: ip });
+  await test("general bucket: /customer is refused past its per-IP max", async () => {
+    assert.equal((await jsonReq(`${h.origin}/customer`, { headers: ip })).status, 200);
+    assert.equal((await jsonReq(`${h.origin}/customer`, { headers: ip })).status, 200);
+    const third = await jsonReq(`${h.origin}/customer`, { headers: ip });
     assert.equal(third.status, 429);
     assert.ok(third.body.retryAfterSeconds >= 1);
   });
 
   await test("general bucket is SHARED across its named routes — a second route from the same IP is already spent too", async () => {
     const r = await jsonReq(`${h.origin}/install.sh?key=nope`, { headers: ip });
-    assert.equal(r.status, 429, "install.sh shares the same general bucket as /api/billing/plans");
+    assert.equal(r.status, 429, "install.sh shares the same general bucket as /customer");
   });
 
   await test("a route NOT in the general bucket is completely unaffected — /api/health stays live", async () => {
@@ -210,7 +210,7 @@ function leaseSignature(challenge, privateKey) {
   });
 
   await test("a different IP has its own untouched general budget", async () => {
-    const r = await jsonReq(`${h.origin}/api/billing/plans`, { headers: { "x-forwarded-for": "198.51.100.5" } });
+    const r = await jsonReq(`${h.origin}/customer`, { headers: { "x-forwarded-for": "198.51.100.5" } });
     assert.equal(r.status, 200);
   });
 
@@ -251,7 +251,7 @@ function leaseSignature(challenge, privateKey) {
   await test("webhook: the SAME burst size against the general bucket (3/min) WOULD refuse — proving the webhook path is not merely reusing that bucket", async () => {
     let refused = 0;
     for (let i = 0; i < 15; i++) {
-      const r = await jsonReq(`${h.origin}/api/billing/plans`, { headers: { "x-forwarded-for": "198.51.100.200" } });
+      const r = await jsonReq(`${h.origin}/customer`, { headers: { "x-forwarded-for": "198.51.100.200" } });
       if (r.status === 429) refused++;
     }
     assert.ok(refused > 0, "the general bucket, sized to 3/min, refuses well before 15 requests");

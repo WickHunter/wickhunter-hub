@@ -1,7 +1,10 @@
 ## v0.4.84 — Checkout allowance for shared website proxy IPs
 
-Checkout-creating routes now admit 30 attempts per source IP per rolling minute,
-so independent website buyers sharing a proxy edge IP can reach Checkout.
+Checkout entry shares a 300-request allowance per source IP per rolling minute
+only for GET `/api/billing/plans`, GET `/api/hosting/options`, GET `/buy` and
+POST `/api/billing/checkout`. Readiness reads therefore allow independent website
+buyers sharing a proxy edge IP to reach Checkout. Checkout-creating routes retain
+a separate allowance of 30 attempts per source IP per rolling minute.
 Requests above the limit receive 429 with Retry-After. Retries still count
 toward the allowance and reuse their original immutable Checkout Session.
 Referral-code, sign-in, authentication, webhook and general route limits remain

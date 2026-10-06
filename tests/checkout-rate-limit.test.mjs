@@ -65,6 +65,16 @@ try {
     .map(f => JSON.parse(fs.readFileSync(path.join(h.dataDir, 'billing-launch-intents.v1', f), 'utf8')));
   let firstUrl;
 
+  await test('61 readiness reads behind the shared proxy leave the independent creation budget available', async () => {
+    for (let i = 0; i < 61; i++) {
+      const route = i % 2 ? '/api/hosting/options' : '/api/billing/plans';
+      const response = await fetch(h.origin + route, { headers: { 'x-forwarded-for': sharedIp } });
+      assert.equal(response.status, 200, `readiness read ${i + 1}`);
+      await response.text();
+    }
+    assert.equal(creates.length, 0);
+  });
+
   await test('four independent genuine licence holders behind one trusted proxy IP can start Checkout', async () => {
     for (const buyer of buyers.slice(0, 4)) {
       const response = await checkout(buyer), body = await response.json();
@@ -104,6 +114,49 @@ try {
     assert.equal(creates.length, 31);
     assert.equal((await jsonReq(h.origin + '/api/health', { headers: { 'x-forwarded-for': sharedIp } })).status, 200);
     assert.equal((await jsonReq(h.origin + '/api/billing/plans', { headers: { 'x-forwarded-for': sharedIp } })).status, 200);
+  });
+  await test('the four checkout entry routes share exactly 300 requests and refuse before provider or intent work', async () => {
+    const ip = '203.0.113.92', headers = { 'x-forwarded-for': ip };
+    for (let i = 0; i < 298; i++) {
+      const response = await fetch(h.origin + (i % 2 ? '/api/hosting/options' : '/api/billing/plans'), { headers });
+      assert.equal(response.status, 200, `entry request ${i + 1}`);
+      await response.text();
+    }
+    // An invalid /buy and an immutable Checkout replay spend the same entry
+    // allowance without creating another Session or changing purchase inputs.
+    assert.notEqual((await fetch(h.origin + '/buy?plan=invalid', { headers, redirect: 'manual' })).status, 429);
+    assert.equal((await checkout(buyers[0], ip)).status, 200);
+    for (const route of ['/api/billing/plans', '/api/hosting/options', '/buy?plan=monthly']) {
+      const response = await fetch(h.origin + route, { headers, redirect: 'manual' });
+      const body = await response.json();
+      assert.equal(response.status, 429);
+      assert.equal(body.retryAfterSeconds, 60);
+      assert.equal(response.headers.get('retry-after'), '60');
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    const over = await checkout(buyers[30], ip);
+    assert.equal(over.status, 429);
+    assert.equal(over.headers.get('retry-after'), '60');
+    assert.equal(creates.length, 31);
+    assert.equal(intents().length, 31);
+    assert.equal(h.hub.hosting.store.instances().length, 0);
+  });
+  await test('checkout entry exhaustion leaves the general 60-request bucket and sign-in guard unchanged', async () => {
+    const headers = { 'x-forwarded-for': '203.0.113.92' };
+    for (let i = 0; i < 60; i++) {
+      const response = await fetch(h.origin + '/customer', { headers });
+      assert.equal(response.status, 200, `general request ${i + 1}`);
+      await response.text();
+    }
+    const refused = await fetch(h.origin + '/customer', { headers });
+    assert.equal(refused.status, 429);
+    assert.equal(refused.headers.get('retry-after'), '60');
+    const signin = await fetch(h.origin + '/api/customer/signin', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ email: 'offline@example.com' }),
+    });
+    assert.equal(signin.status, 429, 'sign-in remains in the exhausted general bucket');
+    assert.equal(signin.headers.get('retry-after'), '60');
+    assert.equal((await fetch(h.origin + '/api/health', { headers })).status, 200);
   });
   await test('a retry after the window returns the original immutable Session without another provider create', async () => {
     clock += 60_001;
