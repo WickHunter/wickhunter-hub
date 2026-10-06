@@ -170,9 +170,9 @@ verify_existing_unit() {
     || die "partial installation has no trustworthy unit/environment; support recovery is required, no files changed"
   state=$(timeout 3s systemctl show "$SERVICE" --all --property=LoadState,FragmentPath,WorkingDirectory,ExecStart,EnvironmentFiles,User,NeedDaemonReload,DropInPaths,ExecStartPre,ExecStartPost,Environment,ExecCondition,ExecStopPost 2>/dev/null) \
     || die "could not verify installed service identity"
-  node - "$state" "$APP_DIR" "$UNIT_FILE" "$ENV_FILE" "$ENTRY" "$(command -v node)" <<'VERIFY_EXISTING_UNIT'
+  node - "$APP_DIR" "$UNIT_FILE" "$ENV_FILE" "$ENTRY" "$(command -v node)" 3< <(printf '%s' "$state") <<'VERIFY_EXISTING_UNIT'
 try {
- const [raw,app,unit,env,entry,node]=process.argv.slice(2),s={};for(const line of raw.split("\n")){if(!line)continue;const i=line.indexOf("=");if(i<1||Object.hasOwn(s,line.slice(0,i)))throw Error();s[line.slice(0,i)]=line.slice(i+1);}
+ const raw=require("node:fs").readFileSync(3,"utf8"),[app,unit,env,entry,node]=process.argv.slice(2),s={};for(const line of raw.split("\n")){if(!line)continue;const i=line.indexOf("=");if(i<1||Object.hasOwn(s,line.slice(0,i)))throw Error();s[line.slice(0,i)]=line.slice(i+1);}
  const m=/^\{ path=([^ ;]+) ; argv\[\]=([^;]+) ;/.exec(s.ExecStart??"");
  // systemctl prints structured Exec arrays once per command; empty arrays
  // can be omitted even with --all. Only these four hooks permit omission.

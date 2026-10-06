@@ -136,6 +136,25 @@ await test('populated command hooks and omitted scalar identity fields still fai
   }finally{f.cleanup();}
  }
 });
+await test('unit secrets travel through a private descriptor rather than the actual verifier child argv',()=>{
+ for(const field of ['none','UNIT_ENV','EXEC_START_PRE','EXEC_START_POST','EXEC_CONDITION','EXEC_STOP_POST']){
+  const f=fixture('inactive');try{
+   const file=path.join(f.dir,'cmd/node'),record=path.join(f.dir,'unit-node-argv');
+   exe(file,'printf "%s\\0" "$@" > "$UNIT_ARGV"\nexec "$REAL_NODE_BINARY" "$@"\n');
+   const extra={REAL_NODE:file,REAL_NODE_BINARY:process.execPath,UNIT_ARGV:record};
+   const secret='never-wh-unit-secret-'+field;
+   if(field==='UNIT_ENV')extra[field]='PRIVATE_KEY='+secret+' NODE_OPTIONS=--require=/private/preload';
+   else if(field!=='none')extra[field]='{ path=/private/hook ; argv[]=/private/hook --key='+secret+' ; ignore_errors=no ; }';
+   const before=f.snapshot(),r=run(f,f.code,extra,false,'ENTRY=server.js; verify_existing_unit');
+   assert.equal(r.status===0,field==='none',field+': verifier outcome');
+   const args=fs.readFileSync(record,'utf8').split('\0').slice(0,-1);
+   assert.ok(args.every(x=>!x.includes(secret)&&!x.includes('LoadState=')&&!x.includes('NODE_OPTIONS')),'raw unit properties never enter child argv');
+   assert.deepEqual(args,['-',f.app,f.env.UNIT_FILE,f.env.ENV_FILE,'server.js',file]);
+   assert.ok(!r.stdout.includes(secret)&&!r.stderr.includes(secret),'no reflected unit secrets');
+   assert.deepEqual(f.snapshot(),before);assert.ok(!fs.existsSync(f.env.STARTED));
+  }finally{f.cleanup();}
+ }
+});
 await test('changed files, foreign signing key, partial installation and unsafe unit never start',()=>{
  for(const kind of ['tampered','foreign','partial','dropin','licence','unit_env','preload']){
   const f=fixture('inactive');try{
