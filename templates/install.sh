@@ -7,8 +7,9 @@
 #
 # What it does: Node 22, fetch + verify the latest beta build, unpack to
 # /opt/wickhunter (your data/ survives re-runs), systemd unit, license key,
-# HTTPS via the bot's own vps-setup, health check. Safe to re-run any time —
-# re-running upgrades to the latest beta and keeps your settings.
+# HTTPS via the bot's own vps-setup, and verified startup. Re-runs validate an
+# existing signed installation; only a proven stopped service may be started.
+# Upgrades use the authenticated app updater, never overwrite a running bot.
 set -Eeuo pipefail
 
 HUB="__HUB_ORIGIN__"
@@ -111,6 +112,291 @@ ask() { # ask VAR "prompt" [--secret]
   printf -v "$__var" '%s' "$__val"
 }
 
+# Existing installs take a separate path before package/app/env/license writes.
+# Authenticate with the Hub-embedded keyring, never a key from local metadata.
+verify_signed_tree() {
+  timeout 30s node - "$1" "$RELEASE_KEYS_B64U" <<'VERIFY_SIGNED_TREE'
+const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
+const [root,keysB64u]=process.argv.slice(2);
+const fail=()=>{console.error("signed installation integrity could not be verified; no files changed");process.exit(1);};
+try {
+  const regular=file=>{let at=path.resolve(file);while(at!==path.dirname(at)){const st=fs.lstatSync(at);if(st.isSymbolicLink())fail();at=path.dirname(at);}const st=fs.lstatSync(file);if(!st.isFile())fail();return st;};
+  const json=file=>{if(regular(file).size>1048576)fail();return JSON.parse(fs.readFileSync(file,"utf8"));};
+  const d=json(path.join(root,"integrity.json")), keys=JSON.parse(Buffer.from(keysB64u,"base64url"));
+  if(d.schema!=="wickhunter.integrity.v1"||d.product!=="wickhunter"||d.recoveryProtocol!==1
+    ||!/^\d+\.\d+\.\d+$/.test(d.version)||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(d.buildId)
+    ||!Number.isFinite(Date.parse(d.issuedAt))||!Array.isArray(d.files)||!d.files.length)fail();
+  const canonical=(v,depth=0)=>{if(depth>64)fail();if(v===null)return "null";if(typeof v==="number"&&(!Number.isFinite(v)||Object.is(v,-0)))fail();if(["string","number","boolean"].includes(typeof v))return JSON.stringify(v);if(Array.isArray(v))return "["+v.map(x=>canonical(x,depth+1)).join(",")+"]";if(!v||typeof v!=="object")fail();return "{"+Object.keys(v).filter(k=>v[k]!==undefined).sort().map(k=>JSON.stringify(k)+":"+canonical(v[k],depth+1)).join(",")+"}";};
+  const decode=(v,n)=>{if(typeof v!=="string"||! /^[A-Za-z0-9_-]+$/.test(v))throw Error();const b=Buffer.from(v,"base64url");if(b.length!==n||b.toString("base64url")!==v)throw Error();return b;};
+  const unsigned={...d};delete unsigned.signatures;delete unsigned.ok;
+  const bytes=Buffer.from(canonical(unsigned));
+  if(!Array.isArray(d.signatures)||!d.signatures.some(sig=>{try{return sig.alg==="Ed25519"&&Object.hasOwn(keys,sig.kid)&&crypto.verify(null,bytes,crypto.createPublicKey({key:Buffer.concat([Buffer.from("302a300506032b6570032100","hex"),decode(keys[sig.kid],32)]),format:"der",type:"spki"}),decode(sig.sig,64));}catch{return false;}}))fail();
+  let previous="";const names=new Set();
+  for(const f of d.files){if(typeof f.path!=="string"||!f.path||f.path.includes("\\")||f.path.startsWith("/")||f.path.startsWith("data/")||f.path.split("/").some(x=>!x||x==="."||x==="..")||f.path<=previous||!/^[a-f0-9]{64}$/.test(f.sha256))fail();previous=f.path;names.add(f.path);const file=path.join(root,f.path);regular(file);if(crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")!==f.sha256)fail();}
+  const pkg=json(path.join(root,"package.json")), entry={"node server.js":"server.js","node dist/server/index.js":"dist/server/index.js"}[pkg.scripts?.start];
+  if(pkg.version!==d.version||!entry||!["package.json",entry,"bin/wh-core-linux-amd64","scripts/release-auth.mjs"].every(x=>names.has(x)))fail();
+  const core=d.files.find(f=>f.path==="bin/wh-core-linux-amd64");fs.accessSync(path.join(root,core.path),fs.constants.X_OK);
+  process.stdout.write([d.version,d.buildId,core.sha256,entry,d.files.find(f=>f.path==="scripts/release-auth.mjs").sha256].join("\n"));
+} catch { fail(); }
+VERIFY_SIGNED_TREE
+}
+
+# No process signals are sent here. An absent cgroup is acceptable only under
+# the exact service scope on a proven cgroup-v2 host; surviving children refuse.
+prove_empty_service() {
+  local state
+  state=$(timeout 3s systemctl show "$SERVICE" --all --property=ActiveState,SubState,MainPID,ControlPID,Job,ControlGroup 2>/dev/null) \
+    || die "could not verify stopped service ownership; no files changed"
+  node - "$state" "$SERVICE" <<'VERIFY_EMPTY_SERVICE'
+const fs=require("node:fs"),path=require("node:path");
+try {
+ const [raw,service]=process.argv.slice(2), s={};for(const line of raw.split("\n")){if(!line)continue;const i=line.indexOf("=");const k=line.slice(0,i);if(i<1||Object.hasOwn(s,k))throw Error();s[k]=line.slice(i+1);}
+ if(!["inactive","failed"].includes(s.ActiveState)||!["dead","failed"].includes(s.SubState)||s.MainPID!=="0"||s.ControlPID!=="0"||s.Job!=="")throw Error();
+ const scope="/system.slice/"+service+".service", root="/sys/fs/cgroup";
+ if(s.ControlGroup!==""&&s.ControlGroup!==scope)throw Error();
+ const regular=file=>{const st=fs.lstatSync(file);if(!st.isFile()||st.isSymbolicLink())throw Error();};
+ for(const file of [root,path.join(root,"system.slice")]){const st=fs.lstatSync(file);if(!st.isDirectory()||st.isSymbolicLink())throw Error();}
+ regular(path.join(root,"cgroup.controllers"));
+ const dir=root+scope;
+ let st;try{st=fs.lstatSync(dir);}catch(e){if(e.code!=="ENOENT")throw e;process.exit(0);}
+ if(!st.isDirectory()||st.isSymbolicLink())throw Error();
+ let count=0;const visit=dir=>{if(++count>256)throw Error();for(const file of ["cgroup.procs","cgroup.events"])regular(path.join(dir,file));if(fs.readFileSync(path.join(dir,"cgroup.procs"),"utf8").trim())throw Error();const events={};for(const row of fs.readFileSync(path.join(dir,"cgroup.events"),"utf8").trim().split("\n")){const m=/^([a-z_]+) ([0-9]+)$/.exec(row);if(!m||Object.hasOwn(events,m[1]))throw Error();events[m[1]]=m[2];}if(events.populated!=="0")throw Error();for(const name of fs.readdirSync(dir)){const file=path.join(dir,name),st=fs.lstatSync(file);if(st.isSymbolicLink())throw Error();if(st.isDirectory())visit(file);}};visit(dir);
+} catch {console.error("stopped service/cgroup proof is missing or still occupied; no start or files changed");process.exit(1);}
+VERIFY_EMPTY_SERVICE
+}
+verify_existing_unit() {
+  local state
+  [ -f "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] && [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
+    || die "partial installation has no trustworthy unit/environment; support recovery is required, no files changed"
+  state=$(timeout 3s systemctl show "$SERVICE" --all --property=LoadState,FragmentPath,WorkingDirectory,ExecStart,EnvironmentFiles,User,NeedDaemonReload,DropInPaths,ExecStartPre,ExecStartPost,Environment,ExecCondition,ExecStopPost 2>/dev/null) \
+    || die "could not verify installed service identity"
+  node - "$state" "$APP_DIR" "$UNIT_FILE" "$ENV_FILE" "$ENTRY" "$(command -v node)" <<'VERIFY_EXISTING_UNIT'
+try {
+ const [raw,app,unit,env,entry,node]=process.argv.slice(2),s={};for(const line of raw.split("\n")){if(!line)continue;const i=line.indexOf("=");if(i<1||Object.hasOwn(s,line.slice(0,i)))throw Error();s[line.slice(0,i)]=line.slice(i+1);}
+ const m=/^\{ path=([^ ;]+) ; argv\[\]=([^;]+) ;/.exec(s.ExecStart??"");
+ if(s.LoadState!=="loaded"||s.FragmentPath!==unit||s.WorkingDirectory!==app||s.NeedDaemonReload!=="no"||!["","root"].includes(s.User)
+   ||s.EnvironmentFiles!==env+" (ignore_errors=no)"||s.DropInPaths!==""||s.ExecStartPre!==""||s.ExecStartPost!==""||s.Environment!==""||s.ExecCondition!==""||s.ExecStopPost!==""||!m||m[1]!==node||![node+" "+entry,node+" "+app+"/"+entry].includes(m[2].trim()))throw Error();
+} catch {console.error("installed unit does not match the verified server entry; no files changed");process.exit(1);}
+VERIFY_EXISTING_UNIT
+}
+verify_existing_license() {
+  node -e 'const fs=require("node:fs");try{const s=fs.lstatSync(process.argv[1]);if(!s.isFile()||s.isSymbolicLink()||s.size>1048576||/^\s*NODE_OPTIONS\s*=/m.test(fs.readFileSync(process.argv[1],"utf8")))process.exit(1)}catch{process.exit(1)}' "$ENV_FILE" \
+    || die "existing environment contains an unsafe Node preload or cannot be read; no files changed"
+  printf '%s' "$KEY" | node -e 'const fs=require("node:fs"),path=require("node:path");try{const f=process.argv[1],d=fs.lstatSync(path.dirname(f)),s=fs.lstatSync(f);if(!d.isDirectory()||d.isSymbolicLink()||!s.isFile()||s.isSymbolicLink()||s.size>8192||fs.readFileSync(f,"utf8").replace(/\r?\n$/,"")!==fs.readFileSync(0,"utf8"))process.exit(1)}catch{process.exit(1)}' "$APP_DIR/data/license.key" \
+    || die "installer licence does not match this existing installation; no activation or files changed"
+
+}
+verify_recovery_lock() {
+  node - "$APP_DIR/data/release-operation.lock" "$1" <<'VERIFY_RECOVERY_LOCK'
+const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
+try {
+ const [dir,raw]=process.argv.slice(2),p=JSON.parse(Buffer.from(raw,"base64url")),d=fs.lstatSync(dir),parent=fs.lstatSync(path.dirname(dir)),o=fs.lstatSync(path.join(dir,"owner.json")),bytes=fs.readFileSync(path.join(dir,"owner.json")),owner=JSON.parse(bytes);
+ if(!d.isDirectory()||d.isSymbolicLink()||!o.isFile()||o.isSymbolicLink()||d.dev!==p.dev||d.ino!==p.ino||parent.dev!==p.parentDev||parent.ino!==p.parentIno||o.dev!==p.ownerDev||o.ino!==p.ownerIno||crypto.createHash("sha256").update(bytes).digest("hex")!==p.sha||owner.pid!==p.pid||owner.bootId!==p.bootId||fs.readFileSync('/proc/sys/kernel/random/boot_id','utf8').trim()!==p.bootId)process.exit(1);
+ process.kill(p.pid,0);
+} catch {process.exit(1);}
+VERIFY_RECOVERY_LOCK
+}
+with_recovery_lock() {
+  # Pipe the already-trusted shell functions/variables through a private FD,
+  # not argv. The long-lived guard owns the installed updater's actual lock.
+  timeout 180s node - "$APP_DIR" "$REL_AUTH_SHA" 3< <(
+    printf 'set -Eeuo pipefail\n'
+    declare -f die warn ok say verify_signed_tree verify_existing_unit verify_existing_license prove_empty_service verify_recovery_lock verify_no_release_operation startup_diagnostics startup_failed startup_generation wait_for_signed_version
+    declare -f sleep 2>/dev/null || true
+    declare -p APP_DIR ENV_FILE UNIT_FILE SERVICE PORT KEY RELEASE_KEYS_B64U REL_VERSION REL_BUILD_ID REL_CORE_SHA REL_AUTH_SHA ENTRY HEALTH_DEADLINE_SECONDS STARTUP_SINCE identity
+    cat <<'RECOVERY_CHILD'
+[ "$(verify_signed_tree "$APP_DIR")" = "$identity" ] && verify_existing_unit && prove_empty_service && verify_existing_license && verify_no_release_operation "$RECOVERY_LOCK_PROOF" \
+  || die "existing installation changed under the recovery guard; no start or files changed"
+timeout 15s systemctl start "$SERVICE" || startup_failed "systemd could not start the existing verified release"
+wait_for_signed_version
+RECOVERY_CHILD
+  ) <<'OWN_RECOVERY_LOCK'
+const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto"),{spawnSync}=require("node:child_process");
+(async()=>{
+ let proof;
+ const fail=()=>{console.error("same-release recovery could not be confirmed; retained release ownership evidence for support, no force or data restore");process.exitCode=1;};
+ try {
+  const [root,sha]=process.argv.slice(2),helper=path.join(root,"scripts/release-auth.mjs"),st=fs.lstatSync(helper),bytes=fs.readFileSync(helper);
+  if(!st.isFile()||st.isSymbolicLink()||crypto.createHash("sha256").update(bytes).digest("hex")!==sha)throw Error();
+  // Import the exact verified bytes, preventing a pathname change between
+  // authentication and execution. This existing module imports built-ins only.
+  const auth=await import("data:text/javascript;base64,"+bytes.toString("base64"));
+  const script=fs.readFileSync(3,"utf8"),dir=path.join(root,"data/release-operation.lock"),ownerFile=path.join(dir,"owner.json");
+  const bootId=fs.readFileSync('/proc/sys/kernel/random/boot_id','utf8').trim();
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId))throw Error();
+  auth.acquireReleaseLock(root); // Do not call its recursive cleanup closure.
+  const d=fs.lstatSync(dir),parent=fs.lstatSync(path.dirname(dir)),o=fs.lstatSync(ownerFile),ownerBytes=fs.readFileSync(ownerFile),owner=JSON.parse(ownerBytes);
+  if(owner.pid!==process.pid||owner.bootId!==bootId||!d.isDirectory()||d.isSymbolicLink()||!o.isFile()||o.isSymbolicLink())throw Error();
+  proof={dev:d.dev,ino:d.ino,parentDev:parent.dev,parentIno:parent.ino,ownerDev:o.dev,ownerIno:o.ino,sha:crypto.createHash("sha256").update(ownerBytes).digest("hex"),pid:process.pid,bootId};
+  const result=spawnSync("bash",["-s"],{input:script,stdio:["pipe","inherit","inherit"],timeout:150000,env:{...process.env,RECOVERY_LOCK_PROOF:Buffer.from(JSON.stringify(proof)).toString("base64url")}});
+  if(result.status!==0)throw Error();
+  const nowD=fs.lstatSync(dir),nowP=fs.lstatSync(path.dirname(dir)),nowO=fs.lstatSync(ownerFile),nowBytes=fs.readFileSync(ownerFile);
+  if(nowD.isSymbolicLink()||nowO.isSymbolicLink()||nowD.dev!==proof.dev||nowD.ino!==proof.ino||nowP.dev!==proof.parentDev||nowP.ino!==proof.parentIno||nowO.dev!==proof.ownerDev||nowO.ino!==proof.ownerIno||!nowBytes.equals(ownerBytes)||JSON.parse(nowBytes).pid!==process.pid||JSON.parse(nowBytes).bootId!==bootId||fs.readdirSync(dir).length!==1)throw Error();
+  fs.unlinkSync(ownerFile);fs.rmdirSync(dir);
+ } catch {fail();}
+})();
+OWN_RECOVERY_LOCK
+}
+verify_no_release_operation() {
+  local marker
+  for marker in release-operation.lock release-transition.json; do
+    if [ "$marker" = release-operation.lock ] && [ -n "${1:-}" ]; then
+      verify_recovery_lock "$1" || die "recovery lock ownership changed; retained evidence, no start"
+    else
+      [ ! -e "$APP_DIR/data/$marker" ] && [ ! -L "$APP_DIR/data/$marker" ] \
+        || die "an authenticated release operation needs recovery; retain all data and use support"
+    fi
+  done
+  if [ -e "$APP_DIR/data/revert-state.json" ] || [ -L "$APP_DIR/data/revert-state.json" ]; then
+    node -e 'const fs=require("node:fs");try{const s=fs.lstatSync(process.argv[1]);const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(!s.isFile()||s.isSymbolicLink()||!["complete","failed"].includes(x.phase))process.exit(1)}catch{process.exit(1)}' "$APP_DIR/data/revert-state.json" \
+      || die "a release recovery record needs support; no files changed"
+  fi
+}
+recover_existing_install() {
+  unset RECOVERY_LOCK_PROOF
+  [ -z "${NODE_OPTIONS:-}" ] || die "NODE_OPTIONS preloads are not allowed for verified installer recovery"
+  command -v node >/dev/null && command -v timeout >/dev/null && command -v ss >/dev/null \
+    || die "existing installation needs Node, timeout and ss for safe recovery; no files changed"
+  node -e 'if(Number(process.versions.node.split(".")[0])<22)process.exit(1)' \
+    || die "existing service recovery requires Node22+; no files changed"
+  local identity state
+  identity=$(verify_signed_tree "$APP_DIR") || die "partial or changed installation requires support recovery; no files changed"
+  REL_VERSION=$(printf '%s\n' "$identity" | sed -n '1p')
+  REL_BUILD_ID=$(printf '%s\n' "$identity" | sed -n '2p')
+  REL_CORE_SHA=$(printf '%s\n' "$identity" | sed -n '3p')
+  ENTRY=$(printf '%s\n' "$identity" | sed -n '4p')
+  REL_AUTH_SHA=$(printf '%s\n' "$identity" | sed -n '5p')
+  verify_existing_unit || die "existing service identity is unsafe for automatic recovery"
+  verify_existing_license
+  verify_no_release_operation
+  STARTUP_SINCE=$(( $(date +%s) - 600 ))
+  state=$(timeout 3s systemctl show "$SERVICE" --property=ActiveState,SubState,MainPID 2>/dev/null) || die "could not inspect the existing service"
+  if printf '%s\n' "$state" | grep -qx 'ActiveState=active'; then
+    wait_for_signed_version
+    ok "already installed; use the authenticated app updater for upgrades. No files or service state changed."
+    return
+  fi
+  prove_empty_service || startup_failed "existing runtime cannot safely be started; inspect local service diagnostics"
+  # Recheck authenticated bytes and unit immediately before the only mutation.
+  [ "$(verify_signed_tree "$APP_DIR")" = "$identity" ] && verify_existing_unit && prove_empty_service && verify_existing_license && verify_no_release_operation \
+    || die "existing installation changed during verification; no start or files changed"
+  with_recovery_lock || die "existing signed release still needs support recovery; ownership evidence retained"
+  ok "existing signed release recovered; code, environment, licence and current data were retained"
+}
+
+HEALTH_DEADLINE_SECONDS=45
+startup_diagnostics() {
+  warn "startup diagnostics for $SERVICE (credentials and raw logs omitted)"
+  timeout 3s systemctl show "$SERVICE" \
+    --property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,OOMPolicy \
+    2>/dev/null | sed -n '/^\(ActiveState\|SubState\|Result\|OOMPolicy\)=[a-z-]*$/p; /^\(MainPID\|ExecMainCode\|ExecMainStatus\|NRestarts\|MemoryCurrent\|MemoryPeak\)=[0-9]*$/p' >&2 || true
+  # Output only recognized diagnostic labels, never a matching log line.
+  timeout 3s journalctl -u "$SERVICE" --since "@$STARTUP_SINCE" -n 80 --no-pager -o cat 2>/dev/null \
+    | node -e 'let s=""; process.stdin.on("data",x=>{if(s.length<131072)s+=x});process.stdin.on("end",()=>{for(const [label,re] of [["Bybit denied this VPS request (HTTP 403; US IP restrictions or rate limits may apply; check the response body)",/bybit.*(?:HTTP 403|\b403\b)/i],["port already in use",/EADDRINUSE/],["missing runtime dependency",/MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/],["server syntax error",/SyntaxError/],["memory exhaustion",/out of memory|oom-kill|oom-killed/i],["native core startup failure",/native core.*(?:failed|missing|not found|refus)/i],["invalid login configuration",/password.*(?:minimum|at least|too short)|LIQHUNTER_SECRET.*(?:required|missing)/i]])if(re.test(s))console.error("   ! journal signal: "+label)})' || true
+  if command -v ss >/dev/null; then
+    # Only the listening address and numeric PID are shown, not process names.
+    timeout 3s ss -H -ltnp "sport = :$PORT" 2>/dev/null \
+      | node -e 'let s="";process.stdin.on("data",x=>{if(s.length<16384)s+=x});process.stdin.on("end",()=>{for(const line of s.split("\n")){const address=line.trim().split(/\s+/)[3];if(!address||!/^[a-fA-F0-9.*:[\]]+$/.test(address))continue;const pid=/pid=(\d+)/.exec(line)?.[1];console.error("   ! port listener: "+address+(pid?" pid="+pid:""))}})' || true
+  fi
+  warn "inspect locally: journalctl -u $SERVICE -n 80 --no-pager (do not share credentials or license URLs)"
+}
+startup_failed() { startup_diagnostics; die "$1"; }
+startup_generation() {
+  remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || return 1
+  budget=$remaining; [ "$budget" -le 2 ] || budget=2
+  timeout "${budget}s" node - "$APP_DIR/data/release-readiness.json" "$REL_VERSION" "$REL_BUILD_ID" "$REL_CORE_SHA" "$1" <<'VERIFY_STARTUP_READINESS'
+const fs=require("node:fs");
+try {
+  const [file,version,buildId,coreSha,pid]=process.argv.slice(2), st=fs.lstatSync(file);
+  if(!st.isFile()||st.isSymbolicLink()||st.size>65536)process.exit(1);
+  const x=JSON.parse(fs.readFileSync(file,"utf8")), age=Date.now()-x.at;
+  if(x.ready!==true||x.version!==version||x.buildId!==buildId||x.coreSha256!==coreSha||x.pid!==Number(pid)
+    ||!Number.isFinite(age)||age<0||age>=5000||typeof x.generation!=="string"||!x.generation
+    ||x.nonce!==null||!Array.isArray(x.contextKeys)||!x.contextKeys.length
+    ||x.contextKeys.some(k=>typeof k!=="string"||!k)||new Set(x.contextKeys).size!==x.contextKeys.length)process.exit(1);
+  process.stdout.write(JSON.stringify([x.pid,x.generation,[...x.contextKeys].sort()]));
+} catch { process.exit(1); }
+VERIFY_STARTUP_READINESS
+}
+wait_for_signed_version() {
+  local deadline=$((SECONDS + HEALTH_DEADLINE_SECONDS)) remaining budget status restarts baseline="" baseline_pid="" active sub result pid invocation baseline_invocation="" health listeners generation stable_since="" stable_generation=""
+  while :; do
+    [ -z "${RECOVERY_LOCK_PROOF:-}" ] || verify_recovery_lock "$RECOVERY_LOCK_PROOF" || startup_failed "release ownership changed during recovery; retained evidence"
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -gt 0 ] || startup_failed "the bot did not prove signed v$REL_VERSION startup on 127.0.0.1:$PORT within ${HEALTH_DEADLINE_SECONDS}s"
+    budget=$remaining; [ "$budget" -le 2 ] || budget=2
+    status=$(timeout "${budget}s" systemctl show "$SERVICE" --property=ActiveState,SubState,Result,MainPID,NRestarts,InvocationID 2>/dev/null) \
+      || startup_failed "could not read the bot service state"
+    active=$(printf '%s\n' "$status" | sed -n 's/^ActiveState=//p')
+    sub=$(printf '%s\n' "$status" | sed -n 's/^SubState=//p')
+    result=$(printf '%s\n' "$status" | sed -n 's/^Result=//p')
+    pid=$(printf '%s\n' "$status" | sed -n 's/^MainPID=//p')
+    invocation=$(printf '%s\n' "$status" | sed -n 's/^InvocationID=//p')
+    restarts=$(printf '%s\n' "$status" | sed -n 's/^NRestarts=//p')
+    case "$restarts:$pid" in *[!0-9:]*|:*|*:) startup_failed "the bot service returned invalid process metadata" ;; esac
+    [ -n "$baseline" ] || baseline=$restarts
+    case "$active:$sub:$result" in failed:*|inactive:*|*:auto-restart:*|*:*:oom-kill|*:*:exit-code|*:*:signal|*:*:core-dump)
+      startup_failed "the bot service exited or is restarting before health became ready" ;; esac
+    [ "$restarts" -eq "$baseline" ] || startup_failed "the bot service restarted before health became ready"
+    if [ "$pid" -gt 0 ]; then
+      [[ "$invocation" =~ ^[0-9a-f]{32}$ ]] || startup_failed "the bot service has no invocation identity"
+      [ -n "$baseline_invocation" ] || baseline_invocation=$invocation
+      [ "$invocation" = "$baseline_invocation" ] || startup_failed "the bot service invocation changed before startup proof stabilized"
+      [ -n "$baseline_pid" ] || baseline_pid=$pid
+      [ "$pid" = "$baseline_pid" ] || startup_failed "the bot service process changed before startup proof stabilized"
+    fi
+    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+    budget=$remaining; [ "$budget" -le 3 ] || budget=3
+    if health=$(curl -q -fsS --noproxy '*' --connect-timeout "$budget" --max-time "$budget" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | head -c 65537); then
+      [ "${#health}" -le 65536 ] || startup_failed "the local health responder exceeded the response limit"
+      remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+      budget=$remaining; [ "$budget" -le 2 ] || budget=2
+      printf '%s' "$health" | timeout "${budget}s" node -e 'const fs=require("node:fs");let x;try{x=JSON.parse(fs.readFileSync(0,"utf8"))}catch{process.exit(1)};if(x.ok!==true||x.version!==process.argv[1]||(x.buildId!==undefined&&x.buildId!==process.argv[2]))process.exit(1)' "$REL_VERSION" "$REL_BUILD_ID" \
+        || startup_failed "the local health responder does not match the signed release (check for a port conflict)"
+      [ "$active:$sub:$result" = active:running:success ] && [ "$pid" -gt 0 ] || startup_failed "health answered without a running bot service"
+      remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+      budget=$remaining; [ "$budget" -le 2 ] || budget=2
+      listeners=$(timeout "${budget}s" ss -H -ltnp "sport = :$PORT" 2>/dev/null) || startup_failed "could not prove ownership of the bot listener"
+      remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+      budget=$remaining; [ "$budget" -le 2 ] || budget=2
+      printf '%s' "$listeners" | timeout "${budget}s" node -e 'const fs=require("node:fs");const rows=fs.readFileSync(0,"utf8").trim().split("\n").filter(Boolean);if(!rows.length||rows.some(row=>{const p=[...row.matchAll(/pid=(\d+)/g)].map(x=>x[1]);return !p.length||p.some(x=>x!==process.argv[1])}))process.exit(1)' "$pid" \
+        || startup_failed "the port listener is not owned exclusively by the current bot service process"
+      # Use the existing signed-customer release readiness contract. Minimal
+      # public health alone never proves native/account startup, including135.
+      generation=$(startup_generation "$pid") || generation=""
+      if [ -n "$generation" ]; then
+        if [ "$generation" != "$stable_generation" ]; then stable_generation=$generation; stable_since=$SECONDS; fi
+        if [ $((SECONDS - stable_since)) -ge 10 ]; then
+          # Re-read after all external probes so an old process cannot provide
+          # the final proof for a changed/restarting unit.
+          remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+          budget=$remaining; [ "$budget" -le 2 ] || budget=2
+          status=$(timeout "${budget}s" systemctl show "$SERVICE" --property=ActiveState,SubState,Result,MainPID,NRestarts,InvocationID 2>/dev/null) \
+            || startup_failed "could not confirm final service identity"
+          [ "$(printf '%s\n' "$status" | sed -n 's/^MainPID=//p')" = "$pid" ] \
+            && [ "$(printf '%s\n' "$status" | sed -n 's/^NRestarts=//p')" = "$baseline" ] \
+            && [ "$(printf '%s\n' "$status" | sed -n 's/^ActiveState=//p')" = active ] \
+            && [ "$(printf '%s\n' "$status" | sed -n 's/^SubState=//p')" = running ] \
+            || startup_failed "the bot service changed during final startup verification"
+          [ "$(printf '%s\n' "$status" | sed -n 's/^InvocationID=//p')" = "$baseline_invocation" ] \
+            && [ "$(printf '%s\n' "$status" | sed -n 's/^Result=//p')" = success ] \
+            && [ "$(startup_generation "$pid")" = "$generation" ] \
+            || startup_failed "the final signed startup proof is stale or belongs to another invocation"
+          [ -z "${RECOVERY_LOCK_PROOF:-}" ] || verify_recovery_lock "$RECOVERY_LOCK_PROOF" || startup_failed "release ownership changed before recovery confirmation; retained evidence"
+          [ "$SECONDS" -lt "$deadline" ] || continue
+          ok "signed bot v$REL_VERSION passed stable process, native and context startup checks"
+          return 0
+        fi
+      else stable_since=""; stable_generation=""; fi
+    else stable_since=""; stable_generation=""; fi
+    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
+    budget=$remaining; [ "$budget" -le 2 ] || budget=2
+    sleep "$budget"
+  done
+}
+
+
+# END_STARTUP_FUNCTIONS
 [ "$(id -u)" -eq 0 ] || die "run as root: curl -q -fsS \"...\" | sudo bash"
 command -v systemctl >/dev/null || die "systemd is required (Ubuntu 22.04+ VPS)"
 case "$HUB" in https://*) ;; *) die "the WickHunter Hub must use HTTPS" ;; esac
@@ -122,6 +408,20 @@ if [ "$CHANNEL_AWARE" = "1" ]; then
   [ ! -e "$APP_DIR" ] && [ ! -L "$APP_DIR" ] && [ ! -e "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
     && [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] \
     || die "channel installer requires a fresh host; existing installs keep their release channel"
+fi
+
+[ -z "${NODE_OPTIONS:-}" ] || die "NODE_OPTIONS preloads are not allowed for verified installation"
+command -v timeout >/dev/null || die "bounded systemd inspection requires coreutils timeout"
+service_load=$(timeout 3s systemctl show "$SERVICE" --all --property=LoadState 2>/dev/null || true)
+service_load=$(printf '%s\n' "$service_load" | sed -n 's/^LoadState=//p')
+case "$service_load" in
+  not-found) existing_service=0 ;;
+  loaded|error|masked|bad-setting|stub|merged) existing_service=1 ;;
+  *) die "service ownership could not be inspected; no packages or installation files changed" ;;
+esac
+if [ "$existing_service" = "1" ] || [ -e "$APP_DIR" ] || [ -L "$APP_DIR" ] || [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ] || [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
+  recover_existing_install
+  exit 0
 fi
 
 say "Installing prerequisites"
@@ -155,8 +455,11 @@ CHANNEL_STATE_SEEDED=0
 CHANNEL_INSTALL_COMPLETE=0
 cleanup() {
   if [ "$CHANNEL_AWARE" = "1" ] && [ "$CHANNEL_STATE_SEEDED" = "1" ] && [ "$CHANNEL_INSTALL_COMPLETE" != "1" ]; then
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-    rm -f "$APP_DIR/data/release-channel-preference.v1.json" "$APP_DIR/data/release-state.json"
+    if (verify_existing_unit) && timeout 330s systemctl stop "$SERVICE" >/dev/null 2>&1 && prove_empty_service; then
+      rm -f "$APP_DIR/data/release-channel-preference.v1.json" "$APP_DIR/data/release-state.json"
+    else
+      warn "fresh channel startup did not stop cleanly; retained release records for support recovery"
+    fi
   fi
   rm -rf "$work"
 }
@@ -340,6 +643,7 @@ VERIFY_PINNED_RELEASE
 fi
 
 REL_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' "$work/verified.json")
+REL_BUILD_ID=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).buildId' "$work/verified.json")
 REL_FILE=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).file' "$work/verified.json")
 REL_SHA=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).sha256' "$work/verified.json")
 ok "latest is v$REL_VERSION"
@@ -362,7 +666,7 @@ mkdir -p "$work/unpack"
 if [ "$CHANNEL_AWARE" = "1" ]; then
   mkdir "$APP_DIR" || die "another install created $APP_DIR; refusing to overwrite its channel"
 else
-  mkdir -p "$APP_DIR"
+  mkdir "$APP_DIR" || die "another installation appeared; refusing to overwrite it"
 fi
 tar -xzf "$work/$REL_FILE" -C "$work/unpack"
 # Tolerate both layouts: files at archive root, or a single top-level dir.
@@ -404,6 +708,10 @@ process.stdout.write(entry);
 PREFLIGHT_ARTIFACT
 }
 ENTRY=$(preflight_artifact "$src") || die "signed artifact startup preflight failed; installed files were not replaced"
+identity=$(verify_signed_tree "$src") || die "signed artifact integrity preflight failed"
+[ "$(printf '%s\n' "$identity" | sed -n '1p')" = "$REL_VERSION" ] && [ "$(printf '%s\n' "$identity" | sed -n '2p')" = "$REL_BUILD_ID" ] \
+  || die "signed artifact build identity differs from the release manifest"
+REL_CORE_SHA=$(printf '%s\n' "$identity" | sed -n '3p')
 rsync -a --checksum --delete --exclude data --exclude node_modules "$src/" "$APP_DIR/"
 mkdir -p "$APP_DIR/data"
 if [ "$CHANNEL_AWARE" = "1" ]; then
@@ -625,6 +933,8 @@ printf '%s\n' \
   "ExecStart=$(command -v node) $ENTRY" \
   'Restart=always' \
   'RestartSec=5' \
+  'SendSIGKILL=no' \
+  'TimeoutStopSec=300s' \
   '' \
   '[Install]' \
   'WantedBy=multi-user.target' \
@@ -635,58 +945,9 @@ systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 # Keep every health attempt inside one elapsed-time budget. Detect a failed
 # process or restart loop before waiting for the full budget. Diagnostic output
 # is allowlisted metadata/codes; raw journals and health bodies stay private.
-HEALTH_DEADLINE_SECONDS=45
-startup_diagnostics() {
-  warn "startup diagnostics for $SERVICE (credentials and raw logs omitted)"
-  timeout 3s systemctl show "$SERVICE" \
-    --property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,OOMPolicy \
-    2>/dev/null | sed -n '/^\(ActiveState\|SubState\|Result\|OOMPolicy\)=[a-z-]*$/p; /^\(MainPID\|ExecMainCode\|ExecMainStatus\|NRestarts\|MemoryCurrent\|MemoryPeak\)=[0-9]*$/p' >&2 || true
-  # Output only recognized diagnostic labels, never a matching log line.
-  timeout 3s journalctl -u "$SERVICE" --since "@$STARTUP_SINCE" -n 80 --no-pager -o cat 2>/dev/null \
-    | node -e 'let s=""; process.stdin.on("data",x=>{if(s.length<131072)s+=x});process.stdin.on("end",()=>{for(const [label,re] of [["Bybit denied this VPS request (HTTP 403; US IP restrictions or rate limits may apply; check the response body)",/bybit.*(?:HTTP 403|\b403\b)/i],["port already in use",/EADDRINUSE/],["missing runtime dependency",/MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/],["server syntax error",/SyntaxError/],["memory exhaustion",/out of memory|oom-kill|oom-killed/i],["native core startup failure",/native core.*(?:failed|missing|not found|refus)/i],["invalid login configuration",/password.*(?:minimum|at least|too short)|LIQHUNTER_SECRET.*(?:required|missing)/i]])if(re.test(s))console.error("   ! journal signal: "+label)})' || true
-  if command -v ss >/dev/null; then
-    # Only the listening address and numeric PID are shown, not process names.
-    timeout 3s ss -H -ltnp "sport = :$PORT" 2>/dev/null \
-      | node -e 'let s="";process.stdin.on("data",x=>{if(s.length<16384)s+=x});process.stdin.on("end",()=>{for(const line of s.split("\n")){const address=line.trim().split(/\s+/)[3];if(!address||!/^[a-fA-F0-9.*:[\]]+$/.test(address))continue;const pid=/pid=(\d+)/.exec(line)?.[1];console.error("   ! port listener: "+address+(pid?" pid="+pid:""))}})' || true
-  fi
-  warn "inspect locally: journalctl -u $SERVICE -n 80 --no-pager (do not share credentials or license URLs)"
-}
-startup_failed() { startup_diagnostics; die "$1"; }
-wait_for_signed_version() {
-  local deadline=$((SECONDS + HEALTH_DEADLINE_SECONDS)) remaining budget status restarts baseline="" active sub result pid health
-  while :; do
-    remaining=$((deadline - SECONDS))
-    [ "$remaining" -gt 0 ] || startup_failed "the bot did not serve signed v$REL_VERSION on 127.0.0.1:$PORT within ${HEALTH_DEADLINE_SECONDS}s"
-    budget=$remaining; [ "$budget" -le 2 ] || budget=2
-    status=$(timeout "${budget}s" systemctl show "$SERVICE" --property=ActiveState,SubState,Result,MainPID,NRestarts 2>/dev/null) \
-      || startup_failed "could not read the bot service state"
-    active=$(printf '%s\n' "$status" | sed -n 's/^ActiveState=//p')
-    sub=$(printf '%s\n' "$status" | sed -n 's/^SubState=//p')
-    result=$(printf '%s\n' "$status" | sed -n 's/^Result=//p')
-    pid=$(printf '%s\n' "$status" | sed -n 's/^MainPID=//p')
-    restarts=$(printf '%s\n' "$status" | sed -n 's/^NRestarts=//p')
-    case "$restarts:$pid" in *[!0-9:]*|:*|*:) startup_failed "the bot service returned invalid process metadata" ;; esac
-    [ -n "$baseline" ] || baseline=$restarts
-    case "$active:$sub:$result" in failed:*|inactive:*|*:auto-restart:*|*:*:oom-kill|*:*:exit-code|*:*:signal|*:*:core-dump)
-      startup_failed "the bot service exited or is restarting before health became ready" ;; esac
-    [ "$restarts" -eq "$baseline" ] || startup_failed "the bot service restarted before health became ready"
-    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
-    budget=$remaining; [ "$budget" -le 3 ] || budget=3
-    if health=$(curl -q -fsS --noproxy '*' --connect-timeout "$budget" --max-time "$budget" "http://127.0.0.1:$PORT/api/health" 2>/dev/null | head -c 65537); then
-      [ "${#health}" -le 65536 ] || startup_failed "the local health responder exceeded the response limit"
-      printf '%s' "$health" | node -e 'const fs=require("node:fs");const want=process.argv[1];let x;try{x=JSON.parse(fs.readFileSync(0,"utf8"))}catch{process.exit(1)};if(x.ok!==true||x.version!==want)process.exit(1)' "$REL_VERSION" \
-        || startup_failed "the local health responder is not signed v$REL_VERSION (check for a port conflict)"
-      [ "$active" = active ] && [ "$pid" -gt 0 ] || startup_failed "health answered without an active bot service"
-      ok "bot v$REL_VERSION is healthy"
-      return 0
-    fi
-    remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ] || continue
-    budget=$remaining; [ "$budget" -le 2 ] || budget=2
-    sleep "$budget"
-  done
-}
+
 STARTUP_SINCE=$(date +%s)
-systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot"
+timeout 330s systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot"
 say "Waiting for the bot to come up"
 wait_for_signed_version
 
@@ -704,7 +965,7 @@ VERIFY_BOOTSTRAP_CREDENTIAL
   unset BOOTSTRAP_PW
   unset LIQHUNTER_BOOTSTRAP_PASSWORD
   STARTUP_SINCE=$(date +%s)
-  systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot after credential seeding"
+  timeout 330s systemctl restart "$SERVICE" || startup_failed "systemd could not restart the bot after credential seeding"
   wait_for_signed_version
   ok "temporary hosted login was seeded and removed from the restarted service environment"
 fi
@@ -740,5 +1001,5 @@ CHANNEL_INSTALL_COMPLETE=1
 say "Done — Wick Hunter $INSTALL_CHANNEL v$REL_VERSION is installed"
 ok "URL:      https://${PUBLIC_IP}/"
 ok "Login:    use your configured dashboard password or hosted access details"
-ok "Upgrade:  re-run this same install command any time"
+ok "Upgrade:  use the authenticated app updater; installer reruns verify or recover the current release"
 ok "Logs:     journalctl -u $SERVICE -f"

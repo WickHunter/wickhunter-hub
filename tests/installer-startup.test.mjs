@@ -14,10 +14,10 @@ const slice = (start, end) => {
 const codec = slice("env_file() {", "\nSECRET=$(get_env");
 const config = slice("SECRET=$(get_env", "\n# License key:");
 const preflight = slice("preflight_artifact() {", '\nENTRY=$(preflight_artifact');
-const readiness = slice("HEALTH_DEADLINE_SECONDS=", '\nSTARTUP_SINCE=$(date');
+const readiness = slice("HEALTH_DEADLINE_SECONDS=", '\n# END_STARTUP_FUNCTIONS');
 const sandbox = () => fs.mkdtempSync(path.join(os.tmpdir(), "wh-startup-fixture-"));
 const base = 'set -Eeuo pipefail\ndie() { printf "ERROR: %s\\n" "$*" >&2; exit 1; }\nwarn() { printf "%s\\n" "$*" >&2; }\nok() { printf "%s\\n" "$*"; }\nsay() { :; }\n';
-const run = (script, env = {}, timeout = 12000) => spawnSync("bash", ["-c", base + script], {
+const run = (script, env = {}, timeout = 30000) => spawnSync("bash", ["-c", base + script], {
   encoding: "utf8", timeout,
   env: { PATH: process.env.PATH, HOME: os.homedir(), ...env },
 });
@@ -143,15 +143,15 @@ case "$MOCK_MODE" in
  failed) printf 'ActiveState=failed\\nSubState=failed\\nResult=exit-code\\nMainPID=0\\nNRestarts=95\\n';;
  oom) printf 'ActiveState=failed\\nSubState=failed\\nResult=oom-kill\\nMainPID=0\\nNRestarts=1\\n';;
  restarting) printf 'ActiveState=activating\\nSubState=auto-restart\\nResult=exit-code\\nMainPID=0\\nNRestarts=1\\n';;
- changed) printf 'ActiveState=active\\nSubState=running\\nResult=success\\nMainPID=42\\nNRestarts=%s\\n' "$count";;
- *) printf 'ActiveState=active\\nSubState=running\\nResult=success\\nMainPID=42\\nNRestarts=0\\n';;
+ changed) printf 'ActiveState=active\\nSubState=running\\nResult=success\\nMainPID=42\\nInvocationID=0123456789abcdef0123456789abcdef\\nNRestarts=%s\\n' "$count";;
+ *) printf 'ActiveState=active\\nSubState=running\\nResult=success\\nMainPID=42\\nInvocationID=0123456789abcdef0123456789abcdef\\nNRestarts=0\\n';;
 esac
 `);
   executable(path.join(dir, "curl"), `budget=0
 while [ "$#" -gt 0 ]; do if [ "$1" = --max-time ]; then shift; budget=$1; fi; shift; done
 printf '%s\\n' "$budget" >> "$CURL_BUDGETS"
 case "$MOCK_MODE" in
- good) printf '{"ok":true,"version":"0.90.135"}';;
+ good) node -e 'const fs=require("node:fs");fs.mkdirSync(process.env.APP_DIR+"/data",{recursive:true});fs.writeFileSync(process.env.APP_DIR+"/data/release-readiness.json",JSON.stringify({ready:true,nonce:null,version:process.env.REL_VERSION,buildId:process.env.REL_BUILD_ID,coreSha256:process.env.REL_CORE_SHA,pid:42,generation:"one",contextKeys:["env:futures"],at:Date.now()}));'; printf '{"ok":true,"version":"0.90.135"}';;
  wrong) printf '{"ok":true,"version":"0.90.134","url":"https://private/?key=never-wh-secret"}';;
  invalid) printf 'not-json-never-wh-secret';;
  oversized) node -e 'process.stdout.write("x".repeat(66000))';;
@@ -160,8 +160,8 @@ case "$MOCK_MODE" in
 esac
 `);
   executable(path.join(dir, "journalctl"), 'printf "bybit /v5/market/tickers HTTP 403 https://private/?key=never-wh-secret\\nEADDRINUSE never-wh-secret\\nout of memory never-wh-secret\\n"\n');
-  executable(path.join(dir, "ss"), 'printf \'LISTEN 0 100 127.0.0.1:8090 0.0.0.0:* users:(("never-wh-secret",pid=333,fd=1))\\n\'\n');
-  return { PATH: `${dir}:${process.env.PATH}`, SERVICE: "wickhunter", PORT: "8090", REL_VERSION: "0.90.135", STARTUP_SINCE: "100", MOCK_MODE: mode, COUNTER: path.join(dir, "count"), CURL_BUDGETS: path.join(dir, "budgets") };
+  executable(path.join(dir, "ss"), 'printf \'LISTEN 0 100 127.0.0.1:8090 0.0.0.0:* users:(("never-wh-secret",pid=42,fd=1))\\n\'\n');
+  return { PATH: `${dir}:${process.env.PATH}`, SERVICE: "wickhunter", PORT: "8090", REL_VERSION: "0.90.135", REL_BUILD_ID: "signed-build", REL_CORE_SHA: "a".repeat(64), APP_DIR: dir, STARTUP_SINCE: "100", MOCK_MODE: mode, COUNTER: path.join(dir, "count"), CURL_BUDGETS: path.join(dir, "budgets") };
 }
 
 await test("startup accepts only the signed version, detects exit/restart/OOM, and redacts diagnostics", () => {
@@ -172,7 +172,7 @@ await test("startup accepts only the signed version, detects exit/restart/OOM, a
       assert.equal(result.status === 0, mode === "good", `${mode}: ${result.stderr}`);
       if (mode !== "good") {
         assert.match(result.stderr, /Bybit denied this VPS request/);
-        assert.match(result.stderr, /port listener: 127.0.0.1:8090 pid=333/);
+        assert.match(result.stderr, /port listener: 127.0.0.1:8090 pid=42/);
         assert.doesNotMatch(result.stderr + result.stdout, /never-wh-secret|https:/);
       }
       if (["failed", "oom", "restarting"].includes(mode)) assert.equal(fs.existsSync(path.join(dir, "budgets")), false, "exited service does not waste time probing health");

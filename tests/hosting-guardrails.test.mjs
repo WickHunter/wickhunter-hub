@@ -62,7 +62,7 @@ printf 'unattended-credential-fallback-ok'
 await test("installer waits for apt locks with bounded retries and never removes or kills them", () => {
   const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
   const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
-  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  const end = installer.indexOf('\n# Existing installs take a separate path', start);
   assert.ok(start >= 0 && end > start, "apt retry helper was not found");
   const helper = installer.slice(start, end)
     .replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=10")
@@ -97,7 +97,7 @@ apt_retry update -qq
 await test("installer apt retry stops only completed failures at its deadline", () => {
   const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
   const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
-  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  const end = installer.indexOf('\n# Existing installs take a separate path', start);
   const helper = installer.slice(start, end)
     .replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=1")
     .replace("APT_RETRY_SLEEP_SECONDS=5", "APT_RETRY_SLEEP_SECONDS=1");
@@ -138,7 +138,7 @@ apt_retry update -qq
 await test("installer never kills an apt transaction that succeeds after the retry deadline", () => {
   const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
   const start = installer.indexOf("APT_RETRY_DEADLINE_SECONDS=");
-  const end = installer.indexOf('\n\n[ "$(id -u)"', start);
+  const end = installer.indexOf('\n# Existing installs take a separate path', start);
   const helper = installer.slice(start, end).replace("APT_RETRY_DEADLINE_SECONDS=600", "APT_RETRY_DEADLINE_SECONDS=1");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-installer-apt-finish-"));
   try {

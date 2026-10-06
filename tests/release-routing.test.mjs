@@ -201,14 +201,15 @@ await test("channel installer verifies the exact signed channel and refuses exis
     assert.ok(start >= 0 && end > start);
     const guard = template.slice(start, end);
     const runner = path.join(dir, "guard.sh");
-    fs.writeFileSync(runner, `#!/usr/bin/env bash\nset -Eeuo pipefail\nCHANNEL_AWARE="\$1"\nINSTALL_CHANNEL=production\nPINNED_MANIFEST_B64U=pin\nPINNED_RELEASE_B64U=pin\nAPP_DIR="\$2"\nENV_FILE="\$3"\nUNIT_FILE="\$4"\ndie(){ echo "\$*" >&2; exit 1; }\n${guard}\n`);
+    fs.writeFileSync(runner, `#!/usr/bin/env bash\nset -Eeuo pipefail\nCHANNEL_AWARE="\$1"\nINSTALL_CHANNEL=production\nPINNED_MANIFEST_B64U=pin\nPINNED_RELEASE_B64U=pin\nAPP_DIR="\$2"\nENV_FILE="\$3"\nUNIT_FILE="\$4"\ndie(){ echo "\$*" >&2; exit 1; }\nNODE_OPTIONS=\nSERVICE=wickhunter\ntimeout(){ shift; "\$@"; }\nsystemctl(){ echo LoadState=not-found; }\nrecover_existing_install(){ echo safe-existing-recovery; }\n${guard}\n`);
     const appPath = path.join(dir, "host-app"), envPath = path.join(dir, "host-env"), unitPath = path.join(dir, "host-unit");
     assert.equal(spawnSync("bash", [runner, "1", appPath, envPath, unitPath]).status, 0);
     fs.mkdirSync(appPath);
     assert.notEqual(spawnSync("bash", [runner, "1", appPath, envPath, unitPath]).status, 0,
       "a missing preference on an existing app cannot turn it into Production");
-    assert.equal(spawnSync("bash", [runner, "0", appPath, envPath, unitPath]).status, 0,
-      "the legacy installer retains its existing rerun behavior");
+    const legacyRecovery = spawnSync("bash", [runner, "0", appPath, envPath, unitPath], { encoding: "utf8" });
+    assert.equal(legacyRecovery.status, 0, "legacy reruns enter the separately verified existing-install path");
+    assert.match(legacyRecovery.stdout, /safe-existing-recovery/);
   } finally { await h.close(); }
 });
 
@@ -256,13 +257,26 @@ await test("an incomplete fresh channel install stops its service and removes on
   for (const name of ["release-channel-preference.v1.json", "release-state.json"]) fs.writeFileSync(path.join(data, name), "new");
   fs.writeFileSync(path.join(data, "customer-settings.json"), "preserve");
   const runner = path.join(dir, "cleanup.sh");
-  fs.writeFileSync(runner, `#!/usr/bin/env bash\nset -Eeuo pipefail\nCHANNEL_AWARE=1\nCHANNEL_STATE_SEEDED=1\nCHANNEL_INSTALL_COMPLETE=0\nAPP_DIR="\$1"\nwork="\$2"\nSERVICE=wickhunter\nsystemctl(){ printf '%s' "\$*" > "\$APP_DIR/stop-call"; }\ncleanup(){\n${cleanup[1]}\n}\ncleanup\n`);
+  fs.writeFileSync(runner, `#!/usr/bin/env bash\nset -Eeuo pipefail\nCHANNEL_AWARE=1\nCHANNEL_STATE_SEEDED=1\nCHANNEL_INSTALL_COMPLETE=0\nAPP_DIR="\$1"\nwork="\$2"\nSERVICE=wickhunter\ntimeout(){ shift; "\$@"; }\nprove_empty_service(){ return "\${EMPTY_STATUS:-0}"; }\nverify_existing_unit(){ return "\${UNIT_STATUS:-0}"; }\nwarn(){ echo "\$*" >&2; }\nsystemctl(){ printf '%s' "\$*" > "\$APP_DIR/stop-call"; }\ncleanup(){\n${cleanup[1]}\n}\ncleanup\n`);
   assert.equal(spawnSync("bash", [runner, path.join(dir, "app"), work]).status, 0);
   assert.equal(fs.existsSync(path.join(data, "release-channel-preference.v1.json")), false);
   assert.equal(fs.existsSync(path.join(data, "release-state.json")), false);
   assert.equal(fs.readFileSync(path.join(data, "customer-settings.json"), "utf8"), "preserve");
   assert.equal(fs.readFileSync(path.join(dir, "app/stop-call"), "utf8"), "stop wickhunter");
   assert.equal(fs.existsSync(work), false);
+  // A surviving child or unknown stop proof keeps the new channel identity
+  // available to recovery instead of deleting records under a live process.
+  fs.mkdirSync(work);
+  for (const name of ["release-channel-preference.v1.json", "release-state.json"]) fs.writeFileSync(path.join(data, name), "new");
+  const refused = spawnSync("bash", [runner, path.join(dir, "app"), work], { env: { ...process.env, EMPTY_STATUS: "1" }, encoding: "utf8" });
+  assert.equal(refused.status, 0, refused.stderr);
+  assert.match(refused.stderr, /retained release records/);
+  for (const name of ["release-channel-preference.v1.json", "release-state.json"]) assert.equal(fs.readFileSync(path.join(data, name), "utf8"), "new");
+  fs.unlinkSync(path.join(dir, "app/stop-call"));
+  const foreign = spawnSync("bash", [runner, path.join(dir, "app"), work], { env: { ...process.env, UNIT_STATUS: "1" }, encoding: "utf8" });
+  assert.equal(foreign.status, 0, foreign.stderr);
+  assert.equal(fs.existsSync(path.join(dir, "app/stop-call")), false, "unknown/foreign service is never stopped during fresh cleanup");
+  for (const name of ["release-channel-preference.v1.json", "release-state.json"]) assert.equal(fs.readFileSync(path.join(data, name), "utf8"), "new");
 });
 
 await test("Production route refuses a shelf alias that would overwrite or reinterpret the legacy Beta shelf", async () => {

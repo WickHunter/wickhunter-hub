@@ -1794,8 +1794,9 @@ personalised command):
 > It installs Node, the bot, and HTTPS, then prints your dashboard URL and
 > login when it finishes (about 2–3 minutes). It will ask you to choose a
 > dashboard password (or press Enter to have one generated). Your key expires
-> on `<date>`. To upgrade to a newer beta later, just re-run the same command
-> — your settings and data survive.
+> on `<date>`. Re-running safely checks the current installation or starts a
+> verified stopped release. Upgrade through the authenticated app updater;
+> settings and current data are retained.
 >
 > The key is yours alone — please don't share it. Your bot checks in with my
 > hub (version + install id only) so I can see who's on what build and revoke
@@ -1828,7 +1829,7 @@ pointer). The Hub holds only the dedicated release PUBLIC keyring in
 `HUB_RELEASE_PUBLIC_KEYS_JSON`; never copy the private release key here and
 never reuse the licence/candle/market-data keys. Full signed contract, rollout
 order and publish snippet: [`releases/README.md`](releases/README.md).
-Testers upgrade by re-running their install command.
+Installer reruns validate an active installation or start a verified stopped release without replacing its files. Trading upgrades use the authenticated app updater; see [installer recovery and readiness](docs/INSTALLER-RERUN-SAFETY.md).
 
 ### Signed-release rollout (mandatory order)
 
