@@ -1897,6 +1897,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.82 — Explicit Stripe coupon product proof, safe retry of referral verification, and preserved credit for verified retired offers and existing subscription renewals.
+
 - v0.4.81 — Earn with WH: saved manual withdrawal destinations, 35% default exchange share, verified forever referral discounts, typed-code attribution, and audited payout/refund reconciliation.
 
 - v0.4.80 — Customer installer retry hotfix: verified support reissues revoke previous customer links and issue a reusable 24-hour command on the existing licence. Installer preflights the signed server/native core, preserves valid login hashes, detects restart failures within a bounded readiness budget, and names possible US-IP restrictions in Bybit HTTP 403 diagnostics. The public Beta runtime startup limitation is stated explicitly in the support email.
