@@ -38,6 +38,25 @@ export interface LaunchIntent {
   url?: string;
   expiredAtMs?: number;
 }
+
+export class HostedCheckoutExpiryError extends Error {
+  readonly status: 409 | 410;
+  readonly code: 'HOSTED_CHECKOUT_EXPIRY_PENDING' | 'HOSTED_CHECKOUT_EXPIRED';
+  constructor(confirmed: boolean) {
+    super(confirmed ? 'This VPS checkout has expired. Start a new checkout when you are ready.'
+      : 'VPS checkout expiry is awaiting confirmation. Keep this attempt and try again later.');
+    this.status = confirmed ? 410 : 409;
+    this.code = confirmed ? 'HOSTED_CHECKOUT_EXPIRED' : 'HOSTED_CHECKOUT_EXPIRY_PENDING';
+  }
+}
+
+function assertHostedCheckoutRetryable(intent: LaunchIntent | null, now: number): void {
+  if (!intent?.hosting) return;
+  // Only expireSession's canonical unpaid Stripe proof sets this flag. A local
+  // deadline, including a lost-create response, never authorizes rotation.
+  if (intent.expiredAtMs !== undefined) throw new HostedCheckoutExpiryError(true);
+  if (now >= intent.hosting.expiresAtMs) throw new HostedCheckoutExpiryError(false);
+}
 const blankMode = (): LaunchMode => ({ enabled: false, cryptoEnabled: false, cryptoCapable: false, promotionId: '', prices: {} });
 const configPath = (dir: string) => path.join(dir, 'billing-launch.v1.json');
 const intentPath = (dir: string, id: string) => path.join(dir, 'billing-launch-intents.v1', `${id}.json`);
@@ -270,6 +289,7 @@ export class LaunchBilling {
       if (customer && customer.livemode !== (mode === 'live')) throw Error('This license is already bound in another Stripe mode');
       if (!intent && customer?.subscriptionId && customer.subscriptionStatus !== 'canceled') throw Error('Use Manage subscription for your existing subscription');
       if (!intent && customer?.lifetimeAccess) throw Error('This license already has Lifetime access');
+      assertHostedCheckoutRetryable(intent, now);
       const file = claimPath(this.dataDir, mode, licenseId);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       let claim = readJson<{ id: string; createdAtMs: number } | null>(file, null);
@@ -278,9 +298,17 @@ export class LaunchBilling {
         if (old?.sessionId && customer?.chargeIds.includes(`cs:${old.sessionId}`)) {
           fs.unlinkSync(file);
           claim = null;
-        } else if (old?.url && (old.requestHash === requestHash || old.hostingRequested === undefined && old.requestHash === legacyRequestHash) && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
-          now - old.createdAtMs < 23 * 3600_000) return { ok: true, url: old.url };
-        else if (old?.sessionId && now - old.createdAtMs >= 24 * 3600_000) {
+        } else if (old?.hosting && old.expiredAtMs !== undefined && old.id === claim.id && old.mode === mode && old.licenseId === licenseId) {
+          fs.unlinkSync(file);
+          claim = null;
+        } else {
+          assertHostedCheckoutRetryable(old, now);
+          if (old?.url && (old.requestHash === requestHash || old.hostingRequested === undefined && old.requestHash === legacyRequestHash) && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
+            now - old.createdAtMs < 23 * 3600_000) return { ok: true, url: old.url };
+        }
+        // Software-only legacy expiry keeps its existing reconciliation. A
+        // hosted claim needs the stronger full expireSession proof above.
+        if (claim && old?.sessionId && !old.hosting && now - old.createdAtMs >= 24 * 3600_000) {
           const priorSession = await this.api(mode).call('GET', `/v1/checkout/sessions/${old.sessionId}`);
           if (priorSession.id === old.sessionId && priorSession.status === 'expired') {
             fs.unlinkSync(file);
@@ -295,9 +323,9 @@ export class LaunchBilling {
       }
       if (!claim || claim.id !== id) throw Error('A checkout is already pending for this license; continue that checkout or contact support');
     }
+    assertHostedCheckoutRetryable(intent, now);
     if (intent?.url) {
       if (intent.expiredAtMs) throw Error('This hosted checkout expired; start a new attempt');
-      if (intent.hosting && now >= intent.hosting.expiresAtMs) throw Error('This hosted checkout expired; start a new attempt');
       if (now - intent.createdAtMs >= 23 * 3600_000) throw Error('This checkout expired; start a new attempt');
       return { ok: true, url: intent.url };
     }

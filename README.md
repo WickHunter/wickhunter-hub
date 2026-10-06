@@ -12,6 +12,10 @@ the configured provider cost ceiling still counts every retained reservation
 and resource. Known capacity refusals return 503 with a stable public code and
 Retry-After; customers can retain their attempt or choose software only.
 
+A hosted checkout past its local deadline retains its retry identity and returns
+`HOSTED_CHECKOUT_EXPIRY_PENDING` (409). Only verified unpaid Stripe expiry returns
+`HOSTED_CHECKOUT_EXPIRED` (410), allowing a customer to start a fresh attempt.
+
 ## v0.4.83 — One checkout for software and optional VPS
 
 Monthly, Yearly and Lifetime each support software-only or software with VPS,

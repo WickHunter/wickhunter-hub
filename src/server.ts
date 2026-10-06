@@ -117,7 +117,7 @@ import {
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
-import { LaunchBilling } from "./billing/launch.js";
+import { LaunchBilling, HostedCheckoutExpiryError } from "./billing/launch.js";
 import { HostedOffer } from "./billing/hosted-offer.js";
 import { LaunchBillingReporting } from "./billing/reporting.js";
 import { loadStarterPack, starterPackEligible } from "./billing/starter-pack.js";
@@ -957,6 +957,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
       catch (e) {
         if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
+        if (e instanceof HostedCheckoutExpiryError) return sendJson(res, e.status, { ok: false, code: e.code, error: e.message }, { 'cache-control': 'no-store' });
         return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' });
       }
     }

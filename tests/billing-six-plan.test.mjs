@@ -191,6 +191,42 @@ await test('hosted /buy inactive referral fallback retains stable capacity503 an
   assert.equal(response.headers.get('retry-after'),'60');assert.equal(response.headers.get('cache-control'),'no-store');
   assert.equal(c.sessions.size,1);assert.equal(c.h.hub.hosting.store.instances().length,1);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
+await test('hosted retries distinguish local expiry pending from exact canonical unpaid expiry',async()=>{
+  const c=await setup(),attemptId=randomUUID();assert.equal((await c.checkout('lifetime',true,{attemptId})).status,200);
+  const s=c.last(),file=path.join(c.h.dataDir,'billing-launch-intents.v1',s.metadata.wh_launch_intent+'.json'),before=JSON.parse(fs.readFileSync(file));
+  c.advance(30*60000);assert.equal((await c.checkout('lifetime',true,{attemptId})).body.url,s.url);
+  c.advance(60000);const pending=await c.checkout('lifetime',true,{attemptId});assert.equal(pending.status,409);assert.equal(pending.body.code,'HOSTED_CHECKOUT_EXPIRY_PENDING');
+  assert.equal(JSON.parse(fs.readFileSync(file)).expiredAtMs,undefined);assert.equal(c.sessions.size,1);
+  assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409,'an open Session cannot authorize rotation');
+  s.status='expired';s.payment_status='paid';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409,'a paid Session cannot authorize rotation');
+  s.payment_status='unpaid';const price=s.lines[1].price.id;s.lines[1].price.id='price_wrong';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,409);s.lines[1].price.id=price;
+  assert.equal(JSON.parse(fs.readFileSync(file)).expiredAtMs,undefined);
+  assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,200);
+  const response=await fetch(c.h.origin+'/api/billing/checkout',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({plan:'lifetime',payment:'card',hosting:true,attemptId})});
+  assert.equal(response.status,410);assert.equal((await response.json()).code,'HOSTED_CHECKOUT_EXPIRED');assert.equal(response.headers.get('cache-control'),'no-store');
+  assert.equal((await c.checkout('lifetime',true)).status,200);assert.equal((await c.checkout('lifetime',true,{attemptId})).status,410);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).stripeParams,before.stripeParams);assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
+await test('authenticated hosted claim retains its identity on local expiry and rebinds only after canonical expiry',async()=>{
+  const c=await setup(),issued=c.h.store.issue('Authenticated hosted expiry',30),auth={licenseId:issued.payload.id,token:issued.token},attemptId=randomUUID();
+  assert.equal((await c.checkout('monthly',true,{...auth,attemptId})).status,200);const s=c.last();
+  const claim=path.join(c.h.dataDir,'billing-launch-claims.v1','live',hash(issued.payload.id)+'.json'),original=fs.readFileSync(claim,'utf8');
+  assert.equal((await c.checkout('monthly',true,auth)).body.url,s.url,'a new browser id before expiry still reuses the owned pending Session');
+  c.advance(25*3600000);const pending=await c.checkout('monthly',true,auth);assert.equal(pending.status,409);assert.equal(pending.body.code,'HOSTED_CHECKOUT_EXPIRY_PENDING');assert.equal(fs.readFileSync(claim,'utf8'),original);assert.equal(c.sessions.size,1);
+  assert.equal(c.calls.filter(x=>x.p==='/v1/checkout/sessions/'+s.id).length,0,'local time must not clear the hosted claim using the weaker legacy status-only shortcut');
+  s.status='expired';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,200);assert.equal(fs.existsSync(claim),false);
+  assert.equal((await c.checkout('monthly',true,{...auth,attemptId})).status,410);assert.equal(fs.existsSync(claim),false,'old attempt must not recreate its cleared claim');
+  // Reproduce a crash after canonical proof was saved but before claim cleanup.
+  fs.writeFileSync(claim,original);const next=await c.checkout('monthly',true,auth);assert.equal(next.status,200);assert.notEqual(next.body.url,s.url);
+  assert.equal(JSON.parse(fs.readFileSync(claim)).id,c.last().metadata.wh_launch_intent);assert.equal(c.sessions.size,2);assert.equal(c.provider.createCalls.length,0);await c.h.close();
+});
+await test('lost hosted create response retains retry identity until canonical expiry proof',async()=>{
+  const c=await setup({loseResponse:true}),attemptId=randomUUID();assert.equal((await c.checkout('yearly',true,{attemptId})).status,400);const s=c.last();
+  c.advance(31*60000);const pending=await c.checkout('yearly',true,{attemptId});assert.equal(pending.status,409);assert.equal(pending.body.code,'HOSTED_CHECKOUT_EXPIRY_PENDING');assert.equal(c.sessions.size,1);
+  assert.equal(c.calls.filter(x=>x.p==='/v1/checkout/sessions'&&x.method==='POST').length,1);
+  s.status='expired';assert.equal((await c.admin('/admin/api/billing/hosted-checkout/reconcile-expired',{sessionId:s.id})).status,200);
+  assert.equal((await c.checkout('yearly',true,{attemptId})).status,410);assert.equal((await c.checkout('yearly',true)).status,200);assert.equal(c.sessions.size,2);await c.h.close();
+});
 await test('owned /buy links and old hosted aliases all use reserved v2 checkout with launch disabled',async()=>{
   const c=await setup();await c.admin('/admin/api/billing/launch',{enabled:false,cryptoEnabled:false});
   for(const suffix of ['?plan=monthly&hosting=true','?plan=hosted-yearly','?plan=lifetime-hosted']) {const r=await fetch(c.h.origin+'/buy'+suffix,{redirect:'manual'});assert.equal(r.status,302);assert.equal(c.last().metadata.bundle,'software-hosting-v2');}
