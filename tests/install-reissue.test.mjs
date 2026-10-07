@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { JSDOM } from "jsdom";
 import { spawnSync } from "node:child_process";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { createHub } from "../dist/src/server.js";
@@ -174,6 +175,124 @@ await test("emailed command executes only a successful download and cleans up af
       assert.deepEqual(fs.readdirSync(path.join(dir, "tmp")), []);
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test("reinstall email rotates only install links with accurate wording, same dashboard and stale-request refusal", async () => {
+  const f = await fixture();
+  try {
+    const before = JSON.stringify(f.store.getCustomer(f.customer.key));
+    const revision = f.store.installRevision(f.customer.key);
+    const request = { issue: "reinstall", confirmed: true, expectedRevision: revision, acknowledgeMachineBinding: true };
+    assert.equal((await f.reissue({ ...request, confirmed: false })).status, 409);
+    assert.equal((await f.reissue({ ...request, deviceReplacement: true })).status, 409);
+    assert.equal((await fetch(f.url(`/install/${f.oldInstall}`))).status, 200, "refused action leaves old token live");
+    request.expectedRevision = f.store.installRevision(f.customer.key);
+    const r = await f.reissue(request); assert.equal(r.status, 200); assert.deepEqual(r.body.revoked, { page: 0, install: 1 });
+    assert.match(f.mails[0].text, /VPS reset/); assert.doesNotMatch(f.mails[0].text, /US IP|HTTP 403|install-page.*revoked/);
+    assert.equal(f.store.lookupPage(f.oldPage)?.customerKey, f.customer.key);
+    assert.equal(f.store.lookupPage(f.otherPage)?.customerKey, "cus_other");
+    assert.equal((await fetch(f.url(`/install/${f.oldInstall}`))).status, 403);
+    const raw = rawFromMail(f.mails[0]); assert.equal((await fetch(f.url(`/install/${raw}`))).status, 200);
+    assert.equal((await f.reissue(request)).status, 409, "stale expected revision cannot invalidate a newer command");
+    assert.equal((await fetch(f.url(`/install/${raw}`))).status, 200); assert.equal(f.mails.length, 1);
+    assert.equal(JSON.stringify(f.store.getCustomer(f.customer.key)), before);
+  } finally { await f.close(); }
+});
+
+function customerHeaders(f, email = f.customer.email) {
+  const sessions = f.h.hub.customerSessions.store;
+  const identity = sessions.ensureIdentity(email);
+  return { cookie: `wh_customer_session=${sessions.createSession(identity.id, "127.0.0.1")}`,
+    "content-type": "application/json", "x-wh-customer-action": "1", origin: new URL(f.h.cfg.publicOrigin).origin, "sec-fetch-site": "same-origin" };
+}
+await test("real dashboard regeneration is owner-only, reusable, CAS protected and cannot silently replace a machine", async () => {
+  const f = await fixture();
+  try {
+    const pair = generateKeyPairSync("ed25519"), leaseHeaders = { "content-type": "application/json", "x-license": f.issued.token };
+    const c = await jsonReq(f.url("/api/license/lease/challenge"), { method: "POST", headers: leaseHeaders,
+      body: JSON.stringify({ purpose: "activate", installId: "still-live-old-vps", installPublicKey: pair.publicKey.export({type:"spki",format:"der"}).subarray(-32).toString("base64url") }) });
+    assert.equal(c.status, 200);
+    assert.equal((await jsonReq(f.url("/api/license/lease/activate"), { method:"POST", headers:leaseHeaders,
+      body:JSON.stringify({nonce:c.body.challenge.nonce,signature:sign(null,Buffer.from(c.body.challenge.proofBytesB64u,"base64url"),pair.privateKey).toString("base64url")}) })).status,200);
+    const headers = customerHeaders(f), foreign = customerHeaders(f,"foreign@example.test");
+    const state = await jsonReq(f.url("/api/customer/state"), { headers });
+    const recovery = state.body.software[0].installRecovery;
+    assert.equal(recovery.binding,"bound"); assert.doesNotMatch(JSON.stringify(recovery),/installPublicKey|activationId/);
+    const preserved = Object.fromEntries(fs.readdirSync(f.h.dataDir).filter(n=>!n.startsWith("billing-")&&!n.startsWith("customer-")).map(n=>[n,fs.readFileSync(path.join(f.h.dataDir,n))]));
+    const body = {customerKey:f.customer.key,confirmed:true,expectedRevision:recovery.revision};
+    const rotate = (over={},h=headers)=>jsonReq(f.url("/api/customer/install-command"),{method:"POST",headers:h,body:JSON.stringify({...body,...over})});
+    assert.equal((await rotate({},foreign)).status,404);
+    assert.equal((await rotate()).status,409,"bound-machine acknowledgement is mandatory");
+    assert.equal((await rotate({acknowledgeMachineBinding:true,deviceReplacement:true})).status,409);
+    const result = await rotate({acknowledgeMachineBinding:true}); assert.equal(result.status,200);
+    assert.equal(result.body.deviceTransferred,false); assert.equal(result.body.binding,"bound");
+    const raw=/\/install\/([A-Za-z0-9_-]+)/.exec(result.body.command)[1];
+    assert.equal((await fetch(f.url(`/install/${f.oldInstall}`))).status,403);
+    assert.equal((await fetch(f.url(`/install/${raw}`))).status,200); assert.equal((await fetch(f.url(`/install/${raw}`))).status,200);
+    assert.equal((await rotate({acknowledgeMachineBinding:true})).status,409);
+    assert.equal((await rotate({acknowledgeMachineBinding:true},{...headers,origin:"https://evil.test"})).status,403);
+    for(const [name,bytes] of Object.entries(preserved)) assert.deepEqual(fs.readFileSync(path.join(f.h.dataDir,name)),bytes,name);
+    assert.equal(f.store.lookupPage(f.oldPage)?.customerKey,f.customer.key);
+  } finally { await f.close(); }
+});
+
+await test("dashboard cannot invalidate a support command while its verified email delivery is in flight", async () => {
+  const f=await fixture();let release;
+  try {
+    const headers=customerHeaders(f),revision=f.store.installRevision(f.customer.key);
+    f.pause(new Promise(resolve=>{release=resolve}));
+    const pending=f.reissue({issue:"reinstall",confirmed:true,expectedRevision:revision,acknowledgeMachineBinding:true});
+    while(!f.mails.length)await new Promise(resolve=>setTimeout(resolve,5));
+    const result=await jsonReq(f.url("/api/customer/install-command"),{method:"POST",headers,body:JSON.stringify({customerKey:f.customer.key,confirmed:true,expectedRevision:f.store.installRevision(f.customer.key),acknowledgeMachineBinding:true})});
+    assert.equal(result.status,409);
+    assert.equal((await fetch(f.url(`/welcome/${f.oldPage}`))).status,409,"welcome cannot evict an in-flight email command by minting repeatedly");
+    release();assert.equal((await pending).status,200);
+    assert.equal((await fetch(f.url(`/install/${rawFromMail(f.mails[0])}`))).status,200);
+  } finally {release?.();await f.close()}
+});
+
+await test("atomic token rotation refuses repeated randomness without invalidating previous links or another customer", async()=>{
+  const f=await fixture();
+  try {
+    const bytes=Buffer.alloc(32,9),store=new BillingStore(f.h.dataDir,()=>bytes);
+    store.mint("install",f.issued.payload.id,"other-customer");
+    const before=fs.readFileSync(path.join(f.h.dataDir,TOKENS_FILE));
+    assert.throws(()=>store.rotateInstall(f.issued.payload.id,f.customer.key,store.installRevision(f.customer.key),Date.now()),/fresh token/);
+    assert.deepEqual(fs.readFileSync(path.join(f.h.dataDir,TOKENS_FILE)),before);
+    const revision=f.store.installRevision(f.customer.key);
+    fs.writeFileSync(path.join(f.h.dataDir,TOKENS_FILE),"{broken");
+    assert.throws(()=>f.store.rotateInstall(f.issued.payload.id,f.customer.key,revision,Date.now()),/support review/);
+    assert.equal(fs.readFileSync(path.join(f.h.dataDir,TOKENS_FILE),"utf8"),"{broken","unreadable registry is preserved rather than overwritten empty");
+  } finally{await f.close()}
+});
+
+await test("actual customer page requires confirmation, sends current revision, replaces the command and truthfully falls back on copy denial",async()=>{
+  const requests=[],confirmations=[];let approve=false,clipboardMode="denied";const copyDeadlines=[];
+  const state={ok:true,email:"fixture@example.test",software:[{customerKey:"cus_own",livemode:true,plan:"monthly",exp:Date.now()+86400000,installRecovery:{revision:"rev1",binding:"bound"}}],hosting:{available:false}};
+  const dom=new JSDOM(fs.readFileSync(new URL("../public/customer.html",import.meta.url),"utf8"),{url:"https://hub.test/customer",runScripts:"dangerously",beforeParse(w){
+    w.confirm=message=>{confirmations.push(message);return approve};
+    w.fetch=async(route,opts={})=>{requests.push({route,opts});return{ok:true,status:200,json:async()=>route==="/api/customer/state"?state:{ok:true,command:"safe-command-"+requests.length,revision:"rev"+requests.length,binding:"bound",deviceTransferred:false}}};
+    const nativeSetTimeout=w.setTimeout.bind(w);w.setTimeout=(fn,ms,...args)=>{if(ms===2000)copyDeadlines.push(ms);return nativeSetTimeout(fn,ms===2000?5:ms,...args)};
+    Object.defineProperty(w.navigator,"clipboard",{configurable:true,value:{writeText:()=>{
+      if(clipboardMode==="success")return Promise.resolve();if(clipboardMode==="pending")return new Promise(()=>{});
+      throw Error("denied");
+    }}});
+  }});
+  const settle=()=>new Promise(resolve=>setTimeout(resolve,20));
+  try {
+    await settle();const doc=dom.window.document,button=doc.querySelector("#softwareCards .v-install");
+    assert.equal(button.textContent,"Regenerate install command");button.click();await settle();assert.equal(requests.length,1);
+    assert.match(confirmations[0],/does not transfer or revoke/);approve=true;button.click();await settle();
+    const first=JSON.parse(requests[1].opts.body);assert.equal(first.expectedRevision,"rev1");assert.equal(first.confirmed,true);assert.equal(first.acknowledgeMachineBinding,true);
+    assert.equal(requests[1].opts.headers["x-wh-customer-action"],"1");
+    doc.querySelector("#softwareCards .copy").click();await settle();assert.equal(doc.querySelector("#softwareCards .copy").textContent,"Select and copy manually");
+    assert.equal(dom.window.getSelection().toString(),"safe-command-2","manual selection excludes Copy button text");
+    button.click();await settle();assert.equal(JSON.parse(requests[2].opts.body).expectedRevision,"rev2");assert.equal(doc.querySelectorAll("#softwareCards .copy").length,1);
+    clipboardMode="success";doc.querySelector("#softwareCards .copy").click();await settle();assert.equal(doc.querySelector("#softwareCards .copy").textContent,"Copied");
+    clipboardMode="pending";doc.querySelector("#softwareCards .copy").click();await settle();assert.equal(doc.querySelector("#softwareCards .copy").textContent,"Select and copy manually");assert.equal(doc.querySelector("#softwareCards .copy").disabled,false);
+    Object.defineProperty(dom.window.navigator,"clipboard",{value:undefined});doc.querySelector("#softwareCards .copy").click();await settle();assert.equal(doc.querySelector("#softwareCards .copy").textContent,"Select and copy manually");
+    assert.deepEqual(copyDeadlines,[2000,2000,2000,2000]);
+  } finally{dom.window.close()}
 });
 
 summary("install-reissue");

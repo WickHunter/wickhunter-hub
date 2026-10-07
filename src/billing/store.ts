@@ -561,6 +561,46 @@ export class BillingStore {
     return bare(readJson<Record<string, TokenRecord>>(this.tokensFile, {}));
   }
 
+  /** Rotation never treats an unreadable token file as an empty registry. */
+  private regenerationTokens(): Record<string, TokenRecord> {
+    let all: unknown;
+    try { all = JSON.parse(fs.readFileSync(this.tokensFile, "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return {}; throw new Error("Install token registry needs support review"); }
+    if (!all || typeof all !== "object" || Array.isArray(all)) throw new Error("Install token registry needs support review");
+    for (const [hash, value] of Object.entries(all)) {
+      const t = value as TokenRecord;
+      if (!/^[a-f0-9]{64}$/.test(hash) || !t || typeof t !== "object" || !(t.kind === "install" || t.kind === "page")
+        || typeof t.licenseId !== "string" || typeof t.customerKey !== "string" || !Number.isFinite(t.createdAtMs)
+        || ![t.expiresAtMs, t.usedAtMs, t.revokedAtMs].every(v => v === null || (typeof v === "number" && Number.isFinite(v))))
+        throw new Error("Install token registry needs support review");
+    }
+    return all as Record<string, TokenRecord>;
+  }
+
+  /** Opaque compare-and-swap revision: only this customer's token state is covered.
+   * No raw token or individual token hash is disclosed. */
+  installRevision(customerKey: string): string {
+    const rows = Object.entries(this.regenerationTokens()).filter(([, t]) => t.customerKey === customerKey && t.kind === "install")
+      .sort(([a], [b]) => a.localeCompare(b));
+    return createHash("sha256").update(JSON.stringify({ licenseId: this.getCustomer(customerKey)?.licenseId ?? null, rows })).digest("hex");
+  }
+
+  /** Rotate one customer's install links in one atomic file replacement.
+   * Randomness/serialization failures leave the previous links untouched. */
+  rotateInstall(licenseId: string, customerKey: string, expectedRevision: string, now: number): { raw: string; revoked: number } {
+    if (expectedRevision !== this.installRevision(customerKey)) throw new Error("install command revision changed");
+    const raw = this.randomBytes(32).toString("base64url"), all = this.regenerationTokens(), hash = hashToken(raw);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(raw) || all[hash]) throw new Error("install token source did not provide a fresh token");
+    let revoked = 0;
+    for (const t of Object.values(all)) {
+      if (t.customerKey === customerKey && t.kind === "install" && t.revokedAtMs === null) { t.revokedAtMs = now; revoked++; }
+    }
+    all[hash] = { kind: "install", licenseId, customerKey, createdAtMs: now, expiresAtMs: now + INSTALL_TOKEN_TTL_MS,
+      usedAtMs: null, revokedAtMs: null, reusable: true };
+    writeJsonAtomic(this.tokensFile, all);
+    return { raw, revoked };
+  }
+
   /** Mint a token; returns the RAW value (shown once) and stores its hash. */
   mint(kind: TokenKind, licenseId: string, customerKey: string, now = Date.now(), options: { reusable?: true } = {}): string {
     if (options.reusable && kind !== "install") throw new Error("only install tokens can be reusable");

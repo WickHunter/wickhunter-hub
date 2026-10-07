@@ -200,11 +200,11 @@
     </div>
     <p class="err v-lapsed" hidden style="margin:10px 0 0">This licence has lapsed — the bot keeps closing and protecting positions but opens nothing new until it is renewed.</p>
     <div class="row" style="margin-top:14px">
-      <button class="btn v-install" type="button">Get install command</button>
+      <button class="btn v-install" type="button">Regenerate install command</button>
       <button class="btn quiet v-portal" type="button">Manage billing</button>
     </div>
     <div class="cmd v-cmd" hidden></div>
-    <p class="fine v-cmd-note" hidden>This command works once and expires in 24 hours. Ask again for a fresh one — for example to reinstall on a new server.</p>
+    <p class="fine v-cmd-note" hidden>This command can be retried for 24 hours. Previous opaque install commands are invalidated. Your licence, subscription and machine binding stay unchanged. If a VPS reset lost its machine key, contact support before trading.</p>
     <p class="err v-install-err" hidden style="margin:10px 0 0"></p>
     <p class="err v-portal-err" hidden style="margin:10px 0 0"></p>
     <p class="fine">Manage billing opens Stripe's billing portal, which may list other subscriptions on this account too.</p>
@@ -266,24 +266,33 @@
       var cmdBox = node.querySelector(".v-cmd");
       var cmdNote = node.querySelector(".v-cmd-note");
       installBtn.addEventListener("click", async function () {
+        if (!window.confirm("Regenerate this account’s install command? Previous opaque install commands will stop working. Your licence and subscription stay unchanged. This does not transfer or revoke an active machine binding; a lost machine key requires support recovery.")) return;
         installBtn.disabled = true;
         installErr.hidden = true;
-        var r = await api("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey }) });
+        var r = await api("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey, confirmed: true, expectedRevision: sw.installRecovery && sw.installRecovery.revision, acknowledgeMachineBinding: true }) });
         installBtn.disabled = false;
         if (!r.ok || !r.body || !r.body.ok) {
           installErr.textContent = (r.body && r.body.error) || "could not get an install command";
           installErr.hidden = false;
           return;
         }
+        sw.installRecovery = { revision: r.body.revision, binding: r.body.binding };
         cmdBox.textContent = r.body.command;
         var copy = document.createElement("button");
         copy.className = "copy";
         copy.type = "button";
         copy.textContent = "Copy";
         copy.addEventListener("click", function () {
-          var done = function () { copy.textContent = "Copied"; setTimeout(function () { copy.textContent = "Copy"; }, 1500); };
-          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(r.body.command).then(done, done);
-          else done();
+          copy.disabled = true;
+          var timeout;
+          Promise.race([
+            Promise.resolve().then(function () { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable"); return navigator.clipboard.writeText(r.body.command); }),
+            new Promise(function (_, reject) { timeout = setTimeout(function () { reject(new Error("Clipboard timed out")); }, 2000); })
+          ]).then(function () { copy.textContent = "Copied"; }, function () {
+            copy.textContent = "Select and copy manually";
+            var range = document.createRange(); range.selectNodeContents(cmdBox.firstChild);
+            var selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+          }).finally(function () { clearTimeout(timeout); copy.disabled = false; });
         });
         cmdBox.appendChild(copy);
         cmdBox.hidden = false;

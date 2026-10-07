@@ -58,7 +58,7 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   public   GET  /customer/signin?token=        burns the token, sets the session cookie, 302 -> /customer
 //   session  GET  /customer                      static dashboard shell (public/customer.html)
 //   session  GET  /api/customer/state            licence + (placeholder) hosting view for the signed-in identity
-//   session  POST /api/customer/install-command  {customerKey} -> a fresh one-time install command
+//   session  POST /api/customer/install-command  {customerKey} -> confirmed install-link rotation (same licence and machine binding)
 //   session  POST /api/customer/portal           {customerKey} -> a Customer Portal session, as JSON
 //   session  POST /api/customer/signout          revokes the presented session, clears the cookie
 //   admin    POST /admin/api/customers/signin-link {email} -> a raw sign-in link (bounced-email fallback)
@@ -422,6 +422,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   try { notifications = new Notifications(cfg.dataDir, deps.notificationFetch, deps.billingNow); }
   catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
   const billing: BillingService = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+    installBindingState: (licenseId) => {
+      if (!licenseLeases) return "unavailable";
+      try {
+        const state = licenseLeases.adminSnapshot(licenseId);
+        return state.recoveryLockedLicenses.includes(licenseId) ? "recovery-locked"
+          : state.activations.some(a => a.status === "active") ? "bound" : "unbound";
+      } catch { return "unavailable"; }
+    },
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
     launchFetch,
@@ -1757,9 +1765,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const body = await readJsonBody(req);
     const customerKey = typeof body?.customerKey === "string" ? body.customerKey : "";
     if (!customerKey) return sendJson(res, 400, { ok: false, error: "expected {customerKey}" }, { "cache-control": "no-store" });
-    const r = customerSessions.installCommand(identity, customerKey, readLatest() !== null);
+    const r = customerSessions.installCommand(identity, customerKey, readLatest() !== null, {
+      confirmed: body?.confirmed === true, expectedRevision: typeof body?.expectedRevision === "string" ? body.expectedRevision : "",
+      acknowledgeMachineBinding: body?.acknowledgeMachineBinding === true, deviceReplacement: body?.deviceReplacement === true,
+    });
     if (!r.ok) return sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
-    sendJson(res, 200, { ok: true, command: r.command }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ...r }, { "cache-control": "no-store" });
   }
 
   async function customerPortal(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -3163,11 +3174,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     }
     if (m === "POST" && p === "/admin/api/billing/reissue-install") {
       const body = await readJsonBody(req);
-      if (body === null || typeof body.customerId !== "string" || !body.customerId || typeof body.email !== "string" || !body.email || body.issue !== "bybit-us-ip") {
-        return sendJson(res, 400, { ok: false, error: "expected {customerId,email,issue:'bybit-us-ip'}" }, { "cache-control": "no-store" });
+      if (body === null || typeof body.customerId !== "string" || !body.customerId || typeof body.email !== "string" || !body.email || !(body.issue === "bybit-us-ip" || body.issue === "reinstall")) {
+        return sendJson(res, 400, { ok: false, error: "expected {customerId,email,issue:'bybit-us-ip'|'reinstall'}" }, { "cache-control": "no-store" });
       }
       if (!readLatest()) return sendJson(res, 503, { ok: false, error: "no authenticated release is available; existing links were not changed" }, { "cache-control": "no-store" });
-      const r = await billing.reissueInstall(body.customerId, body.email);
+      const r = await billing.reissueInstall(body.customerId, body.email, body.issue, {
+        confirmed: body.confirmed === true, expectedRevision: typeof body.expectedRevision === "string" ? body.expectedRevision : "",
+        acknowledgeMachineBinding: body.acknowledgeMachineBinding === true, deviceReplacement: body.deviceReplacement === true,
+      });
       return r.ok ? sendJson(res, 200, r, { "cache-control": "no-store" }) : sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
     }
     if (m === "POST" && p === "/admin/api/billing/test-email") {

@@ -306,17 +306,27 @@ await test("install-command / portal are refused for a customerKey that does not
   assert.equal(portal.status, 404);
 });
 
-await test("install-command: mints a fresh one-time command that the existing /install/<token> route accepts", async () => {
+await test("install-command: rotates a confirmed reusable command that the existing /install/<token> route accepts", async () => {
+  const dashboard = await (await fetch(`${h.origin}/api/customer/state`, { headers: { cookie: adaCookie } })).json();
+  const current = dashboard.software.find(s => s.customerKey === ada.key);
   const r = await fetch(`${h.origin}/api/customer/install-command`, {
-    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: ada.key }),
+    method: "POST", headers: browserAction(adaCookie), body: JSON.stringify({ customerKey: ada.key, confirmed: true,
+      expectedRevision: current.installRecovery.revision, acknowledgeMachineBinding: true }),
   });
   assert.equal(r.status, 200);
   const body = await r.json();
-  assert.match(body.command, /^curl -q -fsSL "https:\/\/hub\.test\/hub\/install\/[A-Za-z0-9_-]+" \| sudo bash$/);
-  const token = /install\/([A-Za-z0-9_-]+)"/.exec(body.command)[1];
+  assert.match(body.command, /--fail-with-body/);
+  assert.match(body.command, /--proto '=https'/);
+  const token = /install\/([A-Za-z0-9_-]+)/.exec(body.command)[1];
   const consumed = await fetch(`${h.origin}/install/${token}`);
   assert.equal(consumed.status, 200);
   assert.match(consumed.headers.get("content-type"), /text\/x-shellscript/);
+  assert.equal((await fetch(`${h.origin}/install/${token}`)).status, 200, "explicit regenerated link permits retries");
+  assert.equal(body.deviceTransferred, false);
+  const stale = await fetch(`${h.origin}/api/customer/install-command`, { method: "POST", headers: browserAction(adaCookie),
+    body: JSON.stringify({ customerKey: ada.key, confirmed: true, expectedRevision: current.installRecovery.revision, acknowledgeMachineBinding: true }) });
+  assert.equal(stale.status, 409, "a stale dashboard cannot revoke the newly issued command");
+  assert.equal((await fetch(`${h.origin}/install/${token}`)).status, 200);
 });
 
 await test("portal: opens the record's own mode's static login link when no secret key is configured", async () => {

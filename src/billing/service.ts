@@ -40,7 +40,7 @@ import {
   type StripeModeConfig,
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
-import { escapeHtml, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
+import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { EarnStripeApi } from "../earn-stripe-api.js";
@@ -94,7 +94,13 @@ const EARN_HOOK_TYPES = new Set([
   "charge.refunded", "charge.dispute.created", "charge.dispute.closed",
 ]);
 
+export type InstallBindingState = "unbound" | "bound" | "recovery-locked" | "unavailable";
+export interface InstallRegenerationOptions {
+  confirmed: boolean; expectedRevision: string; acknowledgeMachineBinding?: boolean; deviceReplacement?: boolean;
+}
+
 export interface BillingServiceDeps {
+  installBindingState?: (licenseId: string) => InstallBindingState;
   onVerifiedEvent?: (event: StripeEvent) => Promise<void>;
   now?: () => number;
   /** One injected fetch serves the email provider AND the Stripe portal call. */
@@ -175,6 +181,7 @@ export class BillingService {
    * for one customer must calculate their target from the latest expiry. */
   private readonly checkoutLocks = new Map<string, Promise<void>>();
   private readonly installReissues = new Set<string>();
+  private readonly installBindingState: (licenseId: string) => InstallBindingState;
   private readonly bundleLocks = new Map<string, Promise<void>>();
 
   constructor(
@@ -184,6 +191,7 @@ export class BillingService {
     private readonly templatesDir: string,
     deps: BillingServiceDeps = {},
   ) {
+    this.installBindingState = deps.installBindingState ?? (() => "unavailable");
     this.onVerifiedEvent = deps.onVerifiedEvent;
     this.afterCommitOutbox = deps.onVerifiedEvent ? new AfterCommitOutbox(dataDir) : null;
     this.store = new BillingStore(dataDir, deps.randomBytes);
@@ -1578,9 +1586,40 @@ export class BillingService {
     return { ok: true, sentTo: rec.email };
   }
 
+  installRecovery(customerKey: string): { revision: string; binding: InstallBindingState } {
+    const rec = this.store.getCustomer(customerKey);
+    return { revision: this.store.installRevision(customerKey), binding: rec ? this.installBindingState(rec.licenseId) : "unavailable" };
+  }
+
+  /** All explicit regeneration uses this synchronous admission and mutation.
+   * The email lock remains held across provider awaits, so dashboard clicks
+   * cannot revoke a command while its delivery is in flight. */
+  regenerateInstall(customerKey: string, expectedEmail: string, options: InstallRegenerationOptions):
+    { ok: true; raw: string; command: string; expiresAtMs: number; revoked: number; revision: string; binding: InstallBindingState }
+    | { ok: false; status: number; error: string } {
+    if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    const rec = this.store.getCustomer(customerKey), now = this.now();
+    const lic = rec && this.licenses.get(rec.licenseId), key = lic && this.licenses.tokenFor(lic.id);
+    if (!rec || normalizeInstallEmail(rec.email) !== normalizeInstallEmail(expectedEmail)) return { ok: false, status: 404, error: "unknown customer" };
+    if (!rec.livemode || rec.refunded || rec.disputed || !lic || lic.exp <= now || !key || !this.licenses.verify(key, now).ok)
+      return { ok: false, status: 403, error: "an active live customer licence without a refund or dispute is required" };
+    if (options.deviceReplacement) return { ok: false, status: 409, error: "Device replacement requires verified support recovery; regenerating a command does not revoke or transfer an active machine." };
+    if (options.confirmed !== true || options.expectedRevision !== this.store.installRevision(rec.key))
+      return { ok: false, status: 409, error: "Confirm regeneration from the current dashboard; reload if another command was issued." };
+    const binding = this.installBindingState(rec.licenseId);
+    if (binding !== "unbound" && options.acknowledgeMachineBinding !== true)
+      return { ok: false, status: 409, error: "Confirm that the existing machine binding is preserved. Lost machine keys need support recovery before trading." };
+    const { revoked, raw } = this.store.rotateInstall(lic.id, rec.key, options.expectedRevision, now);
+    const expiresAtMs = now + INSTALL_TOKEN_TTL_MS;
+    this.store.appendEvent({ id: `customer-install-regeneration:${rec.key}:${now}`, type: "customer.install.regenerate", livemode: true,
+      receivedAtMs: now, outcome: "applied", note: JSON.stringify({ customerKey: rec.key, licenseId: lic.id, revoked, expiresAtMs, binding, deviceTransferred: false }) });
+    return { ok: true, raw, command: safeInstallCommand(`${this.origin}/install/${raw}`), expiresAtMs, revoked,
+      revision: this.store.installRevision(rec.key), binding };
+  }
+
   /** Admin-only support action. Never mutates the licence, seat or customer
    * account, and sends only to the stored verified billing email. */
-  async reissueInstall(customerKey: string, expectedEmail: string): Promise<
+  async reissueInstall(customerKey: string, expectedEmail: string, issue: "bybit-us-ip" | "reinstall" = "bybit-us-ip", options?: InstallRegenerationOptions): Promise<
     { ok: true; sentTo: string; expiresAtMs: number; revoked: { page: number; install: number } }
     | { ok: false; status: number; error: string }
   > {
@@ -1601,16 +1640,25 @@ export class BillingService {
     this.installReissues.add(customerKey);
     let raw = "";
     try {
-      const revoked = { page: this.store.revokeTokens(rec.key, "page", now), install: this.store.revokeTokens(rec.key, "install", now) };
-      raw = this.store.mint("install", lic.id, rec.key, now, { reusable: true });
+      let revoked: { page: number; install: number };
+      if (issue === "reinstall") {
+        // Admission/mutation has no await; lock is restored before delivery.
+        this.installReissues.delete(customerKey);
+        const prepared = this.regenerateInstall(customerKey, expectedEmail, options ?? { confirmed: false, expectedRevision: "" });
+        this.installReissues.add(customerKey);
+        if (!prepared.ok) return prepared;
+        raw = prepared.raw;
+        revoked = { page: 0, install: prepared.revoked };
+      } else revoked = { page: this.store.revokeTokens(rec.key, "page", now), install: this.store.revokeTokens(rec.key, "install", now) };
+      if (!raw) raw = this.store.mint("install", lic.id, rec.key, now, { reusable: true });
       const expiresAtMs = now + INSTALL_TOKEN_TTL_MS;
       const audit = (stage: "prepared" | "sent" | "failed") => this.store.appendEvent({
         id: `admin-install-reissue:${rec.key}:${now}:${stage}`, type: "admin.install.reissue", livemode: true,
         receivedAtMs: this.now(), outcome: stage === "failed" ? "error" : "applied",
-        note: JSON.stringify({ actor: "admin", customerKey: rec.key, licenseId: lic.id, stage, revoked, reusable: true, expiresAtMs, issue: "bybit-us-ip" }),
+        note: JSON.stringify({ actor: "admin", customerKey: rec.key, licenseId: lic.id, stage, revoked, reusable: true, expiresAtMs, issue }),
       });
       audit("prepared");
-      const result = await sendEmail(cfg.email, reissuedInstallEmail(rec.email, { name: rec.name, installUrl: `${this.origin}/install/${raw}`, expiresAtMs }), this.fetchLike);
+      const result = await sendEmail(cfg.email, reissuedInstallEmail(rec.email, { name: rec.name, installUrl: `${this.origin}/install/${raw}`, expiresAtMs, issue }), this.fetchLike);
       if (!result.ok) {
         this.store.revokeInstall(raw, this.now());
         audit("failed");
@@ -1645,6 +1693,7 @@ export class BillingService {
     }
     const lic = this.licenses.list().find((l) => l.id === t.licenseId);
     if (!rec || !lic) return { ok: false, status: 404, text: "This licence is no longer on file. Please contact support." };
+    if (this.installReissues.has(rec.key)) return { ok: false, status: 409, text: "An install command is being emailed. Wait for delivery before requesting another command." };
     const now = this.now();
     const cfg = this.config();
     const expired = lic.exp <= now;
@@ -1908,6 +1957,7 @@ export class BillingService {
         const seen = roster[c.licenseId];
         return {
           customerId: c.key,
+          installRecovery: this.installRecovery(c.key),
           stripeCustomerId: c.stripeCustomerId,
           email: c.email,
           name: c.name,
@@ -1946,3 +1996,5 @@ export function renderTemplate(template: string, vars: Record<string, string>, f
   const withBlocks = template.replace(/\{\{#if ([A-Za-z0-9_]+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (_m, flag: string, body: string) => (flags[flag] ? body : ""));
   return withBlocks.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_m, name: string) => escapeHtml(vars[name] ?? ""));
 }
+
+function normalizeInstallEmail(value: string): string { return value.trim().toLowerCase(); }

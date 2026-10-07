@@ -331,6 +331,7 @@ export interface SoftwareView {
   currentPeriodEndMs: number | null;
   portalAvailable: boolean;
   lifetimeAccess?: boolean;
+  installRecovery?: { revision: string; binding: import("./billing/service.js").InstallBindingState };
 }
 
 export interface CustomerStateView {
@@ -345,7 +346,7 @@ export interface CustomerStateView {
 }
 
 export type PortalOutcome = { ok: true; url: string } | { ok: false; status: number; error: string };
-export type InstallCommandOutcome = { ok: true; command: string } | { ok: false; status: number; error: string };
+export type InstallCommandOutcome = { ok: true; command: string; expiresAtMs: number; revision: string; binding: import("./billing/service.js").InstallBindingState; deviceTransferred: false } | { ok: false; status: number; error: string };
 
 /** Every `CustomerRecord` whose email matches (case-folded) — deliberately
  *  a filter over the WHOLE table rather than `BillingStore.findByEmail`
@@ -483,6 +484,7 @@ export class CustomerSessionService {
         const info = this.billing.subscriptionInfoFor(rec.licenseId);
         return {
           customerKey: rec.key,
+          installRecovery: this.billing.installRecovery(rec.key),
           livemode: rec.livemode,
           licenseId: rec.licenseId,
           licenseName: payload?.name ?? null,
@@ -540,23 +542,19 @@ export class CustomerSessionService {
    *  from the browser on its own. */
   private ownedCustomer(identity: CustomerIdentity, customerKey: string): CustomerRecord | null {
     const rec = this.billing.store.getCustomer(customerKey);
-    return rec && rec.email === identity.email ? rec : null;
+    return rec && normalizeCustomerEmail(rec.email) === normalizeCustomerEmail(identity.email) ? rec : null;
   }
 
-  /** POST /api/customer/install-command. Mints a fresh one-time install
-   *  token exactly the way the `/welcome/<page-token>` page does (reuses
-   *  `BillingStore.mint`, the SAME `/install/<token>` route consumes it) —
-   *  never inline on a page load, so a dashboard left open does not mint a
-   *  fresh install command on every poll. */
-  installCommand(identity: CustomerIdentity, customerKey: string, releaseReady: boolean): InstallCommandOutcome {
+  /** Explicit rotation is account-scoped; machine bindings are never modified. */
+  installCommand(identity: CustomerIdentity, customerKey: string, releaseReady: boolean,
+    options: import("./billing/service.js").InstallRegenerationOptions): InstallCommandOutcome {
     const rec = this.ownedCustomer(identity, customerKey);
     if (!rec) return { ok: false, status: 404, error: "unknown customer" };
-    const lic = this.licenses.get(rec.licenseId);
-    if (!lic || this.licenses.isRevoked(rec.licenseId)) return { ok: false, status: 403, error: "this licence has been revoked — contact support" };
-    if (lic.exp <= this.now()) return { ok: false, status: 403, error: "this licence has lapsed — renew it first (see Manage billing)" };
     if (!releaseReady) return { ok: false, status: 503, error: "no release is published on the Hub right now — check back shortly" };
-    const raw = this.billing.store.mint("install", rec.licenseId, rec.key, this.now());
-    return { ok: true, command: `curl -q -fsSL "${this.origin}/install/${raw}" | sudo bash` };
+    const result = this.billing.regenerateInstall(customerKey, identity.email, options);
+    if (!result.ok) return result;
+    return { ok: true, command: result.command, expiresAtMs: result.expiresAtMs,
+      revision: result.revision, binding: result.binding, deviceTransferred: false };
   }
 
   /** POST /api/customer/portal. Ownership-checked, then the exact Stripe
