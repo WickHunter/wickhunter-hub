@@ -1,3 +1,7 @@
+## v0.4.89 — Recovery after repeated install challenges
+
+Reset recovery reads the existing signed lease from the complete verified audit history, even after more than 250 later challenges. The admin audit display remains capped at 250 events. Signature, machine revision, sequence, audit confirmation and recorded offline grace checks remain enforced; this does not issue extra authority or alter the paid plan, expiry or seat limit.
+
 ## v0.4.88 — Account-linked reinstall recovery
 
 The customer dashboard can regenerate a reusable 24-hour install command and copy it. Regeneration invalidates older commands for that account, preserves its licence and subscription, and provides a support handoff for a reset server with a lost installation key.
@@ -1970,6 +1974,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.89 — Resolve reset recovery against complete verified lease history while retaining the bounded admin audit display and all authority checks.
 - v0.4.88 — Regenerate account-scoped install commands and recover a confirmed reset server through an audited replacement licence, preserving billing, dashboard and Earn history. Keep the bounded Earn copy fallback.
 - v0.4.87 — Open unselected purchase links on the existing referral-preserving plan chooser; provide truthful Earn copy fallback and the saved WH trading-fee share.
 - v0.4.86 — Verify signed installed releases, service ownership, fresh readiness and release locks on installer reruns; preserve active installations and customer data. Empty systemd command hooks remain compatible, and captured unit properties stay out of verifier process arguments.

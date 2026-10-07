@@ -111,7 +111,6 @@ import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
 import {
   LicenseLeaseService,
-  verifyLicenseLease,
   leaseRequestFailure,
   type LeaseChallengeInput,
   type LeasePurpose,
@@ -428,14 +427,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     recoveryHostingActive: rec => !hostingRef || [rec.key,rec.stripeCustomerId,`email:${normalizeCustomerEmail(rec.email)}`].some(k=>hostingRef!.store.activeInstanceForOwner(k,"live") || hostingRef!.store.activeInstanceForOwner(k,"test")),
     deviceRecoverySnapshot: licenseId => {
       if(!licenseLeases)throw Error("Machine recovery is unavailable");
-      const snapshot=licenseLeases.adminSnapshot(licenseId);
-      return {auditRevision:snapshot.auditRevision,locked:snapshot.recoveryLockedLicenses.includes(licenseId),active:snapshot.activations.filter(a=>a.status==="active").map(a=>{
-        const event=[...snapshot.audit].reverse().find(e=>"lease" in e && "activation" in e && e.activation.id===a.id && e.activation.revision===a.revision);
-        if(!event || !("lease" in event))throw Error("Signed machine grace is unavailable");
-        const proof=verifyLicenseLease(event.lease.token,snapshot.publicKeys);
-        if(!proof.ok || proof.payload.licenseId!==licenseId || proof.payload.activationId!==a.id || proof.payload.sequence!==a.lastSequence)throw Error("Signed machine grace is invalid");
-        return {id:a.id,revision:a.revision,cachedGraceUntilMs:proof.payload.policy.cachedGraceUntilMs};
-      })};
+      return licenseLeases.deviceRecoverySnapshot(licenseId);
     },
     checkRecoveryActivation: (licenseId,activationId,revision,reason) => {
       if(!licenseLeases)throw Error("Current machine retirement check unavailable");

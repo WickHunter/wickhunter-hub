@@ -24,7 +24,7 @@ async function fixture(checkpoint = () => {}) {
     if (paused) await paused;
     return mailFailure ? { ok: false, status: 422, text: async () => init.body } : { ok: true, status: 200, text: async () => '{"id":"fixture-mail"}' };
   };
-  const h = await freshHub({}, { billingFetch: fetchMail, billingNow: () => now, licenseLeaseNow: () => now, billingRecoveryCheckpoint: checkpoint });
+  const h = await freshHub({}, { billingFetch: fetchMail, billingNow: () => now, licenseLeaseNow: () => now, licenseLeaseMonotonicNow: () => now, billingRecoveryCheckpoint: checkpoint });
   let running = h.hub, origin = h.origin;
   const store = new BillingStore(h.dataDir);
   const issued = h.store.issueUntil("Henrique Fixture", now + 30 * 86400000, "unleashed", now);
@@ -47,7 +47,7 @@ async function fixture(checkpoint = () => {}) {
     reissue: (over = {}) => admin("/admin/api/billing/reissue-install", { customerId: customer.key, email: customer.email, issue: "bybit-us-ip", ...over }),
     url: (suffix) => `${origin}${suffix}`,
     advance: (ms) => { now += ms; }, failMail: () => { mailFailure = true; }, pause: (promise) => { paused = promise; },
-    restart: async () => { await running.close(); running = createHub(h.cfg, { billingFetch: fetchMail, billingNow: () => now, licenseLeaseNow: () => now, billingRecoveryCheckpoint: checkpoint, candleSleep: async () => {} }); const port = await running.listen(); origin = `http://127.0.0.1:${port}`; },
+    restart: async () => { await running.close(); running = createHub(h.cfg, { billingFetch: fetchMail, billingNow: () => now, licenseLeaseNow: () => now, licenseLeaseMonotonicNow: () => now, billingRecoveryCheckpoint: checkpoint, candleSleep: async () => {} }); const port = await running.listen(); origin = `http://127.0.0.1:${port}`; },
     close: async () => { await running.close(); fs.rmSync(h.dataDir, { recursive: true, force: true }); fs.rmSync(h.releasesDir, { recursive: true, force: true }); },
   };
 }
@@ -88,7 +88,11 @@ await test("linked reset recovery retires only old authority, preserves payment/
     const flags=JSON.parse(fs.readFileSync(path.join(f.h.dataDir,"flags.json")));assert.deepEqual(flags.byLicense[next],{marketplace:false,earlyAccess:true});assert.deepEqual(flags.byLicense.unrelated,{unchanged:false});
     assert.deepEqual(f.store.lookupPage(f.otherPage),otherToken);assert.equal(f.store.lookupPage(f.oldPage),null);
     assert.equal((await fetch(f.url(`/install/${f.oldInstall}`))).status,403);
-    assert.equal(f.mails.length,1);assert.match(f.mails[0].text,/same plan and expiry/);assert.match(f.mails[0].text,/Settings → License/);assert.ok(f.mails[0].text.includes(f.h.store.tokenFor(next)));assert.ok(!f.mails[0].text.includes(f.issued.token));assert.doesNotMatch(f.mails[0].text,/US IP|Go|offline|licence remain unchanged|existing licence/);
+    assert.equal(f.mails.length,1);assert.match(f.mails[0].text,/same plan and expiry/);assert.match(f.mails[0].text,/Settings → License/);assert.ok(f.mails[0].text.includes(f.h.store.tokenFor(next)));assert.ok(!f.mails[0].text.includes(f.issued.token));
+    // Keys and install tokens are separately checked exactly; their random
+    // base64url bytes are not prose and can legitimately contain "Go".
+    const recoveryProse=f.mails[0].text.replaceAll(f.h.store.tokenFor(next),"[replacement key]").replaceAll(rawFromMail(f.mails[0]),"[install token]");
+    assert.doesNotMatch(recoveryProse,/US IP|Go|offline|licence remain unchanged|existing licence/);
     const raw=rawFromMail(f.mails[0]);assert.equal((await fetch(f.url(`/install/${raw}`))).status,200);assert.equal((await fetch(f.url(`/install/${raw}`))).status,200);
     const payload=f.h.store.get(next);assert.deepEqual({name:payload.name,exp:payload.exp,plan:payload.plan},{name:f.issued.payload.name,exp:f.issued.payload.exp,plan:f.issued.payload.plan});
     const signed=f.h.store.tokenFor(next);assert.equal((await activate(f,{token:signed},machine("replacement-server"))).status,200);
@@ -98,6 +102,46 @@ await test("linked reset recovery retires only old authority, preserves payment/
     const done=await recover(f,request);assert.equal(done.status,200);assert.equal(done.body.alreadyCompleted,true);assert.equal(done.body.expiresAtMs,result.body.expiresAtMs);assert.equal(f.mails.length,1);
     const audit=f.store.recentEvents().filter(e=>e.type==="admin.install.device-recovery");assert.equal(audit.length,1);assert.match(audit[0].note,/providerMessageId/);assert.ok(!audit[0].note.includes(raw));
     f.h.store.revoke(next);assert.equal((await recover(f,request)).status,409,"later refund/revocation cannot report a working completed command");
+  }finally{await f.close();}
+});
+await test("reset recovery finds signed grace beyond 250 later challenges without expanding admin history",async()=>{
+  const f=await fixture();try{
+    const {old,request}=await prepare(f,"older-lease-recovery");
+    const replacement=machine("reset-server-with-lost-key");
+    for(let i=0;i<251;i++){
+      f.advance(6*60_000);
+      f.hub.licenseLeases.challenge(f.issued.token,{purpose:"activate",installId:replacement.id,installPublicKey:replacement.pub});
+    }
+    await f.restart(); // Force verified disk replay, not the append cache.
+    const snapshot=f.hub.licenseLeases.adminSnapshot(f.issued.payload.id);
+    assert.equal(snapshot.audit.length,250);
+    assert.ok(snapshot.audit.every(e=>e.kind==="challenge_issued"));
+    assert.ok(old.body.lease.payload.expiresAtMs<f.now,"original short lease has expired");
+    assert.equal((await recover(f,request)).status,409,"stale audit confirmation still refuses");
+    assert.deepEqual(recoveryRecords(f.h.dataDir),[]);
+    const result=await recover(f,{...request,expectedAuditRevision:snapshot.auditRevision});
+    assert.equal(result.status,200,JSON.stringify(result.body));
+    assert.equal(result.body.cachedOldGraceUntilMs,old.body.lease.payload.policy.cachedGraceUntilMs);
+    assert.equal(f.mails.length,1);
+    const next=f.h.store.get(result.body.licenseId);
+    assert.equal(next.exp,f.issued.payload.exp);assert.equal(next.plan,f.issued.payload.plan);
+    assert.equal(f.h.store.isRevoked(f.issued.payload.id),true);
+    assert.ok(f.hub.licenseLeases.adminSnapshot(f.issued.payload.id).audit.length<=250);
+    assert.equal((await activate(f,{token:f.h.store.tokenFor(next.id)},replacement)).status,200);
+  }finally{await f.close();}
+});
+await test("recovery refuses a corrupted signed historical lease before reserving replacement authority",async()=>{
+  const f=await fixture();try{
+    const {request}=await prepare(f,"corrupt-historical-lease");
+    const file=path.join(f.h.dataDir,"license-lease-audit.v1.jsonl");
+    const lines=fs.readFileSync(file,"utf8").trimEnd().split("\n");
+    const index=lines.findIndex(line=>JSON.parse(line).event.kind==="activation_created");
+    const row=JSON.parse(lines[index]);row.event.lease.token=row.event.lease.token.slice(0,-1)+"!";
+    lines[index]=JSON.stringify(row);fs.writeFileSync(file,lines.join("\n")+"\n");
+    const count=f.h.store.list().length;
+    assert.equal((await recover(f,request)).status,409);
+    assert.deepEqual(recoveryRecords(f.h.dataDir),[]);assert.equal(f.mails.length,0);
+    assert.equal(f.h.store.list().length,count);assert.equal(f.h.store.isRevoked(f.issued.payload.id),false);
   }finally{await f.close();}
 });
 await test("exact customer, machine and audit confirmations refuse before any recovery write",async()=>{

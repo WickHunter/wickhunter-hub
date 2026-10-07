@@ -184,10 +184,23 @@ await test("startup accepts only the signed version, detects exit/restart/OOM, a
 await test("a hung health call stays inside the single readiness deadline", () => {
   const dir = sandbox();
   try {
-    const started = Date.now();
-    const result = run(readiness.replace("HEALTH_DEADLINE_SECONDS=45", "HEALTH_DEADLINE_SECONDS=2") + '\nwait_for_signed_version', readinessFixture(dir, "hung"));
+    const env = readinessFixture(dir, "hung");
+    // Prime newly written fixture executables before measuring. macOS may
+    // spend the entire short deadline inspecting a script's first execution.
+    const warm = run('timeout 3s systemctl show "$SERVICE" >/dev/null\ncurl --max-time 0 >/dev/null || true\ntimeout 3s journalctl >/dev/null\ntimeout 3s ss >/dev/null', { ...env, MOCK_MODE: "warm" });
+    assert.equal(warm.status, 0, warm.stderr);
+    fs.unlinkSync(env.COUNTER); fs.unlinkSync(env.CURL_BUDGETS);
+    env.READINESS_TIMING = path.join(dir, "readiness-timing");
+    // Measure the readiness loop, not process launch or the separately bounded
+    // failure diagnostics. The original diagnostics still execute in full.
+    const timed = readiness.replace("HEALTH_DEADLINE_SECONDS=45", "HEALTH_DEADLINE_SECONDS=2")
+      .replace("startup_diagnostics() {", "fixture_startup_diagnostics() {");
+    const result = run(timed + '\nstartup_diagnostics() { printf "%s\\n" "$EPOCHREALTIME" >> "$READINESS_TIMING"; fixture_startup_diagnostics; }\nprintf "%s\\n" "$EPOCHREALTIME" > "$READINESS_TIMING"\nwait_for_signed_version', env);
+    const times = fs.readFileSync(env.READINESS_TIMING, "utf8").trim().split("\n").map(Number);
+    assert.equal(times.length, 2); assert.ok(times.every(n => Number.isFinite(n) && n > 0));
+    const elapsedMs = (times[1] - times[0]) * 1000;
     assert.notEqual(result.status, 0); assert.match(result.stderr, /within 2s/);
-    assert.ok(Date.now() - started < 4000, "hung curl cannot repeat the full deadline for nine attempts");
+    assert.ok(elapsedMs >= 0 && elapsedMs < 4000, `hung curl cannot repeat the full deadline for nine attempts (${elapsedMs}ms)`);
     const budgets = fs.readFileSync(path.join(dir, "budgets"), "utf8").trim().split("\n").map(Number);
     assert.equal(budgets.length, 1);
     assert.ok(budgets[0] >= 1 && budgets[0] <= 2, "service-state time consumes the same deadline before curl starts");
