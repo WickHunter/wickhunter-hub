@@ -23,6 +23,7 @@ import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, readJson, writeJsonAtomic } from "../jsonfile.js";
+import { committedRecoveryLicenses } from "./install-recovery.js";
 import type { BillingRole } from "./roles.js";
 
 export const CUSTOMERS_FILE = "billing-customers.v1.json";
@@ -385,8 +386,13 @@ export class BillingStore {
   }
 
   findByLicense(licenseId: string): CustomerRecord | null {
-    for (const rec of Object.values(this.customers())) if (rec.licenseId === licenseId) return rec;
+    for (const rec of Object.values(this.customers())) if (rec.licenseId === licenseId || this.historicalLicenseIds(rec).includes(licenseId)) return rec;
     return null;
+  }
+
+  historicalLicenseIds(rec: CustomerRecord): string[] { return committedRecoveryLicenses(this.dataDir, rec); }
+  customerLicenseMatches(rec: CustomerRecord, id: string | null | undefined): boolean {
+    return !!id && (rec.licenseId === id || this.historicalLicenseIds(rec).includes(id));
   }
 
   findByCharge(id: string): CustomerRecord | null {

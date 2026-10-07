@@ -150,7 +150,7 @@ export class LicenseStore {
    *  checkout). Same v1 wire format: `plan` was always a free string that the
    *  bot verifies only for TYPE, so a value other than "beta" is not a format
    *  change. `issue()` above is this with `now + days` and "beta". */
-  issueUntil(name: string, exp: number, plan = "beta", now = Date.now()): { payload: LicensePayload; token: string } {
+  issueUntil(name: string, exp: number, plan = "beta", now = Date.now(), reservedId?: string): { payload: LicensePayload; token: string } {
     const trimmed = name.trim();
     if (!trimmed || trimmed.length > 120) throw new Error("name must be 1..120 characters");
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(plan)) throw new Error("plan must be letters, digits, dots, dashes or underscores, max 64 characters");
@@ -162,7 +162,9 @@ export class LicenseStore {
     if (expMs > iat + 3650 * 86_400_000) throw new Error("expiry must be within 3650 days of issue");
     // Key order below IS the pinned v1 wire order (JS object insertion order
     // survives JSON.stringify). Do not reorder.
-    const payload: LicensePayload = { v: 1, id: randomUUID(), name: trimmed, exp: expMs, iat, plan };
+    if (reservedId !== undefined && !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(reservedId)) throw new Error("replacement license ID must be a reserved UUID");
+    if (reservedId && this.isKnown(reservedId)) throw new Error("reserved replacement license already exists");
+    const payload: LicensePayload = { v: 1, id: reservedId ?? randomUUID(), name: trimmed, exp: expMs, iat, plan };
     const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
     const sig = edSign(null, payloadBytes, priv);
     const token = `${TOKEN_PREFIX}.${payloadBytes.toString("base64url")}.${sig.toString("base64url")}`;

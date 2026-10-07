@@ -295,4 +295,27 @@ await test("actual customer page requires confirmation, sends current revision, 
   } finally{dom.window.close()}
 });
 
+
+await test("actual regenerate network rejection and timeout show a retryable error and always release the button",async()=>{
+  const state={ok:true,email:"fixture@example.test",software:[{customerKey:"cus_own",livemode:true,plan:"monthly",exp:Date.now()+86400000,installRecovery:{revision:"before",binding:"bound"}}],hosting:{available:false}};
+  let mode="reject",aborted=false,requests=0;const errors=[],deadlines=[];
+  const dom=new JSDOM(fs.readFileSync(new URL("../public/customer.html",import.meta.url),"utf8"),{url:"https://hub.test/customer",runScripts:"dangerously",beforeParse(w){
+    w.confirm=()=>true;w.addEventListener("error",e=>errors.push(e.message));w.addEventListener("unhandledrejection",e=>errors.push(String(e.reason)));
+    const timeout=w.setTimeout.bind(w);w.setTimeout=(fn,ms,...args)=>{if(ms===15000)deadlines.push(ms);return timeout(fn,ms===15000?5:ms,...args)};
+    w.fetch=async(route,opts={})=>{
+      if(route==="/api/customer/state")return {ok:true,status:200,json:async()=>state};
+      requests++;if(mode==="reject")throw Error("fixture network failed");
+      if(mode==="pending"){opts.signal.addEventListener("abort",()=>{aborted=true});return new Promise(()=>{});}
+      return {ok:true,status:200,json:async()=>({ok:true,command:"retry-command",revision:"after",binding:"bound"})};
+    };
+  }});
+  const settle=()=>new Promise(resolve=>setTimeout(resolve,20));try{
+    await settle();const doc=dom.window.document,button=doc.querySelector("#softwareCards .v-install"),error=doc.querySelector("#softwareCards .v-install-err");
+    button.click();await settle();assert.equal(button.disabled,false);assert.equal(error.hidden,false);assert.match(error.textContent,/Reload.*try again/);assert.equal(doc.querySelector("#softwareCards .v-cmd").hidden,true);
+    mode="success";button.click();await settle();assert.equal(button.disabled,false);assert.equal(error.hidden,true);assert.match(doc.querySelector("#softwareCards .v-cmd").textContent,/retry-command/);
+    mode="pending";button.click();await settle();assert.equal(aborted,true);assert.equal(button.disabled,false);assert.equal(error.hidden,false);assert.match(error.textContent,/Recover a reset server/);assert.equal(doc.querySelector("#softwareCards .v-cmd").hidden,true);assert.equal(doc.querySelector("#softwareCards .v-cmd-note").hidden,true);
+    assert.equal(requests,3);assert.deepEqual(deadlines,[15000,15000,15000]);assert.deepEqual(errors,[]);assert.ok(doc.querySelector("#softwareCards .v-recovery").href.includes("#message="));
+  }finally{dom.window.close()}
+});
+
 summary("install-reissue");

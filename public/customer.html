@@ -201,9 +201,13 @@
     <p class="err v-lapsed" hidden style="margin:10px 0 0">This licence has lapsed — the bot keeps closing and protecting positions but opens nothing new until it is renewed.</p>
     <div class="row" style="margin-top:14px">
       <button class="btn v-install" type="button">Regenerate install command</button>
+      <a class="btn quiet v-recovery" href="support" target="_blank" rel="noopener">Recover a reset server</a>
       <button class="btn quiet v-portal" type="button">Manage billing</button>
     </div>
     <div class="cmd v-cmd" hidden></div>
+    <button class="btn quiet v-replacement-key" type="button" hidden style="margin-top:10px">Show replacement licence key</button>
+    <p class="fine v-key-note" hidden>Already installed on your reset server? Save this key in Settings → License before using the install command. Do not reuse the old server.</p>
+    <div class="cmd v-key" hidden></div>
     <p class="fine v-cmd-note" hidden>This command can be retried for 24 hours. Previous opaque install commands are invalidated. Your licence, subscription and machine binding stay unchanged. If a VPS reset lost its machine key, contact support before trading.</p>
     <p class="err v-install-err" hidden style="margin:10px 0 0"></p>
     <p class="err v-portal-err" hidden style="margin:10px 0 0"></p>
@@ -222,6 +226,16 @@
     return { status: res.status, ok: res.ok, body: body };
   }
 
+  async function boundedApi(path, opts) {
+    var controller = new AbortController(), deadline;
+    try {
+      return await Promise.race([
+        api(path, Object.assign({}, opts, { signal: controller.signal })),
+        new Promise(function (_, reject) { deadline = setTimeout(function () { controller.abort(); reject(new Error("Request timed out")); }, 15000); })
+      ]);
+    } finally { clearTimeout(deadline); }
+  }
+
   var loadingEl = document.getElementById("loading");
   var signedOutEl = document.getElementById("signedOut");
   var signedInEl = document.getElementById("signedIn");
@@ -238,7 +252,29 @@
     return ["live", "Active"];
   }
 
-  function renderSoftware(list) {
+  function showCopyText(box, text, label) {
+    box.textContent = text;
+    var copy = document.createElement("button");
+    copy.className = "copy";
+    copy.type = "button";
+    copy.textContent = label;
+    copy.addEventListener("click", function () {
+      copy.disabled = true;
+      var timeout;
+      Promise.race([
+        Promise.resolve().then(function () { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable"); return navigator.clipboard.writeText(text); }),
+        new Promise(function (_, reject) { timeout = setTimeout(function () { reject(new Error("Clipboard timed out")); }, 2000); })
+      ]).then(function () { copy.textContent = "Copied"; }, function () {
+        copy.textContent = "Select and copy manually";
+        var range = document.createRange(); range.selectNodeContents(box.firstChild);
+        var selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      }).finally(function () { clearTimeout(timeout); copy.disabled = false; });
+    });
+    box.appendChild(copy);
+    box.hidden = false;
+  }
+
+  function renderSoftware(list, accountEmail) {
     var host = document.getElementById("softwareCards");
     var tpl = document.getElementById("softwareCardTpl");
     host.innerHTML = "";
@@ -261,6 +297,15 @@
       node.querySelector(".v-sub").textContent = sw.subscriptionStatus || "one-time purchase";
       node.querySelector(".v-lapsed").hidden = !sw.exitOnly;
 
+      node.querySelector(".v-recovery").href = "support#message=" + encodeURIComponent("I reset or replaced my server and lost its installation key. Please help recover my account. Email: " + (accountEmail || "") + ". Account: " + sw.customerKey);
+      var keyBtn=node.querySelector(".v-replacement-key");keyBtn.hidden=!sw.recoveredInstallation || sw.revoked || sw.exitOnly;
+      keyBtn.addEventListener("click",async function(){
+        keyBtn.disabled=true;
+        try{var response=await boundedApi("/api/customer/replacement-license-key",{method:"POST",body:JSON.stringify({customerKey:sw.customerKey})});
+          if(!response.ok || !response.body || !response.body.ok)throw new Error("Replacement licence is unavailable; contact support.");
+          showCopyText(node.querySelector(".v-key"),response.body.licenseKey,"Copy licence key");node.querySelector(".v-key-note").hidden=false;
+        }catch(error){node.querySelector(".v-install-err").textContent=error.message;node.querySelector(".v-install-err").hidden=false;}finally{keyBtn.disabled=false;}
+      });
       var installBtn = node.querySelector(".v-install");
       var installErr = node.querySelector(".v-install-err");
       var cmdBox = node.querySelector(".v-cmd");
@@ -269,34 +314,23 @@
         if (!window.confirm("Regenerate this account’s install command? Previous opaque install commands will stop working. Your licence and subscription stay unchanged. This does not transfer or revoke an active machine binding; a lost machine key requires support recovery.")) return;
         installBtn.disabled = true;
         installErr.hidden = true;
-        var r = await api("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey, confirmed: true, expectedRevision: sw.installRecovery && sw.installRecovery.revision, acknowledgeMachineBinding: true }) });
-        installBtn.disabled = false;
+        cmdBox.hidden = true;
+        cmdNote.hidden = true;
+        try {
+        var r = await boundedApi("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey, confirmed: true, expectedRevision: sw.installRecovery && sw.installRecovery.revision, acknowledgeMachineBinding: true }) });
         if (!r.ok || !r.body || !r.body.ok) {
           installErr.textContent = (r.body && r.body.error) || "could not get an install command";
           installErr.hidden = false;
           return;
         }
         sw.installRecovery = { revision: r.body.revision, binding: r.body.binding };
-        cmdBox.textContent = r.body.command;
-        var copy = document.createElement("button");
-        copy.className = "copy";
-        copy.type = "button";
-        copy.textContent = "Copy";
-        copy.addEventListener("click", function () {
-          copy.disabled = true;
-          var timeout;
-          Promise.race([
-            Promise.resolve().then(function () { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable"); return navigator.clipboard.writeText(r.body.command); }),
-            new Promise(function (_, reject) { timeout = setTimeout(function () { reject(new Error("Clipboard timed out")); }, 2000); })
-          ]).then(function () { copy.textContent = "Copied"; }, function () {
-            copy.textContent = "Select and copy manually";
-            var range = document.createRange(); range.selectNodeContents(cmdBox.firstChild);
-            var selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
-          }).finally(function () { clearTimeout(timeout); copy.disabled = false; });
-        });
-        cmdBox.appendChild(copy);
-        cmdBox.hidden = false;
+        showCopyText(cmdBox, r.body.command, "Copy command");
         cmdNote.hidden = false;
+        } catch (error) {
+          installErr.textContent = "Could not regenerate the command. Reload your dashboard and try again, or use Recover a reset server for help.";
+          installErr.hidden = false;
+        } finally { installBtn.disabled = false; }
+
       });
 
       var portalBtn = node.querySelector(".v-portal");
@@ -456,7 +490,7 @@
     signedOutEl.hidden = true;
     signedInEl.hidden = false;
     document.getElementById("accountEmail").textContent = state.email;
-    renderSoftware(state.software || []);
+    renderSoftware(state.software || [], state.email);
     renderStarterPack(state.starterPack);
     renderHosting(state.hosting);
   }

@@ -485,6 +485,7 @@ export class CustomerSessionService {
         return {
           customerKey: rec.key,
           installRecovery: this.billing.installRecovery(rec.key),
+          recoveredInstallation: this.billing.store.historicalLicenseIds(rec).length>0,
           livemode: rec.livemode,
           licenseId: rec.licenseId,
           licenseName: payload?.name ?? null,

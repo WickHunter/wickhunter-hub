@@ -1,3 +1,7 @@
+import { randomUUID, createHash } from "node:crypto";
+import { recoveryPath, recoveryRecords, type InstallRecoveryRecord } from "./install-recovery.js";
+import { readFlags } from "../flags.js";
+import { writeJsonAtomic, readJson } from "../jsonfile.js";
 // src/billing/service.ts
 // Stripe -> licence. One class owns the whole chain: a verified webhook event
 // becomes (or extends, or revokes) an LHK1 licence, the buyer is emailed a
@@ -45,7 +49,7 @@ import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutS
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { EarnStripeApi } from "../earn-stripe-api.js";
 import { softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
-import { readJson } from "../jsonfile.js";
+
 import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
@@ -99,7 +103,17 @@ export interface InstallRegenerationOptions {
   confirmed: boolean; expectedRevision: string; acknowledgeMachineBinding?: boolean; deviceReplacement?: boolean;
 }
 
+export interface DeviceRecoveryOptions {
+  operationId: string; expectedLicenseId: string; expectedActivationId: string; expectedActivationRevision: number; expectedAuditRevision: number;
+  confirmedDestroyedInstall: boolean; acknowledgeCachedGrace: boolean;
+}
+export interface DeviceRecoverySnapshot { auditRevision: number; active: { id: string; revision: number; cachedGraceUntilMs: number }[]; locked: boolean; }
 export interface BillingServiceDeps {
+  deviceRecoverySnapshot?: (licenseId: string) => DeviceRecoverySnapshot;
+  checkRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
+  retireRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
+  recoveryHostingActive?: (customer: CustomerRecord) => boolean;
+  recoveryCheckpoint?: (phase: string) => void;
   installBindingState?: (licenseId: string) => InstallBindingState;
   onVerifiedEvent?: (event: StripeEvent) => Promise<void>;
   now?: () => number;
@@ -181,6 +195,7 @@ export class BillingService {
    * for one customer must calculate their target from the latest expiry. */
   private readonly checkoutLocks = new Map<string, Promise<void>>();
   private readonly installReissues = new Set<string>();
+  private readonly recoveryDeps: BillingServiceDeps;
   private readonly installBindingState: (licenseId: string) => InstallBindingState;
   private readonly bundleLocks = new Map<string, Promise<void>>();
 
@@ -191,6 +206,7 @@ export class BillingService {
     private readonly templatesDir: string,
     deps: BillingServiceDeps = {},
   ) {
+    this.recoveryDeps = deps;
     this.installBindingState = deps.installBindingState ?? (() => "unavailable");
     this.onVerifiedEvent = deps.onVerifiedEvent;
     this.afterCommitOutbox = deps.onVerifiedEvent ? new AfterCommitOutbox(dataDir) : null;
@@ -1015,6 +1031,7 @@ export class BillingService {
     const oneOffDays = this.oneOffDaysFor(f.metadata, planByKey(cfg, planKey), cfg);
     const beforeRecovery = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
       ?? this.findCustomer(f.customerId, f.email, ev.livemode, !grant);
+    if(beforeRecovery && this.recoveryPending(beforeRecovery.key))throw Error("Customer recovery must complete before checkout mutation");
     const recoveryKeys = [...new Set([beforeRecovery?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
     for (const key of recoveryKeys) await this.recoverPendingCheckout(key, cfg, now, ev);
     const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
@@ -1094,7 +1111,7 @@ export class BillingService {
       marker.targetExpMs,
       now,
     );
-    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`checkout session ${f.sessionId} changed license`);
+    if (marker.licenseId && !this.store.customerLicenseMatches(rec, marker.licenseId)) throw new Error(`checkout session ${f.sessionId} changed license`);
     if (!marker.licenseId) {
       marker.licenseId = rec.licenseId;
       marker.updatedAtMs = now;
@@ -1155,7 +1172,7 @@ export class BillingService {
       starterPackCandidateAtMs: marker.starterPackGrantAtMs,
       ...(marker.launchIntentId ? { metadata: { wh_launch_intent: marker.launchIntentId, plan: marker.planKey ?? '' } } : {}),
     }, cfg, marker.targetExpMs, now);
-    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`pending checkout ${sessionId} changed license`);
+    if (marker.licenseId && !this.store.customerLicenseMatches(rec, marker.licenseId)) throw new Error(`pending checkout ${sessionId} changed license`);
     if (!marker.licenseId) {
       marker.licenseId = rec.licenseId;
       marker.updatedAtMs = now;
@@ -1213,7 +1230,7 @@ export class BillingService {
     const rec = this.store.getCustomer(marker.customerKey) ?? this.store.findByLicense(marker.licenseId);
     const issued = this.licenses.get(marker.licenseId) ||
       (this.licenses.isRevoked(marker.licenseId) && this.licenses.isKnown(marker.licenseId));
-    if (!rec || rec.key !== marker.customerKey || rec.licenseId !== marker.licenseId || !issued) {
+    if (!rec || rec.key !== marker.customerKey || !this.store.customerLicenseMatches(rec, marker.licenseId) || !issued) {
       throw new Error(`applied checkout session ${marker.sessionId} has inconsistent durable state`);
     }
   }
@@ -1416,7 +1433,7 @@ export class BillingService {
       catch { return false; } // corrupt evidence cannot grant or break check-in
       if (!marker) continue;
       foundDurableMarker = true;
-      if (marker.status === 'applied' && marker.customerKey === rec.key && marker.licenseId === rec.licenseId &&
+      if (marker.status === 'applied' && marker.customerKey === rec.key && this.store.customerLicenseMatches(rec, marker.licenseId) &&
         marker.planKey === 'lifetime' && marker.livemode === true &&
         (Number.isSafeInteger(marker.paidAtMs) && marker.paidAtMs! > 0 || /^pi_[A-Za-z0-9_]+$/.test(marker.paymentIntentId ?? ''))) return true;
     }
@@ -1441,12 +1458,13 @@ export class BillingService {
   private ensureCustomer(facts: CustomerFacts, cfg: BillingConfig, initialExp: number, now: number): { rec: CustomerRecord; created: boolean } {
     const grant = launchGrant(this.dataDir, facts.metadata ?? {}, facts.livemode);
     const direct = facts.customerId ? this.store.getCustomer(facts.customerId) ?? this.store.findByStripeCustomer(facts.customerId) : null;
-    if (grant?.licenseId && direct && direct.licenseId !== grant.licenseId) throw Error('Stripe customer is already bound to another license');
+    if (grant?.licenseId && direct && !this.store.customerLicenseMatches(direct, grant.licenseId)) throw Error('Stripe customer is already bound to another license');
     const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
       ?? this.findCustomer(facts.customerId, facts.email, facts.livemode, !grant);
     if (existing) {
+      if(this.recoveryPending(existing.key))throw Error("Customer recovery must complete before checkout mutation");
       if (existing.livemode !== facts.livemode) throw Error('Checkout license is already bound in another Stripe mode');
-      if (grant?.licenseId && existing.licenseId !== grant.licenseId) throw Error('Checkout conflicts with an existing billing license');
+      if (grant?.licenseId && !this.store.customerLicenseMatches(existing, grant.licenseId)) throw Error('Checkout conflicts with an existing billing license');
       if (facts.customerId && existing.stripeCustomerId && existing.stripeCustomerId !== facts.customerId) throw Error('Checkout conflicts with an existing Stripe customer');
       if (facts.email && !existing.email) existing.email = facts.email;
       if (facts.name && (!existing.name || existing.name === existing.email)) existing.name = facts.name;
@@ -1578,12 +1596,111 @@ export class BillingService {
   }
 
   async resendWelcome(customerKey: string): Promise<{ ok: true; sentTo: string } | { ok: false; status: number; error: string }> {
+    if(this.recoveryPending(customerKey))return {ok:false,status:409,error:"Server recovery needs completion before a new welcome link can be sent"};
     const rec = this.store.getCustomer(customerKey);
     if (!rec) return { ok: false, status: 404, error: "unknown customer" };
     const note = await this.sendWelcomeIfNeeded(rec, this.config(), this.now(), true);
     if (rec.welcomeError) return { ok: false, status: 502, error: rec.welcomeError };
     void note;
     return { ok: true, sentTo: rec.email };
+  }
+
+  async recoverDestroyedInstall(customerKey: string, expectedEmail: string, options: DeviceRecoveryOptions): Promise<
+    { ok: true; sentTo: string; licenseId: string; previousLicenseId: string; expiresAtMs: number; cachedOldGraceUntilMs: number; alreadyCompleted?: true }
+    | { ok: false; status: number; error: string }> {
+    if (this.installReissues.has(customerKey)) return {ok:false,status:409,error:"A recovery or reissue is already in progress"};
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(options.operationId) || !options.confirmedDestroyedInstall || !options.acknowledgeCachedGrace)
+      return {ok:false,status:400,error:"Explicit destroyed-server authorization and cached offline-grace acknowledgement are required"};
+    const rec=this.store.getCustomer(customerKey),now=this.now(),cfg=this.config();
+    if(!rec || normalizeInstallEmail(rec.email)!==normalizeInstallEmail(expectedEmail) || !rec.livemode || rec.refunded || rec.disputed)
+      return {ok:false,status:409,error:"Confirmed active live billing customer required"};
+
+    const file=recoveryPath(this.dataDir,options.operationId);
+    let op: InstallRecoveryRecord | null;
+    try { op=recoveryRecords(this.dataDir).find(r=>r.operationId===options.operationId)??null; }
+    catch { return {ok:false,status:409,error:"Recovery journal needs support review; no new recovery started"}; }
+    if(op && (op.customerKey!==rec.key || op.oldLicense.id!==options.expectedLicenseId || op.activationId!==options.expectedActivationId
+      || op.activationRevision!==options.expectedActivationRevision || op.auditRevision!==options.expectedAuditRevision))return {ok:false,status:409,error:"Recovery operation identity changed"};
+    if(op?.phase==="sent" && (rec.licenseId!==op.newLicenseId || !this.licenses.isRevoked(op.oldLicense.id) || !this.licenses.get(op.newLicenseId) || this.licenses.get(op.newLicenseId)!.exp<=now))return {ok:false,status:409,error:"Completed recovery identity needs review"};
+    if(op?.phase==="sent")return {ok:true,sentTo:rec.email,licenseId:op.newLicenseId,previousLicenseId:op.oldLicense.id,expiresAtMs:op.installExpiresAtMs!,cachedOldGraceUntilMs:op.cachedGraceUntilMs,alreadyCompleted:true};
+    if(op && ["email-prepared","email-failed"].includes(op.phase))return {ok:false,status:409,error:"Review the recovery email audit; use same-licence reissue if a replacement email is needed"};
+    if(!emailReady(cfg.email))return {ok:false,status:503,error:"Email provider unavailable; recovery not started"};
+    this.installReissues.add(customerKey);
+    let raw="";
+    try {
+      if(!op){
+        if(this.checkoutLocks.has(rec.key))throw Error("Customer checkout is still in progress");
+        const old=this.licenses.get(rec.licenseId),key=old&&this.licenses.tokenFor(old.id);
+        if(rec.licenseId!==options.expectedLicenseId || !old || !key || !this.licenses.verify(key,now).ok)throw Error("Current licence identity changed or is inactive");
+        if(recoveryRecords(this.dataDir).some(r=>r.customerKey===rec.key && !["committed","email-prepared","email-failed","sent"].includes(r.phase)))throw Error("An earlier recovery needs completion");
+        const pending=this.store.getPendingCheckout(rec.key);
+        if(pending && this.store.getCheckoutSession(pending)?.status!=="applied")throw Error("Pending checkout must be settled before device recovery");
+        if(!this.recoveryDeps.recoveryHostingActive || this.recoveryDeps.recoveryHostingActive(rec))throw Error("Active hosting must be reviewed before device recovery");
+        const facts=this.recoveryDeps.deviceRecoverySnapshot?.(old.id);
+        if(!facts || facts.locked || facts.auditRevision!==options.expectedAuditRevision || facts.active.length!==1)throw Error("Current single-machine lease audit required");
+        const active=facts.active[0];
+        if(active.id!==options.expectedActivationId || active.revision!==options.expectedActivationRevision || !Number.isSafeInteger(active.cachedGraceUntilMs))throw Error("Current machine revision and signed grace required");
+        // Do not rewrite immutable launch/payment grants. An unsettled launch
+        // claim is a separate purchase and must finish before reassociation.
+        const claimFile=path.join(this.dataDir,"billing-launch-claims.v1","live",createHash("sha256").update(old.id).digest("hex")+".json");
+        const claim=readJson<{id:string}|null>(claimFile,null);
+        if(claim){if(!/^[A-Za-z0-9_-]{1,128}$/.test(claim.id))throw Error("Launch claim identity needs review");const intent=readJson<{sessionId?:string;expiredAtMs?:number;reservationReleasedAtMs?:number}|null>(path.join(this.dataDir,"billing-launch-intents.v1",claim.id+".json"),null);
+          if(!intent || !(intent.sessionId && rec.chargeIds.includes("cs:"+intent.sessionId)) && !(intent.expiredAtMs!==undefined && intent.reservationReleasedAtMs!==undefined))throw Error("Unsettled launch checkout must be reviewed");}
+        this.ensureLifetimeAccess(rec,old);
+        op={v:1,operationId:options.operationId,customerKey:rec.key,newLicenseId:randomUUID(),oldCustomer:{...rec},oldLicense:{...old},atMs:now,
+          activationId:active.id,activationRevision:active.revision,auditRevision:facts.auditRevision,cachedGraceUntilMs:active.cachedGraceUntilMs,featureOverrides:{...(this.recoveryFlags().byLicense[old.id]??{})},phase:"prepared"};
+        writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("prepared");
+      }
+      const old=op.oldLicense;
+      if(rec.licenseId!==old.id && rec.licenseId!==op.newLicenseId)throw Error("Customer licence moved outside this recovery");
+      const expected={...op.oldCustomer,licenseId:rec.licenseId};
+      if(JSON.stringify(rec)!==JSON.stringify(expected))throw Error("Customer entitlement changed during interrupted recovery; review before resuming");
+      if(!this.licenses.isRevoked(old.id)){
+        const currentOld=this.licenses.get(old.id);
+        if(!currentOld || JSON.stringify(currentOld)!==JSON.stringify(old))throw Error("Old licence entitlement changed before retirement");
+        if(JSON.stringify(this.recoveryFlags().byLicense[old.id]??{})!==JSON.stringify(op.featureOverrides))throw Error("Old feature authorization changed before retirement");
+      } else if(["prepared","issued"].includes(op.phase))throw Error("Old licence was retired outside this recovery");
+      if(!this.recoveryDeps.checkRecoveryActivation)throw Error("Current machine retirement check unavailable");
+      this.recoveryDeps.checkRecoveryActivation(old.id,op.activationId,op.activationRevision,"Destroyed-server recovery "+op.operationId);
+      const existing=this.licenses.get(op.newLicenseId);
+      if(existing){if(existing.name!==old.name||existing.exp!==old.exp||existing.plan!==old.plan||existing.iat!==op.atMs)throw Error("Reserved replacement licence differs");}
+      else this.licenses.issueUntil(old.name,old.exp,old.plan,op.atMs,op.newLicenseId);
+      if(op.phase==="prepared"){op.phase="issued";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("issued");}
+      if(op.phase==="issued"){op.phase="retiring";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("retiring");}
+      if(!this.licenses.isRevoked(old.id))this.licenses.revoke(old.id,new Date(op.atMs));
+      if(!this.recoveryDeps.retireRecoveryActivation)throw Error("Audited machine retirement unavailable");
+      this.recoveryDeps.retireRecoveryActivation(old.id,op.activationId,op.activationRevision,"Destroyed-server recovery "+op.operationId);
+      if(op.phase==="retiring"){op.phase="retired";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("retired");}
+      const flags=this.recoveryFlags();flags.byLicense[op.newLicenseId]={...op.featureOverrides};writeJsonAtomic(path.join(this.dataDir,"flags.json"),flags);
+      this.store.revokeTokens(rec.key,"all",op.atMs);
+      if(rec.licenseId!==op.newLicenseId){rec.licenseId=op.newLicenseId;this.store.putCustomer(rec);this.recoveryDeps.recoveryCheckpoint?.("linked");}
+      op.phase="committed";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("committed");
+      const issuedAt=this.now();
+      raw=this.store.mint("install",op.newLicenseId,rec.key,issuedAt,{reusable:true});
+      op.installExpiresAtMs=issuedAt+INSTALL_TOKEN_TTL_MS;
+      op.phase="email-prepared";writeJsonAtomic(file,op);
+      const msg=reissuedInstallEmail(rec.email,{name:rec.name,installUrl:`${this.origin}/install/${raw}`,expiresAtMs:op.installExpiresAtMs,issue:"device-recovery",replacementLicenseToken:this.licenses.tokenFor(op.newLicenseId)!,dashboardUrl:`${this.origin}/customer`});
+      const result=await sendEmail(cfg.email,msg,this.fetchLike);
+      if(!result.ok){this.store.revokeInstall(raw,this.now());op.phase="email-failed";writeJsonAtomic(file,op);return {ok:false,status:502,error:"Recovery committed, but email failed; new link revoked. Review before a same-licence reissue."};}
+      op.providerMessageId=result.id;op.emailSentAtMs=this.now();writeJsonAtomic(file,op);
+      this.store.appendEvent({id:"device-recovery:"+op.operationId,type:"admin.install.device-recovery",livemode:true,receivedAtMs:this.now(),outcome:"applied",
+        note:JSON.stringify({customerKey:rec.key,previousLicenseId:old.id,licenseId:op.newLicenseId,cachedOldGraceUntilMs:op.cachedGraceUntilMs,oldServerDestroyedConfirmed:true,providerMessageId:result.id,installExpiresAtMs:op.installExpiresAtMs})});
+      op.phase="sent";writeJsonAtomic(file,op);
+      return {ok:true,sentTo:rec.email,licenseId:op.newLicenseId,previousLicenseId:old.id,expiresAtMs:op.installExpiresAtMs,cachedOldGraceUntilMs:op.cachedGraceUntilMs};
+    } catch {return {ok:false,status:409,error:"Device recovery stopped. Inspect the durable recovery journal before resuming; no completion is claimed."};}
+    finally{this.installReissues.delete(customerKey);}
+  }
+
+  private recoveryFlags(): ReturnType<typeof readFlags> {
+    const raw=readJson<unknown>(path.join(this.dataDir,"flags.json"),{default:{},byLicense:{}});
+    const object=(v:unknown):v is Record<string,unknown> => !!v && typeof v==="object" && !Array.isArray(v);
+    if(!object(raw) || Object.keys(raw).some(k=>k!=="default"&&k!=="byLicense") || !object(raw.default) || !object(raw.byLicense)
+      || Object.values(raw.default).some(v=>typeof v!=="boolean") || Object.entries(raw.byLicense).some(([k,v])=>["__proto__","constructor","prototype"].includes(k) || !object(v) || Object.values(v).some(x=>typeof x!=="boolean")))throw Error("Saved feature overrides need review");
+    return readFlags(this.dataDir);
+  }
+
+  private recoveryPending(customerKey: string): boolean {
+    return recoveryRecords(this.dataDir).some(r=>r.customerKey===customerKey && ["prepared","issued","retiring","retired"].includes(r.phase));
   }
 
   installRecovery(customerKey: string): { revision: string; binding: InstallBindingState } {
@@ -1598,6 +1715,7 @@ export class BillingService {
     { ok: true; raw: string; command: string; expiresAtMs: number; revoked: number; revision: string; binding: InstallBindingState }
     | { ok: false; status: number; error: string } {
     if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    if(recoveryRecords(this.dataDir).some(r=>r.customerKey===customerKey && ["prepared","issued","retiring","retired"].includes(r.phase)))return {ok:false,status:409,error:"Server recovery needs completion before another command can be issued"};
     const rec = this.store.getCustomer(customerKey), now = this.now();
     const lic = rec && this.licenses.get(rec.licenseId), key = lic && this.licenses.tokenFor(lic.id);
     if (!rec || normalizeInstallEmail(rec.email) !== normalizeInstallEmail(expectedEmail)) return { ok: false, status: 404, error: "unknown customer" };
@@ -1624,6 +1742,7 @@ export class BillingService {
     | { ok: false; status: number; error: string }
   > {
     if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    if(this.recoveryPending(customerKey))return {ok:false,status:409,error:"Server recovery needs completion before another command can be issued"};
     const rec = this.store.getCustomer(customerKey);
     if (!rec) return { ok: false, status: 404, error: "unknown customer" };
     const now = this.now();
@@ -1687,6 +1806,7 @@ export class BillingService {
     const t = this.store.lookupPage(rawPageToken);
     if (!t) return { ok: false, status: 404, text: "This link is not valid any more. If you were sent a newer email, use that one; otherwise contact support." };
     const rec = this.store.getCustomer(t.customerKey) ?? this.store.findByLicense(t.licenseId);
+    if(rec && recoveryRecords(this.dataDir).some(r=>r.customerKey===rec.key && ["prepared","issued","retiring","retired"].includes(r.phase)))return {ok:false,status:409,text:"Server recovery is pending; contact support."};
     if (rec) {
       this.ensureLifetimeAccess(rec, this.licenses.get(rec.licenseId));
       this.refreshLifetimeLicense(rec.licenseId);
@@ -1732,6 +1852,7 @@ export class BillingService {
       portalAction: `${this.origin}/welcome/${rawPageToken}/portal`,
       siteOrigin: cfg.siteOrigin,
       supportEmail,
+      recoverySupportUrl: `${this.origin}/support#message=${encodeURIComponent(`I reset or replaced my server and lost its installation key. Email: ${rec.email}. Account: ${rec.key}`)}`,
     };
     const starterPack = starterPackEligible(rec) && !lic.revoked ? loadStarterPack(this.templatesDir) : null;
     if (starterPack) {
@@ -1765,6 +1886,7 @@ export class BillingService {
       }[r.reason];
       return { ok: false, status: 403, text };
     }
+    if(this.recoveryPending(r.rec.customerKey))return {ok:false,status:409,text:"Server recovery needs completion before installation; contact support"};
     if (r.rec.reusable === true) {
       const customer = this.store.getCustomer(r.rec.customerKey);
       if (!customer || !customer.livemode || customer.refunded || customer.disputed || customer.licenseId !== r.rec.licenseId) {
@@ -1941,6 +2063,7 @@ export class BillingService {
    * revoked licenses. Check-in already proves token possession and the seat. */
   refreshLifetimeLicense(licenseId: string): void {
     const rec = this.store.findByLicense(licenseId), current = this.licenses.get(licenseId);
+    if(rec && this.recoveryPending(rec.key))return;
     if (!rec || !current || !this.ensureLifetimeAccess(rec, current) || !rec.livemode || rec.refunded || rec.disputed) return;
     if (current.exp - this.now() > 365 * DAY_MS) return;
     this.licenses.renewLifetimeToken(licenseId, this.now());

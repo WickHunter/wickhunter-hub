@@ -1,3 +1,11 @@
+## v0.4.88 — Account-linked reinstall recovery
+
+The customer dashboard can regenerate a reusable 24-hour install command and copy it. Regeneration invalidates older commands for that account, preserves its licence and subscription, and provides a support handoff for a reset server with a lost installation key.
+
+Verified admin reset recovery reserves one replacement licence, retains the same plan and expiry, and retires the old licence and machine binding before exposing a new command. A durable operation journal supports interruption recovery; payment receipts and Earn ownership keep their original identities through customer-scoped committed lineage. Active hosting and unsettled purchases require support review. Previously signed offline authority is recorded, not erased; the old reset server must not be reused. No seat-limit override or financial-history rewrite is performed.
+
+The shared Earn asset retains the acknowledged-copy timeout fix. Public Beta release archives are unchanged.
+
 ## v0.4.87 — Referral plan chooser and reliable Earn copy
 
 Purchase links with no selected plan now open the existing website chooser,
@@ -457,8 +465,7 @@ The Hub sells the product without a second server. A visitor buys through a
 Stripe **Payment Link**; Stripe posts a signed webhook to the Hub; the Hub
 mints an `LHK1` licence, stores it against the Stripe customer, and emails the
 buyer a link to a **private install page**. That page shows a one-line install
-command whose token works **once** and expires in 24 hours; reloading the page
-mints a fresh one (that is how a customer reinstalls on a new server). The
+command with a 24-hour token. Historical welcome-page commands are single-use; the signed-in dashboard regenerates a reusable command and invalidates older account commands. A reset server with a lost installation key needs the verified recovery action below, not merely a fresh command. The
 licence key itself is never in an email or a URL — it is written into the
 installer the Hub serves for that one-time token, exactly as `install.sh?key=`
 does for a beta invite.
@@ -1963,6 +1970,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.88 — Regenerate account-scoped install commands and recover a confirmed reset server through an audited replacement licence, preserving billing, dashboard and Earn history. Keep the bounded Earn copy fallback.
 - v0.4.87 — Open unselected purchase links on the existing referral-preserving plan chooser; provide truthful Earn copy fallback and the saved WH trading-fee share.
 - v0.4.86 — Verify signed installed releases, service ownership, fresh readiness and release locks on installer reruns; preserve active installations and customer data. Empty systemd command hooks remain compatible, and captured unit properties stay out of verifier process arguments.
 
@@ -2910,3 +2918,9 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 ### Marketplace setup and paid billing
 
 Fresh Marketplace setup defaults to mock. If the private deployment already uses Stripe or MoonPay, Hub setup refuses configuration edits instead of resetting the payment mode or removing vendor credentials. Manage paid billing through the private deployment workflow; the status bridge reports the configured rail and its required inputs.
+
+### Verified reset recovery (0.4.88)
+
+`POST /admin/api/billing/recover-install`, behind existing admin authentication, accepts `customerId`, the exact stored `email`, a stable `operationId`, `expectedLicenseId`, `expectedActivationId`, `expectedActivationRevision`, `expectedAuditRevision`, `confirmedDestroyedInstall:true` and `acknowledgeCachedGrace:true`. Obtain the current machine audit using the existing admin lease snapshot. Confirm the old server was reset/destroyed and record its last signed cached-grace deadline. Reuse the same operation ID after an interruption; never blindly create another replacement. Only a completed operation sends the command to the stored account email. An ambiguous or failed email needs audit review and an explicit same-licence reissue, not another licence replacement.
+
+`data/billing-install-recovery.v1/<sha256(operationId)>.json` retains the reserved identity, old account/entitlement, exact machine audit, phases, actual install expiry and provider outcome. Malformed/unreadable journals refuse recovery and historical lineage. Do not restore version 87 code after any recovery journal is created: it does not understand linked licence identities. Preserve all data and use an explicit compatible recovery plan.

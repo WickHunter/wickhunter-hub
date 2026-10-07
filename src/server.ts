@@ -111,6 +111,7 @@ import type { HubConfig } from "./config.js";
 import { LicenseStore, type LicensePayload } from "./license.js";
 import {
   LicenseLeaseService,
+  verifyLicenseLease,
   leaseRequestFailure,
   type LeaseChallengeInput,
   type LeasePurpose,
@@ -295,6 +296,7 @@ export interface HubDeps {
   notificationFetch?: typeof fetch;
   marketingFetch?: typeof fetch;
   billingNow?: BillingServiceDeps["now"];
+  billingRecoveryCheckpoint?: BillingServiceDeps["recoveryCheckpoint"];
   billingRandomBytes?: BillingServiceDeps["randomBytes"];
   /** Injectable so customer sign-in tests never reach an email provider and
    *  can drive an exact 15-minute token / 30-day session edge. */
@@ -422,6 +424,37 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   try { notifications = new Notifications(cfg.dataDir, deps.notificationFetch, deps.billingNow); }
   catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
   const billing: BillingService = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+    recoveryCheckpoint: deps.billingRecoveryCheckpoint,
+    recoveryHostingActive: rec => !hostingRef || [rec.key,rec.stripeCustomerId,`email:${normalizeCustomerEmail(rec.email)}`].some(k=>hostingRef!.store.activeInstanceForOwner(k,"live") || hostingRef!.store.activeInstanceForOwner(k,"test")),
+    deviceRecoverySnapshot: licenseId => {
+      if(!licenseLeases)throw Error("Machine recovery is unavailable");
+      const snapshot=licenseLeases.adminSnapshot(licenseId);
+      return {auditRevision:snapshot.auditRevision,locked:snapshot.recoveryLockedLicenses.includes(licenseId),active:snapshot.activations.filter(a=>a.status==="active").map(a=>{
+        const event=[...snapshot.audit].reverse().find(e=>"lease" in e && "activation" in e && e.activation.id===a.id && e.activation.revision===a.revision);
+        if(!event || !("lease" in event))throw Error("Signed machine grace is unavailable");
+        const proof=verifyLicenseLease(event.lease.token,snapshot.publicKeys);
+        if(!proof.ok || proof.payload.licenseId!==licenseId || proof.payload.activationId!==a.id || proof.payload.sequence!==a.lastSequence)throw Error("Signed machine grace is invalid");
+        return {id:a.id,revision:a.revision,cachedGraceUntilMs:proof.payload.policy.cachedGraceUntilMs};
+      })};
+    },
+    checkRecoveryActivation: (licenseId,activationId,revision,reason) => {
+      if(!licenseLeases)throw Error("Current machine retirement check unavailable");
+      const state=licenseLeases.adminSnapshot(licenseId),current=state.activations.find(a=>a.id===activationId);
+      if(!current || state.activations.some(a=>a.id!==activationId && a.status==="active") || (current.status==="active" ? current.revision!==revision : current.revision!==revision+1 || current.deactivationReason!==reason))throw Error("Machine recovery identity changed");
+    },
+    retireRecoveryActivation: (licenseId,activationId,revision,reason) => {
+      if(!licenseLeases)throw Error("Audited machine retirement unavailable");
+      let state=licenseLeases.adminSnapshot(licenseId),current=state.activations.find(a=>a.id===activationId);
+      if(!current || state.activations.some(a=>a.id!==activationId && a.status==="active"))throw Error("Machine recovery identity changed");
+      if(current.status==="active"){
+        if(current.revision!==revision)throw Error("Machine revision changed");
+        licenseLeases.adminDeactivate(licenseId,activationId,revision,reason);
+      } else if(current.revision!==revision+1 || current.deactivationReason!==reason)throw Error("Machine retirement belongs to another operation");
+      state=licenseLeases.adminSnapshot(licenseId);
+      if(!state.audit.some(e=>e.kind==="license_revocation_observed" && e.reason===reason))licenseLeases.observeRevocation(licenseId,reason);
+      state=licenseLeases.adminSnapshot(licenseId);
+      if(!store.isRevoked(licenseId) || state.activations.some(a=>a.status==="active") || !state.recoveryLockedLicenses.includes(licenseId))throw Error("Machine retirement is incomplete");
+    },
     installBindingState: (licenseId) => {
       if (!licenseLeases) return "unavailable";
       try {
@@ -729,7 +762,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // unauthenticated POST here shares. The three cookie-authenticated
       // routes are here too, for the same defence-in-depth reason
       // /api/billing/portal-session (licence-token-authenticated) is.
-      if (p === "/api/customer/signin" || p === "/api/customer/install-command"
+      if (p === "/api/customer/signin" || (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key")
         || p === "/api/customer/portal" || p === "/api/customer/signout") return true;
       // Hosting customer actions (cookie-session-authenticated, like the
       // three above) and the bootstrap-token-authenticated readiness
@@ -769,7 +802,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // Stripe webhooks, public bundle checkout, and server-authenticated
     // hosting callbacks have separate trust contracts and are not in this set.
     const customerCookieWrite = m === "POST" && (
-      p === "/api/customer/install-command" || p === "/api/customer/portal"
+      (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key") || p === "/api/customer/portal"
       || p === "/api/customer/signout" || p === "/api/hosting/checkout"
       || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal")))
     );
@@ -1076,6 +1109,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
     if (m === "GET" && p === "/api/customer/state") return customerState(req, res);
     if (m === "POST" && p === "/api/customer/install-command") return customerInstallCommand(req, res);
+    if(m === "POST" && p === "/api/customer/replacement-license-key") {
+      const identity=authenticatedCustomer(req);if(!identity)return sendJson(res,401,{ok:false,error:"Sign in required"},{"cache-control":"no-store"});
+      const body=await readJsonBody(req), rec=typeof body?.customerKey==="string"?billing.store.getCustomer(body.customerKey):null;
+      if(!rec || normalizeCustomerEmail(rec.email)!==identity.email || !rec.livemode || rec.refunded || rec.disputed || !billing.store.historicalLicenseIds(rec).length)return sendJson(res,403,{ok:false,error:"No active recovered licence for this account"},{"cache-control":"no-store"});
+      const key=store.tokenFor(rec.licenseId);if(!key || !store.verify(key,(deps.billingNow??Date.now)()).ok)return sendJson(res,403,{ok:false,error:"Recovered licence is inactive"},{"cache-control":"no-store"});
+      return sendJson(res,200,{ok:true,licenseKey:key},{"cache-control":"no-store"});
+    }
     if (m === "POST" && p === "/api/customer/portal") return customerPortal(req, res);
     if (m === "POST" && p === "/api/customer/signout") return customerSignout(req, res);
     // ── hosting (H4/H5/H6) ───────────────────────────────────────────────
@@ -1676,7 +1716,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   function earnBillingKeys(record: CustomerRecord): string[] {
-    return [`license:${record.licenseId}`,
+    return [`license:${record.licenseId}`, ...billing.store.historicalLicenseIds(record).map(id=>`license:${id}`),
       ...(record.stripeCustomerId.startsWith('cus_') ? [`stripe:live:${record.stripeCustomerId}`] : [])];
   }
 
@@ -1685,7 +1725,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const keys=sorted.flatMap(earnBillingKeys);
     if (fallbackLicenseId) keys.push(`license:${fallbackLicenseId}`);
     const legacy=[...sorted.map(record=>earnOwner('email:'+normalizeCustomerEmail(record.email))),
-      ...sorted.map(record=>earnOwner('license:'+record.licenseId))];
+      ...sorted.flatMap(record=>[record.licenseId,...billing.store.historicalLicenseIds(record)].map(id=>earnOwner('license:'+id)))];
     if (!sorted.length && fallbackLicenseId) legacy.push(earnOwner('license:'+fallbackLicenseId));
     const first=sorted.find(record=>record.stripeCustomerId.startsWith('cus_'));
     const preferred=earnOwner(first ? `stripe:live:${first.stripeCustomerId}` : `license:${fallbackLicenseId ?? sorted[0]?.licenseId}`);
@@ -3171,6 +3211,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
       const r = await billing.resendWelcome(body.customerId);
       return r.ok ? sendJson(res, 200, { ok: true, sentTo: r.sentTo }) : sendJson(res, r.status, { ok: false, error: r.error });
+    }
+    if(m === "POST" && p === "/admin/api/billing/recover-install") {
+      const body=await readJsonBody(req);
+      if(!body || typeof body.customerId!=="string" || typeof body.email!=="string" || typeof body.operationId!=="string" || typeof body.expectedLicenseId!=="string" || typeof body.expectedActivationId!=="string" || !Number.isSafeInteger(body.expectedActivationRevision) || !Number.isSafeInteger(body.expectedAuditRevision))return sendJson(res,400,{ok:false,error:"Exact customer, licence and current machine audit are required"},{"cache-control":"no-store"});
+      if(!readLatest())return sendJson(res,503,{ok:false,error:"No authenticated release available; recovery not started"},{"cache-control":"no-store"});
+      const result=await billing.recoverDestroyedInstall(body.customerId,body.email,{operationId:body.operationId,expectedLicenseId:body.expectedLicenseId,expectedActivationId:body.expectedActivationId,expectedActivationRevision:Number(body.expectedActivationRevision),expectedAuditRevision:Number(body.expectedAuditRevision),confirmedDestroyedInstall:body.confirmedDestroyedInstall===true,acknowledgeCachedGrace:body.acknowledgeCachedGrace===true});
+      return sendJson(res,result.ok?200:result.status,result,{"cache-control":"no-store"});
     }
     if (m === "POST" && p === "/admin/api/billing/reissue-install") {
       const body = await readJsonBody(req);
