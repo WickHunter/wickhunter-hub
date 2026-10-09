@@ -1,4 +1,3 @@
-import { referralMonthlyIncome, type ReferralIncomeScope } from '../earn-monthly-income.js';
 // Launch-only recurring revenue view. BillingStore remains the authority for
 // which software customers/subscriptions are known; Stripe reads are through
 // EarnStripeApi and are always read-only. No email, token, webhook secret, or
@@ -201,13 +200,6 @@ export class LaunchBillingReporting {
       cancelAtPeriodEnd: sf.cancelAtPeriodEnd, currentPeriodEndMs: sf.currentPeriodEndMs,
       firstPaymentAtMs, discountPercent, currency, grossMrrMinor, netMrrMinor,
       linesKnown: !!lines && discountPercent !== null, updatedAtMs: this.now() };
-  }
-  referralIncome(owner: string, scope: ReferralIncomeScope, rate: number) {
-    // Only exact known software subscriptions may contribute. A dispute or
-    // refund excludes the subscription even if the provider still says active.
-    const customers = this.softwareCustomers(scope.mode).filter(c => !c.disputed && !c.refunded);
-    const facts = this.state.facts.filter(f => customers.some(c => c.stripeCustomerId === f.customerId && c.subscriptionId === f.subscriptionId));
-    return referralMonthlyIncome(owner, scope, facts, rate, this.now());
   }
   snapshot() {
     const config = this.billing();

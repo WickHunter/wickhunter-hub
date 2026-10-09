@@ -652,7 +652,27 @@ export class BillingService {
       && knownHosting?.lastEventType?.startsWith("checkout.session.")
       && knownHosting.subscriptionStatus === "active" && knownHosting.periodEndMs === null
       && !knownHosting.disputed && !knownHosting.refunded);
-    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    const eventSha256 = createHash("sha256").update(JSON.stringify(ev)).digest("hex");
+    const pendingInitial = prior?.initialPaidPending;
+    // The admission is durable before either role changes. A retry may finish
+    // a partial write/hook, but only for exactly that event and while no newer
+    // lifecycle state has superseded the original checkout watermark.
+    const resumingInitialPaid = !!(stale && pendingInitial
+      && pendingInitial.eventSha256 === eventSha256
+      && pendingInitial.checkoutWatermarkMs === prior?.latestEventCreatedMs
+      && !prior?.pendingStatus && !prior?.terminal
+      && knownSoftware?.subscriptionStatus === "active"
+      && knownHosting?.subscriptionStatus === "active"
+      && !knownSoftware.refunded && !knownSoftware.disputed
+      && !knownHosting.refunded && !knownHosting.disputed
+      && [knownSoftware, knownHosting].every(rec =>
+        (rec.lastEventType?.startsWith("checkout.session.") && rec.periodEndMs === null)
+        || (rec.lastEventType === ev.type && rec.lastEventId === ev.id)));
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout && !resumingInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+
+    if (initialPaidAfterCheckout) this.store.putBundleSubscription({
+      ...prior!, initialPaidPending: { eventSha256, checkoutWatermarkMs: prior!.latestEventCreatedMs },
+    });
 
     let softwareEvent = ev;
     if (bundle.hosting && ev.type.startsWith('invoice.')) softwareEvent = { ...ev, object: softwareInvoiceProjection(ev.object, bundle.hosting) };
@@ -899,6 +919,7 @@ export class BillingService {
 
   private touchHosting(rec: RoleSubscriptionRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }
@@ -1559,6 +1580,7 @@ export class BillingService {
 
   private touch(rec: CustomerRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }

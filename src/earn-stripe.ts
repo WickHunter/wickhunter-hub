@@ -101,13 +101,6 @@ export class EarnStripeService {
    rows:page.slice(0,50).map((r:StripeObject)=>({id:r.id,label:r.label,code:r.code,kind:r.kind||'subscription',status:r.status,paidThrough:r.paidThrough})),
    next:more?page[49].id:null};
  }
- /** Internal owner-scoped input for forecasts; independent of UI pagination. */
- incomeScope(owner:string){
-  const c=this.settings(),p=this.profile(c.mode,owner);
-  return {mode:c.mode,asOf:typeof p.referralStatusAt==='number'?p.referralStatusAt:null,
-   rows:(Array.isArray(p.referralStatus)?p.referralStatus:[]).filter((r:StripeObject)=>r.owner===owner)
-    .map((r:StripeObject)=>({id:String(r.id),kind:String(r.kind||'subscription'),status:String(r.status)}))};
- }
  /** Only metadata on six exact existing objects changes. Preflight every object
   * and local owner conflict before the first POST; repeat safely after a partial
   * network failure. This never creates a coupon, payout, or commission entry. */

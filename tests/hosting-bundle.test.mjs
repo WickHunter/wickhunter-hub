@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { signStripePayload } from "../dist/src/billing/stripe.js";
+import { createHub } from "../dist/src/server.js";
 import { FakeProvider } from "../dist/src/hosting/provider.js";
 
 const WHSEC = "whsec_test_bundle_0123456789";
@@ -167,6 +168,67 @@ await test("checkout delivered before its older initial paid invoice fills the b
   assert.equal((await c.post(second)).body.outcome, "ignored", "second event does not repeat already-established term");
   await c.h.close();
 });
+
+// Recreate the entire service against the same durable files after an injected
+// partial application, rather than proving only an in-memory retry.
+for (const [failurePoint, fence] of [["hosting-write", null], ["hosting-hook", null], ["completion-write", null], ["hosting-write", "failure"], ["hosting-write", "cancellation"]]) {
+  await test(`older initial invoice restart at ${failurePoint}, newer fence=${fence}`, async () => {
+    const c = await setup();
+    try {
+      await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174120" });
+      const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: c.h.hub.hosting.store.instances()[0].id };
+      const end = Math.floor((c.now() + 30 * 86400000) / 1000);
+      const invoice = c.event("evt_retry_initial", "invoice.paid", { id: "in_retry_initial", paid: true, billing_reason: "subscription_create", customer: "cus_retry", customer_email: "retry@example.com", subscription: "sub_retry", subscription_details: { metadata }, lines: { data: [{ period: { end }, price: { id: "price_bundle_month" } }] } });
+      c.advance(2000);
+      const checkout = c.event("evt_retry_checkout", "checkout.session.completed", { id: "cs_retry", mode: "subscription", payment_status: "paid", customer: "cus_retry", customer_details: { email: "retry@example.com" }, subscription: "sub_retry", metadata });
+      assert.equal((await c.post(checkout)).body.outcome, "applied");
+      const billing = c.h.hub.billing;
+      if (failurePoint === "hosting-write") billing.store.putRoleSubscription = () => { throw Error("injected hosting write refusal"); };
+      if (failurePoint === "hosting-hook") billing.onHostingEvent = () => { throw Error("injected hosting hook refusal"); };
+      if (failurePoint === "completion-write") {
+        const put = billing.store.putBundleSubscription.bind(billing.store);
+        billing.store.putBundleSubscription = rec => { if (!rec.initialPaidPending) throw Error("injected completion refusal"); return put(rec); };
+      }
+      assert.equal((await c.post(invoice)).status, 500);
+      const software = billing.store.getCustomer("cus_retry");
+      assert.equal(software.periodEndMs, end * 1000);
+      assert.ok(billing.store.getBundleSubscription("sub_retry").initialPaidPending);
+      assert.equal(billing.store.seenEvent(invoice.id), false);
+      const expiry = c.h.hub.store.get(software.licenseId).exp;
+      await c.h.close();
+      const restarted = createHub(c.h.cfg, { candleSleep: async () => {}, billingNow: c.now, hostingNow: c.now, hostingProvider: c.provider, billingFetch: async () => ({ ok: true, status: 200, text: async () => "{}" }) });
+      c.h.hub = restarted;
+      c.h.close = () => restarted.close();
+      c.h.origin = `http://127.0.0.1:${await restarted.listen()}`;
+      let hookCalls = 0;
+      const hook = restarted.billing.onHostingEvent.bind(restarted.billing);
+      restarted.billing.onHostingEvent = (...args) => { hookCalls++; return hook(...args); };
+      if (fence) {
+        c.advance(2000);
+        const later = fence === "failure"
+          ? c.event("evt_new_failure", "invoice.payment_failed", { ...invoice.data.object, id: "in_failed_renewal", paid: false, billing_reason: "subscription_cycle" })
+          : c.event("evt_new_cancellation", "customer.subscription.deleted", { id: "sub_retry", customer: "cus_retry", status: "canceled", metadata, items: { data: [{ price: { id: "price_bundle_month" } }] } });
+        assert.equal((await c.post(later)).body.outcome, "applied");
+        assert.equal((await c.post(invoice)).body.outcome, "ignored");
+        assert.equal(restarted.billing.store.getCustomer("cus_retry").subscriptionStatus, fence === "failure" ? "past_due" : "canceled");
+        assert.equal(restarted.billing.store.getRoleSubscription("cus_retry", "hosting").periodEndMs, null);
+        return;
+      }
+      const altered = { ...invoice, data: { object: { ...invoice.data.object, amount_paid: 999999 } } };
+      // Distinct event cannot borrow the durable admission.
+      altered.id = "evt_unadmitted_alias";
+      assert.equal((await c.post(altered)).body.outcome, "ignored");
+      assert.equal((await c.post(invoice)).body.outcome, "applied");
+      assert.equal(restarted.billing.store.getRoleSubscription("cus_retry", "hosting").periodEndMs, end * 1000);
+      assert.equal(restarted.store.get(software.licenseId).exp, expiry);
+      assert.equal(hookCalls, 1);
+      assert.equal(restarted.billing.store.getBundleSubscription("sub_retry").initialPaidPending, undefined);
+      assert.equal(restarted.billing.store.getBundleSubscription("sub_retry").latestEventCreatedMs, checkout.created * 1000);
+      assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+      assert.equal(hookCalls, 1);
+    } finally { await c.h.close(); }
+  });
+}
 
 await test("checkout then initial paid invoice before the worker preserves one current provision job and one create", async () => {
   const c = await setup();

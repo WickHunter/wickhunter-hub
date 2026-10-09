@@ -1,3 +1,7 @@
+## v0.4.91 — Recoverable initial paid subscription terms
+
+Hosted subscription checkout preserves the initial paid invoice even when Stripe delivers it after a newer checkout event. Exact durable retry admission lets software and hosting finish after an interrupted write while retaining later failure, refund and cancellation guards.
+
 ## v0.4.89 — Recovery after repeated install challenges
 
 Reset recovery reads the existing signed lease from the complete verified audit history, even after more than 250 later challenges. The admin audit display remains capped at 250 events. Signature, machine revision, sequence, audit confirmation and recorded offline grace checks remain enforced; this does not issue extra authority or alter the paid plan, expiry or seat limit.
