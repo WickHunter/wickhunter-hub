@@ -16,7 +16,12 @@ through the reviewed procedure. The companion review is
 > * `STAGE_ROOT` = `/root/wh-hub0491-<YYYYMMDD>` on the box (the precedent
 >   naming; a persistent filesystem, never `/tmp`).
 > * The PostgreSQL unit name on the box if it is not `postgresql.service`
->   (e.g. `postgresql@16-main.service`): pass it as `--protected-service`.
+>   (on the Hub box it is `postgresql@18-main.service`, found on the first live
+>   run 2026-10-09): pass it as `--protected-service`. ⚠ `--protected-service`
+>   REPLACES the script's default list, it does not add to it — name all five
+>   defaults again beside it (the `PROTECTED` line in step 4), and put every
+>   `--protected-service` / `--data-backup-exclude` BEFORE the subcommand: they
+>   are global flags, and after `preflight`/`deploy`/`verify` argparse refuses them.
 > * Whether `--data-backup-exclude candles` is needed: compare
 >   `du -sh /opt/wickhunter-hub/data` against `df -h /root` (the preflight's
 >   `stage.free-space` check does the arithmetic; `candles/` is the only data
@@ -51,7 +56,7 @@ through the reviewed procedure. The companion review is
 STAGE_ROOT=/root/wh-hub0491-$(date -u +%Y%m%d)
 ssh root@HUB "install -d -m 0700 -o root -g root $STAGE_ROOT"
 scp scripts/deploy-hub-0491.py scripts/deploy-hub-0491-selftest.py root@HUB:$STAGE_ROOT/
-ssh root@HUB "cd $STAGE_ROOT && python3 -I deploy-hub-0491.py --self-test | tail -1"   # expect: SELF-TEST: 12 passed, 0 failed
+ssh root@HUB "cd $STAGE_ROOT && python3 -I deploy-hub-0491.py --self-test | tail -1"   # expect: SELF-TEST: 13 passed, 0 failed
 ```
 
 ### 1. Baseline (box, read-only)
@@ -87,10 +92,15 @@ ssh root@HUB "chmod 0700 $STAGE_ROOT/stage && chmod -R go-rwx $STAGE_ROOT/stage 
 
 ```
 cd $STAGE_ROOT
-python3 -I deploy-hub-0491.py preflight --stage $STAGE_ROOT/stage [--protected-service postgresql@16-main.service] [--data-backup-exclude candles] \
+# Global flags go BEFORE the subcommand. --protected-service REPLACES the default list, so
+# the five defaults are named again beside the box's PostgreSQL unit (postgresql@18-main.service).
+PROTECTED="--protected-service liqhunter.service --protected-service liqhunter-marketplace-api.service --protected-service liqhunter-marketplace-worker.service --protected-service nginx.service --protected-service postgresql.service --protected-service postgresql@18-main.service"
+python3 -I deploy-hub-0491.py $PROTECTED [--data-backup-exclude candles] preflight --stage $STAGE_ROOT/stage \
   | tee $STAGE_ROOT/preflight-$(date -u +%Y%m%dT%H%M%SZ).txt
 ```
-Every line is `[pass|fail|unknown] name — detail`. Proceed only on `PREFLIGHT PASS`. Use exactly the same `--protected-service` / `--data-backup-exclude` flags on every later command. An `unknown` (exit 3) is not a pass.
+Every line is `[pass|fail|unknown] name — detail`. Proceed only on `PREFLIGHT PASS`. Use exactly the same `$PROTECTED` / `--data-backup-exclude` flags on every later command. An `unknown` (exit 3) is not a pass.
+
+The health probe waits up to 90 s per request (was 15 s): the Hub's event loop blocks for 45–50 s while it builds a `bitget 1440m x30` candle snapshot (observed on the box 2026-10-09), and a 15 s probe timed out on a healthy service. A preflight or verify that still reports a health timeout is re-run once; never restart the service to clear it. The block itself is a Hub defect (a snapshot build running on the event loop) and is a follow-up on the Hub, not something this runbook works around further.
 
 ### 5. Before-listings by hand (box, read-only; for the deployment record)
 
@@ -99,7 +109,7 @@ ls -la /opt/wickhunter-hub/data /opt/wickhunter-hub/releases | tee $STAGE_ROOT/l
 find /opt/wickhunter-hub/data -type f | wc -l | tee -a $STAGE_ROOT/listing-before.txt
 python3 -c 'import json;print("licences",len(json.load(open("/opt/wickhunter-hub/data/licenses.json"))))' | tee -a $STAGE_ROOT/listing-before.txt
 sha256sum /opt/wickhunter-hub/releases/latest.json /opt/wickhunter-hub/releases/*.tar.gz | tee -a $STAGE_ROOT/listing-before.txt
-for u in wickhunter-hub liqhunter liqhunter-marketplace-api liqhunter-marketplace-worker nginx postgresql; do systemctl show $u --property=Id,ActiveState,MainPID,InvocationID,NRestarts; done | tee $STAGE_ROOT/services-before.txt
+for u in wickhunter-hub liqhunter liqhunter-marketplace-api liqhunter-marketplace-worker nginx postgresql postgresql@18-main; do systemctl show $u --property=Id,ActiveState,MainPID,InvocationID,NRestarts; done | tee $STAGE_ROOT/services-before.txt
 curl -sS --noproxy '*' --max-time 10 http://127.0.0.1:8091/api/health | tee $STAGE_ROOT/health-before.json
 ```
 
@@ -107,7 +117,7 @@ curl -sS --noproxy '*' --max-time 10 http://127.0.0.1:8091/api/health | tee $STA
 
 ```
 cd $STAGE_ROOT
-python3 -I deploy-hub-0491.py deploy --stage $STAGE_ROOT/stage --confirm-version 0.4.91 [same flags as step 4] \
+python3 -I deploy-hub-0491.py $PROTECTED [same --data-backup-exclude as step 4] deploy --stage $STAGE_ROOT/stage --confirm-version 0.4.91 \
   2>&1 | tee $STAGE_ROOT/deploy-$(date -u +%Y%m%dT%H%M%SZ).txt
 ```
 Order inside: preflight again → in-progress marker → runtime-file + env backup (verified) → `systemctl stop` + natural-exit/PID/cgroup proof → data tarball (verified member by member) + `recovery.json` → replace files (exclusive temp + atomic rename) and move removals aside → write `data/hub-build.v1.json` → prove data/ untouched otherwise → `systemctl start` → health on literal loopback tied to the new MainPID/InvocationID, exact version and commit → protected paths/services/licence counts unchanged → `receipt.json`. Downtime is stop + data backup + start (the data backup dominates on a large `candles/`).
@@ -117,12 +127,12 @@ On success the last line is `{"ok":true,"result":"deployed-and-verified",...,"ol
 ### 7. Verify (box, read-only; repeatable) and after-listings
 
 ```
-python3 -I deploy-hub-0491.py verify --stage $STAGE_ROOT/stage [same flags] | tee $STAGE_ROOT/verify-$(date -u +%Y%m%dT%H%M%SZ).txt
+python3 -I deploy-hub-0491.py $PROTECTED [same --data-backup-exclude] verify --stage $STAGE_ROOT/stage | tee $STAGE_ROOT/verify-$(date -u +%Y%m%dT%H%M%SZ).txt
 ls -la /opt/wickhunter-hub/data /opt/wickhunter-hub/releases | tee $STAGE_ROOT/listing-after.txt
 find /opt/wickhunter-hub/data -type f | wc -l | tee -a $STAGE_ROOT/listing-after.txt
 python3 -c 'import json;print("licences",len(json.load(open("/opt/wickhunter-hub/data/licenses.json"))))' | tee -a $STAGE_ROOT/listing-after.txt
 sha256sum /opt/wickhunter-hub/releases/latest.json /opt/wickhunter-hub/releases/*.tar.gz | tee -a $STAGE_ROOT/listing-after.txt
-for u in wickhunter-hub liqhunter liqhunter-marketplace-api liqhunter-marketplace-worker nginx postgresql; do systemctl show $u --property=Id,ActiveState,MainPID,InvocationID,NRestarts; done | tee $STAGE_ROOT/services-after.txt
+for u in wickhunter-hub liqhunter liqhunter-marketplace-api liqhunter-marketplace-worker nginx postgresql postgresql@18-main; do systemctl show $u --property=Id,ActiveState,MainPID,InvocationID,NRestarts; done | tee $STAGE_ROOT/services-after.txt
 nginx -t && curl -sS --max-time 10 "$(sed -n 's/^HUB_PUBLIC_ORIGIN=//p' /etc/wickhunter-hub/env)/api/health"   # through nginx, from the box or the workstation
 journalctl -u wickhunter-hub -n 40 --no-pager                      # the clean stop and the new start, no restart loop
 ```
