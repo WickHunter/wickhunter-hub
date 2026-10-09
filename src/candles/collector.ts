@@ -419,6 +419,37 @@ export class VenueCollector {
     return this.coverageCache.get(symbol) ?? null;
   }
 
+  /** ── WILL THIS SNAPSHOT SKIP CHANGE BEFORE THE BUCKET TURNS OVER? (v0.4.92)
+   *
+   *  `buildSnapshot` names a symbol `short` when its history begins after the
+   *  window start and `gap` when its newest closed minute is behind the window
+   *  end. The snapshot cache used to retry EVERY partial result five minutes
+   *  later, which is right while the skip is this collector's unfinished work
+   *  and wrong when nothing will ever change it: on the operator's Hub a
+   *  750-pair venue with 32 pairs listed inside the last 30 days was folded
+   *  (48–60 s, event loop blocked) every five minutes, all day.
+   *
+   *  A delisted or untradable record gets no work from `workQueue`, so neither
+   *  label changes for it. A live symbol's `gap` is the tail this collector
+   *  fills next. A live symbol's `short` changes only while backfill is still
+   *  due below the window start — `workQueue`'s own rule, restated: dig from
+   *  the older of our oldest candle and the oldest minute proved empty, and
+   *  only down to the retention horizon. Unknown coverage is treated as still
+   *  changing: that is the direction that re-folds, never the one that hides
+   *  a pair until tomorrow. */
+  snapshotSkipIsTransient(symbol: string, reason: "gap" | "short", windowStartMs: number, now: number): boolean {
+    const rec = this.tracked.get(symbol);
+    if (!rec || rec.delisted || !rec.tradable) return false;
+    if (reason === "gap") return true;
+    const horizon = settledOpenMs(now) - this.opts.retentionDays * DAY_MS;
+    if (windowStartMs < horizon) return false;
+    const cov = this.coverageCache.get(symbol);
+    if (!cov || cov.firstClosedMs === null) return true;
+    const floor = this.backfillFloor.get(symbol);
+    const digFrom = floor === undefined ? cov.firstClosedMs : Math.min(cov.firstClosedMs, floor);
+    return digFrom > windowStartMs;
+  }
+
   /** Fill the exact coverage cache without monopolising Node's event loop.
    *  A cold 30-day roster is gigabytes of synchronous day-file reads; yielding
    *  after each symbol keeps health and other HTTP work responsive while the

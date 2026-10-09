@@ -1,3 +1,7 @@
+## v0.4.92 — Daily candle snapshots are built once per window
+
+- The signed candle snapshot a bot asks for (for example a venue's 1d × 30 volatility windows) was re-folded from 30 days of 1-minute files every five minutes for as long as any pair was skipped, and a venue always has one: a pair listed inside the window, a contract the venue still lists but no longer trades. On the operator's Hub that was a 48–60 second fold of a 750-pair venue, event loop blocked, every five minutes all day, and the app asking for it timed out each time. A skip the collector cannot change before the window moves (a delisted or untradable pair; a pair listed inside the window once the venue's emptiness below it is proved) no longer triggers the retry, and a window that still has a changing skip is re-folded at most six times before it is held until its boundary. A failed snapshot (nothing to serve yet) keeps the unbounded five-minute retry, because that fold is cheap and the retry is what turns a cold venue's first complete pair into its first answer. The build log line now says which decision was taken. The fold itself still runs on the request path; moving it off the event loop is a separate change.
+
 ## v0.4.91 — Recoverable initial paid subscription terms
 
 Hosted subscription checkout preserves the initial paid invoice even when Stripe delivers it after a newer checkout event. Exact durable retry admission lets software and hosting finish after an interrupted write while retaining later failure, refund and cancellation guards.
@@ -1978,6 +1982,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.92 — Daily candle snapshots are built once per window: a skipped pair the collector cannot change before the window moves no longer re-folds the whole venue every five minutes, and a still-changing skip re-folds at most six times per window.
 - v0.4.91 — Recoverable initial paid subscription terms: hosted checkout keeps the initial paid invoice when Stripe delivers it after a newer checkout event, and exact-event durable retry admission lets software and hosting finish after an interrupted write while later payment-failure, refund, dispute and cancellation guards stay in force.
 
 - v0.4.90 — Verified existing Oskaras product-scoped offers, separate read-only dashboard grants, and owner-filtered subscription and one-time purchase status without financial replay.
