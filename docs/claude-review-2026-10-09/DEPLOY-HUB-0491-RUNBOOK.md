@@ -8,11 +8,8 @@ through the reviewed procedure. The companion review is
 
 > **FILL IN BEFORE RUNNING**
 >
-> * `QUALIFIED_COMMIT` = `<<PLACEHOLDER — the 40-hex SHA of the FINAL qualified
->   0.4.91 commit, decided after the billing review agent finishes; the
->   operator refuses the all-zero placeholder and refuses a build dir whose
->   HEAD differs>>`
-> * `QUAL_FILE` = the qualification evidence JSON for that commit (shape as
+> * `QUALIFIED_COMMIT` = `6c01ff4504464c2b22e3bead753c3828f518e253` (final qualified 0.4.91 source; see `LINUX-QUALIFICATION-2026-10-09.md`. Deploy HEAD of `claude/hub-billing-review` and confirm `git diff --stat 6c01ff4 HEAD` touches only `docs/`; if it does not, STOP.)
+> * `QUAL_FILE` = `docs/claude-review-2026-10-09/linux-qualification-6c01ff4.json` (shape as
 >   `docs/HUB-0464-VERIFICATION.json`: at least `sourceCommit`, `version`,
 >   `gateExit`, `gateSuites`; the operator requires `sourceCommit`/`version`
 >   to agree with the manifest when present).
