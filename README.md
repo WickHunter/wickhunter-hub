@@ -1978,6 +1978,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.91 — Recoverable initial paid subscription terms: hosted checkout keeps the initial paid invoice when Stripe delivers it after a newer checkout event, and exact-event durable retry admission lets software and hosting finish after an interrupted write while later payment-failure, refund, dispute and cancellation guards stay in force.
+
 - v0.4.90 — Verified existing Oskaras product-scoped offers, separate read-only dashboard grants, and owner-filtered subscription and one-time purchase status without financial replay.
 
 - v0.4.89 — Resolve reset recovery against complete verified lease history while retaining the bounded admin audit display and all authority checks.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
-import { signStripePayload } from "../dist/src/billing/stripe.js";
+import { parseStripeEvent, signStripePayload } from "../dist/src/billing/stripe.js";
 import { createHub } from "../dist/src/server.js";
 import { FakeProvider } from "../dist/src/hosting/provider.js";
 
@@ -229,6 +229,163 @@ for (const [failurePoint, fence] of [["hosting-write", null], ["hosting-hook", n
     } finally { await c.h.close(); }
   });
 }
+
+// Review additions (2026-10-09). The restart loop above proves one retry per
+// interruption point. These pin what surrounds that admission: a protection
+// event landing after a partial application, an exact redelivery that was
+// applied but never marked seen, a newer renewal superseding the pending
+// admission, and repeated refusals with an alias event in between.
+async function olderInitialAfterCheckout(c, attemptSuffix, tag) {
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: `123e4567-e89b-12d3-a456-4266141741${attemptSuffix}` });
+  const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: c.h.hub.hosting.store.instances()[0].id };
+  const end = Math.floor((c.now() + 30 * 86400000) / 1000);
+  const invoice = c.event(`evt_initial_${tag}`, "invoice.paid", { id: `in_${tag}`, paid: true, billing_reason: "subscription_create", amount_paid: 11900, customer: `cus_${tag}`, customer_email: `${tag}@example.com`, subscription: `sub_${tag}`, subscription_details: { metadata }, charge: `ch_${tag}`, payment_intent: `pi_${tag}`, lines: { data: [{ period: { end }, price: { id: "price_bundle_month" } }] } });
+  c.advance(2000);
+  const checkout = c.event(`evt_checkout_${tag}`, "checkout.session.completed", { id: `cs_${tag}`, mode: "subscription", payment_status: "paid", customer: `cus_${tag}`, customer_details: { email: `${tag}@example.com` }, subscription: `sub_${tag}`, metadata });
+  assert.equal((await c.post(checkout)).body.outcome, "applied");
+  return { end, invoice, checkout, key: `cus_${tag}`, sub: `sub_${tag}` };
+}
+const countHostingHook = (billing) => {
+  const hook = billing.onHostingEvent.bind(billing);
+  const counter = { calls: 0 };
+  billing.onHostingEvent = (...args) => { counter.calls++; return hook(...args); };
+  return counter;
+};
+
+for (const fence of ["refund", "dispute"]) {
+  await test(`a ${fence} landing after a partially applied older initial invoice revokes and fences its retry`, async () => {
+    const c = await setup();
+    try {
+      const { invoice, end, key, sub } = await olderInitialAfterCheckout(c, fence === "refund" ? "30" : "31", fence);
+      const billing = c.h.hub.billing;
+      const hook = billing.onHostingEvent.bind(billing);
+      billing.onHostingEvent = () => { throw Error("injected hosting hook refusal"); };
+      assert.equal((await c.post(invoice)).status, 500);
+      billing.onHostingEvent = hook;
+      const software = billing.store.getCustomer(key);
+      assert.equal(software.periodEndMs, end * 1000);
+      assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, end * 1000, "the hosting record was written before its hook refused");
+      assert.ok(billing.store.getBundleSubscription(sub).initialPaidPending);
+      assert.equal(billing.store.seenEvent(invoice.id), false);
+      c.advance(2000);
+      const later = fence === "refund"
+        ? c.event("evt_refund_after_pending", "charge.refunded", { id: `ch_${fence}`, customer: key, payment_intent: `pi_${fence}`, amount: 11900, amount_refunded: 11900, refunded: true })
+        : c.event("evt_dispute_after_pending", "charge.dispute.created", { id: `dp_${fence}`, charge: `ch_${fence}`, payment_intent: `pi_${fence}`, reason: "fraudulent" });
+      assert.equal((await c.post(later)).body.outcome, "applied");
+      const flag = fence === "refund" ? "refunded" : "disputed";
+      assert.equal(billing.store.getCustomer(key)[flag], true);
+      assert.equal(billing.store.getRoleSubscription(key, "hosting")[flag], true);
+      assert.equal(c.h.hub.store.isRevoked(software.licenseId), true);
+      assert.equal(billing.store.getBundleSubscription(sub).initialPaidPending, undefined, "a newer protection event retires the pending admission");
+      const counter = countHostingHook(billing);
+      assert.equal((await c.post(invoice)).body.outcome, "ignored");
+      assert.equal(counter.calls, 0, "the fenced retry never touches hosting");
+      assert.equal(c.h.hub.store.isRevoked(software.licenseId), true);
+      assert.equal(c.h.hub.store.get(software.licenseId), null, "the retry re-issues nothing");
+      assert.equal(billing.store.getCustomer(key).licenseId, software.licenseId);
+      assert.equal(billing.store.getCustomer(key)[flag], true);
+      assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+    } finally { await c.h.close(); }
+  });
+}
+
+await test("an older initial invoice applied once but never marked seen is inert on its exact redelivery", async () => {
+  const c = await setup();
+  try {
+    const { invoice, end, key, sub, checkout } = await olderInitialAfterCheckout(c, "32", "unseen");
+    const billing = c.h.hub.billing;
+    const counter = countHostingHook(billing);
+    // applyEvent directly: the first application completed every write and
+    // the process died before markSeen, so the exact same event is delivered
+    // again with no durable dedupe entry to answer it.
+    const ev = parseStripeEvent(invoice);
+    assert.equal((await billing.applyEvent(ev)).outcome, "applied");
+    const software = billing.store.getCustomer(key);
+    const exp = c.h.hub.store.get(software.licenseId).exp;
+    assert.equal(software.periodEndMs, end * 1000);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, end * 1000);
+    assert.equal(billing.store.getBundleSubscription(sub).initialPaidPending, undefined);
+    assert.equal(counter.calls, 1);
+    assert.equal(billing.store.seenEvent(invoice.id), false);
+    assert.equal((await billing.applyEvent(ev)).outcome, "ignored", "the completed admission is gone; the stale guard refuses the second application");
+    assert.equal((await c.post(invoice)).body.outcome, "ignored");
+    assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+    assert.equal(c.h.hub.store.get(software.licenseId).exp, exp);
+    assert.equal(billing.store.getCustomer(key).periodEndMs, end * 1000);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, end * 1000);
+    assert.equal(billing.store.getBundleSubscription(sub).latestEventCreatedMs, checkout.created * 1000);
+    assert.equal(counter.calls, 1);
+  } finally { await c.h.close(); }
+});
+
+await test("a newer renewal supersedes a completion-interrupted older initial invoice; its retry adds nothing", async () => {
+  const c = await setup();
+  try {
+    const { invoice, end, key, sub } = await olderInitialAfterCheckout(c, "33", "superseded");
+    const billing = c.h.hub.billing;
+    const put = billing.store.putBundleSubscription.bind(billing.store);
+    billing.store.putBundleSubscription = rec => { if (!rec.initialPaidPending) throw Error("injected completion refusal"); return put(rec); };
+    assert.equal((await c.post(invoice)).status, 500);
+    billing.store.putBundleSubscription = put;
+    const software = billing.store.getCustomer(key);
+    assert.equal(software.periodEndMs, end * 1000);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, end * 1000);
+    assert.ok(billing.store.getBundleSubscription(sub).initialPaidPending);
+    const counter = countHostingHook(billing);
+    c.advance(2000);
+    const renewalEnd = end + 30 * 86400;
+    const renewal = c.event("evt_renewal_supersedes", "invoice.paid", { ...invoice.data.object, id: "in_superseded_renewal", billing_reason: "subscription_cycle", charge: "ch_superseded_2", payment_intent: "pi_superseded_2", lines: { data: [{ period: { end: renewalEnd }, price: { id: "price_bundle_month" } }] } });
+    assert.equal((await c.post(renewal)).body.outcome, "applied");
+    assert.equal(billing.store.getCustomer(key).periodEndMs, renewalEnd * 1000);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, renewalEnd * 1000);
+    assert.equal(billing.store.getBundleSubscription(sub).initialPaidPending, undefined, "the newer applied event retires the pending admission");
+    assert.equal(billing.store.getBundleSubscription(sub).latestEventCreatedMs, renewal.created * 1000);
+    assert.equal(counter.calls, 1);
+    const exp = c.h.hub.store.get(software.licenseId).exp;
+    assert.equal((await c.post(invoice)).body.outcome, "ignored");
+    assert.equal(billing.store.getCustomer(key).periodEndMs, renewalEnd * 1000);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, renewalEnd * 1000);
+    assert.equal(c.h.hub.store.get(software.licenseId).exp, exp);
+    assert.equal(billing.store.getBundleSubscription(sub).latestEventCreatedMs, renewal.created * 1000, "the watermark never moves backwards");
+    assert.equal(counter.calls, 1);
+    assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+  } finally { await c.h.close(); }
+});
+
+await test("repeated hosting write refusals keep the exact admission; an alias event cannot borrow it; the next delivery completes once", async () => {
+  const c = await setup();
+  try {
+    const { invoice, end, key, sub, checkout } = await olderInitialAfterCheckout(c, "34", "twice");
+    const billing = c.h.hub.billing;
+    const put = billing.store.putRoleSubscription.bind(billing.store);
+    billing.store.putRoleSubscription = () => { throw Error("injected hosting write refusal"); };
+    assert.equal((await c.post(invoice)).status, 500);
+    const software = billing.store.getCustomer(key);
+    const exp = c.h.hub.store.get(software.licenseId).exp;
+    const pending = billing.store.getBundleSubscription(sub).initialPaidPending;
+    assert.ok(pending);
+    assert.equal((await c.post(invoice)).status, 500, "a second refusal is still a refusal");
+    assert.deepEqual(billing.store.getBundleSubscription(sub).initialPaidPending, pending);
+    assert.equal(c.h.hub.store.get(software.licenseId).exp, exp);
+    assert.equal(billing.store.seenEvent(invoice.id), false);
+    const alias = { ...invoice, id: "evt_alias_between_retries", type: "invoice.payment_succeeded" };
+    assert.equal((await c.post(alias)).body.outcome, "ignored", "the payment_succeeded alias is a different event and cannot resume the admission");
+    assert.deepEqual(billing.store.getBundleSubscription(sub).initialPaidPending, pending);
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, null);
+    billing.store.putRoleSubscription = put;
+    const counter = countHostingHook(billing);
+    assert.equal((await c.post(invoice)).body.outcome, "applied");
+    assert.equal(billing.store.getRoleSubscription(key, "hosting").periodEndMs, end * 1000);
+    assert.equal(billing.store.getCustomer(key).periodEndMs, end * 1000);
+    assert.equal(c.h.hub.store.get(software.licenseId).exp, exp, "the completed retry extends nothing a second time");
+    assert.equal(counter.calls, 1);
+    assert.equal(billing.store.getBundleSubscription(sub).initialPaidPending, undefined);
+    assert.equal(billing.store.getBundleSubscription(sub).latestEventCreatedMs, checkout.created * 1000);
+    assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+    assert.equal((await c.post(alias)).body.outcome, "duplicate");
+    assert.equal(counter.calls, 1);
+  } finally { await c.h.close(); }
+});
 
 await test("checkout then initial paid invoice before the worker preserves one current provision job and one create", async () => {
   const c = await setup();

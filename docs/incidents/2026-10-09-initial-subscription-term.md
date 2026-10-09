@@ -10,4 +10,4 @@ The remediation changes license expiry only. It does not rewrite billing event h
 
 An exact-event digest and the checkout watermark are persisted before the admitted initial invoice changes either role. Both role records also retain the last event ID. A retry after restart may finish only the same admitted event while both roles still reflect checkout or that exact invoice and no newer failure, terminal, refund or dispute fence intervenes. Completion removes the pending admission only after both role writes and the hosting hook return. Tests inject hosting write, hosting hook and completion-record failures and reconstruct the service against its durable files before retrying.
 
-The deferred referral-income display and App182 release are excluded from this billing-only change. Qualification and deployment remain separate steps.
+Qualification and deployment remain separate steps.
