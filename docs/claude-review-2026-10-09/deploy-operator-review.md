@@ -77,3 +77,10 @@ systemd whose `systemctl start` launches a real child process serving
 * The `source.tar.gz` shipped in the stage is whatever the packager is handed
   (`git archive <commit>` is the recommended producer); its hash is recorded,
   its content is not re-derived on the box.
+
+## Findings from the first live run on the Hub box (2026-10-09, after this review)
+
+1. **The stop proof refused a natural stop.** `judge_stop_state` expected `ExecMainCode=exited`; `systemctl show` answers the exit's si_code as a digit (`1` = CLD_EXITED, `2` = CLD_KILLED, `3` = CLD_DUMPED) and only `systemctl status` renders the word. The first live `systemctl stop` was refused as `ExecMainCode='1' (want 'exited')` with the service already cleanly stopped. Fixed: `EXEC_MAIN_CODE_EXITED = "1"`, the self-test's fake host answers digits, and a new assertion refuses the word. The review's self-test could not see this because its fake host was written from the same wrong reading of the property.
+2. **`--protected-service` replaces the default list** and the global flags must precede the subcommand; the runbook's bracketed examples put them after it. Runbook corrected (`$PROTECTED` names all five defaults plus `postgresql@18-main.service`, the unit on the box).
+3. **The Hub's event loop blocks 45–50 s** while it builds a `bitget 1440m x30` candle snapshot, so the 15 s health probe timed out on a healthy service. `HEALTH_TIMEOUT` is 90 s. The block is a Hub defect to fix on the Hub (the snapshot build runs on the event loop); it is recorded here, not worked around further.
+

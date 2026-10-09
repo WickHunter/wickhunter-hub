@@ -11,7 +11,8 @@ and adds what the review of the draft required:
   * typed, never-empty checklists (every check is named and pass/fail/unknown);
   * the ORIGINAL service's PID, systemd invocation id, cgroup and process start
     time are captured BEFORE the stop; after `systemctl stop` the operator
-    proves a natural exit (ExecMainCode=exited, ExecMainStatus=0,
+    proves a natural exit (ExecMainCode=1 — systemd's si_code digit for
+    CLD_EXITED, which `systemctl status` renders as "code=exited" — ExecMainStatus=0,
     Result=success), that the PID is gone (or reused by a different process),
     and that the cgroup is drained (cgroup.procs empty, cgroup.events
     populated 0, descendants included) inside a bounded wait — any ambiguity
@@ -142,7 +143,17 @@ PROXY_VARS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "ftp_proxy",
 SUBPROCESS_TIMEOUT = 60
 STOP_SETTLE_SECONDS = 45
 READY_SECONDS = 240
-HEALTH_TIMEOUT = 15
+# 2026-10-09, first live run on the Hub box: the Hub's event loop blocks for 45–50 s
+# while it builds a `bitget 1440m x30` candle snapshot, so a 15 s probe timed out on
+# a healthy service. One request now waits long enough for that block to end; the
+# ready loop still retries transport errors inside READY_SECONDS. The block itself is
+# a Hub defect (a snapshot build on the event loop), noted in the runbook, not hidden.
+HEALTH_TIMEOUT = 90
+# `systemctl show -p ExecMainCode` prints the exit's si_code as a DIGIT (1 = CLD_EXITED,
+# 2 = CLD_KILLED, 3 = CLD_DUMPED, 0 = not exited); the word "exited" is what
+# `systemctl status` renders, never what `show` answers. Found on the first live stop
+# (2026-10-09): a natural stop was refused as `ExecMainCode='1' (want 'exited')`.
+EXEC_MAIN_CODE_EXITED = "1"
 HEALTH_BODY_MAX = 1024 * 1024
 STABILITY_WINDOW_SECONDS = 3
 MAX_FILE_BYTES = 512 * 1024 * 1024
@@ -735,7 +746,7 @@ def protected_service_facts(host: Host, units: Iterable[str]) -> Dict[str, Dict[
 def judge_stop_state(rt: Dict[str, str]) -> Optional[str]:
     """None when the unit shows a complete natural stop; else the first disagreeing fact."""
     expectations = (("ActiveState", "inactive"), ("SubState", "dead"), ("MainPID", "0"), ("ControlPID", "0"),
-                    ("Job", ""), ("Result", "success"), ("ExecMainCode", "exited"), ("ExecMainStatus", "0"))
+                    ("Job", ""), ("Result", "success"), ("ExecMainCode", EXEC_MAIN_CODE_EXITED), ("ExecMainStatus", "0"))
     for key, want in expectations:
         if rt.get(key, "") != want:
             return f"{key}={rt.get(key, '')!r} (want {want!r})"
@@ -1228,7 +1239,7 @@ def rollback_recipe(backup_dir: Path, facts: ServiceFacts, manifest: Dict[str, A
     """The manual rollback, as commands the operator runs by hand. Nothing here is ever executed by this script."""
     lines = [f"# Manual rollback of {facts.unit} to {manifest['baselineVersion']} — run as root, one line at a time, read each result.",
              f"systemctl stop {facts.unit}",
-             f"systemctl show {facts.unit} --property=ActiveState,SubState,MainPID,ControlPID,Job,Result,ExecMainCode,ExecMainStatus   # want inactive/dead/0/0//success/exited/0"]
+             f"systemctl show {facts.unit} --property=ActiveState,SubState,MainPID,ControlPID,Job,Result,ExecMainCode,ExecMainStatus   # want inactive/dead/0/0//success/1/0 (ExecMainCode is the si_code digit: 1 = CLD_EXITED)"]
     for relative, evidence in sorted(manifest["files"].items()):
         target = facts.install_dir / relative
         meta = metadata.get(relative, {})

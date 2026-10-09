@@ -134,7 +134,7 @@ class FakeHost(op.Host):
         self.extra_units = {u: {"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "MainPID": "4242",
                                 "InvocationID": "f" * 32, "NRestarts": "0"} for u in extra_units}
         self.state = {"ActiveState": "inactive", "SubState": "dead", "MainPID": "0", "ControlPID": "0", "Job": "", "InvocationID": "",
-                      "ControlGroup": f"/system.slice/{unit}", "NRestarts": "0", "Result": "success", "ExecMainCode": "exited",
+                      "ControlGroup": f"/system.slice/{unit}", "NRestarts": "0", "Result": "success", "ExecMainCode": "1",
                       "ExecMainStatus": "0", "ExecMainStartTimestampMonotonic": "0"}
         self.calls = []
 
@@ -182,12 +182,12 @@ class FakeHost(op.Host):
         child = self.child
         if self.stop_mode == "term":
             child.terminate(); rc = child.wait(timeout)
-            self.state.update({"ExecMainCode": "exited" if rc >= 0 else "killed", "ExecMainStatus": str(abs(rc)), "Result": "success"})
+            self.state.update({"ExecMainCode": "1" if rc >= 0 else "2", "ExecMainStatus": str(abs(rc)), "Result": "success"})
         elif self.stop_mode == "kill":
             child.kill(); rc = child.wait(timeout)
-            self.state.update({"ExecMainCode": "killed", "ExecMainStatus": "9", "Result": "timeout"})
+            self.state.update({"ExecMainCode": "2", "ExecMainStatus": "9", "Result": "timeout"})
         elif self.stop_mode == "linger":
-            self.state.update({"ExecMainCode": "exited", "ExecMainStatus": "0", "Result": "success"})  # lies: the child keeps running
+            self.state.update({"ExecMainCode": "1", "ExecMainStatus": "0", "Result": "success"})  # lies: the child keeps running
         self.state.update({"ActiveState": "inactive", "SubState": "dead", "MainPID": "0", "InvocationID": self.state["InvocationID"], "Job": ""})
         return subprocess.CompletedProcess(["systemctl", "stop", unit], 0, b"", b"")
 
@@ -341,9 +341,13 @@ def t_checklist_and_judges(root):
         op.Check("n", "maybe", "d"); raise AssertionError("untyped status accepted")
     except op.DeployError:
         pass
-    good = {"ActiveState": "inactive", "SubState": "dead", "MainPID": "0", "ControlPID": "0", "Job": "", "Result": "success", "ExecMainCode": "exited", "ExecMainStatus": "0"}
+    good = {"ActiveState": "inactive", "SubState": "dead", "MainPID": "0", "ControlPID": "0", "Job": "", "Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0"}
     assert op.judge_stop_state(good) is None
-    assert "ExecMainCode" in op.judge_stop_state({**good, "ExecMainCode": "killed", "ExecMainStatus": "9"})
+    assert "ExecMainCode" in op.judge_stop_state({**good, "ExecMainCode": "2", "ExecMainStatus": "9"})
+    # `systemctl show` answers the si_code DIGIT; the word is `systemctl status` output and must be refused
+    # (the first live stop on 2026-10-09 was refused as ExecMainCode='1' (want 'exited') by the old expectation).
+    assert "ExecMainCode" in op.judge_stop_state({**good, "ExecMainCode": "exited"})
+    assert op.EXEC_MAIN_CODE_EXITED == "1"
     assert "ExecMainStatus" in op.judge_stop_state({**good, "ExecMainStatus": "1"})
     assert "Job" in op.judge_stop_state({**good, "Job": "123"})
     assert "ControlPID" in op.judge_stop_state({**good, "ControlPID": "77"})
