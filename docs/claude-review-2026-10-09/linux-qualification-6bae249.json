@@ -1,0 +1,50 @@
+{
+  "sourceCommit": "6bae2490c661596eebea2024afeb2044843e7afe",
+  "version": "0.4.92",
+  "packageVersion": "0.4.92",
+  "baseCommit": "393fadabcabf0cb6d85003644bf4e4723a4b9fb8",
+  "baseVersion": "0.4.91",
+  "changeCommit": "e817304ec5a21d7ba60f8ed8f0e2b4d4452f61de",
+  "gateCommand": "npm ci && npm run build && npm test && python3 scripts/deploy-hub-0491.py --self-test",
+  "gateExit": 0,
+  "gateSuites": 110,
+  "gatePassed": 110,
+  "gateFailed": 0,
+  "buildExit": 0,
+  "npmCiExit": 0,
+  "operatorSelfTest": {
+    "passed": 13,
+    "failed": 0,
+    "exit": 0
+  },
+  "environment": {
+    "os": "Linux 6.18.44 x86_64 (cloud container)",
+    "node": "v22.22.0",
+    "npm": "10.9.4",
+    "python": "3.13.16",
+    "cpus": 4,
+    "memoryGiB": 16
+  },
+  "startedAt": "2026-10-09T23:53:33Z",
+  "finishedAt": "2026-10-09T23:56:39Z",
+  "evidence": {
+    "finalLog": {
+      "path": "docs/claude-review-2026-10-09/evidence/linux-qualification-final-6bae249.log",
+      "sha256": "c3e579a4c166aaeb396685627c762b43827a8ddbeb6e1ca86d934790a2b1ffaa"
+    }
+  },
+  "scope": "src/candles/service.ts (snapshot cache expiry: structural skips hold until the boundary, transient skips re-fold at most SNAPSHOT_RETRIES_PER_BUCKET=6 times per window, failed results keep the 5-minute retry; one log line), src/candles/collector.ts (snapshotSkipIsTransient, read-only), tests/candles-http.test.mjs (+2 tests), README.md, package.json/package-lock.json/src/version.ts (version strings only)",
+  "unchanged": [
+    "scripts/ (deploy operator identical to the 0.4.91 deploy: git diff --stat 393fada 6bae249 -- scripts/ is empty)",
+    "src/billing (no section-6 recheck needed)",
+    "data/ formats (the snapshot cache is in-memory; day files untouched)",
+    "env keys (none added or read differently)",
+    "dependencies (npm ci resolves the same tree; lockfile changed only in its version fields)"
+  ],
+  "notes": [
+    "No live deployment was performed from this environment.",
+    "The qualified source is main 6bae249 (merge of PR #87); its tree is byte-identical to e817304 (git diff --stat e817304 6bae249 is empty).",
+    "A docs-only commit recording this receipt follows 6bae249 on main; deploy HEAD of main and confirm `git diff --stat 6bae249 HEAD` touches only docs/.",
+    "Operational: the first snapshot request per venue after a window boundary still folds on the request path (48-60 s for a 750-pair 1440m x30 window, event loop blocked once); the follow-up (fold off the event loop, memory) is not in this version."
+  ]
+}
