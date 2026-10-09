@@ -1,0 +1,600 @@
+{
+  "schema": "wickhunter-hub.deploy-receipt.v1",
+  "operator": "deploy-hub-0491.py/1",
+  "change": "Hub 0.4.91 — initial subscription term after checkout (docs/incidents/2026-10-09-initial-subscription-term.md)",
+  "startedAt": "2026-10-09T19:06:56Z",
+  "service": {
+    "unit": "wickhunter-hub.service",
+    "fragmentPath": "/etc/systemd/system/wickhunter-hub.service",
+    "fragment": {
+      "mode": 420,
+      "uid": 0,
+      "gid": 0,
+      "type": "regular",
+      "size": 679,
+      "sha256": "e4db4a258abd8e0c7fa312a9e0505970cb598a70110b3c5de2b7df9291bcf677"
+    },
+    "dropIns": {
+      "/etc/systemd/system/wickhunter-hub.service.d/support.conf": {
+        "mode": 420,
+        "uid": 0,
+        "gid": 0,
+        "type": "regular",
+        "size": 58,
+        "sha256": "4ebec0cba78abd818dae7642169aa4b56d18d44df8786212b4740a5b6c55be95"
+      }
+    },
+    "user": "wickhunter-hub",
+    "group": "wickhunter-hub",
+    "uid": 995,
+    "gid": 981,
+    "installDir": "/opt/wickhunter-hub",
+    "envFile": "/etc/wickhunter-hub/env",
+    "envFileFacts": {
+      "mode": 384,
+      "uid": 0,
+      "gid": 0,
+      "type": "regular",
+      "size": 611,
+      "sha256": "c499f6e15995267e5ba05a8488ca71acc0b185f7df480ebd9ebbf72f00c2cae1"
+    },
+    "optionalEnvFiles": [
+      "/etc/wickhunter-hub/marketplace.env",
+      "/etc/wickhunter-hub/support.env"
+    ],
+    "port": 8091,
+    "dataDir": "/opt/wickhunter-hub/data",
+    "releasesDir": "/opt/wickhunter-hub/releases",
+    "node": "/usr/bin/node",
+    "execArgv": [
+      "/usr/bin/node",
+      "dist/src/main.js"
+    ],
+    "killSignal": "15",
+    "killMode": "control-group",
+    "stopBudgetSeconds": 120.0
+  },
+  "preflight": [
+    {
+      "name": "operator.proxy-env",
+      "status": "pass",
+      "detail": "proxy variables scrubbed from this process: none were set"
+    },
+    {
+      "name": "operator.euid",
+      "status": "pass",
+      "detail": "running as uid 0"
+    },
+    {
+      "name": "stage.directory",
+      "status": "pass",
+      "detail": "/root/wh-hub0491-attempt2-20261009/stage is root-owned 0700 on a persistent filesystem, 12 entries, no symlinks"
+    },
+    {
+      "name": "manifest.valid",
+      "status": "pass",
+      "detail": "Hub 0.4.91 — initial subscription term after checkout (docs/incidents/2026-10-09-initial-subscription-term.md): 0.4.90 -> 0.4.91 at 6c01ff4504464c2b22e3bead753c3828f518e253, 4 file(s), 0 removal(s), manifest sha256 de748951ca77dbe5…"
+    },
+    {
+      "name": "manifest.removals",
+      "status": "pass",
+      "detail": "no live file is retired"
+    },
+    {
+      "name": "qualification.hash",
+      "status": "pass",
+      "detail": "qualification evidence sha256 320850f5266c66b5… matches the manifest"
+    },
+    {
+      "name": "baseline.hash",
+      "status": "pass",
+      "detail": "baseline.json sha256 fdc8ceec54da33df… matches the manifest (captured 2026-10-09T18:57:53Z)"
+    },
+    {
+      "name": "source.tarball",
+      "status": "pass",
+      "detail": "source tarball sha256 f2662c934fa373da… matches the manifest"
+    },
+    {
+      "name": "artifacts.hash",
+      "status": "pass",
+      "detail": "all 4 staged artifacts match their after hashes; bundle digest 01bef80954cdc50c…"
+    },
+    {
+      "name": "stage.markers",
+      "status": "pass",
+      "detail": "no in-progress marker, receipt or failure evidence in the stage"
+    },
+    {
+      "name": "service.binding",
+      "status": "pass",
+      "detail": "wickhunter-hub.service: unit /etc/systemd/system/wickhunter-hub.service (sha256 e4db4a258abd…), user wickhunter-hub:wickhunter-hub, install /opt/wickhunter-hub, env /etc/wickhunter-hub/env, port 8091, data /opt/wickhunter-hub/data, releases /opt/wickhunter-hub/releases, node /usr/bin/node, drop-ins ['/etc/systemd/system/wickhunter-hub.service.d/support.conf']"
+    },
+    {
+      "name": "service.node",
+      "status": "pass",
+      "detail": "ExecStart interpreter /usr/bin/node"
+    },
+    {
+      "name": "service.running",
+      "status": "pass",
+      "detail": "MainPID 1109340 invocation 2aae8bedc6584ebc9a3cdc129622d292 cgroup /system.slice/wickhunter-hub.service start-time 458191033 NRestarts 0"
+    },
+    {
+      "name": "baseline.service",
+      "status": "pass",
+      "detail": "baseline.json service facts agree with the live binding"
+    },
+    {
+      "name": "baseline.version",
+      "status": "pass",
+      "detail": "baseline.json recorded version '0.4.90'; manifest expects baseline '0.4.90'"
+    },
+    {
+      "name": "live.health",
+      "status": "pass",
+      "detail": "live health version '0.4.90' commit 'b24234c79f51ac8578090d16c5c209a28364806b'"
+    },
+    {
+      "name": "live.listener",
+      "status": "pass",
+      "detail": "port 8091 listener(s) owned by MainPID 1109340; all loopback: True"
+    },
+    {
+      "name": "live.files",
+      "status": "pass",
+      "detail": "every manifest before-hash matches the live tree (4 entries)"
+    },
+    {
+      "name": "protected.service.liqhunter.service",
+      "status": "pass",
+      "detail": "active/running MainPID 1035398 invocation 1c547c02… NRestarts 0"
+    },
+    {
+      "name": "protected.service.liqhunter-marketplace-api.service",
+      "status": "pass",
+      "detail": "active/running MainPID 1035400 invocation 7f2ae6eb… NRestarts 0"
+    },
+    {
+      "name": "protected.service.liqhunter-marketplace-worker.service",
+      "status": "pass",
+      "detail": "active/running MainPID 1035407 invocation 9fc6a708… NRestarts 0"
+    },
+    {
+      "name": "protected.service.nginx.service",
+      "status": "pass",
+      "detail": "active/running MainPID 3458865 invocation c5c137b2… NRestarts 0"
+    },
+    {
+      "name": "protected.service.postgresql.service",
+      "status": "pass",
+      "detail": "active/exited MainPID 0 invocation a72c0e85… NRestarts 0"
+    },
+    {
+      "name": "protected.service.postgresql@18-main.service",
+      "status": "pass",
+      "detail": "active/running MainPID 3458916 invocation 77300ec5… NRestarts 0"
+    },
+    {
+      "name": "protected.paths",
+      "status": "pass",
+      "detail": "27 protected paths fingerprinted, 5 absent (Alpha /opt/liqhunter, Hub code roots, release shelf /opt/wickhunter-hub/releases, identity/env/unit files)"
+    },
+    {
+      "name": "data.readable",
+      "status": "pass",
+      "detail": "221355 entries, 9657275396 bytes under /opt/wickhunter-hub/data; licences 94, revoked 1"
+    },
+    {
+      "name": "data.build-record",
+      "status": "pass",
+      "detail": "hub-build.v1.json: {'schemaVersion': 1, 'packageVersion': '0.4.90', 'commit': 'b24234c79f51ac8578090d16c5c209a28364806b', 'branch': 'codex/hub-timeframe-dense-r3', 'builtAtMs': 1791536304062}"
+    },
+    {
+      "name": "stage.free-space",
+      "status": "pass",
+      "detail": "208626143232 bytes free on the stage filesystem, 10690273797 needed for the backups (data backup excludes ['candles'])"
+    }
+  ],
+  "manifest": {
+    "sha256": "de748951ca77dbe5b364664550a98aef759096b60efe626be8b381afb0022451",
+    "expectedVersion": "0.4.91",
+    "baselineVersion": "0.4.90",
+    "sourceCommit": "6c01ff4504464c2b22e3bead753c3828f518e253",
+    "sourceTree": "813b9bcd28cb3668e6a176a9221a38018176aecd",
+    "sourceBranch": null,
+    "sourceTarballSha256": "f2662c934fa373da57e4e55fcecca52b198c24acae1d9d983830de1622ecb6a6",
+    "qualificationSha256": "320850f5266c66b53fb56b2d5f25a62dbad0611e7bdd48e00bd348ef6b61d72a",
+    "baselineSha256": "fdc8ceec54da33dfd8c4e071e60760cd5a53ebbc16ecb72d23719b6168656b8c",
+    "runtimeBundleSha256": "01bef80954cdc50c34707664ae883d0e4936bfa97252a41a0adee4a88620d41d",
+    "buildTreeSha256": "c7d4fdc8164b6d75f9d2782c35d2a94dd34d2c78060a6dce3511c8d2e9e75db2",
+    "fullTree": true,
+    "include": [
+      "dist",
+      "public",
+      "templates",
+      "package.json",
+      "package-lock.json"
+    ],
+    "files": {
+      "dist/src/billing/service.js": {
+        "before": "c5211fa6a0340148cc409e0f5cf524717a8e1d9155b3cc7f8bd58bbd820cd55c",
+        "after": "dd8c122d3829b317d5000c15549fe43ef7a835d8fb82528f784e310bd6b7771a",
+        "mode": 420
+      },
+      "dist/src/version.js": {
+        "before": "1eb614863013e618cf0e6ed3ccf1a3d504ab61ddf591edbea1ce88a5aa9d4ba9",
+        "after": "c7844b8c5166a8658d67dde665651a9a838495b62b71141b1cfc651d4a85f026",
+        "mode": 420
+      },
+      "package-lock.json": {
+        "before": "2e9664ead056248112cbfe9d64b1c4ea3f9a3c022f5b2af902f928044cf7f977",
+        "after": "bc266a267121dd116aa8723f1b71da1fc043495d8946c689c7869529b4751d37",
+        "mode": 420
+      },
+      "package.json": {
+        "before": "ec696e9813b9697666ebb415e943f4f9d16861df3b8834b20055f9891465abd6",
+        "after": "ceb68d5bb6acc302409b0578103b21dfba403bea4c3de35120882161a4460d1d",
+        "mode": 420
+      }
+    },
+    "removals": {}
+  },
+  "original": {
+    "pid": 1109340,
+    "invocationId": "2aae8bedc6584ebc9a3cdc129622d292",
+    "cgroup": "/system.slice/wickhunter-hub.service",
+    "startTime": 458191033,
+    "nRestarts": "0",
+    "execMainStartMonotonic": "4581910334076",
+    "procCgroup": "/system.slice/wickhunter-hub.service",
+    "cgroupProcs": [
+      1109340
+    ],
+    "capturedAt": "2026-10-09T19:06:25Z"
+  },
+  "healthBefore": {
+    "version": "0.4.90",
+    "build": {
+      "schemaVersion": 1,
+      "packageVersion": "0.4.90",
+      "commit": "b24234c79f51ac8578090d16c5c209a28364806b",
+      "branch": "codex/hub-timeframe-dense-r3",
+      "builtAtMs": 1791536304062
+    }
+  },
+  "protectedServicesBefore": {
+    "liqhunter.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035398",
+      "InvocationID": "1c547c02f08e4b6bbcd001b09787bd0c",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "liqhunter-marketplace-api.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035400",
+      "InvocationID": "7f2ae6ebd4ff496eb85a6adb9479a88b",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "liqhunter-marketplace-worker.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035407",
+      "InvocationID": "9fc6a70846df4a58beb0f022de96fadc",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "nginx.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "3458865",
+      "InvocationID": "c5c137b292da4881a84cdba1a7cacfc4",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "postgresql.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "exited",
+      "MainPID": "0",
+      "InvocationID": "a72c0e8587ad47418676a45b4e16ac93",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "postgresql@18-main.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "3458916",
+      "InvocationID": "77300ec58ec54a4bb70806f302376dc6",
+      "NRestarts": "0",
+      "presence": "present"
+    }
+  },
+  "protectedFingerprintsBefore": {
+    "/opt/liqhunter/dist": "f7803b6673383517f947cc2bab974b229f1f055c7934691e112c4400abe15e77",
+    "/opt/liqhunter/src": "1d81c6da97ea0e5a1e78ef3833a83d628e5380c009bb070d69130d92c33c3189",
+    "/opt/liqhunter/public": "7d98d5b41cc50f6b82d61c10aa87721337c78c927b12aa8db45ee86e794edd9e",
+    "/opt/liqhunter/scripts": "65856a36d21c92c09a026a517fbb66686c7fe12b4a787aab4ad1a83f563f85b8",
+    "/opt/liqhunter/migrations": "c625ecbd6860fc894b043aff7d9ab2d8a917072b4a83db7a8bd1c0e9d3ebdeaf",
+    "/opt/liqhunter/package.json": "dc59236b90ed21407cf5dadf27395aa6a1ffac028a83dbb8bbc14bb7e04601ed",
+    "/opt/liqhunter/package-lock.json": "5d79e43a355dfa1d81c28d4bb1e8f90f5be3fdbc6e190b15e0a177b4a8f23fe2",
+    "/opt/liqhunter/.deployed-commit": "92bdbf908f1ec54c919a68b67914f3c8721b5627dc3ade3d1856d86c1a37da5f",
+    "/opt/liqhunter/.deployed-at": null,
+    "/opt/liqhunter/bin": "c49a5eb57c96bfab93227973d32ab6c107457ada0b81e26731cd1de8689c3755",
+    "/opt/liqhunter/native": null,
+    "/opt/liqhunter/.native": null,
+    "/opt/wickhunter-hub/dist": "2c37baa4860633d4172835a879542fac7e5187635b0000923de2302e036bff88",
+    "/opt/wickhunter-hub/src": "dcc96329db318c41712598687bba0c142080eb0f9d33d693b01025eb6a6e5ae7",
+    "/opt/wickhunter-hub/public": "2227ef8dceb98687acaa173b82f27ab2be4432f8ba4e3c5dff46003e4a90557d",
+    "/opt/wickhunter-hub/templates": "eaba05e3329c68610fd201be4a513e2f73765834fb91dda27314981ab8c9f353",
+    "/opt/wickhunter-hub/nginx": "d028b92ea26e237f6e86a0a5fe1eb2443fefe3c64cd9aa4cc9ca71002857610e",
+    "/opt/wickhunter-hub/scripts": "cd26b9df8f9763eb49c37f4fa4ac49311433b5d0c3a2aa3e0ea32237381f130b",
+    "/opt/wickhunter-hub/bin": "020c5886b843d28c35506bc989b44bff110214cfb49df2cd88156467bcd74ae4",
+    "/opt/wickhunter-hub/migrations": null,
+    "/opt/wickhunter-hub/releases": "3d9dde035b90fdbb90ad7ce55279c4917529b2e9c54d980186a04fa2de44460b",
+    "/etc/wickhunter-hub/marketplace-state.env": "c39a14272e55e38c3d1f86cbc1cc8558f7fa4ece809340bbedacd9602771941f",
+    "/etc/wickhunter-hub/marketplace.env": "bc856679a84c062698a8f3fe1a8e2c5545bc8d10904cf1c9d05193e49d8ea91a",
+    "/etc/wickhunter-hub/support.env": "1a809931032b1260bd43fa4673523788c531b188f0d51c34f4f33be213127711",
+    "/etc/liqhunter/marketplace-common.env": "ed7933458a8e46e2f30743fc28ecd377ebb056eb5b55c8333d823b6a865ad5c8",
+    "/etc/liqhunter/marketplace-api.env": "7f85b57084db9b50d2fd8fd99858efd13fd709b084a4eb2b5f70e8029bc37a35",
+    "/etc/liqhunter/marketplace-worker.env": "10ee217da75945d437d30570a6d5b749d4674a694169b8aaaac47fc6cd977180",
+    "/etc/liqhunter/marketplace-migrate.env": "a457025619d8bccc0aded5a1d8508a057dd8914d519294b8adcc1ebf574085b8",
+    "/etc/liqhunter/marketplace.env": null,
+    "/etc/wickhunter-hub/env": "e93ab014e052b9ed87c678f541dd6a7acaaa81cb5e7fdfb3f2797523b303d232",
+    "/etc/systemd/system/wickhunter-hub.service": "1a5a828b7b659a21c44baf13073327847900f3c822e21c0620bdef3fed7aa654",
+    "/etc/systemd/system/wickhunter-hub.service.d/support.conf": "6e8eae5412b910469d3167e4ddcfdf572bae99c6fb621f46c2329b6e79d72334"
+  },
+  "licenceCountsBefore": {
+    "licenses": 94,
+    "revoked": 1
+  },
+  "dataWrites": [
+    "hub-build.v1.json"
+  ],
+  "replaced": [
+    "dist/src/billing/service.js",
+    "dist/src/version.js",
+    "package-lock.json",
+    "package.json"
+  ],
+  "retired": [],
+  "phases": {
+    "capture": "2026-10-09T19:06:56Z",
+    "runtime-backup": "2026-10-09T19:06:56Z",
+    "stop": "2026-10-09T19:06:56Z",
+    "data-backup": "2026-10-09T19:18:06Z",
+    "install": "2026-10-09T19:18:06Z",
+    "build-record": "2026-10-09T19:18:06Z",
+    "data-proof": "2026-10-09T19:18:32Z",
+    "start": "2026-10-09T19:18:52Z",
+    "post-verify": "2026-10-09T19:19:19Z"
+  },
+  "runtimeBackup": {
+    "runtimeDir": "/root/wh-hub0491-attempt2-20261009/stage/backup/runtime",
+    "files": {
+      "dist/src/billing/service.js": "c5211fa6a0340148cc409e0f5cf524717a8e1d9155b3cc7f8bd58bbd820cd55c",
+      "dist/src/version.js": "1eb614863013e618cf0e6ed3ccf1a3d504ab61ddf591edbea1ce88a5aa9d4ba9",
+      "package-lock.json": "2e9664ead056248112cbfe9d64b1c4ea3f9a3c022f5b2af902f928044cf7f977",
+      "package.json": "ec696e9813b9697666ebb415e943f4f9d16861df3b8834b20055f9891465abd6"
+    },
+    "envFileCopy": "/root/wh-hub0491-attempt2-20261009/stage/backup/env-file",
+    "envFileSha256": "c499f6e15995267e5ba05a8488ca71acc0b185f7df480ebd9ebbf72f00c2cae1"
+  },
+  "stopProof": {
+    "stoppedAt": "2026-10-09T19:06:56Z",
+    "stopSeconds": 0.153,
+    "unitState": {
+      "ActiveState": "inactive",
+      "SubState": "dead",
+      "MainPID": "0",
+      "ControlPID": "0",
+      "Job": "",
+      "InvocationID": "2aae8bedc6584ebc9a3cdc129622d292",
+      "ControlGroup": "",
+      "NRestarts": "0",
+      "Result": "success",
+      "ExecMainCode": "1",
+      "ExecMainStatus": "0",
+      "ExecMainStartTimestampMonotonic": "4581910334076"
+    },
+    "pidFate": "gone",
+    "cgroupState": {
+      "exists": false,
+      "procs": [],
+      "populated": "0",
+      "dirs": 0
+    },
+    "naturalExit": true
+  },
+  "dataBackup": {
+    "archive": "/root/wh-hub0491-attempt2-20261009/stage/backup/data-20261009T191021Z-d3d57d.tar.gz",
+    "archiveSha256": "500b9b6e94183a32da4a2905b935ed9ac5b758001e35d4daf7fa12f80c14360a",
+    "archiveBytes": 341575438,
+    "members": 99890,
+    "regularFiles": 92238,
+    "bytes": 1531736831,
+    "excluded": [
+      "candles"
+    ],
+    "verified": {
+      "ok": true,
+      "members": 99890,
+      "verifiedAt": "2026-10-09T19:17:59Z"
+    },
+    "listing": "/root/wh-hub0491-attempt2-20261009/stage/backup/data-listing.json",
+    "listingEntries": 221355
+  },
+  "dataListingAfterStop": {
+    "entries": 221355,
+    "sha256": "3914b56b800cad5a7126a95f6ecce9fd9c618e1dea59ee2194735bd254c987d6"
+  },
+  "recovery": "/root/wh-hub0491-attempt2-20261009/stage/backup/recovery.json",
+  "installedRuntimeSha256": "01bef80954cdc50c34707664ae883d0e4936bfa97252a41a0adee4a88620d41d",
+  "installedTreeSha256": "c7d4fdc8164b6d75f9d2782c35d2a94dd34d2c78060a6dce3511c8d2e9e75db2",
+  "installedTreeFiles": 121,
+  "buildRecord": {
+    "before": {
+      "sha256": "c7cc370d85d9ab46ae1b5b39bf0de8d18ce4ecf519c64e3e26a198ddd34f06d4",
+      "value": {
+        "schemaVersion": 1,
+        "packageVersion": "0.4.90",
+        "commit": "b24234c79f51ac8578090d16c5c209a28364806b",
+        "branch": "codex/hub-timeframe-dense-r3",
+        "builtAtMs": 1791536304062
+      }
+    },
+    "after": {
+      "sha256": "5459dcb46e820fee7916ebae64a18fa14faeee73ec42bdde62d5e99417797379",
+      "value": {
+        "schemaVersion": 1,
+        "packageVersion": "0.4.91",
+        "commit": "6c01ff4504464c2b22e3bead753c3828f518e253",
+        "branch": null,
+        "builtAtMs": 1791573486319
+      }
+    },
+    "path": "/opt/wickhunter-hub/data/hub-build.v1.json"
+  },
+  "dataUntouchedExceptBuildRecord": true,
+  "new": {
+    "pid": 1117428,
+    "invocationId": "29d054ee6b6947de881309074031532e",
+    "nRestarts": "0",
+    "cgroup": "/system.slice/wickhunter-hub.service",
+    "health": {
+      "version": "0.4.91",
+      "packageVersion": "0.4.91",
+      "build": {
+        "schemaVersion": 1,
+        "packageVersion": "0.4.91",
+        "commit": "6c01ff4504464c2b22e3bead753c3828f518e253",
+        "branch": null,
+        "builtAtMs": 1791573486319
+      },
+      "sourceVsRuntime": "unknown"
+    },
+    "listener": {
+      "port": 8091,
+      "pid": 1117428,
+      "listeners": [
+        {
+          "family": 4,
+          "addr": "0100007F",
+          "inode": 81356991,
+          "loopback": true
+        }
+      ],
+      "allLoopback": true
+    },
+    "readyAt": "2026-10-09T19:18:52Z",
+    "execMainStartMonotonic": "4583792144061"
+  },
+  "protectedFingerprintsAfter": {
+    "/opt/liqhunter/dist": "f7803b6673383517f947cc2bab974b229f1f055c7934691e112c4400abe15e77",
+    "/opt/liqhunter/src": "1d81c6da97ea0e5a1e78ef3833a83d628e5380c009bb070d69130d92c33c3189",
+    "/opt/liqhunter/public": "7d98d5b41cc50f6b82d61c10aa87721337c78c927b12aa8db45ee86e794edd9e",
+    "/opt/liqhunter/scripts": "65856a36d21c92c09a026a517fbb66686c7fe12b4a787aab4ad1a83f563f85b8",
+    "/opt/liqhunter/migrations": "c625ecbd6860fc894b043aff7d9ab2d8a917072b4a83db7a8bd1c0e9d3ebdeaf",
+    "/opt/liqhunter/package.json": "dc59236b90ed21407cf5dadf27395aa6a1ffac028a83dbb8bbc14bb7e04601ed",
+    "/opt/liqhunter/package-lock.json": "5d79e43a355dfa1d81c28d4bb1e8f90f5be3fdbc6e190b15e0a177b4a8f23fe2",
+    "/opt/liqhunter/.deployed-commit": "92bdbf908f1ec54c919a68b67914f3c8721b5627dc3ade3d1856d86c1a37da5f",
+    "/opt/liqhunter/.deployed-at": null,
+    "/opt/liqhunter/bin": "c49a5eb57c96bfab93227973d32ab6c107457ada0b81e26731cd1de8689c3755",
+    "/opt/liqhunter/native": null,
+    "/opt/liqhunter/.native": null,
+    "/opt/wickhunter-hub/dist": "2c37baa4860633d4172835a879542fac7e5187635b0000923de2302e036bff88",
+    "/opt/wickhunter-hub/src": "dcc96329db318c41712598687bba0c142080eb0f9d33d693b01025eb6a6e5ae7",
+    "/opt/wickhunter-hub/public": "2227ef8dceb98687acaa173b82f27ab2be4432f8ba4e3c5dff46003e4a90557d",
+    "/opt/wickhunter-hub/templates": "eaba05e3329c68610fd201be4a513e2f73765834fb91dda27314981ab8c9f353",
+    "/opt/wickhunter-hub/nginx": "d028b92ea26e237f6e86a0a5fe1eb2443fefe3c64cd9aa4cc9ca71002857610e",
+    "/opt/wickhunter-hub/scripts": "cd26b9df8f9763eb49c37f4fa4ac49311433b5d0c3a2aa3e0ea32237381f130b",
+    "/opt/wickhunter-hub/bin": "020c5886b843d28c35506bc989b44bff110214cfb49df2cd88156467bcd74ae4",
+    "/opt/wickhunter-hub/migrations": null,
+    "/opt/wickhunter-hub/releases": "3d9dde035b90fdbb90ad7ce55279c4917529b2e9c54d980186a04fa2de44460b",
+    "/etc/wickhunter-hub/marketplace-state.env": "c39a14272e55e38c3d1f86cbc1cc8558f7fa4ece809340bbedacd9602771941f",
+    "/etc/wickhunter-hub/marketplace.env": "bc856679a84c062698a8f3fe1a8e2c5545bc8d10904cf1c9d05193e49d8ea91a",
+    "/etc/wickhunter-hub/support.env": "1a809931032b1260bd43fa4673523788c531b188f0d51c34f4f33be213127711",
+    "/etc/liqhunter/marketplace-common.env": "ed7933458a8e46e2f30743fc28ecd377ebb056eb5b55c8333d823b6a865ad5c8",
+    "/etc/liqhunter/marketplace-api.env": "7f85b57084db9b50d2fd8fd99858efd13fd709b084a4eb2b5f70e8029bc37a35",
+    "/etc/liqhunter/marketplace-worker.env": "10ee217da75945d437d30570a6d5b749d4674a694169b8aaaac47fc6cd977180",
+    "/etc/liqhunter/marketplace-migrate.env": "a457025619d8bccc0aded5a1d8508a057dd8914d519294b8adcc1ebf574085b8",
+    "/etc/liqhunter/marketplace.env": null,
+    "/etc/wickhunter-hub/env": "e93ab014e052b9ed87c678f541dd6a7acaaa81cb5e7fdfb3f2797523b303d232",
+    "/etc/systemd/system/wickhunter-hub.service": "1a5a828b7b659a21c44baf13073327847900f3c822e21c0620bdef3fed7aa654",
+    "/etc/systemd/system/wickhunter-hub.service.d/support.conf": "6e8eae5412b910469d3167e4ddcfdf572bae99c6fb621f46c2329b6e79d72334"
+  },
+  "protectedServicesAfter": {
+    "liqhunter.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035398",
+      "InvocationID": "1c547c02f08e4b6bbcd001b09787bd0c",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "liqhunter-marketplace-api.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035400",
+      "InvocationID": "7f2ae6ebd4ff496eb85a6adb9479a88b",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "liqhunter-marketplace-worker.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "1035407",
+      "InvocationID": "9fc6a70846df4a58beb0f022de96fadc",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "nginx.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "3458865",
+      "InvocationID": "c5c137b292da4881a84cdba1a7cacfc4",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "postgresql.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "exited",
+      "MainPID": "0",
+      "InvocationID": "a72c0e8587ad47418676a45b4e16ac93",
+      "NRestarts": "0",
+      "presence": "present"
+    },
+    "postgresql@18-main.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "SubState": "running",
+      "MainPID": "3458916",
+      "InvocationID": "77300ec58ec54a4bb70806f302376dc6",
+      "NRestarts": "0",
+      "presence": "present"
+    }
+  },
+  "licenceCountsAfter": {
+    "licenses": 94,
+    "revoked": 1
+  },
+  "dataListingAfterStart": {
+    "entries": 221355
+  },
+  "verifiedAt": "2026-10-09T19:19:19Z",
+  "result": "deployed-and-verified"
+}
