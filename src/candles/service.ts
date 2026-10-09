@@ -18,7 +18,7 @@ import {
 } from "./timeframe.js";
 import {
   buildSnapshot, isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs,
-  snapshotExpiresAtMs, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
+  snapshotBucketMs, snapshotExpiresAtMs, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
   type SnapshotSigned,
 } from "./snapshot.js";
 
@@ -99,6 +99,11 @@ interface SnapshotCacheEntry {
   /** Sorted tracked symbols folded into this result. A changed roster must
    * invalidate even inside the same candle window so new listings appear. */
   rosterSig: string;
+  /** The window this result answers for (its newest complete bucket's open). */
+  anchor: number;
+  /** How many times this window, with this roster, has been re-folded on the
+   *  five-minute retry. Bounded by `SNAPSHOT_RETRIES_PER_BUCKET`. */
+  retries: number;
 }
 
 export interface CandleServiceConfig {
@@ -151,6 +156,28 @@ const realFetch: FetchLike = async (url: string) => {
 /** A failed or partial snapshot is useful as an honest answer, but it must not
  * suppress a newly completed pair until a coarse timeframe's next boundary. */
 const SNAPSHOT_RETRY_TTL_MS = 5 * MINUTE_MS;
+
+/** ── HOW MANY TIMES ONE WINDOW MAY BE RE-FOLDED ON THAT RETRY (v0.4.92) ──
+ *
+ *  The retry exists for a skip that this hub's own collector is about to
+ *  change (a tail still filling, a backfill still digging). It used to apply
+ *  to every partial result for as long as any symbol was skipped, and a
+ *  venue always has one: a pair listed inside the window, a suspended
+ *  contract the venue still lists. On the operator's Hub that was a 48–60 s
+ *  fold of a 750-pair venue's 30-day window, event loop blocked, every five
+ *  minutes all day ("built bitunix 1440m x30 … in 59859ms" at 23:07, 23:12,
+ *  23:17 on 2026-10-09) — and the app asking for it timed out every time.
+ *
+ *  Two rules replace "any skip": a successful result whose skips the collector
+ *  reports as structural (`snapshotSkipIsTransient`) holds until the boundary
+ *  like a complete one, and a result that still has transient skips is re-folded
+ *  at most this many times per window and roster before it, too, holds until
+ *  the boundary. Six retries is thirty minutes: longer than a tail or a page
+ *  of backfill takes, far shorter than a day. A FAILED result (503, nothing
+ *  to serve) keeps the unbounded retry: that fold is cheap (every symbol is
+ *  refused from its coverage summary, no window is read) and the retry is
+ *  what turns a cold venue's first complete pair into its first 200. */
+export const SNAPSHOT_RETRIES_PER_BUCKET = 6;
 
 export class CandleService {
   readonly store: CandleStore;
@@ -416,6 +443,23 @@ export class CandleService {
       symbols: () => symbols,
     });
 
+    const anchor = this.snapshotWindowAnchor(now, interval);
+    const boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
+    // The same window with the same roster, folded again: a retry. Anything
+    // else is a first fold and starts the count over.
+    const retries = held && held.anchor === anchor && held.rosterSig === rosterSig ? held.retries + 1 : 0;
+    // A skip is transient only when the collector says its own work will
+    // change it before the boundary (see `snapshotSkipIsTransient`). With no
+    // collector for the venue (a store-only roster) nothing can answer that,
+    // and every skip is treated as transient, exactly as before.
+    const windowStart = anchor - (depth - 1) * snapshotBucketMs(interval);
+    const transient = outcome.ok
+      ? outcome.payload.skipped.filter(([symbol, reason]) => collector
+        ? collector.snapshotSkipIsTransient(symbol, reason, windowStart, now)
+        : true).length
+      : 0;
+    const retryAgain = !outcome.ok || (transient > 0 && retries < SNAPSHOT_RETRIES_PER_BUCKET);
+    const expiresAt = retryAgain ? Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS) : boundaryExpiry;
     let result: CandleSnapshotResult;
     if (outcome.ok) {
       const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
@@ -423,19 +467,20 @@ export class CandleService {
       // what a 200 would have.
       const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
       result = { ok: true, payload: outcome.payload, etag, body };
+      const skipped = outcome.payload.skipped.length;
+      // ONE line per fold, the expiry decision on it: an operator reading
+      // "built … every five minutes" can see which skipped pairs kept it
+      // re-folding, and when the bound stopped it.
       this.log(`built ${venue} ${interval}m x${depth}: ${outcome.payload.symbols.length} symbols`
-        + ` (${outcome.payload.skipped.length} skipped), ${body.length} bytes in ${Date.now() - startedAt}ms`);
+        + ` (${skipped} skipped), ${body.length} bytes in ${Date.now() - startedAt}ms; ${retryAgain
+          ? `re-fold in ${Math.round(SNAPSHOT_RETRY_TTL_MS / MINUTE_MS)} min (${transient} of ${skipped} skipped pair(s) still changing; retry ${retries + 1} of ${SNAPSHOT_RETRIES_PER_BUCKET})`
+          : `held until the window turns over (${transient} of ${skipped} skipped pair(s) still changing${retries >= SNAPSHOT_RETRIES_PER_BUCKET ? "; retry bound reached" : ""})`}`);
     } else {
       result = outcome;
       this.log(`built ${venue} ${interval}m x${depth}: ${outcome.code} ${outcome.error}`
         + ` (${Date.now() - startedAt}ms)`);
     }
-    const boundaryExpiry = snapshotExpiresAtMs(this.snapshotWindowAnchor(now, interval), interval);
-    const completeHealthy = outcome.ok && outcome.payload.skipped.length === 0;
-    const expiresAt = completeHealthy
-      ? boundaryExpiry
-      : Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
-    perVenue.set(key, { result, expiresAt, rosterSig });
+    perVenue.set(key, { result, expiresAt, rosterSig, anchor, retries });
     while (perVenue.size > SNAPSHOT_CACHE_PER_VENUE) {
       const oldest = perVenue.keys().next();
       if (oldest.done) break;
