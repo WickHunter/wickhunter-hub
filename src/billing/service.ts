@@ -638,7 +638,21 @@ export class BillingService {
     // the initial term. Allow that one activation, then restore the newer
     // past-due state; once records exist, stale paid events are inert.
     const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
-    if (stale && !activatingBehindFailure && !lifetimeInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    // Checkout creates a short bootstrap grant but is often timestamped AFTER
+    // its initial paid invoice. Delivery order must not discard that first
+    // paid term. Restrict the exception to checkout-only, active records with
+    // no paid-through date; never bypass a failure, refund or terminal fence.
+    const initialPaidAfterCheckout = !!(stale && !lifetimeHosting && !prior?.pendingStatus
+      && (ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded")
+      && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).billingReason === "subscription_create"
+      && invoiceFacts(ev.object).periodEndMs !== null
+      && knownSoftware?.lastEventType?.startsWith("checkout.session.")
+      && knownSoftware.subscriptionStatus === "active" && knownSoftware.periodEndMs === null
+      && !knownSoftware.disputed && !knownSoftware.refunded
+      && knownHosting?.lastEventType?.startsWith("checkout.session.")
+      && knownHosting.subscriptionStatus === "active" && knownHosting.periodEndMs === null
+      && !knownHosting.disputed && !knownHosting.refunded);
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
 
     let softwareEvent = ev;
     if (bundle.hosting && ev.type.startsWith('invoice.')) softwareEvent = { ...ev, object: softwareInvoiceProjection(ev.object, bundle.hosting) };

@@ -141,6 +141,33 @@ await test("bundle webhooks atomically bind one VPS and renew/cancel software an
   await c.h.close();
 });
 
+await test("checkout delivered before its older initial paid invoice fills the bootstrap term exactly once", async () => {
+  const c = await setup();
+  await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174119" });
+  const reserved = c.h.hub.hosting.store.instances()[0];
+  const metadata = { plan: "monthly-hosted", bundle: "software-hosting-v1", reservation: reserved.id };
+  const end = Math.floor((c.now() + 30 * 86400000) / 1000);
+  const invoice = c.event("evt_initial_older", "invoice.paid", { id: "in_initial_older", paid: true, status: "paid", billing_reason: "subscription_create", customer: "cus_initial_older", customer_email: "initial@example.com", subscription: "sub_initial_older", subscription_details: { metadata }, lines: { data: [{ period: { end }, price: { id: "price_bundle_month" } }] } });
+  c.advance(2000);
+  const checkout = c.event("evt_checkout_newer", "checkout.session.completed", { id: "cs_initial_older", mode: "subscription", payment_status: "paid", customer: "cus_initial_older", customer_details: { email: "initial@example.com" }, subscription: "sub_initial_older", metadata });
+  assert.equal((await c.post(checkout)).body.outcome, "applied");
+  const before = c.h.hub.billing.store.getCustomer("cus_initial_older");
+  assert.equal(before.periodEndMs, null);
+  const renewal = { ...invoice, id: "evt_old_renewal", data: { object: { ...invoice.data.object, billing_reason: "subscription_cycle" } } };
+  assert.equal((await c.post(renewal)).body.outcome, "ignored", "old renewal cannot use the initial-term exception");
+  assert.equal((await c.post(invoice)).body.outcome, "applied");
+  const after = c.h.hub.billing.store.getCustomer("cus_initial_older");
+  assert.equal(after.licenseId, before.licenseId);
+  assert.equal(after.periodEndMs, end * 1000);
+  assert.equal(c.h.hub.store.get(after.licenseId).exp, Math.min(end * 1000 + c.h.hub.billing.config().policy.graceDays * 86400000, before.createdAtMs + c.h.hub.billing.config().policy.testMaxDays * 86400000));
+  assert.equal(c.h.hub.billing.store.getRoleSubscription("cus_initial_older", "hosting").periodEndMs, end * 1000);
+  assert.equal(c.h.hub.billing.store.getBundleSubscription("sub_initial_older").latestEventCreatedMs, checkout.created * 1000);
+  assert.equal((await c.post(invoice)).body.outcome, "duplicate");
+  const second = { ...invoice, id: "evt_initial_paid_alias", type: "invoice.payment_succeeded" };
+  assert.equal((await c.post(second)).body.outcome, "ignored", "second event does not repeat already-established term");
+  await c.h.close();
+});
+
 await test("checkout then initial paid invoice before the worker preserves one current provision job and one create", async () => {
   const c = await setup();
   await legacyCheckout(c, { plan: "monthly", checkoutAttemptId: "123e4567-e89b-12d3-a456-426614174112" });
