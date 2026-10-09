@@ -29,3 +29,9 @@ A provider failure can leave a partially completed metadata operation. Preserve 
 Before execution, independently recheck the exact provider field shape, particularly expanded `applies_to`. This verifier requires exactly the observed product list; omitted/unexpanded or changed scope fails closed. Archive the relevant before images through the approved operational workflow. No financial files, customer keys, encrypted credentials or installed customer source are changed by this command.
 
 Normal software-price, mixed-VPS, self-referral, charge, refund, dispute and stacked-discount accounting protections remain in force. Legacy metadata ownership does not bypass the existing software/VPS attribution checks.
+
+### Purchase-status completeness
+
+A status refresh scans all bounded subscription pages and completed Checkout pages before publishing either result. One-time and Lifetime rows require an actual paid Checkout, the exact applied owner promotion/coupon, configured one-time software price and permitted product, and a matching settled PaymentIntent/charge. Mixed Lifetime+VPS purchases additionally prove the initial paid invoice and its payment; recurring VPS renewal is not a Lifetime purchase. Status labels are purchase facts (paid, partially refunded, refunded, disputed), not subscription state or an access entitlement. A partial mixed software/VPS refund is explicitly refund_allocation_unknown because the charge cannot prove which component was refunded. Guest checkout uses a session-derived opaque label. Incomplete/ambiguous payment, item or pagination data retains the previous complete snapshot; no financial ledger, payout or commission replay occurs.
+
+This is an explicitly reconciled as-of view, not a realtime census: subscription events update existing rows, while newly discovered and one-time status changes appear on the next authorized status refresh. Finite limits refuse incomplete scans rather than claiming all rows.

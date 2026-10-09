@@ -5,23 +5,24 @@ import {OSKARAS_EXISTING_OFFERS,OSKARAS_EXISTING_PRODUCT} from '../dist/src/earn
 import {setFlag} from '../dist/src/flags.js';
 import {freshHub,tmpDir,test,summary} from './helpers.mjs';
 const owner=earnOwner('stripe:live:cus_oskaras');
-const cfg={plans:[],stripe:{live:{secretKey:'sk_live_fixture',priceIds:{}},test:{secretKey:'sk_test_fixture',priceIds:{}}}};
+const cfg={plans:[{key:'lifetime',role:'software',interval:null,checkout:'payment-link',lifetime:true},{key:'oneoff',role:'software',interval:null,checkout:'payment-link',lifetime:false}],stripe:{live:{secretKey:'sk_live_fixture',priceIds:{lifetime:'price_lifetime',oneoff:'price_oneoff'}},test:{secretKey:'sk_test_fixture',priceIds:{}}}};
 function fixture(){
  const ledger=new EarnService(tmpDir('exact-offers'));ledger.member(owner,'Owner');
- const objects=new Map(),calls=[];let subscriptions=[],failPath='';
+ const objects=new Map(),calls=[];let subscriptions=[],sessions=[],checkoutPages=null,failPath='';
  for(const s of OSKARAS_EXISTING_OFFERS){
   objects.set('/v1/promotion_codes/'+s.promotion,{id:s.promotion,code:s.code,coupon:s.coupon,active:true,livemode:true,metadata:{},expires_at:null,max_redemptions:null,customer:null,restrictions:{first_time_transaction:false}});
   objects.set('/v1/coupons/'+s.coupon,{id:s.coupon,livemode:true,valid:true,percent_off:s.percent,duration:'forever',applies_to:{products:[OSKARAS_EXISTING_PRODUCT]},metadata:{managed_by:'wickhunter-hub'},amount_off:null,max_redemptions:null,redeem_by:null});
  }
  const fake=async(url,init)=>{const u=new URL(url),body=Object.fromEntries(new URLSearchParams(init.body));calls.push({method:init.method,path:u.pathname,body});
   if(u.pathname==='/v1/subscriptions')return Response.json({data:subscriptions,has_more:false});
+  if(u.pathname==='/v1/checkout/sessions')return Response.json(checkoutPages?.[u.searchParams.get('starting_after')||'']||{data:sessions,has_more:false});
   const obj=objects.get(u.pathname);if(!obj)throw Error('Unexpected external request '+u.pathname);
   if(init.method==='POST'&&u.pathname===failPath){failPath='';return Response.json({error:{code:'fixture_failure'}},{status:500});}
   if(init.method==='POST'){assert.deepEqual(Object.keys(body).sort(),['metadata[wh_earn_code]','metadata[wh_earn_owner]']);obj.metadata={...obj.metadata,wh_earn_owner:body['metadata[wh_earn_owner]'],wh_earn_code:body['metadata[wh_earn_code]']};}
   return Response.json(obj);
  };
  const service=new EarnStripeService(tmpDir('stripe-settings'),ledger,()=>cfg,'https://hub.test',()=>Date.now(),fake);service.configure({enabled:true,mode:'live'});
- return {ledger,service,objects,calls,setSubscriptions:v=>subscriptions=v,failOnce:p=>failPath=p};
+ return {ledger,service,objects,calls,setSubscriptions:v=>subscriptions=v,setSessions:v=>sessions=v,setCheckoutPages:v=>checkoutPages=v,failOnce:p=>failPath=p};
 }
 await test('all six exact live objects preflight before metadata-only adoption; terms unchanged and retry safe',async()=>{
  const f=fixture(),before=structuredClone([...f.objects]);await f.service.adoptExistingOskarasOffers(owner);
@@ -53,6 +54,42 @@ await test('status reconciliation verifies actual applied exact promo and isolat
  const view=f.service.referralActivity(owner);assert.equal(view.rows.length,1);assert.equal(view.rows[0].status,'trialing');assert.equal(view.rows[0].paidThrough,null);assert.equal(view.stale,false);assert.ok(!JSON.stringify(view).includes('cus_friend'));assert.equal(f.service.referralActivity(earnOwner('other')).rows.length,0);assert.deepEqual(f.ledger.admin().entries,beforeEntries);
  f.objects.get('/v1/promotion_codes/'+OSKARAS_EXISTING_OFFERS[0].promotion).metadata.wh_earn_owner=earnOwner('other');
  await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),view,'failed scan retains prior complete status');
+});
+function purchase(f,suffix,{kind='lifetime',mode='payment',customer='cus_friend'}={}){
+ const sid='cs_'+suffix,payment='pi_'+suffix,promo=OSKARAS_EXISTING_OFFERS[0].promotion;
+ const session={id:sid,livemode:true,status:'complete',payment_status:'paid',mode,customer,amount_total:900,currency:'usd',payment_intent:mode==='payment'?payment:null,invoice:mode==='subscription'?'in_'+suffix:null,subscription:mode==='subscription'?'sub_'+suffix:null,total_details:{breakdown:{discounts:[{discount:{promotion_code:promo}}]}}};
+ const item={price:{id:'price_'+kind,product:OSKARAS_EXISTING_PRODUCT,type:'one_time',recurring:null},quantity:1,amount_subtotal:1000,amount_discount:100};
+ f.objects.set('/v1/checkout/sessions/'+sid+'/line_items',{data:[item],has_more:false});
+ const charge={id:'ch_'+suffix,livemode:true,paid:true,customer,payment_intent:payment,currency:'usd',amount:900,amount_refunded:0,disputed:false};
+ const pi={id:payment,livemode:true,status:'succeeded',customer,currency:'usd',amount_received:900,latest_charge:charge};
+ f.objects.set('/v1/payment_intents/'+payment,pi);
+ if(mode==='subscription'){
+  f.objects.set('/v1/invoices/in_'+suffix,{id:'in_'+suffix,livemode:true,status:'paid',customer,parent:{subscription_details:{subscription:'sub_'+suffix}}});
+  f.objects.set('/v1/invoice_payments',{data:[{invoice:'in_'+suffix,livemode:true,status:'paid',payment:{type:'payment_intent',payment_intent:payment}}],has_more:false});
+ }
+ return {session,item,pi,charge};
+}
+await test('all supported purchase kinds use applied owner code and settled payment facts, never fake subscription state',async()=>{
+ const f=fixture();await f.service.adoptExistingOskarasOffers(owner);
+ const a=purchase(f,'life'),b=purchase(f,'one',{kind:'oneoff',customer:null}),c=purchase(f,'mixed',{mode:'subscription'});
+ b.charge.amount_refunded=50;c.charge.disputed=true;
+ f.setSessions([a.session,b.session,c.session,{id:'cs_unrelated',discounts:[{promotion_code:'promo_foreign'}]}]);
+ const financial=structuredClone(f.ledger.admin().entries);await f.service.refreshReferralStatus(owner);
+ const rows=f.service.referralActivity(owner).rows;assert.equal(rows.length,3);
+ assert.deepEqual(rows.map(r=>[r.kind,r.status]).sort(),[['lifetime','disputed'],['lifetime','paid'],['one_time','partially_refunded']].sort());
+ assert.ok(rows.every(r=>r.paidThrough===null&&!r.label.includes('cus_')));assert.deepEqual(f.ledger.admin().entries,financial);
+ a.charge.amount_refunded=900;await f.service.refreshReferralStatus(owner);assert.ok(f.service.referralActivity(owner).rows.some(r=>r.status==='refunded'));
+ c.charge.disputed=false;c.charge.amount_refunded=50;await f.service.refreshReferralStatus(owner);assert.ok(f.service.referralActivity(owner).rows.some(r=>r.status==='refund_allocation_unknown'),'mixed partial refund does not invent software refund allocation');
+ assert.equal(f.calls.filter(x=>x.method==='POST').length,6,'status scans never write provider or replay commission');
+});
+await test('Checkout pages complete before publication; canceled scope, wrong owner/product/payment and partial pages retain complete prior rows',async()=>{
+ for(const corrupt of [x=>x.item.price.product='prod_other',x=>x.session.livemode=false,x=>x.session.total_details.breakdown.discounts[0].discount.coupon='coupon_wrong',x=>x.item.amount_discount=0,x=>x.pi.customer='cus_other',x=>delete x.pi.amount_received,x=>x.charge.livemode=false,x=>x.charge.payment_intent='pi_other',x=>x.charge.amount_refunded=901]){
+  const f=fixture();await f.service.adoptExistingOskarasOffers(owner);const a=purchase(f,'complete');f.setSessions([a.session]);await f.service.refreshReferralStatus(owner);const before=f.service.referralActivity(owner);corrupt(a);await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before);
+ }
+ const f=fixture();await f.service.adoptExistingOskarasOffers(owner);const a=purchase(f,'first'),b=purchase(f,'second');
+ f.setCheckoutPages({'':{data:[a.session],has_more:true},cs_first:{data:[b.session],has_more:false}});await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows.length,2);
+ const before=f.service.referralActivity(owner);f.setCheckoutPages({'':{data:[a.session],has_more:true},cs_first:{data:[],has_more:true}});await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before);
+ f.setCheckoutPages(null);a.session.payment_status='unpaid';f.setSessions([a.session]);await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows.length,0,'unpaid attempts are not paid code redemptions');
 });
 await test('view grants never bind billing identity and cannot mutate any Earn endpoint',async()=>{
  const h=await freshHub();try{

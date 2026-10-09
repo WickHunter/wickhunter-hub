@@ -1974,6 +1974,8 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.90 — Verified existing Oskaras product-scoped offers, separate read-only dashboard grants, and owner-filtered subscription and one-time purchase status without financial replay.
+
 - v0.4.89 — Resolve reset recovery against complete verified lease history while retaining the bounded admin audit display and all authority checks.
 - v0.4.88 — Regenerate account-scoped install commands and recover a confirmed reset server through an audited replacement licence, preserving billing, dashboard and Earn history. Keep the bounded Earn copy fallback.
 - v0.4.87 — Open unselected purchase links on the existing referral-preserving plan chooser; provide truthful Earn copy fallback and the saved WH trading-fee share.

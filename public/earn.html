@@ -112,7 +112,7 @@ let referralRows=[],referralNext=null;
 function renderReferrals(activity,append=false){
  if(!append)referralRows=[];referralRows.push(...(activity.rows||[]));referralNext=activity.next;
  $('referralAsOf').textContent=activity.asOf?'Status checked '+new Date(activity.asOf).toLocaleString()+(activity.stale?' · stale; awaiting reconciliation':''):'Status has not been reconciled yet.';
- $('referralRows').innerHTML=table(['Customer','Offer','Subscription status','Recorded paid through'],referralRows.map(r=>[esc(r.label),esc(r.code),esc(r.status),esc(r.paidThrough?new Date(r.paidThrough).toLocaleDateString():'Not recorded')]));
+ $('referralRows').innerHTML=table(['Customer','Offer','Purchase type','Purchase status','Recorded paid through'],referralRows.map(r=>[esc(r.label),esc(r.code),esc(({subscription:'Subscription',lifetime:'Lifetime',one_time:'One-time'})[r.kind||'subscription']||'Unknown'),esc(r.status),esc(r.paidThrough?new Date(r.paidThrough).toLocaleDateString():'Not recorded')]));
  $('moreReferrals').hidden=!referralNext;
 }
 async function moreReferrals(){const b=$('moreReferrals');b.disabled=true;try{const r=await fetch(endpoint+'?referralsAfter='+encodeURIComponent(referralNext));const d=await r.json();if(!r.ok)throw Error(d.error||'Unable to load referrals');renderReferrals(d.referralActivity,true);}catch(e){toast(e.message);}finally{b.disabled=false;}}

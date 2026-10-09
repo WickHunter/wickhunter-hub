@@ -98,7 +98,7 @@ export class EarnStripeService {
   if(after!==null&&!/^[a-f0-9]{40}$/.test(after))throw Error('Invalid referral cursor');
   const page=selected.filter((r:StripeObject)=>!after||r.id>after).slice(0,51),more=page.length>50;
   return {asOf:p.referralStatusAt??null,stale:!p.referralStatusAt||this.now()-p.referralStatusAt>86400000,
-   rows:page.slice(0,50).map((r:StripeObject)=>({id:r.id,label:r.label,code:r.code,status:r.status,paidThrough:r.paidThrough})),
+   rows:page.slice(0,50).map((r:StripeObject)=>({id:r.id,label:r.label,code:r.code,kind:r.kind||'subscription',status:r.status,paidThrough:r.paidThrough})),
    next:more?page[49].id:null};
  }
  /** Only metadata on six exact existing objects changes. Preflight every object
@@ -151,14 +151,67 @@ export class EarnStripeService {
     const found=await this.appliedReferral(c.mode,sub);if(!found||found.owner!==owner)continue;
     if(typeof sub.id!=='string'||!sub.id.startsWith('sub_')||sub.livemode!==(c.mode==='live')||!id(sub.customer).startsWith('cus_'))throw Error('Incomplete referral subscription identity or mode');
     rows.push({owner,id:hash(owner+':'+sub.id),label:'Customer '+hash(owner+':'+id(sub.customer)).slice(0,8),code:found.offer.code,
-     status:['active','trialing','past_due','unpaid','canceled','incomplete','incomplete_expired','paused'].includes(sub.status)?sub.status:'unknown',
+     kind:'subscription',status:['active','trialing','past_due','unpaid','canceled','incomplete','incomplete_expired','paused'].includes(sub.status)?sub.status:'unknown',
      paidThrough:(book(this.ledger(c.mode).admin()).invoices as Record<string,Invoice>)?Object.values(book(this.ledger(c.mode).admin()).invoices as Record<string,Invoice>).filter(x=>x.owner===owner&&x.subscription===sub.id).reduce((v,x)=>Math.max(v,x.paidThrough||0),0)||null:null});
    }
-   if(!batch.has_more){this.updateProfile(c.mode,owner,{referralStatus:rows,referralStatusAt:this.now()});return {count:rows.length};}
+   if(!batch.has_more){
+    rows.push(...await this.oneTimeReferralStatuses(c.mode,owner));
+    this.updateProfile(c.mode,owner,{referralStatus:rows,referralStatusAt:this.now()});return {count:rows.length};
+   }
    const last=id(batch.data.at(-1));if(!last||last===cursor)throw Error('Invalid referral pagination');cursor=last;
   }
   throw Error('Referral status scan exceeded its finite page limit; previous snapshot retained');
  });}
+ /** Complete Checkout redemptions are purchase facts, never subscription or
+  * commission entries. The provider's applied promotion, configured one-time
+  * software price/product, and settled payment chain must all agree. */
+ private async oneTimeReferralStatuses(mode:BillingMode,owner:string){
+  const api=this.api(mode),cfg=this.billing(),profile=this.profile(mode,owner),rows:StripeObject[]=[];
+  const allowed=[profile.promotion,...(profile.promotionHistory||[]).map((x:StripeObject)=>x.promotion),...(profile.partnerPromotions||[]).map((x:StripeObject)=>x.promotion)].filter(Boolean);
+  const plans=cfg.plans.filter(p=>p.role==='software'&&!p.interval&&p.checkout==='payment-link');
+  const seen=new Set<string>();let cursor='';
+  for(let page=0;page<100;page++){
+   const batch=await api.call('GET','/v1/checkout/sessions',{status:'complete',limit:100,'expand[0]':'data.total_details.breakdown',...(cursor?{starting_after:cursor}:{})});
+   if(!Array.isArray(batch.data)||typeof batch.has_more!=='boolean')throw Error('Incomplete referral Checkout page');
+   for(const session of batch.data){
+    const applied=(session.total_details?.breakdown?.discounts||[]).map((x:StripeObject)=>x.discount);
+    const ds=applied.length?applied:Array.isArray(session.discounts)?session.discounts:[];
+    if(ds.length!==1||!allowed.includes(id(ds[0]?.promotion_code||ds[0]?.source?.promotion_code)))continue;
+    if(typeof session.id!=='string'||!session.id.startsWith('cs_')||seen.has(session.id)||session.livemode!==(mode==='live')||session.status!=='complete')throw Error('Incomplete or duplicate attributed Checkout identity');
+    seen.add(session.id);
+    if(session.payment_status!=='paid')continue; // An unpaid/expired attempt is not a redemption.
+    if(!['payment','subscription'].includes(session.mode))throw Error('Unexpected attributed Checkout mode');
+    const found=await this.appliedReferral(mode,{...session,discounts:ds});if(!found||found.owner!==owner)throw Error('Attributed Checkout owner could not be verified');
+    const appliedCoupon=id(ds[0]?.coupon||ds[0]?.source?.coupon);if(appliedCoupon&&appliedCoupon!==found.offer.proof?.coupon)throw Error('Applied Checkout coupon disagrees with promotion proof');
+    const items=await api.call('GET','/v1/checkout/sessions/'+session.id+'/line_items',{limit:100});
+    if(!Array.isArray(items.data)||items.has_more!==false)throw Error('Incomplete attributed Checkout items');
+    const software=items.data.map((item:StripeObject)=>({item,plan:plans.find(p=>cfg.stripe[mode].priceIds[p.key]===id(item.price))})).filter((x:StripeObject)=>x.plan);
+    if(!software.length)continue; // Recurring-only checkout is already represented by its subscription.
+    if(software.length!==1)throw Error('Ambiguous one-time software purchase');
+    const {item,plan}=software[0];if(!plan)throw Error('One-time plan is unavailable');
+    if(item.price?.type!=='one_time'||item.price?.recurring!=null||!found.offer.products.includes(id(item.price?.product))||item.quantity!==1||!Number.isSafeInteger(item.amount_discount)||item.amount_discount<=0||!Number.isSafeInteger(item.amount_subtotal)||item.amount_discount>item.amount_subtotal)throw Error('One-time software price, product or applied discount mismatch');
+    let payment=id(session.payment_intent);
+    if(!payment&&session.mode==='subscription'){
+     const invoice=id(session.invoice);if(!invoice.startsWith('in_'))throw Error('Mixed one-time purchase has no initial invoice');
+     const inv=await api.call('GET','/v1/invoices/'+invoice);
+     if(inv.id!==invoice||inv.livemode!==(mode==='live')||inv.status!=='paid'||id(inv.customer)!==id(session.customer)||id(inv.subscription||inv.parent?.subscription_details?.subscription)!==id(session.subscription))throw Error('Mixed purchase invoice identity mismatch');
+     const payments=await api.call('GET','/v1/invoice_payments',{invoice,status:'paid',limit:100});
+     if(payments.has_more!==false||!Array.isArray(payments.data)||payments.data.length!==1)throw Error('Mixed purchase payment chain is incomplete or ambiguous');
+     const paid=payments.data[0];
+     if(paid.invoice!==invoice||paid.livemode!==(mode==='live')||paid.status!=='paid'||paid.payment?.type!=='payment_intent')throw Error('Mixed purchase payment identity mismatch');
+     payment=id(paid.payment.payment_intent);
+    }
+    if(!payment.startsWith('pi_'))throw Error('One-time purchase has no settled payment');
+    const pi=await api.call('GET','/v1/payment_intents/'+payment,{'expand[0]':'latest_charge'}),charge=pi.latest_charge;
+    if(pi.id!==payment||pi.livemode!==(mode==='live')||pi.status!=='succeeded'||id(pi.customer)!==id(session.customer)||!Number.isSafeInteger(session.amount_total)||session.amount_total<=0||!Number.isSafeInteger(pi.amount_received)||pi.amount_received<session.amount_total||pi.currency!==session.currency||!charge||typeof charge!=='object'||!id(charge).startsWith('ch_')||charge.livemode!==(mode==='live')||id(charge.payment_intent)!==payment||charge.paid!==true||id(charge.customer)!==id(session.customer)||charge.currency!==session.currency||!Number.isSafeInteger(charge.amount)||charge.amount<session.amount_total||!Number.isSafeInteger(charge.amount_refunded)||charge.amount_refunded<0||charge.amount_refunded>charge.amount||typeof charge.disputed!=='boolean')throw Error('One-time purchase payment or refund facts are incomplete');
+    const status=charge.disputed?'disputed':charge.amount_refunded===charge.amount?'refunded':charge.amount_refunded>0?(session.mode==='subscription'?'refund_allocation_unknown':'partially_refunded'):'paid';
+    rows.push({owner,id:hash(owner+':'+session.id),label:'Customer '+hash(owner+':'+(id(session.customer)||session.id)).slice(0,8),code:found.offer.code,kind:plan.lifetime?'lifetime':'one_time',status,paidThrough:null});
+   }
+   if(!batch.has_more)return rows;
+   const last=id(batch.data.at(-1));if(!last||last===cursor)throw Error('Invalid Checkout pagination');cursor=last;
+  }
+  throw Error('Referral Checkout scan exceeded its finite page limit; previous snapshot retained');
+ }
  private async verifyPromotion(mode:BillingMode,owner:string,promotion:string,code:string,percent:number,products:string[]){
   const api=this.api(mode),promo=await api.call('GET','/v1/promotion_codes/'+promotion),couponId=id(promo.coupon);
   if(promo.id!==promotion||promo.active!==true||promo.livemode!==(mode==='live')||String(promo.code||'').toUpperCase()!==code.toUpperCase()||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner||promo.expires_at!=null||promo.max_redemptions!=null||!couponId)throw Error('Stripe referral promotion could not be verified');
