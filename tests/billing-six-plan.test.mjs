@@ -92,6 +92,15 @@ await test('old ignored hosting retry identity remains exactly software-only wit
   const c=await setup(),attemptId=randomUUID();await c.checkout('monthly',false,{attemptId});const s=c.last(),f=path.join(c.h.dataDir,'billing-launch-intents.v1',hash('live:'+attemptId)+'.json');const i=JSON.parse(fs.readFileSync(f));delete i.hostingRequested;fs.writeFileSync(f,JSON.stringify(i));
   assert.equal((await c.checkout('monthly',true,{attemptId})).body.url,s.url);assert.equal((await c.checkout('monthly',false,{attemptId})).body.url,s.url);assert.equal(c.sessions.size,1);assert.equal(c.h.hub.hosting.store.instances().length,0);await c.h.close();
 });
+await test('mixed hosted initial invoice created before checkout fills both paid terms after checkout delivery',async()=>{
+ const c=await setup();await c.checkout('monthly',true);const s=c.last(),invoice=c.invoice(s),created=c.now();
+ c.advance(2000);assert.equal((await c.post('checkout.session.completed',c.paid(s))).body.outcome,'applied');
+ const before=c.h.hub.billing.store.getCustomer('cus_'+s.id);assert.equal(before.periodEndMs,null);
+ const result=await c.post('invoice.paid',invoice,created);assert.equal(result.body.outcome,'applied',JSON.stringify(result.body));
+ const after=c.h.hub.billing.store.getCustomer('cus_'+s.id);assert.equal(after.licenseId,before.licenseId);assert.equal(after.periodEndMs,invoice.lines.data[0].period.end*1000);
+ assert.equal(c.h.hub.billing.store.getRoleSubscription('cus_'+s.id,'hosting').periodEndMs,invoice.lines.data[1].period.end*1000);
+ assert.equal((await c.post('invoice.payment_succeeded',invoice,created)).body.outcome,'ignored');await c.h.close();
+});
 await test('monthly/yearly mixed webhook discounts display software10%, renew both, and zero software does not start payment clock',async()=>{
   for(const plan of ['monthly','yearly']){
     const c=await setup();await c.checkout(plan,true);const s=c.last();s.lines[0].amount_discount=s.lines[0].amount_subtotal/10;

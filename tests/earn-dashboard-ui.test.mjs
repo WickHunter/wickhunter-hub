@@ -13,4 +13,14 @@ await test('actual portal renders exact offers and honest status, escapes text, 
  d.getElementById('moreReferrals').click();await until(()=>calls.length===2&&d.getElementById('moreReferrals').hidden);assert.match(calls[1].url,/referralsAfter=a{40}$/);assert.match(d.getElementById('referralRows').textContent,/Customer a/);assert.match(d.getElementById('referralRows').textContent,/Customer b/);assert.equal(calls.some(c=>c.init?.method==='POST'),false);assert.deepEqual(errors,[]);
  }finally{dom.window.close();}
 });
+await test('forecast shows partial monthly income and custom override without a misleading next tier',async()=>{
+ const value=structuredClone(state);value.member.commissionPercent=50;value.commissionPercent=50;
+ value.monthlyIncome={rate:50,pricedSubscriptions:11,unknownSubscriptions:1,scheduledSubscriptions:1,excludedSubscriptions:0,asOf:Date.now(),stale:false,monthlyMinorByCurrency:{usd:44055}};
+ const dom=new JSDOM(html,{url:'https://hub.test/earn',runScripts:'dangerously',beforeParse(w){w.fetch=async()=>({ok:true,json:async()=>value});}});
+ try{const d=dom.window.document;await until(()=>!d.getElementById('content').hidden);
+ assert.match(d.getElementById('monthlyIncome').textContent,/440.55.*month/);
+ assert.match(d.getElementById('monthlyIncomeDetails').textContent,/11 priced.*1 subscriptions awaiting.*1 future-start/);
+ assert.match(d.getElementById('nextTier').textContent,/custom 50%/);assert.doesNotMatch(d.getElementById('nextTier').textContent,/reach 30%/);
+ }finally{dom.window.close();}
+});
 summary('earn-dashboard-ui');
