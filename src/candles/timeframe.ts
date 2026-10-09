@@ -382,7 +382,7 @@ export class TimeframeHistory {
     // Read each compatible source once. The old per-target implementation read
     // and atomically rewrote day files for every output bar; a 700 x 720 warmup
     // therefore caused roughly half a million synchronous scans and rewrites.
-    const byBase = new Map<number, Map<number, Row>>();
+    const byBase = new Map<number, Map<number, Row> | { rows: Row[]; firstMs: number }>();
     const minuteFloor = this.minuteFloors.get(this.instrumentIdentity(venue, symbol)) ?? -Infinity;
     for (const base of bases) {
       const baseMs = base * MINUTE_MS;
@@ -401,6 +401,21 @@ export class TimeframeHistory {
         rows = this.store.read(venue, symbol, base, sourceFrom, sourceTo)
           .filter((c) => this.safe(venue, symbol, base, c, minuteRestFrontier))
           .map((c) => [c.openMs, c.open, c.high, c.low, c.close, c.volume]);
+      }
+      // A regular, strictly valid series needs no timestamp hash index. Prove
+      // every row before choosing direct offsets; gaps, duplicates, disorder,
+      // invalid values and Bitunix carried opens retain the original fallback.
+      let dense = rows.length > 0;
+      const firstMs = rows[0]?.[0] ?? 0;
+      for (let i = 0; dense && i < rows.length; i++) {
+        const row = rows[i];
+        dense = row[0] === firstMs + i * baseMs && row[0] % baseMs === 0
+          && basicValues(row[0], row[1], row[2], row[3], row[4], row[5])
+          && row[0] >= minuteFloor && row[2] >= row[1] && row[3] <= row[1];
+      }
+      if (dense) {
+        byBase.set(base, { rows, firstMs });
+        continue;
       }
       const indexed = new Map<number, Row>();
       let previous: Row | undefined;
@@ -430,6 +445,9 @@ export class TimeframeHistory {
         const baseMs = base * MINUTE_MS;
         const indexed = byBase.get(base);
         if (!indexed) continue;
+        const dense = indexed instanceof Map ? null : indexed;
+        const sparse = indexed instanceof Map ? indexed : null;
+        const offset = dense ? (openMs - dense.firstMs) / baseMs : 0;
         const expected = target / base;
         let count = 0;
         let open = 0;
@@ -438,7 +456,7 @@ export class TimeframeHistory {
         let close = 0;
         let volume = 0;
         for (let i = 0; i < expected; i++) {
-          const row = indexed.get(openMs + i * baseMs);
+          const row = dense ? dense.rows[offset + i] : sparse!.get(openMs + i * baseMs);
           if (!row) break;
           if (i === 0) open = row[1];
           high = Math.max(high, row[2]);

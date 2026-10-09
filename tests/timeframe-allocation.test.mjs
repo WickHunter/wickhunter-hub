@@ -128,3 +128,89 @@ test('failed atomic rename keeps prior cache intact and a later correction recov
   assert.equal(signed(f.request()).rows[0][2], 777);
   assert.equal(fs.existsSync(`${file}.tmp.${process.pid}`), false);
 }));
+
+function cacheBytes(root) {
+  const result = {};
+  for (const entry of fs.readdirSync(root, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const file = path.join(entry.parentPath, entry.name);
+    result[path.relative(root, file)] = fs.readFileSync(file).toString('hex');
+  }
+  return result;
+}
+function countSourceIndexes(fn) {
+  const OriginalMap = globalThis.Map;
+  let inserted = 0;
+  globalThis.Map = class extends OriginalMap {
+    set(key, value) {
+      if (Array.isArray(value) && value.length === 6 && typeof value[0] === 'number') inserted++;
+      return super.set(key, value);
+    }
+  };
+  try { return { value: fn(), inserted }; }
+  finally { globalThis.Map = OriginalMap; }
+}
+
+test('dense and deliberately unordered fallback produce identical signed rows and persisted bytes across every interval and venue', () => {
+  for (const venue of ['bybit', 'bitunix', 'bitget', 'binance', 'aster', 'weex']) {
+    for (const target of [3, 5, 15, 30, 60, 120, 180, 240, 360, 720, 1440]) {
+      const size = target * 2;
+      const dense = Array.from({ length: size + 1 }, (_, j) => {
+        const i = j - 1, n = j % 7;
+        return [D + i * M, 100 + n, 103 + n, 99 + n, 102 + n, j % 3 ? 0.1 : 1e16];
+      });
+      // Strict rows stay independently valid on Bitunix too. Reversing only
+      // switches indexing paths; it must not change chronological summation.
+      dense.forEach(Object.freeze); Object.freeze(dense);
+      const evaluate = rows => fixture(f => {
+        f.set(rows);
+        const observed = countSourceIndexes(() => signed(f.request(venue, 'PAIRUSDT', target,
+          D, D + (size - 1) * M, D + (size - 1) * M, D + (size + target) * M)));
+        const bytes = cacheBytes(f.root);
+        assert.deepEqual(signed(f.request(venue, 'PAIRUSDT', target,
+          D, D + (size - 1) * M, D + (size - 1) * M, D + (size + target) * M)), observed.value);
+        assert.equal(f.reads(), 1, 'warm request does not rescan either representation');
+        return { ...observed, bytes };
+      });
+      const fast = evaluate(dense), fallback = evaluate(Object.freeze([...dense].reverse()));
+      assert.equal(fast.inserted, 0, `${venue}/${target}: dense rows allocate no timestamp Map entries`);
+      assert.ok(fallback.inserted >= size, `${venue}/${target}: unordered rows exercise the preserved fallback`);
+      assert.deepEqual(fast.value, fallback.value, `${venue}/${target}: exact signed payload, sum order and provenance`);
+      assert.deepEqual(fast.bytes, fallback.bytes, `${venue}/${target}: exact persistent cache bytes`);
+      assert.equal(dense[0][0], D - M, 'read-only source order is preserved');
+    }
+  }
+});
+
+test('dense prefixes and suffixes preserve missing buckets; irregular data exercises the original fallback', () => {
+  for (const indices of [[1, 2, 3, 4, 5], [0, 1, 2, 3, 4]]) fixture(f => {
+    f.set(indices.map(i => row(i)));
+    const result = countSourceIndexes(() => signed(f.request()));
+    assert.equal(result.inserted, 0, 'a contiguous partial window needs no timestamp Map');
+    assert.equal(result.value.complete, false);
+    assert.deepEqual(result.value.gaps, indices[0] === 1 ? [[D, D]] : [[D + 3 * M, D + 3 * M]]);
+  });
+  const variants = [
+    ['gap', rows => { rows.splice(1, 1); }],
+    ['duplicate last wins', rows => { const last = [...rows[1]]; last[2] = 999; rows.push(last); }],
+    ['out of order', rows => { [rows[0], rows[1]] = [rows[1], rows[0]]; }],
+    ['misaligned', rows => { rows[1][0] += M / 2; }],
+    ['invalid finite field', rows => { rows[1][4] = NaN; }],
+    ['invalid open envelope', rows => { rows[1][1] = 999; }],
+  ];
+  for (const [label, change] of variants) fixture(f => {
+    const rows = Array.from({ length: 6 }, (_, i) => row(i)); change(rows);
+    rows.forEach(Object.freeze); Object.freeze(rows); f.set(rows);
+    const observed = countSourceIndexes(() => signed(f.request()));
+    assert.ok(observed.inserted > 0, `${label}: exact original Map fallback is used`);
+    if (label === 'duplicate last wins') assert.equal(observed.value.rows[0][2], 999);
+    if (label === 'out of order') assert.equal(observed.value.complete, true);
+    if (!['duplicate last wins', 'out of order'].includes(label)) assert.deepEqual(observed.value.gaps, [[D, D]]);
+  });
+  fixture(f => {
+    f.set([[D - M, 90, 102, 89, 101, 1], [D, 101, 103, 102, 102.5, 1], row(1), row(2)]);
+    const result = countSourceIndexes(() => signed(f.request('bitunix', 'CARRYUSDT', 3, D, D + 2 * M, D + 2 * M)));
+    assert.ok(result.inserted > 0, 'Bitunix carried-open boundary remains on its predecessor-aware fallback');
+    assert.equal(result.value.complete, true);
+  });
+});
