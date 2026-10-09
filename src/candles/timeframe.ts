@@ -27,11 +27,16 @@ const SOURCE_NATIVE = 1;
 const SOURCE_AGGREGATE = 2;
 const FILE_EXT = ".ctf2";
 
+function basicValues(openMs: number, open: number, high: number, low: number, close: number, volume: number): boolean {
+  return Number.isSafeInteger(openMs) && openMs > 0
+    && Number.isFinite(open) && Number.isFinite(high) && Number.isFinite(low)
+    && Number.isFinite(close) && Number.isFinite(volume)
+    && open > 0 && high > 0 && low > 0 && close > 0 && volume >= 0
+    && high >= low && high >= close && low <= close;
+}
+
 function basicCandle(c: Candle): boolean {
-  return Number.isSafeInteger(c.openMs) && c.openMs > 0
-    && [c.open, c.high, c.low, c.close, c.volume].every(Number.isFinite)
-    && c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0 && c.volume >= 0
-    && c.high >= c.low && c.high >= c.close && c.low <= c.close;
+  return basicValues(c.openMs, c.open, c.high, c.low, c.close, c.volume);
 }
 
 function strictCandle(c: Candle): boolean {
@@ -41,10 +46,6 @@ function strictCandle(c: Candle): boolean {
 function validAfter(venue: VenueId, interval: number, c: Candle, previous: Candle | undefined): boolean {
   return strictCandle(c) || (basicCandle(c) && venue === "bitunix" && previous !== undefined
     && c.openMs - previous.openMs === interval * MINUTE_MS && c.open === previous.close);
-}
-
-function rowAsCandle(row: Row): Candle {
-  return { openMs: row[0], open: row[1], high: row[2], low: row[3], close: row[4], volume: row[5] };
 }
 
 /** Fixed slots keep absence authoritative and writes idempotent, as in CandleStore. */
@@ -382,6 +383,7 @@ export class TimeframeHistory {
     // and atomically rewrote day files for every output bar; a 700 x 720 warmup
     // therefore caused roughly half a million synchronous scans and rewrites.
     const byBase = new Map<number, Map<number, Row>>();
+    const minuteFloor = this.minuteFloors.get(this.instrumentIdentity(venue, symbol)) ?? -Infinity;
     for (const base of bases) {
       const baseMs = base * MINUTE_MS;
       const sourceFrom = venue === "bitunix" ? Math.max(0, safeFrom - baseMs) : safeFrom;
@@ -401,19 +403,22 @@ export class TimeframeHistory {
           .map((c) => [c.openMs, c.open, c.high, c.low, c.close, c.volume]);
       }
       const indexed = new Map<number, Row>();
-      let previous: Candle | undefined;
+      let previous: Row | undefined;
       for (const row of rows) {
-        const candle = rowAsCandle(row);
-        const structurallyValid = row[0] % baseMs === 0 && basicCandle(candle)
-          && row[0] >= (this.minuteFloors.get(this.instrumentIdentity(venue, symbol)) ?? -Infinity);
-        const valid = structurallyValid && validAfter(venue, base, candle, previous);
+        // Validate the source tuple once without allocating a Candle or a
+        // finite-check array for every minute in a deep history window.
+        const structurallyValid = row[0] % baseMs === 0
+          && basicValues(row[0], row[1], row[2], row[3], row[4], row[5]) && row[0] >= minuteFloor;
+        const valid = structurallyValid && ((row[2] >= row[1] && row[3] <= row[1])
+          || (venue === "bitunix" && previous !== undefined
+            && row[0] - previous[0] === baseMs && row[1] === previous[4]));
         if (valid) {
           indexed.set(row[0], row);
         }
         // Bitunix's first raw row may be the predecessor for the next carried
         // open, but a malformed interior row cannot bridge a gap.
         previous = valid || (structurallyValid && venue === "bitunix" && previous === undefined)
-          ? candle : undefined;
+          ? row : undefined;
       }
       byBase.set(base, indexed);
     }
@@ -426,18 +431,24 @@ export class TimeframeHistory {
         const indexed = byBase.get(base);
         if (!indexed) continue;
         const expected = target / base;
-        const rows: Row[] = [];
+        let count = 0;
+        let open = 0;
+        let high = -Infinity;
+        let low = Infinity;
+        let close = 0;
+        let volume = 0;
         for (let i = 0; i < expected; i++) {
           const row = indexed.get(openMs + i * baseMs);
           if (!row) break;
-          rows.push(row);
+          if (i === 0) open = row[1];
+          high = Math.max(high, row[2]);
+          low = Math.min(low, row[3]);
+          close = row[4];
+          volume += row[5];
+          count++;
         }
-        if (rows.length !== expected) continue;
-        const candle: Candle = {
-          openMs, open: rows[0]![1], high: Math.max(...rows.map((r) => r[2])),
-          low: Math.min(...rows.map((r) => r[3])), close: rows.at(-1)![4],
-          volume: rows.reduce((sum, r) => sum + r[5], 0),
-        };
+        if (count !== expected) continue;
+        const candle: Candle = { openMs, open, high, low, close, volume };
         const batch = writes.get(base);
         if (batch) batch.push(candle); else writes.set(base, [candle]);
         break;
