@@ -1,3 +1,115 @@
+## v0.4.91 — Recoverable initial paid subscription terms
+
+Hosted subscription checkout preserves the initial paid invoice even when Stripe delivers it after a newer checkout event. Exact durable retry admission lets software and hosting finish after an interrupted write while retaining later failure, refund and cancellation guards.
+
+## v0.4.89 — Recovery after repeated install challenges
+
+Reset recovery reads the existing signed lease from the complete verified audit history, even after more than 250 later challenges. The admin audit display remains capped at 250 events. Signature, machine revision, sequence, audit confirmation and recorded offline grace checks remain enforced; this does not issue extra authority or alter the paid plan, expiry or seat limit.
+
+## v0.4.88 — Account-linked reinstall recovery
+
+The customer dashboard can regenerate a reusable 24-hour install command and copy it. Regeneration invalidates older commands for that account, preserves its licence and subscription, and provides a support handoff for a reset server with a lost installation key.
+
+Verified admin reset recovery reserves one replacement licence, retains the same plan and expiry, and retires the old licence and machine binding before exposing a new command. A durable operation journal supports interruption recovery; payment receipts and Earn ownership keep their original identities through customer-scoped committed lineage. Active hosting and unsettled purchases require support review. Previously signed offline authority is recorded, not erased; the old reset server must not be reused. No seat-limit override or financial-history rewrite is performed.
+
+The shared Earn asset retains the acknowledged-copy timeout fix. Public Beta release archives are unchanged.
+
+## v0.4.87 — Referral plan chooser and reliable Earn copy
+
+Purchase links with no selected plan now open the existing website chooser,
+carrying the referral into Monthly, Yearly or Lifetime and optional VPS choices.
+Explicit plan links keep their checkout admission. Earn copy acknowledges only
+an actual clipboard operation, with persistent manual instructions when refused;
+exchange cards show the saved share of trading fees earned by WH.
+
+## v0.4.86 — Verified installer reruns
+
+Installer reruns verify the signed installed release and service ownership before acting. An active installation stays unchanged; a stopped installation can start its existing release once after its licence, empty service cgroup and release-operation lock are verified. Startup succeeds only with fresh readiness and matching service/listener identity. Failures retain recovery evidence and identify restricted-IP exchange refusals. This does not change the public Beta runtime.
+
+## v0.4.85 — Direct website Checkout API
+
+The canonical browser checkout endpoint accepts credential-free CORS requests
+from the Wick Hunter website origins and the Hub's own configured origin.
+Preflight and checkout responses, including rate-limit, validation, and hosted
+capacity errors, remain readable with Retry-After exposed. Foreign origins are
+refused before checkout work; customer cookie actions keep their existing
+same-origin CSRF guard.
+
+## v0.4.84 — Checkout allowance for shared website proxy IPs
+
+Checkout entry shares a 300-request allowance per source IP per rolling minute
+only for GET `/api/billing/plans`, GET `/api/hosting/options`, GET `/buy` and
+POST `/api/billing/checkout`. Readiness reads therefore allow independent website
+buyers sharing a proxy edge IP to reach Checkout. Checkout-creating routes retain
+a separate allowance of 30 attempts per source IP per rolling minute.
+Requests above the limit receive 429 with Retry-After. Retries still count
+toward the allowance and reuse their original immutable Checkout Session.
+A shared referral code admits 60 attempts per rolling minute across source IPs;
+each source IP retains the separate 30-attempt creation bound. Sign-in,
+authentication, webhook and general route limits remain unchanged, as do price
+verification, VPS quotes and provider cost checks.
+
+Combined software/VPS checkout supports up to 30 pending reservations while
+the configured provider cost ceiling still counts every retained reservation
+and resource. Known capacity refusals return 503 with a stable public code and
+Retry-After; customers can retain their attempt or choose software only.
+
+A hosted checkout past its local deadline retains its retry identity and returns
+`HOSTED_CHECKOUT_EXPIRY_PENDING` (409). Only verified unpaid Stripe expiry with durable confirmation of the exact
+reservation release returns `HOSTED_CHECKOUT_EXPIRED` (410), allowing a customer to start a fresh attempt.
+
+## v0.4.83 — One checkout for software and optional VPS
+
+Monthly, Yearly and Lifetime each support software-only or software with VPS,
+using the same plan choices and one Checkout Session. VPS plans bill immediately
+due to VPS provider fees. Monthly and Yearly software-only card plans retain
+the verified October 15 offer. Hosted Monthly and Yearly renew software and VPS
+together; Lifetime software is paid once and remains independent of VPS renewal
+and cancellation. Software promotion codes exclude the separate VPS product.
+
+Paid fulfillment and unused reservation release require durable checkout and
+provider proofs. Mixed invoice earnings use collected software revenue only;
+refund and dispute adjustments preserve the full invoice payment denominator.
+Hosted customers see provisioning status and guidance to check their purchase
+email for their IP address and temporary dashboard password when ready.
+
+## v0.4.82 — Verified recurring referral coupons
+
+Stripe coupon requests now explicitly include product restrictions. Referral
+activation and invoice attribution verify the returned restrictions against the
+registered software offer. Missing or inconsistent proof leaves billing events
+available for retry and review. Retired promotions and already-applied forever
+discounts retain their verified renewal attribution, including older plan prices.
+New redemptions still require a valid, active promotion with the correct owner.
+
+## v0.4.81 — Member-selected Earn payout destinations
+
+Earn members can save or update a payout destination preference for USDT on
+BEP-20, USDT on Polygon, or PayPal. Saves are revision-checked and audited;
+they do not move funds, alter Earn balances, or create payout history. Automatic
+Stripe payout admission skips members with a saved manual preference while
+continuing to reconcile existing Stripe payouts. Manually processed payments
+are scheduled 3–5 business days after month end. New members receive 35% of WH
+commission as the default share; finalized months and entries remain unchanged.
+An explicit audited operator migration is available for untouched legacy 50%
+defaults and is never run automatically. Review candidates with
+`node dist/bin/migrate-earn-rebate-default.js --data-dir <hub-data-dir>`;
+apply only after review by adding `--apply`.
+
+## v0.4.80 — Installer retries and clear startup diagnostics
+
+v0.4.80 — Customer installer retry hotfix: verified support reissues revoke previous customer links and issue a reusable 24-hour command on the existing licence. Installer preflights the signed server/native core, preserves valid login hashes, detects restart failures within a bounded readiness budget, and names possible US-IP restrictions in Bybit HTTP 403 diagnostics. The public Beta runtime startup limitation is stated explicitly in the support email.
+
+## v0.4.79 — Binance coin market-cap coverage and expanded liquidation percentiles
+
+The market-cap producer supports explicitly configured Binance USD-M USDT perpetuals using native instrument identity and CoinMarketCap's Binance derivatives mapping (exchange id 270). Multiplier contracts retain the underlying asset's unscaled capitalisation; unresolved identities and missing market caps remain unknown. Binance production remains off unless included in MARKET_CAP_VENUES, and existing paid-provider budget limits remain in force. Liquidation tables carry additive full-range statistics while preserving legacy display and trading stops.
+
+This source candidate starts from the exact live Hub v0.4.78 source, 44ee9274a7c277134c15a6b40f6aaa55c28de883. Runtime rollout requires separate current authorization. It does not publish or promote customer application releases.
+
+## v0.4.78 — Verified Earn UIDs and clear monthly statements
+
+Members can update their main UID for an exchange. A changed UID needs a new Hub verification before it qualifies for future exchange rebates; claim revisions prevent stale member edits and admin approvals. The customer statement labels WH commission received and shows the amount actually credited, including $0 below the existing $15 combined monthly minimum. Finalized months, payout history and rebate rates are unchanged.
+
 ## v0.4.77 — Marketplace operations and recovery
 
 Show pending copier deliveries and halted Demo provisioning prominently. Provider decisions follow the permitted state transitions. Failed Alpha access changes restore and re-synchronize the previous setting, with an explicit warning if reconciliation fails. Root-helper settings are reconstructed from known fields before reaching the browser.
@@ -361,8 +473,7 @@ The Hub sells the product without a second server. A visitor buys through a
 Stripe **Payment Link**; Stripe posts a signed webhook to the Hub; the Hub
 mints an `LHK1` licence, stores it against the Stripe customer, and emails the
 buyer a link to a **private install page**. That page shows a one-line install
-command whose token works **once** and expires in 24 hours; reloading the page
-mints a fresh one (that is how a customer reinstalls on a new server). The
+command with a 24-hour token. Historical welcome-page commands are single-use; the signed-in dashboard regenerates a reusable command and invalidates older account commands. A reset server with a lost installation key needs the verified recovery action below, not merely a fresh command. The
 licence key itself is never in an email or a URL — it is written into the
 installer the Hub serves for that one-time token, exactly as `install.sh?key=`
 does for a beta invite.
@@ -379,6 +490,12 @@ config, editable from the admin page): **Monthly $99**, **Yearly $699**,
 days, the v1 format's maximum). Every plan carries the same software; they
 differ only in how the customer pays.
 
+- `/buy` with no plan or a blank plan redirects to the configured website's
+  `/unleashed/#pricing` chooser. A nonempty `ref` is retained in the query so
+  the buyer can choose Monthly, Yearly or Lifetime, with or without VPS.
+  This landing request creates no checkout or hosting reservation. Missing
+  or invalid `siteOrigin` refuses with 503; explicit plan links retain their
+  existing checkout admission and referral checks.
 - `/buy?plan=<key>` redirects to that plan's Payment Link in the active mode
   (`stripe.<mode>.paymentLinks[key]`; the legacy `paymentLinkUrl` is the
   fallback for the first plan). The website's three Buy buttons use these.
@@ -1710,8 +1827,9 @@ personalised command):
 > It installs Node, the bot, and HTTPS, then prints your dashboard URL and
 > login when it finishes (about 2–3 minutes). It will ask you to choose a
 > dashboard password (or press Enter to have one generated). Your key expires
-> on `<date>`. To upgrade to a newer beta later, just re-run the same command
-> — your settings and data survive.
+> on `<date>`. Re-running safely checks the current installation or starts a
+> verified stopped release. Upgrade through the authenticated app updater;
+> settings and current data are retained.
 >
 > The key is yours alone — please don't share it. Your bot checks in with my
 > hub (version + install id only) so I can see who's on what build and revoke
@@ -1744,7 +1862,7 @@ pointer). The Hub holds only the dedicated release PUBLIC keyring in
 `HUB_RELEASE_PUBLIC_KEYS_JSON`; never copy the private release key here and
 never reuse the licence/candle/market-data keys. Full signed contract, rollout
 order and publish snippet: [`releases/README.md`](releases/README.md).
-Testers upgrade by re-running their install command.
+Installer reruns validate an active installation or start a verified stopped release without replacing its files. Trading upgrades use the authenticated app updater; see [installer recovery and readiness](docs/INSTALLER-RERUN-SAFETY.md).
 
 ### Signed-release rollout (mandatory order)
 
@@ -1860,6 +1978,25 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.91 — Recoverable initial paid subscription terms: hosted checkout keeps the initial paid invoice when Stripe delivers it after a newer checkout event, and exact-event durable retry admission lets software and hosting finish after an interrupted write while later payment-failure, refund, dispute and cancellation guards stay in force.
+
+- v0.4.90 — Verified existing Oskaras product-scoped offers, separate read-only dashboard grants, and owner-filtered subscription and one-time purchase status without financial replay.
+
+- v0.4.89 — Resolve reset recovery against complete verified lease history while retaining the bounded admin audit display and all authority checks.
+- v0.4.88 — Regenerate account-scoped install commands and recover a confirmed reset server through an audited replacement licence, preserving billing, dashboard and Earn history. Keep the bounded Earn copy fallback.
+- v0.4.87 — Open unselected purchase links on the existing referral-preserving plan chooser; provide truthful Earn copy fallback and the saved WH trading-fee share.
+- v0.4.86 — Verify signed installed releases, service ownership, fresh readiness and release locks on installer reruns; preserve active installations and customer data. Empty systemd command hooks remain compatible, and captured unit properties stay out of verifier process arguments.
+
+- v0.4.85 — Direct, credential-free browser CORS for canonical website Checkout, with early errors readable and cookie-authenticated customer actions unchanged.
+- v0.4.84 — Checkout-only IP allowance and pending combined VPS checkout capacity increase to 30 for shared website traffic; provider cost ceilings and immutable payment/provisioning guards are retained, with explicit bounded capacity refusals.
+- v0.4.83 — Six software/optional VPS choices in one checkout, immediate hosted billing, software-only coupons and referral earnings, independent Lifetime access, and hosted email guidance.
+- v0.4.82 — Explicit Stripe coupon product proof, safe retry of referral verification, and preserved credit for verified retired offers and existing subscription renewals.
+
+- v0.4.81 — Earn with WH: saved manual withdrawal destinations, 35% default exchange share, verified forever referral discounts, typed-code attribution, and audited payout/refund reconciliation.
+
+- v0.4.80 — Customer installer retry hotfix: verified support reissues revoke previous customer links and issue a reusable 24-hour command on the existing licence. Installer preflights the signed server/native core, preserves valid login hashes, detects restart failures within a bounded readiness budget, and names possible US-IP restrictions in Bybit HTTP 403 diagnostics. The public Beta runtime startup limitation is stated explicitly in the support email.
+- v0.4.79 — Add explicitly configured Binance coin market-cap coverage and full-range liquidation statistics; preserve legacy percentile thresholds and unknown-cap refusals.
+- v0.4.78 — Re-verify edited Earn UIDs with claim-revision checks and show credited monthly exchange rebates clearly.
 - v0.4.77 — Surface Marketplace delivery/provisioning alerts, reconcile failed Alpha access changes, and restrict provider decisions and helper snapshots.
 - v0.4.76 — Acknowledge refunded one-time Checkout replays without restoring access, refuse unsafe automatic Hub updates, and explain starter-pack access and import in support.
 
@@ -2794,3 +2931,9 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 ### Marketplace setup and paid billing
 
 Fresh Marketplace setup defaults to mock. If the private deployment already uses Stripe or MoonPay, Hub setup refuses configuration edits instead of resetting the payment mode or removing vendor credentials. Manage paid billing through the private deployment workflow; the status bridge reports the configured rail and its required inputs.
+
+### Verified reset recovery (0.4.88)
+
+`POST /admin/api/billing/recover-install`, behind existing admin authentication, accepts `customerId`, the exact stored `email`, a stable `operationId`, `expectedLicenseId`, `expectedActivationId`, `expectedActivationRevision`, `expectedAuditRevision`, `confirmedDestroyedInstall:true` and `acknowledgeCachedGrace:true`. Obtain the current machine audit using the existing admin lease snapshot. Confirm the old server was reset/destroyed and record its last signed cached-grace deadline. Reuse the same operation ID after an interruption; never blindly create another replacement. Only a completed operation sends the command to the stored account email. An ambiguous or failed email needs audit review and an explicit same-licence reissue, not another licence replacement.
+
+`data/billing-install-recovery.v1/<sha256(operationId)>.json` retains the reserved identity, old account/entitlement, exact machine audit, phases, actual install expiry and provider outcome. Malformed/unreadable journals refuse recovery and historical lineage. Do not restore version 87 code after any recovery journal is created: it does not understand linked licence identities. Preserve all data and use an explicit compatible recovery plan.

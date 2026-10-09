@@ -3,6 +3,8 @@
 // rolls a new price + link), plan labels on licences, and a lifetime licence
 // a ten-year lifetime key.
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { signStripePayload } from "../dist/src/billing/stripe.js";
 import { validatePlans, paymentLinkFor, defaultBillingConfig, DEFAULT_PLANS, BillingConfigError } from "../dist/src/billing/config.js";
@@ -12,7 +14,7 @@ const LIVE_WHSEC = "whsec_live_plans_0123456789";
 const TEST_WHSEC = "whsec_test_plans_0123456789";
 
 // ── a fake Stripe API with just enough state to be idempotent against ───────
-const stripe = { products: [], prices: [], links: [], calls: [] };
+const stripe = { products: [], prices: [], links: [], calls: [], sessions: [] };
 let seq = 0;
 const nextId = (prefix) => `${prefix}_${++seq}`;
 const parseForm = (body) => Object.fromEntries(new URLSearchParams(body));
@@ -27,6 +29,10 @@ const fakeFetch = async (url, init) => {
   const path = u.pathname.replace(/^\/v1/, "");
   const params = init.method === "POST" ? parseForm(init.body) : Object.fromEntries(u.searchParams);
   let m;
+  if (init.method === 'GET' && path.startsWith('/prices/')) return json(stripe.prices.find(p => p.id === path.split('/').at(-1)) ?? {}, stripe.prices.some(p => p.id === path.split('/').at(-1)) ? 200 : 404);
+  if (init.method === 'POST' && path === '/checkout/sessions') {
+    const session = {id:nextId('cs'),url:'https://checkout.stripe.com/c/pay/cs_fixture',params};stripe.sessions.push(session);return json(session);
+  }
   if (init.method === "GET" && path === "/products") return json({ object: "list", data: stripe.products.filter((p) => p.active) });
   if (init.method === "POST" && path === "/products") {
     const p = { id: nextId("prod"), name: params.name, active: true, metadata: { wickhunter: params["metadata[wickhunter]"], managed_by: params["metadata[managed_by]"] } };
@@ -41,7 +47,7 @@ const fakeFetch = async (url, init) => {
     if (taken && params.transfer_lookup_key !== "true") return json({ error: { message: "lookup_key already in use" } }, 400);
     if (taken) taken.lookup_key = null;
     const p = {
-      id: nextId("price"), product: params.product, currency: params.currency, unit_amount: Number(params.unit_amount), active: true,
+      id: nextId("price"), livemode: init.headers.authorization === "Bearer sk_live_fake", type: params["recurring[interval]"] ? "recurring" : "one_time", product: params.product, currency: params.currency, unit_amount: Number(params.unit_amount), active: true,
       lookup_key: params.lookup_key, nickname: params.nickname, metadata: { plan: params["metadata[plan]"] },
       recurring: params["recurring[interval]"] ? { interval: params["recurring[interval]"], interval_count: Number(params["recurring[interval_count]"] ?? 1) } : null,
     };
@@ -57,11 +63,12 @@ const fakeFetch = async (url, init) => {
   if (init.method === "POST" && path === "/payment_links") {
     const l = {
       id: nextId("plink"), url: `https://buy.stripe.com/test_link${seq}`, active: true,
-      metadata: { plan: params["metadata[plan]"], price: params["metadata[price]"], license_days: params["metadata[license_days]"] },
+      metadata: { managed_by: params["metadata[managed_by]"], plan: params["metadata[plan]"], price: params["metadata[price]"], license_days: params["metadata[license_days]"] },
       after_completion: { type: params["after_completion[type]"], redirect: { url: params["after_completion[redirect][url]"] } },
       line_items: [{ price: params["line_items[0][price]"] }],
       billing_address_collection: params.billing_address_collection,
       customer_creation: params.customer_creation,
+      allow_promotion_codes: params.allow_promotion_codes === "true",
       subscription_plan: params["subscription_data[metadata][plan]"],
     };
     stripe.links.push(l);
@@ -70,6 +77,7 @@ const fakeFetch = async (url, init) => {
   if (init.method === "POST" && (m = /^\/payment_links\/(plink_\d+)$/.exec(path))) {
     const l = stripe.links.find((x) => x.id === m[1]);
     if (params.active === "false") l.active = false;
+    if (params.allow_promotion_codes === "true") l.allow_promotion_codes = true;
     return json(l);
   }
   return json({ error: { message: `unhandled ${init.method} ${path}` } }, 404);
@@ -136,7 +144,7 @@ await test("GET /api/billing/plans is public, CORS-open and names the three defa
   assert.equal(body.plans[1].buyUrl, "https://hub.test/hub/buy?plan=yearly");
 });
 
-await test("/buy?plan= routes per plan: unknown 404, unconfigured 503, configured 302, no plan = first plan", async () => {
+await test("/buy?plan= routes explicit plans: unknown 404, unconfigured 503, configured 302", async () => {
   assert.equal((await fetch(`${h.origin}/buy?plan=bogus`, { redirect: "manual" })).status, 404);
   assert.equal((await fetch(`${h.origin}/buy?plan=yearly`, { redirect: "manual" })).status, 503);
   const r = await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { test: { paymentLinkUrl: "https://buy.stripe.com/test_m", paymentLinks: { yearly: "https://buy.stripe.com/test_y" } } } }) });
@@ -144,7 +152,6 @@ await test("/buy?plan= routes per plan: unknown 404, unconfigured 503, configure
   assert.deepEqual(r.body.stripe.test.paymentLinks, { yearly: "https://buy.stripe.com/test_y" });
   assert.equal(r.body.endpoints.buyPlans.lifetime, "https://hub.test/hub/buy?plan=lifetime");
   assert.equal((await fetch(`${h.origin}/buy?plan=yearly`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_y");
-  assert.equal((await fetch(`${h.origin}/buy`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_m");
   assert.equal((await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/test_m");
   const clear = await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ stripe: { test: { paymentLinks: { yearly: null } } } }) });
   assert.deepEqual(clear.body.stripe.test.paymentLinks, {});
@@ -195,13 +202,14 @@ await test("Create in Stripe makes the product, three prices and three links, an
   assert.equal(life.customer_creation, "always");
   assert.equal(life.after_completion.redirect.url, "https://wickhunterunleashed.com/thanks/");
   assert.equal(life.billing_address_collection, "required");
+  assert.equal(life.allow_promotion_codes, true);
   const yearlyLink = stripe.links.find((l) => l.metadata.plan === "yearly");
   assert.equal(yearlyLink.subscription_plan, "yearly", "subscriptions carry the plan in subscription metadata too");
   const cfg = await admin("/admin/api/billing/config");
   assert.deepEqual(Object.keys(cfg.body.stripe.test.paymentLinks).sort(), ["lifetime", "monthly", "yearly"]);
   assert.equal(cfg.body.stripe.test.paymentLinkUrl, "https://buy.stripe.com/test_m", "an already-set legacy field is left alone");
-  assert.equal((await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" })).headers.get("location"), cfg.body.stripe.test.paymentLinks.monthly, "the per-plan link wins over the legacy field");
-  assert.equal((await fetch(`${h.origin}/buy?plan=lifetime`, { redirect: "manual" })).headers.get("location"), life.url);
+  assert.equal((await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" })).headers.get("location"), "https://checkout.stripe.com/c/pay/cs_fixture", "configured base prices use the durable generic Checkout, even while free launch is disabled");
+  assert.equal((await fetch(`${h.origin}/buy?plan=lifetime`, { redirect: "manual" })).headers.get("location"), "https://checkout.stripe.com/c/pay/cs_fixture");
 });
 
 await test("a second run reuses everything", async () => {
@@ -211,6 +219,17 @@ await test("a second run reuses everything", async () => {
   assert.equal(r.body.product.created, false);
   assert.ok(r.body.plans.every((p) => !p.priceCreated && !p.linkCreated));
   assert.deepEqual({ p: creates("/products"), pr: creates("/prices"), l: creates("/payment_links") }, before);
+});
+
+await test('launch provisioning never recreates retired monthly/yearly links and repairs Lifetime promo entry', async () => {
+  const monthly=stripe.links.find(l=>l.metadata.plan==='monthly'),yearly=stripe.links.find(l=>l.metadata.plan==='yearly'),life=stripe.links.find(l=>l.metadata.plan==='lifetime');
+  monthly.active=false;yearly.active=false;life.allow_promotion_codes=false;
+  const state=path.join(h.dataDir,'billing-launch.v1.json');fs.writeFileSync(state,JSON.stringify({test:{enabled:true}}));
+  const before=creates('/payment_links');
+  const r=await admin('/admin/api/billing/plans/provision',{method:'POST',body:JSON.stringify({mode:'test'})});assert.equal(r.status,200);
+  assert.equal(creates('/payment_links'),before);assert.equal(monthly.active,false);assert.equal(yearly.active,false);assert.equal(life.allow_promotion_codes,true);
+  const cfg=await admin('/admin/api/billing/config');assert.equal(cfg.body.stripe.test.paymentLinks.monthly,monthly.url);assert.equal(cfg.body.stripe.test.paymentLinks.yearly,yearly.url);
+  fs.rmSync(state);monthly.active=true;yearly.active=true;
 });
 
 await test("hosted bundle provisioning creates exact prices but no shareable Payment Links", async () => {
@@ -228,7 +247,7 @@ await test("hosted bundle provisioning creates exact prices but no shareable Pay
   const cfg = await admin("/admin/api/billing/config");
   assert.equal(cfg.body.stripe.test.paymentLinks["monthly-hosted"], undefined);
   assert.equal(cfg.body.stripe.test.priceIds["monthly-hosted"], bundles.find((p) => p.key === "monthly-hosted").priceId);
-  assert.equal((await fetch(`${h.origin}/buy?plan=monthly-hosted`)).status, 403);
+  assert.equal((await fetch(`${h.origin}/buy?plan=monthly-hosted`)).status, 400);
   await admin("/admin/api/billing/config", { method: "POST", body: JSON.stringify({ plans: DEFAULT_PLANS }) });
 });
 

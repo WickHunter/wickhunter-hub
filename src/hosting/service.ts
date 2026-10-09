@@ -33,6 +33,9 @@ import { isIP } from "node:net";
 import type { BillingService } from "../billing/service.js";
 import type { RoleSubscriptionRecord } from "../billing/store.js";
 import type { EmailConfig } from "../billing/config.js";
+import type { HostedPriceProof } from "../billing/hosted-offer.js";
+import { launchGrant } from "../billing/launch.js";
+import type { StripeObject } from "../earn-stripe-api.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
 import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold } from "./store.js";
@@ -45,9 +48,18 @@ import * as tmpl from "./emails.js";
 
 const HOUR = 60 * 60 * 1000;
 const MAX_PROVISION_ATTEMPTS = 3;
+// Unpaid v2 checkout reservations are bounded independently of the provider
+// cost ceiling, which includes every retained reservation and live resource.
+const MAX_PENDING_SPLIT_CHECKOUTS = 30;
 const LEASE_TTL_MS = 2 * 60_000;
 const PROVISION_RETRY_BACKOFF_MS = 30_000;
 const PUBLIC_HEALTH_MAX_BYTES = 4096;
+
+export class HostingCheckoutCapacityError extends Error {
+  readonly code = 'HOSTED_CHECKOUT_CAPACITY';
+  readonly retryAfterSeconds = 60;
+  constructor() { super('VPS checkout is temporarily at capacity. Please try again later or choose software only.'); }
+}
 
 const realFetch: EmailFetch = async (url, init) => {
   const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body, signal: init.signal });
@@ -200,7 +212,9 @@ export class HostingService {
     const role = billing.roles[billing.mode].hosting;
     if (!stripe.secretKey) return "managed hosting customer-bound checkout is not configured";
     if (!stripe.webhookSecret) return "managed hosting billing intake is not configured";
-    if (role.priceIds.length !== 1) return "managed hosting requires exactly one classified Stripe price";
+    if (!role.priceIds.length) return "managed hosting requires a classified Stripe price";
+    const canonical = stripe.priceIds[plan.key] || role.priceIds[0];
+    if (!canonical || !role.priceIds.includes(canonical)) return "managed hosting price is not classified";
     return null;
   }
 
@@ -240,7 +254,7 @@ export class HostingService {
     if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
     const ceilingRefusal = this.costCeilingRefusalWithQuote(quote, policy);
     if (ceilingRefusal) return { ok: false, code: "PROVISIONING_DISABLED", error: ceilingRefusal };
-    const priceId = cfg.roles[mode].hosting.priceIds[0]!;
+    const priceId = cfg.stripe[mode].priceIds[planKey] || cfg.roles[mode].hosting.priceIds[0]!;
     const checked = await this.verifyStripeHostingPrice(stripe.secretKey, priceId, policy);
     if (!checked.ok) return { ok: false, code: "PROVISIONING_DISABLED", error: checked.error };
     const finalCeilingRefusal = this.costCeilingRefusalWithQuote(quote, policy);
@@ -277,6 +291,46 @@ export class HostingService {
       .map((p) => ({ key: p.key, interval: p.interval as "month" | "year", amountCents: p.amountCents, currency: p.currency }));
   }
 
+  /** Reserves cost before a v2 mixed Checkout is created. No VPS/provider
+   * purchase happens here. A retry owns the same durable anonymous row. */
+  async reserveSplitCheckout(id: string, proof: HostedPriceProof, customerId?: string): Promise<HostedPriceProof & { reservationId: string; expiresAtMs: number }> {
+    const now = this.now(), cfg = this.billing.config(), policy = this.policy();
+    const issue = this.hostingOfferIssue(); if (issue) throw Error(issue);
+    if (policy.monthlyPriceCents !== 2000 || policy.currency !== 'usd') throw Error('VPS policy differs from the approved $20 monthly price');
+    const ownerId = 'bundle:' + id;
+    this.expireCheckoutReservations(now);
+    const prior = this.store.activeInstanceForOwner(ownerId, cfg.mode);
+    if (prior) {
+      if (prior.stage !== 'ordered' || !prior.checkoutExpiresAtMs || prior.checkoutExpiresAtMs <= now) throw Error('This hosted attempt is already in use');
+      return { ...proof, reservationId: prior.id, expiresAtMs: prior.checkoutExpiresAtMs };
+    }
+    if (customerId && this.store.activeInstanceForOwner(customerId, cfg.mode)) throw Error('Manage your existing VPS from the customer dashboard');
+    const pending = this.store.instances().filter(r => r.ownerId.startsWith('bundle:') && r.stage === 'ordered' && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now);
+    if (pending.length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
+    const provider = this.provider()!;
+    const quote = (await provider.listPlans()).find(p => p.id === policy.planId)?.monthlyCostCents;
+    if (!Number.isSafeInteger(quote) || !quote || quote <= 0 || quote * 2 !== policy.monthlyPriceCents) throw Error('VPS provider cost differs from the approved price');
+    if (this.billing.config().mode !== cfg.mode || JSON.stringify(this.policy()) !== JSON.stringify(policy)) throw Error("Hosting policy changed during price verification");
+    if (this.store.instances().filter(r => r.ownerId.startsWith("bundle:") && r.stage === "ordered" && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now).length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
+    const refusal = this.costCeilingRefusalWithQuote(quote, policy);
+    if (refusal === 'hosting is at its provider cost ceiling') throw new HostingCheckoutCapacityError();
+    if (refusal) throw Error(refusal);
+    const row = this.store.reserveInstance({ id: this.store.newId('host'), ownerId, environment: cfg.mode, region: policy.regions[0]?.id ?? 'nrt', planId: policy.planId, stripeCustomerId: '', nowMs: now });
+    if (!row) throw Error('Hosted checkout reservation changed; retry the same attempt');
+    const expiresAtMs = Math.floor((now + 31 * 60_000) / 1000) * 1000;
+    const saved = this.store.updateInstance(row.id, row.version, d => { d.providerPlanMonthlyCostCents = quote; d.checkoutExpiresAtMs = expiresAtMs; }, now);
+    if (!saved) throw Error('Hosted checkout reservation could not be saved');
+    return { ...proof, reservationId: row.id, expiresAtMs };
+  }
+
+  bindSplitCheckout(proof: HostedPriceProof & { reservationId: string }, params: StripeObject): void {
+    const row = this.store.getInstance(proof.reservationId);
+    if (!row || row.stage !== 'ordered' || params['metadata[reservation]'] !== row.id || params['metadata[bundle]'] !== 'software-hosting-v2' || params['line_items[0][price]'] !== proof.softwarePriceId || params['line_items[1][price]'] !== proof.hostingPriceId) throw Error('Hosted checkout reservation identity changed');
+    const body = new URLSearchParams(Object.entries(params).map(([k,v]) => [k, String(v)])).toString();
+    if (row.checkoutRequestBody && row.checkoutRequestBody !== body) throw Error('Hosted checkout reservation payload changed');
+    if (!row.checkoutRequestBody && !this.store.updateInstance(row.id, row.version, d => { d.checkoutRequestBody = body; }, this.now())) throw Error('Hosted checkout reservation could not be bound');
+  }
+
   bundleOfferIssue(): string | null {
     const base = this.hostingOfferIssue();
     if (base) return base;
@@ -290,7 +344,7 @@ export class HostingService {
 
   /** Anonymous bundle checkout uses a browser-stable attempt id, never an
    * email lookup. Stripe supplies the customer id in its signed webhook. */
-  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now()): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
+  async bundleCheckout(interval: "month" | "year", attemptId: string, nowMs = this.now(), admitNew = true): Promise<HostingActionResult<{ url: string; pricing: { amountCents: number; currency: string; interval: "month" | "year"; softwareDays: number; maximumConnectedAccounts: number } }>> {
     const issue = this.bundleOfferIssue();
     if (issue) return { ok: false, code: "PROVISIONING_DISABLED", error: issue };
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(attemptId)) return { ok: false, code: "PROVISIONING_DISABLED", error: "checkoutAttemptId is malformed" };
@@ -311,6 +365,7 @@ export class HostingService {
       }
       return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this checkout attempt is already in use" };
     }
+    if (!admitNew) return { ok: false, code: 'PROVISIONING_DISABLED', error: 'Refresh the pricing page to start the current reserved software and VPS checkout' };
     const pendingAnonymous = this.store.instances().filter((row) => row.ownerId.startsWith("bundle:") && row.stage === "ordered" && row.checkoutExpiresAtMs != null && row.checkoutExpiresAtMs > nowMs).length;
     if (pendingAnonymous >= 3) return { ok: false, code: "PROVISIONING_DISABLED", error: "too many hosted checkouts are pending; retry shortly" };
     const provider = this.provider()!;
@@ -351,10 +406,21 @@ export class HostingService {
 
   private expireCheckoutReservations(nowMs: number): void {
     for (const row of this.store.instances()) {
+      if (row.checkoutRequestBody && new URLSearchParams(row.checkoutRequestBody).get("metadata[bundle]") === "software-hosting-v2") continue; // Only canonical Stripe expiry can release a mixed paid attempt.
       if (row.stage === "ordered" && row.checkoutExpiresAtMs != null && nowMs >= row.checkoutExpiresAtMs && !row.stripeSubscriptionId) {
         this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
       }
     }
+  }
+
+  releaseSplitReservation(reservationId: string, intentId: string): boolean {
+    const row = this.store.getInstance(reservationId);
+    if (!row || row.ownerId !== 'bundle:' + intentId || row.stripeSubscriptionId || row.providerInstanceId || !row.checkoutRequestBody) return false;
+    const params = new URLSearchParams(row.checkoutRequestBody);
+    if (params.get('metadata[wh_launch_intent]') !== intentId || params.get('metadata[bundle]') !== 'software-hosting-v2') return false;
+    if (row.stage === 'deleted' && row.failureReason === 'checkout_expired') return true;
+    if (row.stage !== 'ordered') return false;
+    return !!this.store.updateInstance(row.id, row.version, d => { d.stage = 'deleted'; d.checkoutExpiresAtMs = null; d.failureReason = 'checkout_expired'; }, this.now());
   }
 
   acceptBundleReservation(reservationId: string, customerId: string, subscriptionId: string, planKey: string, livemode: boolean, terminal: boolean, nowMs = this.now()): boolean {
@@ -424,6 +490,7 @@ export class HostingService {
    *  wanted; every step is idempotent. */
   reconcileAll(nowMs = this.now()): void {
     for (const row of this.store.instances()) {
+      if (row.checkoutRequestBody && new URLSearchParams(row.checkoutRequestBody).get("metadata[bundle]") === "software-hosting-v2") continue; // Only canonical Stripe expiry can release a mixed paid attempt.
       if (row.stage === "ordered" && row.checkoutExpiresAtMs != null && nowMs >= row.checkoutExpiresAtMs && !row.stripeSubscriptionId) {
         this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
       }
@@ -675,7 +742,7 @@ export class HostingService {
     const anchor = row.paidThroughMs ?? nowMs;
     this.scheduleEnd(row, "intentional_cancellation", anchor, policy, nowMs);
     const d = deadlines(anchor, "intentional_cancellation", policy);
-    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt, affectsSoftwareRenewal: !!this.bundlePlanForOwner(ownerId) } };
+    return { ok: true, value: { suspendAt: d.suspendAt, deleteAt: d.deleteAt, affectsSoftwareRenewal: !!this.bundlePlanForOwner(ownerId) && !this.bundlePlanForOwner(ownerId)!.lifetime } };
   }
 
   /** POST /api/hosting/:id/resume-renewal. Only reversible before the
@@ -1316,6 +1383,13 @@ export class HostingService {
 
   private bundlePlanForOwner(ownerId: string) {
     const customer = this.billing.store.getCustomer(ownerId);
+    const host = this.billing.store.getRoleSubscription(ownerId, 'hosting');
+    const bound = host?.subscriptionId ? this.billing.store.getBundleSubscription(host.subscriptionId) : null;
+    if (bound?.launchIntentId) {
+      const grant = launchGrant(this.dataDir, { wh_launch_intent: bound.launchIntentId, plan: bound.planKey }, host!.livemode);
+      const base = this.billing.plan(bound.planKey), proof = grant?.hosting;
+      if (base && proof) return { ...base, checkout: 'hosted-bundle' as const, amountCents: base.lifetime ? proof.hostingAmountCents : Math.round(proof.softwareAmountCents * (100 - (typeof customer?.discountPercent === "number" && customer.discountPercent >= 0 && customer.discountPercent <= 100 ? customer.discountPercent : 0)) / 100) + proof.hostingAmountCents, interval: proof.hostingInterval };
+    }
     const plan = customer?.planKey ? this.billing.plan(customer.planKey) : null;
     return plan?.checkout === "hosted-bundle" ? plan : null;
   }
@@ -1336,12 +1410,12 @@ export class HostingService {
           appUsername: "admin", sshUsername: "root", sshPort: 22, accessUrl: manageUrl,
           temporaryPassword: row.bootstrapTokenHash ? bootstrapPasswordFromTokenHash(row.bootstrapTokenHash) : "",
           maximumConnectedAccounts: policy.maximumConnectedAccounts,
-          billingSummary: bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
+          billingSummary: bundlePlan?.lifetime ? `Your Lifetime software purchase remains yours. VPS hosting renews at ${bundlePrice} per month.` : bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
-        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan);
+        return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan && !bundlePlan.lifetime);
       case "overdue":
-        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
+        return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan?.lifetime ? "This invoice renews VPS hosting only. Your paid Lifetime software access remains yours." : bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
       case "suspended":
         return tmpl.suspendedEmail("", ref, row.deleteAtMs ?? nowMs, manageUrl);
       case "three_days":
@@ -1602,6 +1676,7 @@ export interface HostingInstanceView {
   managedBackupsIncluded: boolean;
   maximumConnectedAccounts: number;
   bundleSubscription: boolean;
+  softwareLifetime: boolean;
   billingPriceLabel: string;
   billingInterval: "month" | "year";
 }
@@ -1634,6 +1709,7 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
     maximumConnectedAccounts: policy.maximumConnectedAccounts,
     bundleSubscription: !!bundlePlan,
+    softwareLifetime: bundlePlan?.lifetime === true,
     billingPriceLabel: bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
     billingInterval: bundlePlan?.interval === "year" ? "year" : "month",
   };

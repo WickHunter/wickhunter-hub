@@ -8,6 +8,7 @@
 <script>
 const root=location.pathname.replace(/\/$/,'');let state=null,current='',busy=false,attempt=null,sessionReady=false,epoch=0,loadSeq=0;
 const el=id=>document.getElementById(id);
+try{const draft=new URLSearchParams(location.hash.slice(1)).get('message');if(draft)el('question').value=draft.slice(0,4000);}catch{}
 const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function swFormat(text){
   const saved=[];

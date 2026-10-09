@@ -4,7 +4,7 @@ import { readReleaseControlState, countUnresolvedHubBugs, DEFAULT_PRODUCTION_SOA
 import { MarketingSettings } from './marketing-settings.js';
 import { MarketingCustomerSync, type MarketingCustomerSyncResult } from './marketing-customer-sync.js';
 import { EarnStripeService } from "./earn-stripe.js";
-import { EarnService, earnOwner } from "./earn.js";
+import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 // src/server.ts
 // The hub's HTTP server: node:http, no framework, no runtime dependencies.
 //
@@ -16,7 +16,7 @@ import { EarnService, earnOwner } from "./earn.js";
 //   keyed    GET  /install/channels/{beta,production}.sh explicit fresh-install channel bootstrap (feature-gated)
 //   keyed    GET  /api/latest                    authenticated signed release manifest (x-license; legacy ?key=)
 //   keyed    GET  /download/<file>               beta tarballs (x-license; legacy ?key=; "latest" resolves)
-//   public   GET  /buy[?plan=key]                302 -> the ACTIVE mode's Stripe Payment Link for that plan
+//   public   GET  /buy[?plan=key]                plan chooser, or the ACTIVE mode checkout for an explicit plan
 //   public   GET  /api/billing/plans             the plans + prices, for the website (CORS *)
 //   admin    POST /admin/api/billing/plans/provision {mode} -> product/prices/links created or reused in Stripe
 //   public   GET  /billing                       302 -> the active mode's Customer Portal login
@@ -58,7 +58,7 @@ import { EarnService, earnOwner } from "./earn.js";
 //   public   GET  /customer/signin?token=        burns the token, sets the session cookie, 302 -> /customer
 //   session  GET  /customer                      static dashboard shell (public/customer.html)
 //   session  GET  /api/customer/state            licence + (placeholder) hosting view for the signed-in identity
-//   session  POST /api/customer/install-command  {customerKey} -> a fresh one-time install command
+//   session  POST /api/customer/install-command  {customerKey} -> confirmed install-link rotation (same licence and machine binding)
 //   session  POST /api/customer/portal           {customerKey} -> a Customer Portal session, as JSON
 //   session  POST /api/customer/signout          revokes the presented session, clears the cookie
 //   admin    POST /admin/api/customers/signin-link {email} -> a raw sign-in link (bounced-email fallback)
@@ -117,7 +117,8 @@ import {
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
 import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
-import { LaunchBilling } from "./billing/launch.js";
+import { LaunchBilling, HostedCheckoutExpiryError } from "./billing/launch.js";
+import { HostedOffer } from "./billing/hosted-offer.js";
 import { LaunchBillingReporting } from "./billing/reporting.js";
 import { loadStarterPack, starterPackEligible } from "./billing/starter-pack.js";
 import { FirstPaymentReminders } from "./billing/reminders.js";
@@ -174,7 +175,7 @@ import {
   readUpgradeStatus,
   writeUpgradeStatus,
 } from "./operations.js";
-import { HostingService, type HostingServiceDeps } from "./hosting/service.js";
+import { HostingService, HostingCheckoutCapacityError, type HostingServiceDeps } from "./hosting/service.js";
 import {
   readHostingPolicy,
   writeHostingPolicy,
@@ -294,6 +295,7 @@ export interface HubDeps {
   notificationFetch?: typeof fetch;
   marketingFetch?: typeof fetch;
   billingNow?: BillingServiceDeps["now"];
+  billingRecoveryCheckpoint?: BillingServiceDeps["recoveryCheckpoint"];
   billingRandomBytes?: BillingServiceDeps["randomBytes"];
   /** Injectable so customer sign-in tests never reach an email provider and
    *  can drive an exact 15-minute token / 30-day session edge. */
@@ -347,17 +349,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     max: rateLimitPolicy.leaseIpMax, windowMs: rateLimitPolicy.leaseIpWindowMs,
   });
   // The shared "everything else public" bucket: install.sh, /api/latest,
-  // /download/*, /welcome/*, /install/<token>, /api/billing/plans, /buy,
+  // /download/*, /welcome/*, /install/<token>,
   // /billing, /api/billing/portal-session. One instance, keyed by IP only —
   // these routes carry no licence identity worth a second dimension (a
   // one-time install/welcome token IS its own single-use identity already).
   const generalIpLimiter = new SlidingWindowLimiter({
     max: rateLimitPolicy.generalIpMax, windowMs: rateLimitPolicy.generalIpWindowMs,
   });
-  // Referral checkout creates a remote Stripe Session on the Earn money
-  // queue. Admit it before that queue, independently of cheap /buy reads.
-  const referralCheckoutIpLimiter = new SlidingWindowLimiter({ max: 3, windowMs: 60_000, maxKeys: 4096 });
-  const referralCheckoutCodeLimiter = new SlidingWindowLimiter({ max: 20, windowMs: 60_000, maxKeys: 4096 });
+  // Readiness reads and checkout entry share a website edge IP. Keep their
+  // allowance separate from sign-in and all other general public routes.
+  const checkoutEntryIpLimiter = new SlidingWindowLimiter({ max: 300, windowMs: 60_000, maxKeys: 4096 });
+  // Checkout-creating routes share this bounded allowance. The website's
+  // proxy can put independent buyers behind one edge IP; admit 30 attempts
+  // per minute while retaining price, idempotency and hosting capacity guards.
+  // Replays count as attempts, but reuse their original immutable Session.
+  const referralCheckoutIpLimiter = new SlidingWindowLimiter({ max: 30, windowMs: 60_000, maxKeys: 4096 });
+  // One popular referral code can serve buyers from multiple independent IPs.
+  const referralCheckoutCodeLimiter = new SlidingWindowLimiter({ max: 60, windowMs: 60_000, maxKeys: 4096 });
   // Stripe webhooks are signature-verified before anything here trusts them;
   // this exists only to cap a runaway or hostile sender, deliberately
   // generous so a burst of Stripe's own retries (same event, several ids) is
@@ -414,7 +422,39 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   catch { console.warn('[marketing] Saved marketing settings need repair; imports remain unavailable.'); }
   try { notifications = new Notifications(cfg.dataDir, deps.notificationFetch, deps.billingNow); }
   catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
-  const billing = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+  const billing: BillingService = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
+    recoveryCheckpoint: deps.billingRecoveryCheckpoint,
+    recoveryHostingActive: rec => !hostingRef || [rec.key,rec.stripeCustomerId,`email:${normalizeCustomerEmail(rec.email)}`].some(k=>hostingRef!.store.activeInstanceForOwner(k,"live") || hostingRef!.store.activeInstanceForOwner(k,"test")),
+    deviceRecoverySnapshot: licenseId => {
+      if(!licenseLeases)throw Error("Machine recovery is unavailable");
+      return licenseLeases.deviceRecoverySnapshot(licenseId);
+    },
+    checkRecoveryActivation: (licenseId,activationId,revision,reason) => {
+      if(!licenseLeases)throw Error("Current machine retirement check unavailable");
+      const state=licenseLeases.adminSnapshot(licenseId),current=state.activations.find(a=>a.id===activationId);
+      if(!current || state.activations.some(a=>a.id!==activationId && a.status==="active") || (current.status==="active" ? current.revision!==revision : current.revision!==revision+1 || current.deactivationReason!==reason))throw Error("Machine recovery identity changed");
+    },
+    retireRecoveryActivation: (licenseId,activationId,revision,reason) => {
+      if(!licenseLeases)throw Error("Audited machine retirement unavailable");
+      let state=licenseLeases.adminSnapshot(licenseId),current=state.activations.find(a=>a.id===activationId);
+      if(!current || state.activations.some(a=>a.id!==activationId && a.status==="active"))throw Error("Machine recovery identity changed");
+      if(current.status==="active"){
+        if(current.revision!==revision)throw Error("Machine revision changed");
+        licenseLeases.adminDeactivate(licenseId,activationId,revision,reason);
+      } else if(current.revision!==revision+1 || current.deactivationReason!==reason)throw Error("Machine retirement belongs to another operation");
+      state=licenseLeases.adminSnapshot(licenseId);
+      if(!state.audit.some(e=>e.kind==="license_revocation_observed" && e.reason===reason))licenseLeases.observeRevocation(licenseId,reason);
+      state=licenseLeases.adminSnapshot(licenseId);
+      if(!store.isRevoked(licenseId) || state.activations.some(a=>a.status==="active") || !state.recoveryLockedLicenses.includes(licenseId))throw Error("Machine retirement is incomplete");
+    },
+    installBindingState: (licenseId) => {
+      if (!licenseLeases) return "unavailable";
+      try {
+        const state = licenseLeases.adminSnapshot(licenseId);
+        return state.recoveryLockedLicenses.includes(licenseId) ? "recovery-locked"
+          : state.activations.some(a => a.status === "active") ? "bound" : "unbound";
+      } catch { return "unavailable"; }
+    },
     now: deps.billingNow,
     fetchLike: deps.billingFetch,
     launchFetch,
@@ -430,10 +470,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       await reporting.handleVerifiedEvent(ev);
     },
     onHostingEvent: (customerKey) => { hostingRef?.reconcileOwner(customerKey); },
+    onExpiredCheckout: (sessionId): Promise<{released:boolean}> => launchBilling.expireSession(sessionId),
     onBundleEvent: (input) => hostingRef?.acceptBundleReservation(input.reservationId, input.customerId, input.subscriptionId, input.planKey, input.livemode, input.terminal) ?? false,
   });
+  const hostedOffer = new HostedOffer(cfg.dataDir, billing, launchFetch);
   const launchBilling = new LaunchBilling(cfg.dataDir, billing, store, cfg.publicOrigin.replace(/\/+$/, ''), launchFetch, deps.billingNow,
-    (code, mode) => earnStripe.launchReferral(code, mode));
+    (code, mode) => earnStripe.launchReferral(code, mode), {
+      ready: () => hostedOffer.ready() && hosting.hostingOfferIssue() === null,
+      prepare: async (plan, id, customer) => hosting.reserveSplitCheckout(id, await hostedOffer.prove(plan), customer),
+      bind: (proof, params) => hosting.bindSplitCheckout(proof, params),
+      release: (proof, id) => hosting.releaseSplitReservation(proof.reservationId, id),
+    });
   const marketingSync = new MarketingCustomerSync({
     dataDir: cfg.dataDir,
     readApiKey: () => marketing?.getApiKeyForSync() ?? null,
@@ -477,8 +524,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       maximumConnectedAccounts: policy.maximumConnectedAccounts,
       managedBackupsIncluded: policy.managedBackupsIncluded,
       purchasable: hosting.hostingOfferIssue() === null,
-      bundleEnabled: hosting.bundleOfferIssue() === null,
-      bundles: hosting.bundlePlans(),
+      bundleEnabled: false,
+      bundles: [],
+      combinedCheckoutEnabled: hostedOffer.ready() && hosting.hostingOfferIssue() === null,
     };
   }
   hostingRef = hosting;
@@ -639,7 +687,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   const support = new SupportChat(cfg.dataDir, {...(cfg.support ?? {enabled:false,aiEnabled:false,apiKey:"",totalMonthlyMicros:50_000_000}), publicCatalog: () => launchBilling.publicPlans(), publicHostingOptions: () => {
     const options=publicHostingOptions();
-    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,regions:options.regions,planLabel:options.planLabel,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
+    return {monthlyPriceLabel:options.monthlyPriceLabel,priceIsProposed:options.priceIsProposed,regions:options.regions,planLabel:options.planLabel,maximumConnectedAccounts:options.maximumConnectedAccounts,managedBackupsIncluded:options.managedBackupsIncluded,purchasable:options.purchasable,combinedCheckoutEnabled:options.combinedCheckoutEnabled,bundleEnabled:options.bundleEnabled,bundles:options.bundles};
   }}, undefined, undefined, event => {
     if (!notifications) throw Error('Notifications need repair');
     const titles = { supportNew: 'New support ticket', supportHuman: 'Support ticket needs a team reply', supportReply: 'Customer replied to a ticket', supportResolved: 'Support ticket resolved' };
@@ -674,35 +722,39 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
 
   // ── the general "everything else public" rate-limit bucket ───────────────
   // Every unauthenticated-or-bearer route below that is not the check-in, a
-  // lease route, feedback (its own limiter since v0.2.x), or the Stripe
+  // lease route, checkout entry, feedback (its own limiter since v0.2.x), or the Stripe
   // webhook (its own generous bucket, handled separately in `handle`). Named
   // by exact path/prefix rather than folded into the dispatch table itself,
   // so this stays a single readable list to audit against the route table in
   // the README, and a route added to `handle` below is NOT silently
   // rate-limited just by sharing a method — it has to be named here too.
+  function isCheckoutEntryRoute(m: string, p: string): boolean {
+    return (m === "GET" && (p === "/api/billing/plans" || p === "/api/hosting/options" || p === "/buy"))
+      || (m === "POST" && p === "/api/billing/checkout");
+  }
+
   function isGeneralRateLimitedRoute(m: string, p: string): boolean {
     if(p === "/api/support/chat" || p.startsWith("/support/")) return true;
     if (p === "/earn" || p.startsWith("/api/customer/earn") || p.startsWith("/api/hub/earn")) return true;
     if (m === "GET") {
-      if (p === "/install.sh" || p === "/api/latest" || p === "/buy"
-        || p === "/api/billing/plans" || p === "/billing"
+      if (p === "/install.sh" || p === "/api/latest" || p === "/billing"
         || p === "/api/hub/liq-percentiles"
         || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
-        || p === "/api/hosting/options" || p === "/api/hosting") return true;
+        || p === "/api/hosting") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
     }
     if (m === "POST") {
       if (p === '/api/marketing/brevo/webhook') return true;
       if (p.startsWith("/welcome/") && p.endsWith("/portal")) return true;
-      if (p === "/api/billing/portal-session" || p === "/api/billing/checkout") return true;
+      if (p === "/api/billing/portal-session") return true;
       // /api/customer/signin also spends the dedicated per-email bucket
       // (`customerSigninEmailLimiter`) inside its own handler — this is the
       // per-IP half, the same "everything else public" bucket every other
       // unauthenticated POST here shares. The three cookie-authenticated
       // routes are here too, for the same defence-in-depth reason
       // /api/billing/portal-session (licence-token-authenticated) is.
-      if (p === "/api/customer/signin" || p === "/api/customer/install-command"
+      if (p === "/api/customer/signin" || (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key")
         || p === "/api/customer/portal" || p === "/api/customer/signout") return true;
       // Hosting customer actions (cookie-session-authenticated, like the
       // three above) and the bootstrap-token-authenticated readiness
@@ -742,7 +794,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // Stripe webhooks, public bundle checkout, and server-authenticated
     // hosting callbacks have separate trust contracts and are not in this set.
     const customerCookieWrite = m === "POST" && (
-      p === "/api/customer/install-command" || p === "/api/customer/portal"
+      (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key") || p === "/api/customer/portal"
       || p === "/api/customer/signout" || p === "/api/hosting/checkout"
       || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal")))
     );
@@ -754,6 +806,56 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         || (site !== undefined && site !== "same-origin")) {
         req.resume();
         return sendJson(res, 403, { ok: false, error: "Customer action requires this Hub origin" }, { "cache-control": "no-store" });
+      }
+    }
+
+    // The product site calls this public, credential-free endpoint directly.
+    // Keep this CORS policy path-scoped: the customer dashboard and every
+    // cookie-authenticated action retain their same-origin CSRF contract.
+    // Install response headers before the pre-dispatch limiter so readable
+    // 429s, validation errors, capacity refusals and success all share one
+    // exact-origin policy.
+    const checkoutCors = p === "/api/billing/checkout" && (m === "POST" || m === "OPTIONS");
+    if (checkoutCors) {
+      const allowedOrigins = new Set([
+        "https://wickhunterunleashed.com",
+        "https://www.wickhunterunleashed.com",
+        // Keep the Hub's own public origin working for same-origin browser
+        // clients that post directly without going through the product site.
+        new URL(cfg.publicOrigin).origin,
+      ]);
+      const origin = req.headers.origin;
+      const allowedOrigin = typeof origin === "string" && allowedOrigins.has(origin) ? origin : null;
+      const vary = String(res.getHeader("vary") ?? "").split(",").map(value => value.trim()).filter(Boolean);
+      if (!vary.some(value => value.toLowerCase() === "origin")) vary.push("Origin");
+      res.setHeader("vary", vary.join(", "));
+      res.setHeader("cache-control", "no-store");
+      if (allowedOrigin) {
+        res.setHeader("access-control-allow-origin", allowedOrigin);
+        res.setHeader("access-control-expose-headers", "Retry-After");
+      }
+      if (m === "OPTIONS") {
+        if (!allowedOrigin) {
+          return sendJson(res, 403, { ok: false, error: "Unsupported checkout origin" }, { "cache-control": "no-store" });
+        }
+        const requestedMethod = String(req.headers["access-control-request-method"] ?? "").toUpperCase();
+        const requestedHeaders = String(req.headers["access-control-request-headers"] ?? "")
+          .split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+        if (requestedMethod !== "POST" || requestedHeaders.some(value => value !== "content-type")) {
+          return sendJson(res, 403, { ok: false, error: "Unsupported checkout preflight" }, { "cache-control": "no-store" });
+        }
+        res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+        res.setHeader("access-control-allow-headers", "content-type");
+        res.setHeader("access-control-max-age", "600");
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      // No Origin is the existing non-browser/API-client path. A supplied but
+      // unapproved Origin is refused before either limiter or checkout work.
+      if (origin !== undefined && !allowedOrigin) {
+        req.resume();
+        return sendJson(res, 403, { ok: false, error: "Unsupported checkout origin" }, { "cache-control": "no-store" });
       }
     }
 
@@ -769,8 +871,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // routes and feedback carry their own dedicated limiters (see `checkin`,
     // `leaseRateLimited`, `feedbackIntake`) and are deliberately not matched
     // here. The signed Stripe webhook gets its own generous allowance so a
-    // burst of Stripe's own retries of one event is never refused; every
-    // other unauthenticated-or-bearer public route shares the general "rest
+    // burst of Stripe's own retries of one event is never refused. The four
+    // checkout entry routes share a bounded allowance of their own; other
+    // unauthenticated-or-bearer public routes share the general "rest
     // of the surface" bucket per IP (`isGeneralRateLimitedRoute`).
     if (m === "POST" && p === "/api/hosting/bundle-checkout") {
       const rate = hostingBundleIpLimiter.take(clientIp(req), rateLimitNow());
@@ -778,6 +881,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     } else if (m === "POST" && (p === "/api/billing/stripe/test" || p === "/api/billing/stripe/live")) {
       const rate = webhookIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "the billing webhook"); }
+    } else if (isCheckoutEntryRoute(m, p)) {
+      const rate = checkoutEntryIpLimiter.take(clientIp(req), rateLimitNow());
+      if (!rate.ok) {
+        if (m !== "GET") req.resume();
+        return sendRateLimited(res, rate, "checkout entry");
+      }
     } else if (isGeneralRateLimitedRoute(m, p)) {
       const rate = generalIpLimiter.take(clientIp(req), rateLimitNow());
       if (!rate.ok) {
@@ -870,9 +979,49 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p.startsWith("/download/")) return download(req, url, res);
     // ── billing (public) ────────────────────────────────────────────────
     if (m === "GET" && p === "/buy") {
-      const planKey = url.searchParams.get("plan");
+      const requestedPlan = url.searchParams.get('plan');
+      // An unselected plan is a landing link, never consent to Monthly or a
+      // hosted reservation. The existing website chooser carries the referral
+      // into the buyer's explicit software/VPS choice.
+      if (!requestedPlan?.trim()) {
+        const siteOrigin = billing.config().siteOrigin;
+        let chooser: URL;
+        try {
+          const site = new URL(siteOrigin);
+          if (site.protocol !== 'https:' || site.username || site.password || site.pathname !== '/' || site.search || site.hash) throw Error('Invalid site origin');
+          chooser = new URL('/unleashed/', site);
+        } catch { return billingRedirect(res, '', 'plan chooser'); }
+        const referral = url.searchParams.get('ref');
+        if (referral) chooser.searchParams.set('ref', referral);
+        chooser.hash = 'pricing';
+        return billingRedirect(res, chooser.href, 'plan chooser');
+      }
+      const baseCardAvailable = ["monthly","yearly","lifetime"].includes(requestedPlan || "monthly") && !!billing.config().stripe[billing.config().mode].priceIds[requestedPlan || "monthly"];
+      const hostedAlias = /^(monthly|yearly|lifetime)-hosted$/.exec(requestedPlan || '') || /^hosted-(monthly|yearly|lifetime)$/.exec(requestedPlan || '');
+      const planKey = hostedAlias ? hostedAlias[1]! : requestedPlan;
       const plan = planKey ? billing.plan(planKey) : null;
       if (planKey && !plan) return sendText(res, 404, "unknown plan");
+      if (hostedAlias || url.searchParams.get('hosting') === 'true') {
+        const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
+        if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
+        const referral = url.searchParams.get('ref');
+        try {
+          const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), hosting: true, ...(referral ? { referral } : {}) });
+          return billingRedirect(res, checkout.url, 'checkout');
+        } catch (e) {
+          if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
+          if ((e as Error).message === 'Referral discount is not active') {
+            try {
+              const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: 'card', attemptId: randomUUID(), hosting: true });
+              return billingRedirect(res, checkout.url, 'checkout');
+            } catch (fallbackError) {
+              if (fallbackError instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, fallbackError);
+              throw fallbackError;
+            }
+          }
+          return sendText(res, 400, (e as Error).message);
+        }
+      }
       if (plan?.role === "hosting") return sendText(res, 403, "managed hosting checkout requires an authenticated customer dashboard session");
       if (plan?.checkout === "hosted-bundle") return sendText(res, 403, "hosted bundles require a reserved Checkout Session");
       const referral = url.searchParams.get("ref");
@@ -882,7 +1031,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         const codeRate = referralCheckoutCodeLimiter.take(referral.slice(0, 128), rateLimitNow());
         if (!codeRate.ok) return sendRateLimited(res, codeRate, "referral checkout attempts");
         try {
-          if (launchBilling.status().enabled) {
+          if (launchBilling.status().enabled || baseCardAvailable) {
             const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID(), referral });
             return billingRedirect(res, checkout.url, 'checkout');
           }
@@ -890,7 +1039,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         }
         catch (e) {
           if ((e as Error).message === 'Referral discount is not active') {
-            if (launchBilling.status().enabled) {
+            if (launchBilling.status().enabled || baseCardAvailable) {
               const checkout = await launchBilling.checkout({ plan: planKey || 'monthly', payment: url.searchParams.get('payment') || 'card', attemptId: randomUUID() });
               return billingRedirect(res, checkout.url, 'checkout');
             }
@@ -899,7 +1048,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           return sendText(res, 400, (e as Error).message);
         }
       }
-      if (launchBilling.status().enabled) {
+      if (launchBilling.status().enabled || baseCardAvailable) {
         const rate = referralCheckoutIpLimiter.take(clientIp(req), rateLimitNow());
         if (!rate.ok) return sendRateLimited(res, rate, 'checkout attempts');
         try {
@@ -920,7 +1069,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const body = await readJsonBody(req, 8 * 1024);
       if (!body) return sendJson(res, 400, { ok: false, error: 'Expected a checkout request' });
       try { return sendJson(res, 200, await launchBilling.checkout(body), { 'cache-control': 'no-store' }); }
-      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+      catch (e) {
+        if (e instanceof HostingCheckoutCapacityError) return sendCheckoutCapacity(res, e);
+        if (e instanceof HostedCheckoutExpiryError) return sendJson(res, e.status, { ok: false, code: e.code, error: e.message }, { 'cache-control': 'no-store' });
+        return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' });
+      }
     }
     if (m === "GET" && p === "/billing") return billingRedirect(res, billing.billingUrl(), "billing management");
     if (m === 'POST' && p === '/api/marketing/brevo/webhook') {
@@ -942,12 +1095,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p.startsWith("/install/")) return installByToken(p, res);
     // ── customer sessions (H2) ──────────────────────────────────────────
     if (m === "GET" && p === "/earn") return earnCustomer(req, res, url);
-    if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh))?$/.test(p)) return earnCustomer(req, res, url);
+    if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh|payout-preference))?$/.test(p)) return earnCustomer(req, res, url);
     if (m === "GET" && p === "/customer") return customerPage(res);
     if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
     if (m === "GET" && p === "/api/customer/state") return customerState(req, res);
     if (m === "POST" && p === "/api/customer/install-command") return customerInstallCommand(req, res);
+    if(m === "POST" && p === "/api/customer/replacement-license-key") {
+      const identity=authenticatedCustomer(req);if(!identity)return sendJson(res,401,{ok:false,error:"Sign in required"},{"cache-control":"no-store"});
+      const body=await readJsonBody(req), rec=typeof body?.customerKey==="string"?billing.store.getCustomer(body.customerKey):null;
+      if(!rec || normalizeCustomerEmail(rec.email)!==identity.email || !rec.livemode || rec.refunded || rec.disputed || !billing.store.historicalLicenseIds(rec).length)return sendJson(res,403,{ok:false,error:"No active recovered licence for this account"},{"cache-control":"no-store"});
+      const key=store.tokenFor(rec.licenseId);if(!key || !store.verify(key,(deps.billingNow??Date.now)()).ok)return sendJson(res,403,{ok:false,error:"Recovered licence is inactive"},{"cache-control":"no-store"});
+      return sendJson(res,200,{ok:true,licenseKey:key},{"cache-control":"no-store"});
+    }
     if (m === "POST" && p === "/api/customer/portal") return customerPortal(req, res);
     if (m === "POST" && p === "/api/customer/signout") return customerSignout(req, res);
     // ── hosting (H4/H5/H6) ───────────────────────────────────────────────
@@ -1548,7 +1708,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   function earnBillingKeys(record: CustomerRecord): string[] {
-    return [`license:${record.licenseId}`,
+    return [`license:${record.licenseId}`, ...billing.store.historicalLicenseIds(record).map(id=>`license:${id}`),
       ...(record.stripeCustomerId.startsWith('cus_') ? [`stripe:live:${record.stripeCustomerId}`] : [])];
   }
 
@@ -1557,7 +1717,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const keys=sorted.flatMap(earnBillingKeys);
     if (fallbackLicenseId) keys.push(`license:${fallbackLicenseId}`);
     const legacy=[...sorted.map(record=>earnOwner('email:'+normalizeCustomerEmail(record.email))),
-      ...sorted.map(record=>earnOwner('license:'+record.licenseId))];
+      ...sorted.flatMap(record=>[record.licenseId,...billing.store.historicalLicenseIds(record)].map(id=>earnOwner('license:'+id)))];
     if (!sorted.length && fallbackLicenseId) legacy.push(earnOwner('license:'+fallbackLicenseId));
     const first=sorted.find(record=>record.stripeCustomerId.startsWith('cus_'));
     const preferred=earnOwner(first ? `stripe:live:${first.stripeCustomerId}` : `license:${fallbackLicenseId ?? sorted[0]?.licenseId}`);
@@ -1569,7 +1729,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // The app license is useful for viewing earnings, not for minting them.
     if (url.pathname.endsWith('/onboard') && !url.pathname.startsWith('/api/customer/'))
       return sendJson(res, 403, { ok: false, error: 'Sign in at the customer portal to connect payouts' }, { 'cache-control': 'no-store' });
-    let owner = "", name = "", allowed = false;
+    let owner = "", name = "", allowed = false, readOnly = false;
     try {
       if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
         const identity = authenticatedCustomer(req);
@@ -1591,7 +1751,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           owner=earnOwner('license:'+payload.id);
           allowed = flagsFor(cfg.dataDir, payload.id).earn === true;
           const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
-          if (allowed) owner=boundEarnOwner(record?[record]:[],payload.id);
+          if (allowed) {
+            const dashboardOwner=earn.dashboardOwner(payload.id);
+            if(dashboardOwner){owner=dashboardOwner;readOnly=true;}
+            else owner=boundEarnOwner(record?[record]:[],payload.id);
+          }
           name = record?.email || store.get(payload.id)?.name || "WH member";
         }
       }
@@ -1604,18 +1768,28 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!allowed) return sendJson(res, 404, { ok: false, error: "Not found" });
     if (url.pathname === "/earn") return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, "earn.html"), "utf8"));
     try {
-      if (req.method === "GET" && /\/earn$/.test(url.pathname)) return sendJson(res, 200, { ok: true, ...earn.view(owner, name), stripe: earnStripe.view(owner) }, { "cache-control": "no-store" });
+      if (req.method === "GET" && /\/earn$/.test(url.pathname)) {
+        const view=earn.view(owner,name),stripe=earnStripe.view(owner);
+        // A viewing grant does not disclose saved payout destinations or UIDs.
+        if(readOnly){view.member={...view.member,uids:[],payoutPreference:null};stripe.jobs=[];stripe.test=undefined;}
+        return sendJson(res,200,{ok:true,...view,capabilities:{readOnly},stripe,referralActivity:earnStripe.referralActivity(owner,url.searchParams.get('referralsAfter'))},{'cache-control':'no-store'});
+      }
       if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "Method not allowed" });
+      if (readOnly) return sendJson(res,403,{ok:false,error:"This dashboard has viewing access only; sign in to the owner’s Hub portal to make changes"});
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 4096);
       if (!body) return sendJson(res, 400, { ok: false, error: "Invalid request" });
+      if(url.pathname.endsWith('/payout-preference')) {
+        const payoutPreference=earn.savePayoutPreference(owner,body,name);
+        return sendJson(res,200,{ok:true,payoutPreference},{'cache-control':'no-store'});
+      }
       earn.member(owner, name);
       if(url.pathname.endsWith('/activate')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.activate(owner) });
       if(url.pathname.endsWith('/onboard')) return sendJson(res, 200, { ok:true, ...await earnStripe.onboard(owner,body) });
       if(url.pathname.endsWith('/refresh')) return sendJson(res, 200, { ok:true, stripe: await earnStripe.refresh(owner) });
       earn.addUid(owner, body);
       return sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
-    } catch (error) { return sendJson(res, 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
+    } catch (error) { return sendJson(res, error instanceof EarnConflictError ? 409 : 400, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
   }
 
   function customerState(req: IncomingMessage, res: ServerResponse): void {
@@ -1633,9 +1807,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const body = await readJsonBody(req);
     const customerKey = typeof body?.customerKey === "string" ? body.customerKey : "";
     if (!customerKey) return sendJson(res, 400, { ok: false, error: "expected {customerKey}" }, { "cache-control": "no-store" });
-    const r = customerSessions.installCommand(identity, customerKey, readLatest() !== null);
+    const r = customerSessions.installCommand(identity, customerKey, readLatest() !== null, {
+      confirmed: body?.confirmed === true, expectedRevision: typeof body?.expectedRevision === "string" ? body.expectedRevision : "",
+      acknowledgeMachineBinding: body?.acknowledgeMachineBinding === true, deviceReplacement: body?.deviceReplacement === true,
+    });
     if (!r.ok) return sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
-    sendJson(res, 200, { ok: true, command: r.command }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ...r }, { "cache-control": "no-store" });
   }
 
   async function customerPortal(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1702,7 +1879,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const plan = body?.plan;
     const checkoutAttemptId = body?.checkoutAttemptId;
     if ((plan !== "monthly" && plan !== "yearly") || typeof checkoutAttemptId !== "string") return sendJson(res, 400, { ok: false, error: "expected {plan: monthly|yearly, checkoutAttemptId}" }, headers);
-    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId);
+    const r = await hosting.bundleCheckout(plan === "monthly" ? "month" : "year", checkoutAttemptId, undefined, false);
     if (!r.ok) return sendJson(res, r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, headers);
     sendJson(res, 200, { ok: true, url: r.value.url, pricing: r.value.pricing }, headers);
   }
@@ -2371,7 +2548,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const m = req.method ?? "GET";
     const p = url.pathname;
 
-    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.admin(), stripe: earnStripe.admin() }, { "cache-control": "no-store" });
+    if (p === "/admin/api/earn" && m === "GET") return sendJson(res, 200, { ok: true, ...earn.adminView(), stripe: earnStripe.admin() }, { "cache-control": "no-store" });
     if (p.startsWith("/admin/api/earn/") && m === "POST") {
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 1_100_000);
@@ -2379,6 +2556,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try {
         let result: unknown;
         switch (p) {
+          case "/admin/api/earn/oskaras-link": {
+            // Exact reviewed identity and dashboard license; no billing merge.
+            if(body.email!=='oskarasridikas@gmail.com'||body.confirm!=='LINK EXISTING LIVE OSKARAS OFFERS')throw Error('Exact reviewed Oskaras confirmation required');
+            const records=Object.values(billing.store.customers()).filter(c=>c.livemode&&normalizeCustomerEmail(c.email)===body.email);
+            if(records.length!==1||earnOwner(records[0]!.licenseId)!=='f45acd8c7b1a2482a8ce95e70ffbf1f0c195ef06e520d1470cd6da97efecf9ad'||!records[0]!.stripeCustomerId.startsWith('cus_'))throw Error('Reviewed billing identity changed');
+            const record=records[0]!,target=store.list().find(l=>earnOwner(l.id)==='797f358fdb8a86e06264bdd08075c1fee8eaefdc4190569a30ea67d3a40e2efa');
+            if(!target||target.exp<=Date.now()||!store.get(record.licenseId)||store.get(record.licenseId)!.exp<=Date.now()||store.isRevoked(target.id)||store.isRevoked(record.licenseId))throw Error('Reviewed licenses must remain valid');
+            const keys=earnBillingKeys(record),legacy=[earnOwner('email:'+body.email),...[record.licenseId,...billing.store.historicalLicenseIds(record)].map(v=>earnOwner('license:'+v))];
+            const state=earn.admin(),historical=[...new Set(legacy.filter(v=>state.members.some(m=>m.id===v)||state.entries.some(e=>e.owner===v)||state.months.some(m=>m.rows.some(r=>r.owner===v))))];
+            const existing=earn.boundOwner(keys),owner=existing??historical[0]??earnOwner('stripe:live:'+record.stripeCustomerId);
+            if(historical.length>1||(existing&&historical.length&&historical[0]!==existing))throw Error('Earn identity requires review');
+            const grant=earn.dashboardOwner(target.id);if(grant&&grant!==owner)throw Error('Dashboard grant conflict');
+            await earnStripe.inspectExistingOskarasOffers(owner); // Every provider object before local writes.
+            if(boundEarnOwner([record])!==owner)throw Error('Earn identity changed during preflight');
+            earn.member(owner,body.email);
+            await earnStripe.adoptExistingOskarasOffers(owner);
+            earn.grantDashboard(target.id,owner,'operator: reviewed Oskaras 11122 dashboard association');
+            setFlag(cfg.dataDir,record.licenseId,'earn',true);setFlag(cfg.dataDir,target.id,'earn',true);
+            result={owner,linked:true,dashboardReadOnly:true,payoutsChanged:false};break;
+          }
+          case "/admin/api/earn/referral-status-refresh": result=await earnStripe.refreshReferralStatus(String(body.owner));break;
           case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
           case "/admin/api/earn/stripe-run": result = await earnStripe.run(); break;
@@ -2986,6 +3184,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, ...billing.adminConfigView(readLatest() !== null) }, { "cache-control": "no-store" });
     }
     if (m === 'GET' && p === '/admin/api/billing/launch') return sendJson(res, 200, { ok: true, ...launchBilling.status() }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/billing/hosted-checkout/reconcile-expired') {
+      const body = await readJsonBody(req, 4096);
+      try { return sendJson(res, 200, { ok: true, ...await launchBilling.expireSession(typeof body?.sessionId === 'string' ? body.sessionId : '') }, { 'cache-control': 'no-store' }); }
+      catch (error) { return sendJson(res, 409, { ok: false, error: (error as Error).message }, { 'cache-control': 'no-store' }); }
+    }
+    if (m === 'GET' && p === '/admin/api/billing/hosted-offer') return sendJson(res, 200, { ok: true, ...hostedOffer.status() }, { 'cache-control': 'no-store' });
+    if (m === 'POST' && p === '/admin/api/billing/hosted-offer') {
+      const body = await readJsonBody(req, 4096);
+      try { return sendJson(res, 200, { ok: true, ...await hostedOffer.verify(body ?? {}) }, { 'cache-control': 'no-store' }); }
+      catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }, { 'cache-control': 'no-store' }); }
+    }
     if (m === 'GET' && p === '/admin/api/billing/report') return sendJson(res, 200, { ...(reporting?.snapshot() ?? { ok: false, error: 'Reporting state needs repair' }), refreshing: reportRefreshRunning, reminders: reminders.status() }, { 'cache-control': 'no-store' });
     if (m === 'POST' && p === '/admin/api/billing/report/refresh') { refreshReport(); return sendJson(res, 202, { ok: true, refreshing: reportRefreshRunning }, { 'cache-control': 'no-store' }); }
     if (m === 'GET' && p === '/admin/api/notifications') return sendJson(res, 200, notifications ? { ok: true, ...notifications.status() } : { ok: false, error: 'Notification state needs repair' }, { 'cache-control': 'no-store' });
@@ -3025,6 +3234,25 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
       const r = await billing.resendWelcome(body.customerId);
       return r.ok ? sendJson(res, 200, { ok: true, sentTo: r.sentTo }) : sendJson(res, r.status, { ok: false, error: r.error });
+    }
+    if(m === "POST" && p === "/admin/api/billing/recover-install") {
+      const body=await readJsonBody(req);
+      if(!body || typeof body.customerId!=="string" || typeof body.email!=="string" || typeof body.operationId!=="string" || typeof body.expectedLicenseId!=="string" || typeof body.expectedActivationId!=="string" || !Number.isSafeInteger(body.expectedActivationRevision) || !Number.isSafeInteger(body.expectedAuditRevision))return sendJson(res,400,{ok:false,error:"Exact customer, licence and current machine audit are required"},{"cache-control":"no-store"});
+      if(!readLatest())return sendJson(res,503,{ok:false,error:"No authenticated release available; recovery not started"},{"cache-control":"no-store"});
+      const result=await billing.recoverDestroyedInstall(body.customerId,body.email,{operationId:body.operationId,expectedLicenseId:body.expectedLicenseId,expectedActivationId:body.expectedActivationId,expectedActivationRevision:Number(body.expectedActivationRevision),expectedAuditRevision:Number(body.expectedAuditRevision),confirmedDestroyedInstall:body.confirmedDestroyedInstall===true,acknowledgeCachedGrace:body.acknowledgeCachedGrace===true});
+      return sendJson(res,result.ok?200:result.status,result,{"cache-control":"no-store"});
+    }
+    if (m === "POST" && p === "/admin/api/billing/reissue-install") {
+      const body = await readJsonBody(req);
+      if (body === null || typeof body.customerId !== "string" || !body.customerId || typeof body.email !== "string" || !body.email || !(body.issue === "bybit-us-ip" || body.issue === "reinstall")) {
+        return sendJson(res, 400, { ok: false, error: "expected {customerId,email,issue:'bybit-us-ip'|'reinstall'}" }, { "cache-control": "no-store" });
+      }
+      if (!readLatest()) return sendJson(res, 503, { ok: false, error: "no authenticated release is available; existing links were not changed" }, { "cache-control": "no-store" });
+      const r = await billing.reissueInstall(body.customerId, body.email, body.issue, {
+        confirmed: body.confirmed === true, expectedRevision: typeof body.expectedRevision === "string" ? body.expectedRevision : "",
+        acknowledgeMachineBinding: body.acknowledgeMachineBinding === true, deviceReplacement: body.deviceReplacement === true,
+      });
+      return r.ok ? sendJson(res, 200, r, { "cache-control": "no-store" }) : sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
     }
     if (m === "POST" && p === "/admin/api/billing/test-email") {
       const body = await readJsonBody(req);
@@ -3334,6 +3562,11 @@ function sendRateLimited(res: ServerResponse, decision: RateDecision, what: stri
     error: `${what} is temporarily rate limited; try again in ${decision.retryAfterSeconds} seconds`,
     retryAfterSeconds: decision.retryAfterSeconds,
   }, { "retry-after": String(decision.retryAfterSeconds), "cache-control": "no-store" });
+}
+
+function sendCheckoutCapacity(res: ServerResponse, error: HostingCheckoutCapacityError): void {
+  sendJson(res, 503, { ok: false, code: error.code, error: error.message, retryAfterSeconds: error.retryAfterSeconds },
+    { 'retry-after': String(error.retryAfterSeconds), 'cache-control': 'no-store' });
 }
 
 /** The exact bytes of a body, or null when it is too large or the connection

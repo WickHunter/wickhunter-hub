@@ -13,13 +13,24 @@ export const EXCHANGES = [
   { id: 'weex', name: 'WEEX', whPercent: 50, url: 'https://www.weex.com/en/register?vipCode=9fcy' },
 ];
 export const BYBIT_HELP = 'https://www.bybit.com/en/help-center/article/How-to-Transfer-Your-Identity-to-Another-Account';
+export const EARN_PAYOUT_TIMING = '3–5 business days after month end';
 export type EarnSource = 'referral' | 'exchange' | 'marketplace';
-type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string };
-export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string };
+type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string; revision?: string };
+export type EarnPayoutMethod = 'usdt-bep20' | 'usdt-polygon' | 'paypal';
+export type EarnPayoutPreference = { method: EarnPayoutMethod; address: string; revision: string };
+export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string; payoutPreference?: EarnPayoutPreference | null };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
-export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
+export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; dashboardGrants?: Record<string, {owner:string;actor:string;at:string}>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
+export class EarnConflictError extends Error { constructor(message='Payout preference changed; refresh and review it before saving') { super(message); this.name='EarnConflictError'; } }
+/** Historical claims predate revisions. Their stable view token changes as soon
+ * as any replacement or verification writes a fresh stored revision. */
+function uidRevision(owner: string, claim: UID): string {
+  return claim.revision ?? createHash('sha256').update(JSON.stringify([
+    'earn-uid-legacy-v1',owner,claim.exchange,claim.uid,claim.submittedAt,claim.verified,
+  ])).digest('hex');
+}
 /** Resolve exact verified keys against one already-read financial snapshot.
  * This keeps invoice admission from parsing the whole ledger once per
  * candidate customer while preserving the same conflict refusal as boundOwner. */
@@ -61,10 +72,16 @@ export class EarnService {
   private date() { return new Date(this.now()).toISOString(); }
   member(owner: string, name: string) {
     const s=this.read(); let m=s.members.find(x=>x.id===owner);
-    if(!m) {m={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:50,createdAt:this.date()};s.members.push(m);this.save(s);}
+    if(!m) {m={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:35,createdAt:this.date(),payoutPreference:null};s.members.push(m);this.save(s);}
     return m;
   }
   admin() { return this.read(); }
+  /** Admin responses expose the same read-only compatibility revision as the
+   * member view, without rewriting historical claims in the ledger. */
+  adminView() {
+    const state=this.read();
+    return {...state,payoutTiming:EARN_PAYOUT_TIMING,members:state.members.map(m=>({...m,payoutPreference:m.payoutPreference??null,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))}))};
+  }
   /** Rename-on-save changes inode, including on filesystems with coarse mtimes.
    * A missing file is a distinct version and is still read on first use. */
   fileVersion(): string {
@@ -81,6 +98,26 @@ export class EarnService {
   /** Reconciliation may prove the provider has not changed any durable fact. */
   transactionIfChanged(fn: (state: EarnState) => boolean): boolean {
     const state=this.read();const changed=fn(state);if(changed)this.save(state);return changed;
+  }
+  /** One-time operator migration for untouched historical default shares.
+   * Explicitly audited rebate-rate changes are treated as overrides, even if
+   * the admin later set the value back to the old 50% default. */
+  migrateDefaultRebateShare(apply=false) {
+    const state=this.read();
+    const candidates=state.members.filter(member=>member.rebatePercent===50
+      && !(state.audit??[]).some(a=>a.owner===member.id&&a.before?.rebatePercent!==a.after?.rebatePercent));
+    if(!apply)return {applied:false,count:candidates.length};
+    const migrated:string[]=[];
+    this.transactionIfChanged(current=>{
+      for(const member of current.members){
+        if(member.rebatePercent!==50||(current.audit??[]).some(a=>a.owner===member.id&&a.before?.rebatePercent!==a.after?.rebatePercent))continue;
+        const before=structuredClone(member);member.rebatePercent=35;
+        (current.audit??=[]).push({at:this.date(),actor:'hub-admin-migration: default WH share 50% to 35%',owner:member.id,before,after:structuredClone(member)});
+        migrated.push(member.id);
+      }
+      return migrated.length>0;
+    });
+    return {applied:true,count:migrated.length,owners:migrated};
   }
   copyMember(member: Member) { this.transaction(s=>{const i=s.members.findIndex(m=>m.id===member.id);if(i<0)s.members.push(structuredClone(member));else s.members[i]=structuredClone(member);}); }
 
@@ -116,14 +153,69 @@ export class EarnService {
     return boundOwnerFromBindings(this.read().ownerBindings ?? {},keys);
   }
 
+  /** Operator-authorized viewing only. Never a billing, payout or UID identity. */
+  grantDashboard(licenseId:string,owner:string,actor:string) {
+    if(!licenseId||licenseId.length>300||!actor.trim()||actor.length>200||! /^[a-f0-9]{64}$/.test(owner))throw Error('Invalid dashboard grant');
+    const key=earnOwner('dashboard-license:'+licenseId);
+    this.transactionIfChanged(state=>{
+      if(!state.members.some(m=>m.id===owner))throw Error('Dashboard owner must already exist');
+      const existing=state.dashboardGrants?.[key];
+      if(existing&&existing.owner!==owner)throw Error('Dashboard grant conflict requires review');
+      if(existing)return false;
+      (state.dashboardGrants??={})[key]={owner,actor,at:this.date()};return true;
+    });
+  }
+  dashboardOwner(licenseId:string):string|null {
+    const state=this.read(),grant=state.dashboardGrants?.[earnOwner('dashboard-license:'+licenseId)];
+    if(!grant)return null;
+    if(!state.members.some(m=>m.id===grant.owner))throw Error('Dashboard owner no longer exists');
+    return grant.owner;
+  }
+
   view(owner: string, name: string) {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);
     const active=s.referrals.filter(r=>r.code===m.code && r.active && (r.paidThrough===undefined || r.paidThrough>this.now())).length;
-    return { member:m, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
+    const member={...m,payoutPreference:m.payoutPreference??null,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))};
+    return { member, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
       paidCents: -entries.filter(e=>e.kind==='payout' || (e.kind==='reversal' && s.entries.find(o=>o.id===e.reverses)?.kind==='payout')).reduce((a,e)=>a+e.cents,0) || 0,
-      entries:entries.slice().reverse(), months:s.months.flatMap(mo=>mo.rows.filter(r=>r.owner===owner).map(r=>({...r,period:mo.period}))) };
+      entries:entries.slice().reverse(), months:s.months.flatMap(mo=>mo.rows.filter(r=>r.owner===owner).map(r=>({
+        ...r, period:mo.period, earnedCents:r.qualified?r.rebateCents:0,
+      }))) };
+  }
+  /** Store only a member-selected destination. This does not create a payout,
+   * Stripe recipient, ledger entry, or balance mutation. Revision comparison
+   * and audit append share the same synchronous durable Earn transaction. */
+  savePayoutPreference(owner: string, input: Record<string,unknown>, name='WH member'): EarnPayoutPreference {
+    const method=input.method;
+    if(method!=='usdt-bep20'&&method!=='usdt-polygon'&&method!=='paypal')throw new Error('Choose an explicit USDT network or PayPal');
+    if(typeof input.address!=='string'||!input.address||input.address.length>254||/[\x00-\x1f\x7f]/.test(input.address))throw new Error('Enter a valid payout address');
+    const address=input.address.trim();
+    if(!address)throw new Error('Enter a valid payout address');
+    if(method==='usdt-bep20'||method==='usdt-polygon'){
+      if(!/^0x[a-fA-F0-9]{40}$/.test(address)||/^0x0{40}$/i.test(address))throw new Error('Enter a valid nonzero EVM wallet address');
+    }else if(address.length>254||! /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/.test(address)){
+      throw new Error('Enter a valid PayPal email address');
+    }
+    if(!Object.prototype.hasOwnProperty.call(input,'expectedRevision'))throw new Error('Refresh and include the payout preference revision');
+    const expected=input.expectedRevision;
+    if(expected!==null&&(typeof expected!=='string'||expected.length<1||expected.length>100))throw new Error('Invalid payout preference revision');
+    let result:EarnPayoutPreference|undefined;
+    this.transactionIfChanged(state=>{
+      let member=state.members.find(m=>m.id===owner);
+      if(!member&&expected!==null)throw new EarnConflictError();
+      if(!member){member={id:owner,name:name.slice(0,120),code:'WH'+randomUUID().replaceAll('-','').slice(0,12).toUpperCase(),uids:[],discountPercent:10,commissionPercent:null,rebatePercent:35,createdAt:this.date(),payoutPreference:null};state.members.push(member);}
+      const current=member.payoutPreference??null;
+      if(expected===null?current!==null:current?.revision!==expected)throw new EarnConflictError();
+      if(current?.method===method&&current.address===address){result=current;return false;}
+      const before=structuredClone({...member,payoutPreference:current});
+      const preference:EarnPayoutPreference={method,address,revision:randomUUID()};
+      member.payoutPreference=preference;
+      (state.audit??=[]).push({at:this.date(),actor:'member',owner:member.id,before,after:structuredClone(member)});
+      result=preference;return true;
+    });
+    return result!;
   }
   addUid(owner: string, input: Record<string,unknown>) {
     if(input.accountType !== 'main')throw new Error('Only main account UIDs are accepted; subaccounts are not eligible');
@@ -132,8 +224,20 @@ export class EarnService {
     const s=this.read(), m=s.members.find(m=>m.id===owner);if(!m)throw new Error('Member not found');
     // Submission is a claim, not proof. Do not disclose another member's
     // ownership or let an unverified claim block its actual owner.
-    if(m.uids.some(u=>u.exchange===exchange))throw new Error('A main account UID is already registered for this exchange; contact support to correct it');
-    m.uids.push({exchange,uid,verified:false,submittedAt:this.date()});this.save(s);
+    const current=m.uids.find(u=>u.exchange===exchange);
+    if(input.expectedUid!==undefined) {
+      const expectedUid=text(input.expectedUid,80);
+      if(!current || current.uid!==expectedUid)throw new Error('UID changed since you opened this page; refresh and review it before saving');
+      if(current.uid===uid)return;
+      if(typeof input.expectedRevision!=='string' || input.expectedRevision!==uidRevision(m.id,current))
+        throw new Error('UID verification or value changed since you opened this page; refresh and review it before saving');
+      const before=structuredClone(m);
+      current.uid=uid;current.verified=false;current.submittedAt=this.date();current.revision=randomUUID();
+      (s.audit??=[]).push({at:this.date(),actor:'member',owner:m.id,before,after:structuredClone(m)});
+      this.save(s);return;
+    }
+    if(current)throw new Error('A main account UID is already registered for this exchange; refresh before editing it');
+    m.uids.push({exchange,uid,verified:false,submittedAt:this.date(),revision:randomUUID()});this.save(s);
   }
   configure(input: Record<string,unknown>) {
     const s=this.read(), m=s.members.find(m=>m.id===input.owner);if(!m)throw new Error('Member not found');
@@ -142,9 +246,13 @@ export class EarnService {
     if(input.commissionPercent!==undefined)m.commissionPercent=input.commissionPercent===null?null:percent(input.commissionPercent);
     if(input.rebatePercent!==undefined)m.rebatePercent=percent(input.rebatePercent);
     if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');
-      if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
-        throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
-      u.verified=input.verified;}
+      if(u.verified!==input.verified){
+        if(typeof input.expectedRevision!=='string' || input.expectedRevision!==uidRevision(m.id,u))
+          throw new Error('UID claim changed since this admin view loaded; refresh and check current exchange evidence');
+        if(input.verified===true && s.members.some(other=>other.id!==m.id && other.uids.some(held=>held.exchange===u.exchange&&held.uid===u.uid&&held.verified)))
+          throw new Error('Exchange UID is already verified for another member; review ownership before transfer');
+        u.verified=input.verified;u.revision=randomUUID();
+      }}
     (s.audit??=[]).push({at:this.date(),actor:'hub-admin',owner:m.id,before,after:structuredClone(m)});
     this.save(s);
   }

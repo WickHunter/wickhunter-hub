@@ -2,6 +2,7 @@
 // which software customers/subscriptions are known; Stripe reads are through
 // EarnStripeApi and are always read-only. No email, token, webhook secret, or
 // provider error body crosses this module's output boundary.
+import { launchGrant } from './launch.js';
 import path from 'node:path';
 import { readJson, writeJsonAtomic } from '../jsonfile.js';
 import { EarnStripeApi, type StripeObject } from '../earn-stripe-api.js';
@@ -177,7 +178,16 @@ export class LaunchBillingReporting {
     const plan = sf.metadata.plan || customer.planKey || 'unknown';
     const discountPercent = discountPercentFromStripe(raw, this.now());
     const configuredPlan = this.billing().plans.find(p => p.key === plan);
-    const lines = configuredPlan?.checkout === 'payment-link' ? subscriptionLines(raw) : null;
+    let pricedRaw = raw;
+    const bound = this.store.getBundleSubscription(subId);
+    if (bound?.launchIntentId) {
+      const grant = launchGrant(this.store.dataDir, {wh_launch_intent:bound.launchIntentId,plan:bound.planKey}, mode === 'live');
+      if (!grant?.hosting || !grant.sessionId || bound.customerId !== customer.stripeCustomerId) throw Error('Mixed subscription lacks durable software proof');
+      const items = raw.items;
+      if (!items || items.has_more || !Array.isArray(items.data) || items.data.some((item: StripeObject) => ![grant.hosting!.softwarePriceId,grant.hosting!.hostingPriceId].includes(id(item.price)))) throw Error('Mixed subscription items differ from its proof');
+      pricedRaw = {...raw,items:{...items,data:items.data.filter((item: StripeObject) => id(item.price) === grant.hosting!.softwarePriceId)}};
+    }
+    const lines = configuredPlan?.checkout === 'payment-link' ? subscriptionLines(pricedRaw) : null;
     let currency: string | null = null, grossMrrMinor: number | null = null, netMrrMinor: number | null = null;
     if (lines && lines.every(line => line.currency === lines[0].currency) && discountPercent !== null) {
       currency = lines[0].currency;

@@ -1,3 +1,7 @@
+import { randomUUID, createHash } from "node:crypto";
+import { recoveryPath, recoveryRecords, type InstallRecoveryRecord } from "./install-recovery.js";
+import { readFlags } from "../flags.js";
+import { writeJsonAtomic, readJson } from "../jsonfile.js";
 // src/billing/service.ts
 // Stripe -> licence. One class owns the whole chain: a verified webhook event
 // becomes (or extends, or revokes) an LHK1 licence, the buyer is emailed a
@@ -40,10 +44,13 @@ import {
   type StripeModeConfig,
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
-import { escapeHtml, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
-import { BillingStore, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
+import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
-import { launchGrant, reconcileLaunchSession } from "./launch.js";
+import { EarnStripeApi } from "../earn-stripe-api.js";
+import { softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
+
+import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
 import { classifyRole, type BillingRole, type ClassifiedRole, type ModeRoleConfig } from "./roles.js";
 import { foreignProductFamilyRefusal } from "./foreign-product-family.js";
@@ -72,6 +79,7 @@ const STRIPE_PORTAL_SESSIONS_URL = "https://api.stripe.com/v1/billing_portal/ses
  *  event outside this set is "ignored — event type not handled" without
  *  ever reaching the role dispatcher: there is nothing here to classify. */
 const DISPATCHED_EVENT_TYPES = new Set([
+  "checkout.session.expired",
   "checkout.session.completed",
   "checkout.session.async_payment_succeeded",
   "invoice.paid",
@@ -90,7 +98,23 @@ const EARN_HOOK_TYPES = new Set([
   "charge.refunded", "charge.dispute.created", "charge.dispute.closed",
 ]);
 
+export type InstallBindingState = "unbound" | "bound" | "recovery-locked" | "unavailable";
+export interface InstallRegenerationOptions {
+  confirmed: boolean; expectedRevision: string; acknowledgeMachineBinding?: boolean; deviceReplacement?: boolean;
+}
+
+export interface DeviceRecoveryOptions {
+  operationId: string; expectedLicenseId: string; expectedActivationId: string; expectedActivationRevision: number; expectedAuditRevision: number;
+  confirmedDestroyedInstall: boolean; acknowledgeCachedGrace: boolean;
+}
+export interface DeviceRecoverySnapshot { auditRevision: number; active: { id: string; revision: number; cachedGraceUntilMs: number }[]; locked: boolean; }
 export interface BillingServiceDeps {
+  deviceRecoverySnapshot?: (licenseId: string) => DeviceRecoverySnapshot;
+  checkRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
+  retireRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
+  recoveryHostingActive?: (customer: CustomerRecord) => boolean;
+  recoveryCheckpoint?: (phase: string) => void;
+  installBindingState?: (licenseId: string) => InstallBindingState;
   onVerifiedEvent?: (event: StripeEvent) => Promise<void>;
   now?: () => number;
   /** One injected fetch serves the email provider AND the Stripe portal call. */
@@ -115,6 +139,7 @@ export interface BillingServiceDeps {
   onHostingEvent?: (customerKey: string, livemode: boolean) => void;
   /** Atomically adopts the anonymous VPS reservation to the Stripe customer
    * proved by a bundle webhook. Returning false makes Stripe retry. */
+  onExpiredCheckout?: (sessionId: string) => Promise<{ released: boolean }>;
   onBundleEvent?: (input: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; livemode: boolean; terminal: boolean }) => boolean;
 }
 
@@ -160,6 +185,7 @@ export class BillingService {
   private drainingAfterCommit: Promise<{ completed: number; failed: number }> | null = null;
   private readonly onRevoke: (licenseId: string, reason: string) => void;
   private readonly onHostingEvent: (customerKey: string, livemode: boolean) => void;
+  private readonly onExpiredCheckout: BillingServiceDeps["onExpiredCheckout"];
   private readonly onBundleEvent: BillingServiceDeps["onBundleEvent"];
   /** Prevent concurrent deliveries of the same event from both entering the
    * licence mutation before the durable seen marker is written. */
@@ -168,6 +194,10 @@ export class BillingService {
    * event ids can describe the same paid session, and different paid sessions
    * for one customer must calculate their target from the latest expiry. */
   private readonly checkoutLocks = new Map<string, Promise<void>>();
+  private readonly installReissues = new Set<string>();
+  private readonly recoveryDeps: BillingServiceDeps;
+  private readonly installBindingState: (licenseId: string) => InstallBindingState;
+  private readonly bundleLocks = new Map<string, Promise<void>>();
 
   constructor(
     readonly dataDir: string,
@@ -176,6 +206,8 @@ export class BillingService {
     private readonly templatesDir: string,
     deps: BillingServiceDeps = {},
   ) {
+    this.recoveryDeps = deps;
+    this.installBindingState = deps.installBindingState ?? (() => "unavailable");
     this.onVerifiedEvent = deps.onVerifiedEvent;
     this.afterCommitOutbox = deps.onVerifiedEvent ? new AfterCommitOutbox(dataDir) : null;
     this.store = new BillingStore(dataDir, deps.randomBytes);
@@ -186,6 +218,7 @@ export class BillingService {
     this.onRevoke = deps.onRevoke ?? (() => {});
     this.onHostingEvent = deps.onHostingEvent ?? (() => {});
     this.onBundleEvent = deps.onBundleEvent;
+    this.onExpiredCheckout = deps.onExpiredCheckout;
   }
 
   /** Run at startup and on a timer, outside the Stripe request. An Earn
@@ -298,7 +331,8 @@ export class BillingService {
     if (!m.secretKey) return { ok: false, status: 400, error: `no ${mode} secret key is saved — paste one in the Stripe · ${mode} card first` };
     let result: ProvisionResult;
     try {
-      result = await provisionPlans({ secretKey: m.secretKey, siteOrigin: cfg.siteOrigin, productName: "Wick Hunter Unleashed", plans: cfg.plans }, this.fetchLike);
+      const launch = readJson<any>(path.join(this.dataDir, "billing-launch.v1.json"), {});
+      result = await provisionPlans({ secretKey: m.secretKey, siteOrigin: cfg.siteOrigin, productName: "Wick Hunter Unleashed", plans: cfg.plans, skipPaymentLinkKeys: launch[mode]?.enabled ? ["monthly", "yearly"] : [] }, this.fetchLike);
     } catch (err) {
       if (err instanceof StripeApiError) {
         const hint = err.status === 401 || err.status === 403
@@ -312,7 +346,8 @@ export class BillingService {
     const priceIds: Record<string, string> = {};
     for (const p of result.plans) {
       priceIds[p.key] = p.priceId;
-      links[p.key] = p.paymentLinkUrl || null;
+      if (p.paymentLinkUrl) links[p.key] = p.paymentLinkUrl;
+      else if (cfg.plans.find(plan => plan.key === p.key)?.checkout === "hosted-bundle") links[p.key] = null;
     }
     const first = cfg.plans[0]?.key;
     this.updateConfig({ stripe: { [mode]: { paymentLinks: links, priceIds, ...(!m.paymentLinkUrl && first && links[first] ? { paymentLinkUrl: links[first] } : {}) } } });
@@ -420,6 +455,15 @@ export class BillingService {
     const foreignFamilyNote = this.foreignProductFamilyNote(ev);
     if (foreignFamilyNote) return { outcome: "ignored", note: foreignFamilyNote };
 
+    if (ev.type === "checkout.session.expired") {
+      const f = checkoutFacts(ev.object);
+      if (f.metadata.bundle !== "software-hosting-v2") return { outcome: "ignored", note: "unowned checkout expiry" };
+      if (!this.onExpiredCheckout) throw Error("Hosted expiry reconciler unavailable");
+      await this.onExpiredCheckout(f.sessionId);
+      return { outcome: "applied", note: "unused expired hosted reservation released" };
+    }
+    const split = this.splitBundleIdentity(ev);
+    if (split.matched && split.identity) return this.withBundleLock(split.identity.launchIntentId, () => this.applyBundleEvent(ev, cfg, this.splitBundleIdentity(ev).identity!));
     const bundle = this.bundleIdentity(ev, cfg);
     if (bundle) return this.applyBundleEvent(ev, cfg, bundle);
 
@@ -473,6 +517,39 @@ export class BillingService {
       default:
         return { outcome: "ignored", note: "event type not handled" };
     }
+  }
+
+  private async withBundleLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prior = this.bundleLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = prior.then(() => new Promise<void>(resolve => { release = resolve; }));
+    this.bundleLocks.set(key, turn);
+    await prior;
+    try { return await fn(); } finally { release(); if (this.bundleLocks.get(key) === turn) this.bundleLocks.delete(key); }
+  }
+
+  private splitBundleIdentity(ev: StripeEvent): { matched: boolean; identity: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string; launchIntentId: string; hosting: NonNullable<LaunchIntent['hosting']> } | null } {
+    let metadata: Record<string,string> = {}, customerId = '', subscriptionId = '', chargeId = '', observed: string[] = [];
+    if (ev.type.startsWith('checkout.session.')) { const f = checkoutFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; }
+    else if (ev.type.startsWith('invoice.')) { const f = invoiceFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; observed = f.priceIds; }
+    else if (ev.type.startsWith('customer.subscription.')) { const f = subscriptionFacts(ev.object); metadata = f.metadata; customerId = f.customerId; subscriptionId = f.subscriptionId; observed = f.priceIds; }
+    else if (ev.type === 'charge.dispute.created') { const f = disputeFacts(ev.object); chargeId = f.chargeId || f.paymentIntentId; }
+    else if (ev.type.startsWith('charge.')) { const f = chargeFacts(ev.object); customerId = f.customerId; chargeId = f.chargeId || f.paymentIntentId; }
+    if (!subscriptionId && chargeId) subscriptionId = this.store.findRoleSubscriptionByCharge('hosting', chargeId)?.subscriptionId ?? '';
+    const bound = subscriptionId ? this.store.getBundleSubscription(subscriptionId) : null;
+    const candidate = metadata.wh_launch_intent ? launchGrant(this.dataDir, metadata, ev.livemode) : null;
+    const marked = metadata.bundle === 'software-hosting-v2' || !!bound?.launchIntentId || !!candidate?.hosting;
+    if (!marked) return { matched: false, identity: null };
+    const fail = (): never => { throw Error("Mixed checkout identity awaits review or durable reconciliation"); };
+    if (bound?.launchIntentId && ((customerId && customerId !== bound.customerId) || (metadata.plan && metadata.plan !== bound.planKey) || (metadata.wh_launch_intent && metadata.wh_launch_intent !== bound.launchIntentId))) return fail();
+    const grant = launchGrant(this.dataDir, bound?.launchIntentId ? { wh_launch_intent: bound.launchIntentId, plan: bound.planKey } : metadata, ev.livemode);
+    const proof = grant?.hosting;
+    if (!grant || !proof || grant.stripeParams['metadata[bundle]'] !== 'software-hosting-v2' || proof.softwarePriceId !== grant.stripeParams['line_items[0][price]'] || proof.hostingPriceId !== grant.stripeParams['line_items[1][price]'] || proof.softwareProductId === proof.hostingProductId || grant.firstPaymentAtMs !== null) return fail();
+    if (metadata.bundle && metadata.bundle !== 'software-hosting-v2' || metadata.reservation && metadata.reservation !== proof.reservationId) return fail();
+    if (grant.expiredAtMs) throw Error('Expired hosted checkout received a conflicting lifecycle event; review required');
+    if (observed.length && (observed.some(p => ![proof.softwarePriceId,proof.hostingPriceId].includes(p)) || !observed.includes(proof.hostingPriceId) || grant.plan !== 'lifetime' && !observed.includes(proof.softwarePriceId))) return fail();
+    if (ev.type.startsWith('invoice.') && !grant.sessionId) throw Error('Mixed checkout awaits its durable session reconciliation');
+    return { matched: true, identity: { reservationId: proof.reservationId, customerId: customerId || bound?.customerId || '', subscriptionId, planKey: grant.plan, priceId: proof.softwarePriceId, launchIntentId: grant.id, hosting: proof } };
   }
 
   private bundleIdentity(ev: StripeEvent, cfg: BillingConfig): { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string } | null {
@@ -533,7 +610,8 @@ export class BillingService {
     return null;
   }
 
-  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string }): Promise<ApplyResult> {
+  private async applyBundleEvent(ev: StripeEvent, cfg: BillingConfig, bundle: { reservationId: string; customerId: string; subscriptionId: string; planKey: string; priceId: string; launchIntentId?: string; hosting?: NonNullable<LaunchIntent['hosting']> }): Promise<ApplyResult> {
+    if (bundle.launchIntentId && (!bundle.subscriptionId || !bundle.customerId)) throw Error("Mixed checkout awaits complete durable subscription identity");
     if (!bundle.subscriptionId || !bundle.customerId || !bundle.planKey || !bundle.priceId) return { outcome: "unclassified", note: "bundle event did not carry a complete subscription identity" };
     const prior = this.store.getBundleSubscription(bundle.subscriptionId);
     if (prior && (
@@ -542,8 +620,10 @@ export class BillingService {
       || prior.priceId !== bundle.priceId
       || (bundle.reservationId && prior.reservationId && prior.reservationId !== bundle.reservationId)
     )) return { outcome: "unclassified", note: "bundle event conflicts with the subscription's durable identity" };
+    const lifetimeHosting = !!bundle.hosting && bundle.planKey === "lifetime";
+    const lifetimeInitialPaid = lifetimeHosting && (ev.type === "checkout.session.completed" || ev.type === "checkout.session.async_payment_succeeded" || ["invoice.paid","invoice.payment_succeeded"].includes(ev.type) && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).priceIds.includes(bundle.priceId));
     const terminal = ev.type === "customer.subscription.deleted";
-    if (prior?.terminal && !terminal) return { outcome: "ignored", note: "bundle subscription already ended; later events cannot reactivate it" };
+    if (prior?.terminal && !terminal && !lifetimeInitialPaid && !["charge.refunded","charge.dispute.created"].includes(ev.type)) return { outcome: "ignored", note: "bundle subscription already ended; later events cannot reactivate it" };
     const confirmed = ev.type === "checkout.session.async_payment_succeeded"
       || (ev.type === "checkout.session.completed" && checkoutFacts(ev.object).paymentStatus !== "unpaid")
       || ((ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded") && invoiceFacts(ev.object).paid);
@@ -558,7 +638,49 @@ export class BillingService {
     // the initial term. Allow that one activation, then restore the newer
     // past-due state; once records exist, stale paid events are inert.
     const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
-    if (stale && !activatingBehindFailure) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    // Checkout creates a short bootstrap grant but is often timestamped AFTER
+    // its initial paid invoice. Delivery order must not discard that first
+    // paid term. Restrict the exception to checkout-only, active records with
+    // no paid-through date; never bypass a failure, refund or terminal fence.
+    const initialPaidAfterCheckout = !!(stale && !lifetimeHosting && !prior?.pendingStatus
+      && (ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded")
+      && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).billingReason === "subscription_create"
+      && invoiceFacts(ev.object).periodEndMs !== null
+      && knownSoftware?.lastEventType?.startsWith("checkout.session.")
+      && knownSoftware.subscriptionStatus === "active" && knownSoftware.periodEndMs === null
+      && !knownSoftware.disputed && !knownSoftware.refunded
+      && knownHosting?.lastEventType?.startsWith("checkout.session.")
+      && knownHosting.subscriptionStatus === "active" && knownHosting.periodEndMs === null
+      && !knownHosting.disputed && !knownHosting.refunded);
+    const eventSha256 = createHash("sha256").update(JSON.stringify(ev)).digest("hex");
+    const pendingInitial = prior?.initialPaidPending;
+    // The admission is durable before either role changes. A retry may finish
+    // a partial write/hook, but only for exactly that event and while no newer
+    // lifecycle state has superseded the original checkout watermark.
+    const resumingInitialPaid = !!(stale && pendingInitial
+      && pendingInitial.eventSha256 === eventSha256
+      && pendingInitial.checkoutWatermarkMs === prior?.latestEventCreatedMs
+      && !prior?.pendingStatus && !prior?.terminal
+      && knownSoftware?.subscriptionStatus === "active"
+      && knownHosting?.subscriptionStatus === "active"
+      && !knownSoftware.refunded && !knownSoftware.disputed
+      && !knownHosting.refunded && !knownHosting.disputed
+      && [knownSoftware, knownHosting].every(rec =>
+        (rec.lastEventType?.startsWith("checkout.session.") && rec.periodEndMs === null)
+        || (rec.lastEventType === ev.type && rec.lastEventId === ev.id)));
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout && !resumingInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+
+    if (initialPaidAfterCheckout) this.store.putBundleSubscription({
+      ...prior!, initialPaidPending: { eventSha256, checkoutWatermarkMs: prior!.latestEventCreatedMs },
+    });
+
+    let softwareEvent = ev;
+    if (bundle.hosting && ev.type.startsWith('invoice.')) softwareEvent = { ...ev, object: softwareInvoiceProjection(ev.object, bundle.hosting) };
+    if (bundle.hosting && ev.type.startsWith('checkout.session.') && confirmed) {
+      const api = new EarnStripeApi(cfg.stripe[ev.livemode ? 'live' : 'test'].secretKey, this.launchFetch);
+      const lines = await api.call('GET', '/v1/checkout/sessions/' + checkoutFacts(ev.object).sessionId + '/line_items', { limit: 3 });
+      softwareEvent = { ...ev, object: { ...ev.object, ...softwareCheckoutProjection(lines, bundle.hosting) } };
+    }
 
     const ledger = {
       subscriptionId: bundle.subscriptionId,
@@ -566,6 +688,7 @@ export class BillingService {
       customerId: bundle.customerId,
       planKey: bundle.planKey,
       priceId: bundle.priceId,
+      ...(bundle.launchIntentId ? { launchIntentId: bundle.launchIntentId } : {}),
       latestEventCreatedMs: orderingRelevant ? Math.max(prior?.latestEventCreatedMs ?? 0, ev.createdMs) : (prior?.latestEventCreatedMs ?? 0),
       pendingStatus: failed ? "past_due" as const : (confirmed && !activatingBehindFailure ? null : prior?.pendingStatus ?? null),
       terminal: terminal || prior?.terminal === true,
@@ -575,30 +698,68 @@ export class BillingService {
     // prevents a paid event delivered after deletion (even with a later
     // event id or timestamp) from creating either entitlement.
     if (terminal) this.store.putBundleSubscription(ledger);
-    if (ledger.reservationId && (confirmed || terminal)) {
+    if (bundle.hosting && ev.type.startsWith("checkout.session.") && confirmed) {
+      const f = checkoutFacts(ev.object);
+      if (f.mode !== "subscription" || f.paymentStatus !== "paid") throw Error("Mixed checkout payment is not confirmed");
+      await reconcileLaunchSession(this.dataDir, f.metadata, ev.livemode, f.sessionId, cfg.stripe[ev.livemode ? "live" : "test"].secretKey, this.launchFetch, this.now());
+    }
+    if (ledger.reservationId && (confirmed || terminal) && !prior?.terminal) {
       if (!this.onBundleEvent?.({ reservationId: ledger.reservationId, customerId: ledger.customerId, subscriptionId: ledger.subscriptionId, planKey: ledger.planKey, livemode: ev.livemode, terminal })) throw new Error("hosted bundle reservation could not be bound to the confirmed Stripe customer");
     }
     if (terminal && !this.store.findBySubscription(bundle.subscriptionId) && !this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId)) {
       return { outcome: "applied", note: "bundle ended before activation; reservation closed and no entitlement issued" };
     }
     let software: ApplyResult;
-    switch (ev.type) {
+    // Lifetime software is a one-time durable purchase on the initial mixed
+    // invoice/session. Its hosting-only renewals and cancellation never
+    // modify that software entitlement or index their charges as software.
+    const lifetimeSoftwarePaid = lifetimeHosting && ['invoice.paid','invoice.payment_succeeded'].includes(ev.type) && invoiceFacts(ev.object).paid && (softwareEvent.object.lines as any)?.data?.length > 0;
+    const skipLifetimeSoftware = lifetimeHosting && !ev.type.startsWith('checkout.session.') && !lifetimeSoftwarePaid && !['charge.refunded','charge.dispute.created'].includes(ev.type);
+    if (skipLifetimeSoftware) software = { outcome: 'ignored', note: 'Lifetime software remains independent of VPS renewals/cancellation' };
+    else switch (ev.type) {
       case "checkout.session.completed":
-      case "checkout.session.async_payment_succeeded": software = await this.onCheckout(ev, cfg); break;
+      case "checkout.session.async_payment_succeeded":
+        if (lifetimeHosting) {
+          const f = checkoutFacts(softwareEvent.object);
+          if (f.paymentStatus === 'unpaid') software = { outcome: 'ignored', note: 'mixed payment is not confirmed' };
+          else {
+            await reconcileLaunchSession(this.dataDir, f.metadata, ev.livemode, f.sessionId, cfg.stripe[ev.livemode ? 'live' : 'test'].secretKey, this.launchFetch, this.now());
+            software = await this.withCheckoutLocks([f.customerId], () => this.onPaymentCheckout(softwareEvent, cfg, { ...f, mode: 'payment', subscriptionId: '' }));
+          }
+        } else software = await this.onCheckout(softwareEvent, cfg);
+        break;
       case "invoice.paid":
-      case "invoice.payment_succeeded": software = await this.onInvoicePaid(ev, cfg); break;
-      case "invoice.payment_failed": software = this.onInvoiceFailed(ev); break;
-      case "customer.subscription.updated": software = this.onSubscriptionUpdated(ev, cfg); break;
+      case "invoice.payment_succeeded":
+        if (lifetimeSoftwarePaid) {
+          const grant = launchGrant(this.dataDir, { wh_launch_intent: bundle.launchIntentId!, plan: bundle.planKey }, ev.livemode)!;
+          const f = invoiceFacts(ev.object);
+          const synthetic = { ...ev, object: { amount_subtotal: softwareEvent.object.amount_subtotal, total_details: softwareEvent.object.total_details, amount_total: softwareEvent.object.amount_paid, id: grant.sessionId, mode: 'payment', payment_status: 'paid', customer: bundle.customerId, customer_details: { email: f.email, name: f.name }, payment_intent: f.paymentIntentId, metadata: { wh_launch_intent: grant.id, plan: grant.plan, non_renewing: 'true', license_days: String(this.plan('lifetime')?.licenseDays ?? cfg.policy.oneOffDays) } } };
+          software = await this.withCheckoutLocks([bundle.customerId], () => this.onPaymentCheckout(synthetic, cfg, checkoutFacts(synthetic.object)));
+          const rec = this.store.getCustomer(bundle.customerId); if (rec) { this.noteCharge(rec, f.chargeId); this.noteCharge(rec, f.paymentIntentId); this.store.putCustomer(rec); }
+        } else software = await this.onInvoicePaid(softwareEvent, cfg);
+        break;
+      case "invoice.payment_failed": software = this.onInvoiceFailed(softwareEvent); break;
+      case "customer.subscription.updated": software = this.onSubscriptionUpdated(softwareEvent, cfg); break;
       case "customer.subscription.deleted": software = this.onSubscriptionDeleted(ev); break;
       case "charge.succeeded": software = this.onChargeSucceeded(ev); break;
-      case "charge.refunded": software = this.onRefund(ev, cfg); break;
-      case "charge.dispute.created": software = this.onDispute(ev, cfg); break;
+      case "charge.refunded":
+      case "charge.dispute.created": {
+        const f = ev.type === 'charge.refunded' ? chargeFacts(ev.object) : disputeFacts(ev.object);
+        const rec = this.store.getCustomer(bundle.customerId);
+        const softwareCharge = !lifetimeHosting || !!rec && [f.chargeId,f.paymentIntentId].some(id => !!id && rec.chargeIds.includes(id));
+        software = softwareCharge ? ev.type === 'charge.refunded' ? this.onRefund(ev, cfg) : this.onDispute(ev, cfg) : { outcome: 'ignored', note: 'VPS-only charge does not change Lifetime software' };
+        break;
+      }
       default: return { outcome: "ignored", note: "bundle event type not handled" };
     }
-    const hosting = this.applyHostingEvent(ev);
+    if (bundle.hosting && confirmed && (ev.type.startsWith('checkout.session.') || ev.type.startsWith('invoice.'))) {
+      const rec = this.store.getCustomer(bundle.customerId), discount = checkoutDiscountPercent(softwareEvent.object);
+      if (rec && discount !== null) { rec.discountPercent = discount; this.store.putCustomer(rec); }
+    }
+    const hosting = prior?.terminal && !["charge.refunded","charge.dispute.created"].includes(ev.type) ? { outcome: "ignored" as const, note: "ended VPS stays ended" } : this.applyHostingEvent(ev);
     if (activatingBehindFailure) {
       const softwareRec = this.store.findBySubscription(bundle.subscriptionId);
-      if (softwareRec) { softwareRec.subscriptionStatus = "past_due"; softwareRec.updatedAtMs = this.now(); this.store.putCustomer(softwareRec); }
+      if (softwareRec && !lifetimeHosting) { softwareRec.subscriptionStatus = "past_due"; softwareRec.updatedAtMs = this.now(); this.store.putCustomer(softwareRec); }
       const hostingRec = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
       if (hostingRec) { hostingRec.subscriptionStatus = "past_due"; hostingRec.updatedAtMs = this.now(); this.saveHostingRecord(hostingRec); }
     }
@@ -758,6 +919,7 @@ export class BillingService {
 
   private touchHosting(rec: RoleSubscriptionRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }
@@ -904,6 +1066,7 @@ export class BillingService {
     const oneOffDays = this.oneOffDaysFor(f.metadata, planByKey(cfg, planKey), cfg);
     const beforeRecovery = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
       ?? this.findCustomer(f.customerId, f.email, ev.livemode, !grant);
+    if(beforeRecovery && this.recoveryPending(beforeRecovery.key))throw Error("Customer recovery must complete before checkout mutation");
     const recoveryKeys = [...new Set([beforeRecovery?.key, f.customerId, f.email ? `email:${f.email}` : undefined].filter((key): key is string => !!key))];
     for (const key of recoveryKeys) await this.recoverPendingCheckout(key, cfg, now, ev);
     const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
@@ -952,7 +1115,7 @@ export class BillingService {
     // clears after observing the missing marker.
     this.store.putPendingCheckout(customerKey, f.sessionId);
     const starterPackGrantAtMs = starterPackGrantAt(grant, ev, newCustomer);
-    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id } : {}), ...(starterPackGrantAtMs !== null ? { starterPackGrantAtMs } : {}) });
+    const claimed = this.store.claimCheckoutSession({ sessionId: f.sessionId, customerKey, licenseId, targetExpMs, newCustomer, createdAtMs: now, now, email: f.email, name: f.name, livemode: ev.livemode, planKey, subscriptionId: f.subscriptionId, paymentIntentId: f.paymentIntentId, ...(f.paymentStatus === 'paid' && Number.isSafeInteger(ev.createdMs) && ev.createdMs > 0 ? { paidAtMs: ev.createdMs } : {}), ...(grant ? { launchIntentId: grant.id, ...(grant.hosting ? { softwarePaid: Number(ev.object.amount_total) > 0 } : {}) } : {}), ...(starterPackGrantAtMs !== null ? { starterPackGrantAtMs } : {}) });
     const marker = claimed.record;
     if (!claimed.created && marker.status === "applied") {
       this.assertAppliedCheckout(marker);
@@ -972,6 +1135,8 @@ export class BillingService {
           this.store.putCustomer(applied);
         }
       }
+      const applied = this.store.getCustomer(marker.customerKey);
+      if (applied) { this.noteCharge(applied, f.paymentIntentId); this.store.putCustomer(applied); }
       this.store.clearPendingCheckout(customerKey, f.sessionId);
       return { outcome: "duplicate", note: "checkout session was already applied" };
     }
@@ -981,7 +1146,7 @@ export class BillingService {
       marker.targetExpMs,
       now,
     );
-    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`checkout session ${f.sessionId} changed license`);
+    if (marker.licenseId && !this.store.customerLicenseMatches(rec, marker.licenseId)) throw new Error(`checkout session ${f.sessionId} changed license`);
     if (!marker.licenseId) {
       marker.licenseId = rec.licenseId;
       marker.updatedAtMs = now;
@@ -1007,7 +1172,7 @@ export class BillingService {
       if (verifiedDiscount !== null) rec.discountPercent = verifiedDiscount;
     }
     if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
-    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
+    if (marker.paidAtMs && (!grant?.hosting || Number(ev.object.amount_total) > 0)) this.noteFirstActualPayment(rec, marker.paidAtMs);
     this.noteCharge(rec, checkoutMarker);
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -1042,7 +1207,7 @@ export class BillingService {
       starterPackCandidateAtMs: marker.starterPackGrantAtMs,
       ...(marker.launchIntentId ? { metadata: { wh_launch_intent: marker.launchIntentId, plan: marker.planKey ?? '' } } : {}),
     }, cfg, marker.targetExpMs, now);
-    if (marker.licenseId && marker.licenseId !== rec.licenseId) throw new Error(`pending checkout ${sessionId} changed license`);
+    if (marker.licenseId && !this.store.customerLicenseMatches(rec, marker.licenseId)) throw new Error(`pending checkout ${sessionId} changed license`);
     if (!marker.licenseId) {
       marker.licenseId = rec.licenseId;
       marker.updatedAtMs = now;
@@ -1056,7 +1221,7 @@ export class BillingService {
       this.extendLicense(rec, marker.targetExpMs, cfg, now);
     }
     this.noteCharge(rec, `cs:${sessionId}`);
-    if (marker.paidAtMs) this.noteFirstActualPayment(rec, marker.paidAtMs);
+    if (marker.paidAtMs && marker.softwarePaid !== false) this.noteFirstActualPayment(rec, marker.paidAtMs);
     if (planByKey(cfg, marker.planKey)?.lifetime && marker.livemode && marker.paidAtMs) rec.lifetimeAccess = true;
     if (!rec.subscriptionId) rec.periodEndMs = marker.targetExpMs;
     this.noteCharge(rec, marker.paymentIntentId ?? "");
@@ -1078,7 +1243,8 @@ export class BillingService {
     if (grant?.firstPaymentAtMs) this.extendLicense(rec, grant.firstPaymentAtMs, cfg, now);
     let note = created ? `licence issued${planKey ? ` (${planKey})` : ""}` : "customer known";
     rec.subscriptionStatus = grant ? 'active' : rec.subscriptionStatus ?? "active";
-    if (f.paymentStatus === 'paid') this.noteFirstActualPayment(rec, ev.createdMs);
+    if (grant?.hosting) { const discount = checkoutDiscountPercent(ev.object); if (discount !== null) rec.discountPercent = discount; }
+    if (f.paymentStatus === 'paid' && (!grant?.hosting || Number(ev.object.amount_total) > 0)) this.noteFirstActualPayment(rec, ev.createdMs);
     this.noteCharge(rec, f.sessionId ? `cs:${f.sessionId}` : "");
     this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
@@ -1099,7 +1265,7 @@ export class BillingService {
     const rec = this.store.getCustomer(marker.customerKey) ?? this.store.findByLicense(marker.licenseId);
     const issued = this.licenses.get(marker.licenseId) ||
       (this.licenses.isRevoked(marker.licenseId) && this.licenses.isKnown(marker.licenseId));
-    if (!rec || rec.key !== marker.customerKey || rec.licenseId !== marker.licenseId || !issued) {
+    if (!rec || rec.key !== marker.customerKey || !this.store.customerLicenseMatches(rec, marker.licenseId) || !issued) {
       throw new Error(`applied checkout session ${marker.sessionId} has inconsistent durable state`);
     }
   }
@@ -1147,6 +1313,7 @@ export class BillingService {
       note += "; invoice had no period end";
     }
     rec.subscriptionStatus = "active";
+    if (launchInvoice?.hosting) { const discount = checkoutDiscountPercent(ev.object); if (discount !== null) rec.discountPercent = discount; }
     const amountPaid = ev.object.amount_paid;
     if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
       const transitions = ev.object.status_transitions as Record<string, unknown> | undefined;
@@ -1301,7 +1468,7 @@ export class BillingService {
       catch { return false; } // corrupt evidence cannot grant or break check-in
       if (!marker) continue;
       foundDurableMarker = true;
-      if (marker.status === 'applied' && marker.customerKey === rec.key && marker.licenseId === rec.licenseId &&
+      if (marker.status === 'applied' && marker.customerKey === rec.key && this.store.customerLicenseMatches(rec, marker.licenseId) &&
         marker.planKey === 'lifetime' && marker.livemode === true &&
         (Number.isSafeInteger(marker.paidAtMs) && marker.paidAtMs! > 0 || /^pi_[A-Za-z0-9_]+$/.test(marker.paymentIntentId ?? ''))) return true;
     }
@@ -1326,12 +1493,13 @@ export class BillingService {
   private ensureCustomer(facts: CustomerFacts, cfg: BillingConfig, initialExp: number, now: number): { rec: CustomerRecord; created: boolean } {
     const grant = launchGrant(this.dataDir, facts.metadata ?? {}, facts.livemode);
     const direct = facts.customerId ? this.store.getCustomer(facts.customerId) ?? this.store.findByStripeCustomer(facts.customerId) : null;
-    if (grant?.licenseId && direct && direct.licenseId !== grant.licenseId) throw Error('Stripe customer is already bound to another license');
+    if (grant?.licenseId && direct && !this.store.customerLicenseMatches(direct, grant.licenseId)) throw Error('Stripe customer is already bound to another license');
     const existing = (grant?.licenseId ? this.store.findByLicense(grant.licenseId) : null)
       ?? this.findCustomer(facts.customerId, facts.email, facts.livemode, !grant);
     if (existing) {
+      if(this.recoveryPending(existing.key))throw Error("Customer recovery must complete before checkout mutation");
       if (existing.livemode !== facts.livemode) throw Error('Checkout license is already bound in another Stripe mode');
-      if (grant?.licenseId && existing.licenseId !== grant.licenseId) throw Error('Checkout conflicts with an existing billing license');
+      if (grant?.licenseId && !this.store.customerLicenseMatches(existing, grant.licenseId)) throw Error('Checkout conflicts with an existing billing license');
       if (facts.customerId && existing.stripeCustomerId && existing.stripeCustomerId !== facts.customerId) throw Error('Checkout conflicts with an existing Stripe customer');
       if (facts.email && !existing.email) existing.email = facts.email;
       if (facts.name && (!existing.name || existing.name === existing.email)) existing.name = facts.name;
@@ -1412,6 +1580,7 @@ export class BillingService {
 
   private touch(rec: CustomerRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }
@@ -1463,12 +1632,201 @@ export class BillingService {
   }
 
   async resendWelcome(customerKey: string): Promise<{ ok: true; sentTo: string } | { ok: false; status: number; error: string }> {
+    if(this.recoveryPending(customerKey))return {ok:false,status:409,error:"Server recovery needs completion before a new welcome link can be sent"};
     const rec = this.store.getCustomer(customerKey);
     if (!rec) return { ok: false, status: 404, error: "unknown customer" };
     const note = await this.sendWelcomeIfNeeded(rec, this.config(), this.now(), true);
     if (rec.welcomeError) return { ok: false, status: 502, error: rec.welcomeError };
     void note;
     return { ok: true, sentTo: rec.email };
+  }
+
+  async recoverDestroyedInstall(customerKey: string, expectedEmail: string, options: DeviceRecoveryOptions): Promise<
+    { ok: true; sentTo: string; licenseId: string; previousLicenseId: string; expiresAtMs: number; cachedOldGraceUntilMs: number; alreadyCompleted?: true }
+    | { ok: false; status: number; error: string }> {
+    if (this.installReissues.has(customerKey)) return {ok:false,status:409,error:"A recovery or reissue is already in progress"};
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(options.operationId) || !options.confirmedDestroyedInstall || !options.acknowledgeCachedGrace)
+      return {ok:false,status:400,error:"Explicit destroyed-server authorization and cached offline-grace acknowledgement are required"};
+    const rec=this.store.getCustomer(customerKey),now=this.now(),cfg=this.config();
+    if(!rec || normalizeInstallEmail(rec.email)!==normalizeInstallEmail(expectedEmail) || !rec.livemode || rec.refunded || rec.disputed)
+      return {ok:false,status:409,error:"Confirmed active live billing customer required"};
+
+    const file=recoveryPath(this.dataDir,options.operationId);
+    let op: InstallRecoveryRecord | null;
+    try { op=recoveryRecords(this.dataDir).find(r=>r.operationId===options.operationId)??null; }
+    catch { return {ok:false,status:409,error:"Recovery journal needs support review; no new recovery started"}; }
+    if(op && (op.customerKey!==rec.key || op.oldLicense.id!==options.expectedLicenseId || op.activationId!==options.expectedActivationId
+      || op.activationRevision!==options.expectedActivationRevision || op.auditRevision!==options.expectedAuditRevision))return {ok:false,status:409,error:"Recovery operation identity changed"};
+    if(op?.phase==="sent" && (rec.licenseId!==op.newLicenseId || !this.licenses.isRevoked(op.oldLicense.id) || !this.licenses.get(op.newLicenseId) || this.licenses.get(op.newLicenseId)!.exp<=now))return {ok:false,status:409,error:"Completed recovery identity needs review"};
+    if(op?.phase==="sent")return {ok:true,sentTo:rec.email,licenseId:op.newLicenseId,previousLicenseId:op.oldLicense.id,expiresAtMs:op.installExpiresAtMs!,cachedOldGraceUntilMs:op.cachedGraceUntilMs,alreadyCompleted:true};
+    if(op && ["email-prepared","email-failed"].includes(op.phase))return {ok:false,status:409,error:"Review the recovery email audit; use same-licence reissue if a replacement email is needed"};
+    if(!emailReady(cfg.email))return {ok:false,status:503,error:"Email provider unavailable; recovery not started"};
+    this.installReissues.add(customerKey);
+    let raw="";
+    try {
+      if(!op){
+        if(this.checkoutLocks.has(rec.key))throw Error("Customer checkout is still in progress");
+        const old=this.licenses.get(rec.licenseId),key=old&&this.licenses.tokenFor(old.id);
+        if(rec.licenseId!==options.expectedLicenseId || !old || !key || !this.licenses.verify(key,now).ok)throw Error("Current licence identity changed or is inactive");
+        if(recoveryRecords(this.dataDir).some(r=>r.customerKey===rec.key && !["committed","email-prepared","email-failed","sent"].includes(r.phase)))throw Error("An earlier recovery needs completion");
+        const pending=this.store.getPendingCheckout(rec.key);
+        if(pending && this.store.getCheckoutSession(pending)?.status!=="applied")throw Error("Pending checkout must be settled before device recovery");
+        if(!this.recoveryDeps.recoveryHostingActive || this.recoveryDeps.recoveryHostingActive(rec))throw Error("Active hosting must be reviewed before device recovery");
+        const facts=this.recoveryDeps.deviceRecoverySnapshot?.(old.id);
+        if(!facts || facts.locked || facts.auditRevision!==options.expectedAuditRevision || facts.active.length!==1)throw Error("Current single-machine lease audit required");
+        const active=facts.active[0];
+        if(active.id!==options.expectedActivationId || active.revision!==options.expectedActivationRevision || !Number.isSafeInteger(active.cachedGraceUntilMs))throw Error("Current machine revision and signed grace required");
+        // Do not rewrite immutable launch/payment grants. An unsettled launch
+        // claim is a separate purchase and must finish before reassociation.
+        const claimFile=path.join(this.dataDir,"billing-launch-claims.v1","live",createHash("sha256").update(old.id).digest("hex")+".json");
+        const claim=readJson<{id:string}|null>(claimFile,null);
+        if(claim){if(!/^[A-Za-z0-9_-]{1,128}$/.test(claim.id))throw Error("Launch claim identity needs review");const intent=readJson<{sessionId?:string;expiredAtMs?:number;reservationReleasedAtMs?:number}|null>(path.join(this.dataDir,"billing-launch-intents.v1",claim.id+".json"),null);
+          if(!intent || !(intent.sessionId && rec.chargeIds.includes("cs:"+intent.sessionId)) && !(intent.expiredAtMs!==undefined && intent.reservationReleasedAtMs!==undefined))throw Error("Unsettled launch checkout must be reviewed");}
+        this.ensureLifetimeAccess(rec,old);
+        op={v:1,operationId:options.operationId,customerKey:rec.key,newLicenseId:randomUUID(),oldCustomer:{...rec},oldLicense:{...old},atMs:now,
+          activationId:active.id,activationRevision:active.revision,auditRevision:facts.auditRevision,cachedGraceUntilMs:active.cachedGraceUntilMs,featureOverrides:{...(this.recoveryFlags().byLicense[old.id]??{})},phase:"prepared"};
+        writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("prepared");
+      }
+      const old=op.oldLicense;
+      if(rec.licenseId!==old.id && rec.licenseId!==op.newLicenseId)throw Error("Customer licence moved outside this recovery");
+      const expected={...op.oldCustomer,licenseId:rec.licenseId};
+      if(JSON.stringify(rec)!==JSON.stringify(expected))throw Error("Customer entitlement changed during interrupted recovery; review before resuming");
+      if(!this.licenses.isRevoked(old.id)){
+        const currentOld=this.licenses.get(old.id);
+        if(!currentOld || JSON.stringify(currentOld)!==JSON.stringify(old))throw Error("Old licence entitlement changed before retirement");
+        if(JSON.stringify(this.recoveryFlags().byLicense[old.id]??{})!==JSON.stringify(op.featureOverrides))throw Error("Old feature authorization changed before retirement");
+      } else if(["prepared","issued"].includes(op.phase))throw Error("Old licence was retired outside this recovery");
+      if(!this.recoveryDeps.checkRecoveryActivation)throw Error("Current machine retirement check unavailable");
+      this.recoveryDeps.checkRecoveryActivation(old.id,op.activationId,op.activationRevision,"Destroyed-server recovery "+op.operationId);
+      const existing=this.licenses.get(op.newLicenseId);
+      if(existing){if(existing.name!==old.name||existing.exp!==old.exp||existing.plan!==old.plan||existing.iat!==op.atMs)throw Error("Reserved replacement licence differs");}
+      else this.licenses.issueUntil(old.name,old.exp,old.plan,op.atMs,op.newLicenseId);
+      if(op.phase==="prepared"){op.phase="issued";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("issued");}
+      if(op.phase==="issued"){op.phase="retiring";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("retiring");}
+      if(!this.licenses.isRevoked(old.id))this.licenses.revoke(old.id,new Date(op.atMs));
+      if(!this.recoveryDeps.retireRecoveryActivation)throw Error("Audited machine retirement unavailable");
+      this.recoveryDeps.retireRecoveryActivation(old.id,op.activationId,op.activationRevision,"Destroyed-server recovery "+op.operationId);
+      if(op.phase==="retiring"){op.phase="retired";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("retired");}
+      const flags=this.recoveryFlags();flags.byLicense[op.newLicenseId]={...op.featureOverrides};writeJsonAtomic(path.join(this.dataDir,"flags.json"),flags);
+      this.store.revokeTokens(rec.key,"all",op.atMs);
+      if(rec.licenseId!==op.newLicenseId){rec.licenseId=op.newLicenseId;this.store.putCustomer(rec);this.recoveryDeps.recoveryCheckpoint?.("linked");}
+      op.phase="committed";writeJsonAtomic(file,op);this.recoveryDeps.recoveryCheckpoint?.("committed");
+      const issuedAt=this.now();
+      raw=this.store.mint("install",op.newLicenseId,rec.key,issuedAt,{reusable:true});
+      op.installExpiresAtMs=issuedAt+INSTALL_TOKEN_TTL_MS;
+      op.phase="email-prepared";writeJsonAtomic(file,op);
+      const msg=reissuedInstallEmail(rec.email,{name:rec.name,installUrl:`${this.origin}/install/${raw}`,expiresAtMs:op.installExpiresAtMs,issue:"device-recovery",replacementLicenseToken:this.licenses.tokenFor(op.newLicenseId)!,dashboardUrl:`${this.origin}/customer`});
+      const result=await sendEmail(cfg.email,msg,this.fetchLike);
+      if(!result.ok){this.store.revokeInstall(raw,this.now());op.phase="email-failed";writeJsonAtomic(file,op);return {ok:false,status:502,error:"Recovery committed, but email failed; new link revoked. Review before a same-licence reissue."};}
+      op.providerMessageId=result.id;op.emailSentAtMs=this.now();writeJsonAtomic(file,op);
+      this.store.appendEvent({id:"device-recovery:"+op.operationId,type:"admin.install.device-recovery",livemode:true,receivedAtMs:this.now(),outcome:"applied",
+        note:JSON.stringify({customerKey:rec.key,previousLicenseId:old.id,licenseId:op.newLicenseId,cachedOldGraceUntilMs:op.cachedGraceUntilMs,oldServerDestroyedConfirmed:true,providerMessageId:result.id,installExpiresAtMs:op.installExpiresAtMs})});
+      op.phase="sent";writeJsonAtomic(file,op);
+      return {ok:true,sentTo:rec.email,licenseId:op.newLicenseId,previousLicenseId:old.id,expiresAtMs:op.installExpiresAtMs,cachedOldGraceUntilMs:op.cachedGraceUntilMs};
+    } catch {return {ok:false,status:409,error:"Device recovery stopped. Inspect the durable recovery journal before resuming; no completion is claimed."};}
+    finally{this.installReissues.delete(customerKey);}
+  }
+
+  private recoveryFlags(): ReturnType<typeof readFlags> {
+    const raw=readJson<unknown>(path.join(this.dataDir,"flags.json"),{default:{},byLicense:{}});
+    const object=(v:unknown):v is Record<string,unknown> => !!v && typeof v==="object" && !Array.isArray(v);
+    if(!object(raw) || Object.keys(raw).some(k=>k!=="default"&&k!=="byLicense") || !object(raw.default) || !object(raw.byLicense)
+      || Object.values(raw.default).some(v=>typeof v!=="boolean") || Object.entries(raw.byLicense).some(([k,v])=>["__proto__","constructor","prototype"].includes(k) || !object(v) || Object.values(v).some(x=>typeof x!=="boolean")))throw Error("Saved feature overrides need review");
+    return readFlags(this.dataDir);
+  }
+
+  private recoveryPending(customerKey: string): boolean {
+    return recoveryRecords(this.dataDir).some(r=>r.customerKey===customerKey && ["prepared","issued","retiring","retired"].includes(r.phase));
+  }
+
+  installRecovery(customerKey: string): { revision: string; binding: InstallBindingState } {
+    const rec = this.store.getCustomer(customerKey);
+    return { revision: this.store.installRevision(customerKey), binding: rec ? this.installBindingState(rec.licenseId) : "unavailable" };
+  }
+
+  /** All explicit regeneration uses this synchronous admission and mutation.
+   * The email lock remains held across provider awaits, so dashboard clicks
+   * cannot revoke a command while its delivery is in flight. */
+  regenerateInstall(customerKey: string, expectedEmail: string, options: InstallRegenerationOptions):
+    { ok: true; raw: string; command: string; expiresAtMs: number; revoked: number; revision: string; binding: InstallBindingState }
+    | { ok: false; status: number; error: string } {
+    if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    if(recoveryRecords(this.dataDir).some(r=>r.customerKey===customerKey && ["prepared","issued","retiring","retired"].includes(r.phase)))return {ok:false,status:409,error:"Server recovery needs completion before another command can be issued"};
+    const rec = this.store.getCustomer(customerKey), now = this.now();
+    const lic = rec && this.licenses.get(rec.licenseId), key = lic && this.licenses.tokenFor(lic.id);
+    if (!rec || normalizeInstallEmail(rec.email) !== normalizeInstallEmail(expectedEmail)) return { ok: false, status: 404, error: "unknown customer" };
+    if (!rec.livemode || rec.refunded || rec.disputed || !lic || lic.exp <= now || !key || !this.licenses.verify(key, now).ok)
+      return { ok: false, status: 403, error: "an active live customer licence without a refund or dispute is required" };
+    if (options.deviceReplacement) return { ok: false, status: 409, error: "Device replacement requires verified support recovery; regenerating a command does not revoke or transfer an active machine." };
+    if (options.confirmed !== true || options.expectedRevision !== this.store.installRevision(rec.key))
+      return { ok: false, status: 409, error: "Confirm regeneration from the current dashboard; reload if another command was issued." };
+    const binding = this.installBindingState(rec.licenseId);
+    if (binding !== "unbound" && options.acknowledgeMachineBinding !== true)
+      return { ok: false, status: 409, error: "Confirm that the existing machine binding is preserved. Lost machine keys need support recovery before trading." };
+    const { revoked, raw } = this.store.rotateInstall(lic.id, rec.key, options.expectedRevision, now);
+    const expiresAtMs = now + INSTALL_TOKEN_TTL_MS;
+    this.store.appendEvent({ id: `customer-install-regeneration:${rec.key}:${now}`, type: "customer.install.regenerate", livemode: true,
+      receivedAtMs: now, outcome: "applied", note: JSON.stringify({ customerKey: rec.key, licenseId: lic.id, revoked, expiresAtMs, binding, deviceTransferred: false }) });
+    return { ok: true, raw, command: safeInstallCommand(`${this.origin}/install/${raw}`), expiresAtMs, revoked,
+      revision: this.store.installRevision(rec.key), binding };
+  }
+
+  /** Admin-only support action. Never mutates the licence, seat or customer
+   * account, and sends only to the stored verified billing email. */
+  async reissueInstall(customerKey: string, expectedEmail: string, issue: "bybit-us-ip" | "reinstall" = "bybit-us-ip", options?: InstallRegenerationOptions): Promise<
+    { ok: true; sentTo: string; expiresAtMs: number; revoked: { page: number; install: number } }
+    | { ok: false; status: number; error: string }
+  > {
+    if (this.installReissues.has(customerKey)) return { ok: false, status: 409, error: "an install reissue is already in progress for this customer" };
+    if(this.recoveryPending(customerKey))return {ok:false,status:409,error:"Server recovery needs completion before another command can be issued"};
+    const rec = this.store.getCustomer(customerKey);
+    if (!rec) return { ok: false, status: 404, error: "unknown customer" };
+    const now = this.now();
+    const lic = this.licenses.get(rec.licenseId);
+    const key = lic && this.licenses.tokenFor(lic.id);
+    if (!rec.livemode || rec.refunded || rec.disputed || !lic || lic.exp <= now || !key || !this.licenses.verify(key, now).ok) {
+      return { ok: false, status: 409, error: "an active live customer licence without a refund or dispute is required" };
+    }
+    if (!rec.email.includes("@") || /[\r\n]/.test(rec.email) || expectedEmail.trim().toLowerCase() !== rec.email.trim().toLowerCase()) {
+      return { ok: false, status: 409, error: "the confirmed email must match the stored billing customer" };
+    }
+    const cfg = this.config();
+    if (!emailReady(cfg.email)) return { ok: false, status: 503, error: "email provider is not configured; existing links were not changed" };
+    this.installReissues.add(customerKey);
+    let raw = "";
+    try {
+      let revoked: { page: number; install: number };
+      if (issue === "reinstall") {
+        // Admission/mutation has no await; lock is restored before delivery.
+        this.installReissues.delete(customerKey);
+        const prepared = this.regenerateInstall(customerKey, expectedEmail, options ?? { confirmed: false, expectedRevision: "" });
+        this.installReissues.add(customerKey);
+        if (!prepared.ok) return prepared;
+        raw = prepared.raw;
+        revoked = { page: 0, install: prepared.revoked };
+      } else revoked = { page: this.store.revokeTokens(rec.key, "page", now), install: this.store.revokeTokens(rec.key, "install", now) };
+      if (!raw) raw = this.store.mint("install", lic.id, rec.key, now, { reusable: true });
+      const expiresAtMs = now + INSTALL_TOKEN_TTL_MS;
+      const audit = (stage: "prepared" | "sent" | "failed") => this.store.appendEvent({
+        id: `admin-install-reissue:${rec.key}:${now}:${stage}`, type: "admin.install.reissue", livemode: true,
+        receivedAtMs: this.now(), outcome: stage === "failed" ? "error" : "applied",
+        note: JSON.stringify({ actor: "admin", customerKey: rec.key, licenseId: lic.id, stage, revoked, reusable: true, expiresAtMs, issue }),
+      });
+      audit("prepared");
+      const result = await sendEmail(cfg.email, reissuedInstallEmail(rec.email, { name: rec.name, installUrl: `${this.origin}/install/${raw}`, expiresAtMs, issue }), this.fetchLike);
+      if (!result.ok) {
+        this.store.revokeInstall(raw, this.now());
+        audit("failed");
+        // Provider bodies can reflect the submitted message. Never return or
+        // log that body, which contains the private opaque link.
+        return { ok: false, status: 502, error: "install email delivery failed; the newly issued link was revoked" };
+      }
+      audit("sent");
+      return { ok: true, sentTo: rec.email, expiresAtMs, revoked };
+    } catch {
+      if (raw) this.store.revokeInstall(raw, this.now());
+      return { ok: false, status: 500, error: "install reissue failed; review the billing audit before retrying" };
+    } finally { this.installReissues.delete(customerKey); }
   }
 
   async sendTestEmail(to: string): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -1484,12 +1842,14 @@ export class BillingService {
     const t = this.store.lookupPage(rawPageToken);
     if (!t) return { ok: false, status: 404, text: "This link is not valid any more. If you were sent a newer email, use that one; otherwise contact support." };
     const rec = this.store.getCustomer(t.customerKey) ?? this.store.findByLicense(t.licenseId);
+    if(rec && recoveryRecords(this.dataDir).some(r=>r.customerKey===rec.key && ["prepared","issued","retiring","retired"].includes(r.phase)))return {ok:false,status:409,text:"Server recovery is pending; contact support."};
     if (rec) {
       this.ensureLifetimeAccess(rec, this.licenses.get(rec.licenseId));
       this.refreshLifetimeLicense(rec.licenseId);
     }
     const lic = this.licenses.list().find((l) => l.id === t.licenseId);
     if (!rec || !lic) return { ok: false, status: 404, text: "This licence is no longer on file. Please contact support." };
+    if (this.installReissues.has(rec.key)) return { ok: false, status: 409, text: "An install command is being emailed. Wait for delivery before requesting another command." };
     const now = this.now();
     const cfg = this.config();
     const expired = lic.exp <= now;
@@ -1528,6 +1888,7 @@ export class BillingService {
       portalAction: `${this.origin}/welcome/${rawPageToken}/portal`,
       siteOrigin: cfg.siteOrigin,
       supportEmail,
+      recoverySupportUrl: `${this.origin}/support#message=${encodeURIComponent(`I reset or replaced my server and lost its installation key. Email: ${rec.email}. Account: ${rec.key}`)}`,
     };
     const starterPack = starterPackEligible(rec) && !lic.revoked ? loadStarterPack(this.templatesDir) : null;
     if (starterPack) {
@@ -1560,6 +1921,13 @@ export class BillingService {
         revoked: "this install command is no longer valid — reload your install page for a fresh one",
       }[r.reason];
       return { ok: false, status: 403, text };
+    }
+    if(this.recoveryPending(r.rec.customerKey))return {ok:false,status:409,text:"Server recovery needs completion before installation; contact support"};
+    if (r.rec.reusable === true) {
+      const customer = this.store.getCustomer(r.rec.customerKey);
+      if (!customer || !customer.livemode || customer.refunded || customer.disputed || customer.licenseId !== r.rec.licenseId) {
+        return { ok: false, status: 403, text: "this customer install command is no longer authorized — contact support" };
+      }
     }
     const lic = this.licenses.get(r.rec.licenseId);
     if (!lic) return { ok: false, status: 403, text: "this licence has been revoked — contact support" };
@@ -1731,6 +2099,7 @@ export class BillingService {
    * revoked licenses. Check-in already proves token possession and the seat. */
   refreshLifetimeLicense(licenseId: string): void {
     const rec = this.store.findByLicense(licenseId), current = this.licenses.get(licenseId);
+    if(rec && this.recoveryPending(rec.key))return;
     if (!rec || !current || !this.ensureLifetimeAccess(rec, current) || !rec.livemode || rec.refunded || rec.disputed) return;
     if (current.exp - this.now() > 365 * DAY_MS) return;
     this.licenses.renewLifetimeToken(licenseId, this.now());
@@ -1747,6 +2116,7 @@ export class BillingService {
         const seen = roster[c.licenseId];
         return {
           customerId: c.key,
+          installRecovery: this.installRecovery(c.key),
           stripeCustomerId: c.stripeCustomerId,
           email: c.email,
           name: c.name,
@@ -1785,3 +2155,5 @@ export function renderTemplate(template: string, vars: Record<string, string>, f
   const withBlocks = template.replace(/\{\{#if ([A-Za-z0-9_]+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (_m, flag: string, body: string) => (flags[flag] ? body : ""));
   return withBlocks.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_m, name: string) => escapeHtml(vars[name] ?? ""));
 }
+
+function normalizeInstallEmail(value: string): string { return value.trim().toLowerCase(); }

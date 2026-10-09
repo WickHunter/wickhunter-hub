@@ -33,6 +33,7 @@ export interface ProvisionInput {
   siteOrigin: string;
   productName: string;
   plans: Plan[];
+  skipPaymentLinkKeys?: string[];
 }
 
 export interface ProvisionPlanResult {
@@ -148,7 +149,7 @@ export async function provisionPlans(input: ProvisionInput, fetchLike: EmailFetc
     // Hosted bundles must pass through the Hub's cost reservation before
     // checkout. A shareable Payment Link would bypass that admission gate.
     if (plan.checkout === "hosted-bundle") {
-      for (const old of links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key)) {
+      for (const old of links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key && asStr(asObj(l.metadata).managed_by) === MANAGED_BY)) {
         await post(`/payment_links/${asStr(old.id)}`, { active: false });
         notes.push(`deactivated link ${asStr(old.id)}`);
       }
@@ -156,8 +157,13 @@ export async function provisionPlans(input: ProvisionInput, fetchLike: EmailFetc
       continue;
     }
 
+    if (input.skipPaymentLinkKeys?.includes(plan.key)) {
+      results.push({ key: plan.key, priceId, priceCreated, paymentLinkUrl: "", linkCreated: false, note: "Use the Hub reserved checkout while the launch is enabled; external links remain retired" });
+      continue;
+    }
+
     // ── payment link ─────────────────────────────────────────────────────
-    const mine = links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key);
+    const mine = links.filter((l) => asStr(asObj(l.metadata).plan) === plan.key && asStr(asObj(l.metadata).managed_by) === MANAGED_BY);
     let link = mine.find((l) => asStr(asObj(l.metadata).price) === priceId) ?? null;
     let linkCreated = false;
     if (!link) {
@@ -174,11 +180,16 @@ export async function provisionPlans(input: ProvisionInput, fetchLike: EmailFetc
         "metadata[managed_by]": MANAGED_BY,
         ...(plan.interval ? { "subscription_data[metadata][plan]": plan.key } : { "metadata[license_days]": String(plan.licenseDays ?? ""), customer_creation: "always" }),
         billing_address_collection: "required",
+        ...(plan.role === "software" ? { allow_promotion_codes: true } : {}),
         ...(redirect
           ? { "after_completion[type]": "redirect", "after_completion[redirect][url]": redirect }
           : { "after_completion[type]": "hosted_confirmation" }),
       });
       linkCreated = true;
+    }
+    if (plan.role === "software" && link.allow_promotion_codes !== true && !linkCreated) {
+      await post(`/payment_links/${asStr(link.id)}`, { allow_promotion_codes: true });
+      notes.push("enabled software promotion code entry");
     }
     const url = asStr(link.url);
     if (!url.startsWith("https://")) throw new StripeApiError(502, `Stripe returned no URL for the ${plan.key} Payment Link`);

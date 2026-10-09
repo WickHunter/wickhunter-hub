@@ -6,6 +6,7 @@ import { EarnStripeApi, type StripeObject } from '../earn-stripe-api.js';
 import type { LicenseStore } from '../license.js';
 import type { BillingService } from './service.js';
 import { paymentLinkFor, type BillingMode, type Plan } from './config.js';
+import type { HostedPriceProof } from './hosted-offer.js';
 
 export const LAUNCH_FIRST_PAYMENT_MS = Date.parse('2026-10-15T00:00:00-04:00');
 export const LAUNCH_REDEEM_UNTIL_MS = Date.parse('2026-10-16T00:00:00-04:00');
@@ -30,9 +31,32 @@ export interface LaunchIntent {
   firstPaymentAtMs: number | null;
   accessUntilMs: number | null;
   discountPercent: number;
+  hostingRequested?: boolean;
+  hosting?: HostedPriceProof & { reservationId: string; expiresAtMs: number };
   stripeParams: StripeObject;
   sessionId?: string;
   url?: string;
+  expiredAtMs?: number;
+  reservationReleasedAtMs?: number;
+}
+
+export class HostedCheckoutExpiryError extends Error {
+  readonly status: 409 | 410;
+  readonly code: 'HOSTED_CHECKOUT_EXPIRY_PENDING' | 'HOSTED_CHECKOUT_EXPIRED';
+  constructor(confirmed: boolean) {
+    super(confirmed ? 'This VPS checkout has expired. Start a new checkout when you are ready.'
+      : 'VPS checkout expiry is awaiting confirmation. Keep this attempt and try again later.');
+    this.status = confirmed ? 410 : 409;
+    this.code = confirmed ? 'HOSTED_CHECKOUT_EXPIRED' : 'HOSTED_CHECKOUT_EXPIRY_PENDING';
+  }
+}
+
+function assertHostedCheckoutRetryable(intent: LaunchIntent | null, now: number): void {
+  if (!intent?.hosting) return;
+  // Older expiry flags were written before reservation release. Rotation
+  // requires the new durable proof written only after exact release succeeds.
+  if (intent.expiredAtMs !== undefined && intent.reservationReleasedAtMs !== undefined) throw new HostedCheckoutExpiryError(true);
+  if (intent.expiredAtMs !== undefined || now >= intent.hosting.expiresAtMs) throw new HostedCheckoutExpiryError(false);
 }
 const blankMode = (): LaunchMode => ({ enabled: false, cryptoEnabled: false, cryptoCapable: false, promotionId: '', prices: {} });
 const configPath = (dir: string) => path.join(dir, 'billing-launch.v1.json');
@@ -71,11 +95,14 @@ export async function reconcileLaunchSession(dir: string, metadata: Record<strin
   } else {
     recovered = await api.call('GET', `/v1/checkout/sessions/${sessionId}`);
     if (recovered.client_reference_id !== intent.id) throw Error('Launch checkout lacks its durable Stripe reference');
-    const lines = await api.call('GET', `/v1/checkout/sessions/${sessionId}/line_items`, { limit: 2 });
+    const lines = await api.call('GET', `/v1/checkout/sessions/${sessionId}/line_items`, { limit: intent.hosting ? 3 : 2 });
     const price = intent.stripeParams['line_items[0][price]'];
     const dynamic = intent.stripeParams['line_items[0][price_data][product]'];
     const line = lines.data?.[0];
-    if (lines.has_more || lines.data?.length !== 1 || line?.quantity !== 1 ||
+    if (intent.hosting) {
+      const expected = new Set([intent.hosting.softwarePriceId, intent.hosting.hostingPriceId]);
+      if (lines.has_more || lines.data?.length !== 2 || lines.data.some((l: StripeObject) => l.quantity !== 1 || !expected.delete(l.price?.id)) || expected.size) throw Error('Hosted checkout line items differ from the persisted purchase');
+    } else if (lines.has_more || lines.data?.length !== 1 || line?.quantity !== 1 ||
       (price ? line.price?.id !== price : line.price?.product !== dynamic || line.price?.unit_amount !== intent.stripeParams['line_items[0][price_data][unit_amount]'])) {
       throw Error('Launch checkout line items differ from the persisted purchase');
     }
@@ -94,7 +121,45 @@ export class LaunchBilling {
   private flights = new Map<string, { requestHash: string; promise: Promise<{ ok: true; url: string }> }>();
   constructor(private dataDir: string, private billing: BillingService, private licenses: LicenseStore,
     private origin: string, private fetcher: typeof fetch = fetch, private now: () => number = Date.now,
-    private resolveReferral?: (code: string, mode: BillingMode) => { code: string; promotionId: string; discountPercent: number }) {}
+    private resolveReferral?: (code: string, mode: BillingMode) => { code: string; promotionId: string; discountPercent: number },
+    private hosted?: { ready: () => boolean; prepare: (plan: string, id: string, customerId?: string) => Promise<NonNullable<LaunchIntent['hosting']>>; bind: (hosting: NonNullable<LaunchIntent['hosting']>, params: StripeObject) => void; release?: (hosting: NonNullable<LaunchIntent['hosting']>, id: string) => boolean }) {}
+
+  /** Read-only Stripe verification followed by release of the exact unused
+   * local reservation. A completed/paid/customer subscription never qualifies. */
+  async expireSession(sessionId: string): Promise<{ released: boolean }> {
+    if (!/^cs_[A-Za-z0-9_]+$/.test(sessionId)) throw Error('Invalid checkout session identity');
+    const c = this.billing.config(), mode = c.mode;
+    const api = new EarnStripeApi(c.stripe[mode].secretKey, this.fetcher);
+    const remote = await api.call('GET', '/v1/checkout/sessions/' + sessionId);
+    if (remote.id !== sessionId || remote.livemode !== (mode === 'live') || remote.status !== 'expired' || remote.payment_status !== 'unpaid' || remote.subscription || remote.payment_intent) throw Error('Only an expired unpaid checkout without a subscription can release a reservation');
+    const intent = launchGrant(this.dataDir, remote.metadata ?? {}, mode === 'live');
+    if (!intent?.hosting || remote.metadata?.bundle !== 'software-hosting-v2' || remote.metadata?.reservation !== intent.hosting.reservationId || remote.client_reference_id !== intent.id || remote.mode !== intent.stripeParams.mode || intent.sessionId && intent.sessionId !== sessionId) throw Error('Expired checkout does not match its durable hosted intent');
+    const lines = await api.call('GET', '/v1/checkout/sessions/' + sessionId + '/line_items', { limit: 3 });
+    const expected = new Set([intent.hosting.softwarePriceId, intent.hosting.hostingPriceId]);
+    if (lines.has_more || lines.data?.length !== 2 || lines.data.some((l: StripeObject) => l.quantity !== 1 || !expected.delete(l.price?.id)) || expected.size) throw Error('Expired checkout prices differ from its durable proof');
+    if (this.billing.config().mode !== mode) throw Error('Billing mode changed during expiry reconciliation');
+    if (!this.hosted?.release?.(intent.hosting, intent.id)) throw Error('Expired reservation has changed; review required');
+    // Release is idempotent for the exact already-deleted reservation. A crash
+    // before this seal leaves rotation blocked until canonical reconciliation
+    // proves the Session again and confirms that release completed.
+    intent.sessionId = sessionId; intent.expiredAtMs ??= this.now(); intent.reservationReleasedAtMs ??= this.now();
+    writeJsonAtomic(intentPath(this.dataDir, intent.id), intent);
+    if (intent.licenseId) {
+      const claim = claimPath(this.dataDir, mode, intent.licenseId), current = readJson<{id:string}|null>(claim, null);
+      if (current?.id === intent.id) fs.rmSync(claim);
+    }
+    return { released: true };
+  }
+
+  private async confirmHistoricalExpiry(intent: LaunchIntent | null): Promise<LaunchIntent | null> {
+    if (!intent?.hosting || intent.expiredAtMs === undefined || intent.reservationReleasedAtMs !== undefined || !intent.sessionId) return intent;
+    // Existing v83 flags may precede a failed release. Only the owned stable
+    // attempt/claim reaches this path; reprove Stripe and release, never create.
+    try { await this.expireSession(intent.sessionId); }
+    catch { throw new HostedCheckoutExpiryError(false); }
+    return readJson<LaunchIntent | null>(intentPath(this.dataDir, intent.id), null);
+  }
+
 
   private allModes(): Record<BillingMode, LaunchMode> {
     return readJson(configPath(this.dataDir), { test: blankMode(), live: blankMode() });
@@ -120,13 +185,14 @@ export class LaunchBilling {
     const mode = this.modeConfig();
     return { active: mode.enabled && this.now() < LAUNCH_REDEEM_UNTIL_MS,
       firstPaymentAtMs: LAUNCH_FIRST_PAYMENT_MS,
-      redeemUntilMs: LAUNCH_REDEEM_UNTIL_MS, cryptoEnabled: mode.enabled && mode.cryptoEnabled };
+      redeemUntilMs: LAUNCH_REDEEM_UNTIL_MS, cryptoEnabled: mode.enabled && mode.cryptoEnabled,
+      hostingCheckoutEnabled: this.hosted?.ready() === true };
   }
   publicPlans(): Record<string, unknown> {
     const result = this.billing.publicPlans(), mode = this.modeConfig();
     return { ...result, launch: this.offer(), plans: (result.plans as Record<string, unknown>[]).map(plan => {
       const base = BASE_PLANS.includes(String(plan.key));
-      return { ...plan, cryptoAvailable: base && plan.key !== 'monthly' && mode.enabled && mode.cryptoEnabled };
+      return { ...plan, available: plan.available === true || base && !!this.billing.config().stripe[this.billing.config().mode].priceIds[String(plan.key)], cryptoAvailable: base && plan.key !== 'monthly' && mode.enabled && mode.cryptoEnabled };
     }) };
   }
   setEnabled(enabled: boolean, cryptoEnabled: boolean): void {
@@ -169,42 +235,65 @@ export class LaunchBilling {
       }
       const product = typeof price.product === 'string' ? price.product : price.product?.id;
       if (!/^prod_[A-Za-z0-9]+$/.test(product)) throw Error('Invalid software product');
-      if (cfg.roles[mode].hosting.productIds.includes(product)) throw Error('Software and hosting must use separate Stripe products');
+      // Legacy hosting prices shared this software product. Preserve their
+      // classification; HostedOffer proves NEW VPS products are disjoint.
       prices[key] = { id: price.id, product, amount: price.unit_amount, currency: price.currency, interval: plan.interval };
     }
     const products = [...new Set(Object.values(prices).map(p => p.product))].sort();
     const account = await api.call('GET', '/v1/account');
     const cryptoEnabled = account.capabilities?.crypto_payments === 'active';
-    this.saveMode(mode, { ...old, prices, cryptoCapable: cryptoEnabled, cryptoEnabled: old.cryptoEnabled && cryptoEnabled });
+    const fresh = this.billing.config();
+    if (JSON.stringify([fresh.mode,fresh.plans,fresh.stripe[mode].priceIds,fresh.stripe[mode].secretKey]) !== JSON.stringify([cfg.mode,cfg.plans,cfg.stripe[mode].priceIds,cfg.stripe[mode].secretKey])) throw Error('Billing configuration changed during preparation; prepare again');
+    const currentOffer = this.modeConfig(mode);
+    this.saveMode(mode, { ...currentOffer, prices, cryptoCapable: cryptoEnabled, cryptoEnabled: currentOffer.cryptoEnabled && cryptoEnabled });
     this.billing.updateConfig({ stripe: { [mode]: { priceIds: { ...cfg.stripe[mode].priceIds, ...Object.fromEntries(Object.entries(prices).map(([k,p]) => [k,p.id])) } } },
-      roles: { [mode]: { software: { priceIds: [...new Set([...cfg.roles[mode].software.priceIds, ...Object.values(prices).map(p => p.id)])],
-        productIds: [...new Set([...cfg.roles[mode].software.productIds, ...products])] } } } });
+      roles: { [mode]: { software: { priceIds: [...new Set([...fresh.roles[mode].software.priceIds, ...Object.values(prices).map(p => p.id)])],
+        productIds: [...new Set([...fresh.roles[mode].software.productIds, ...products.filter(product => !fresh.roles[mode].hosting.productIds.includes(product))])] } } } });
     return this.status();
   }
 
-  checkout(input: { plan?: unknown; payment?: unknown; attemptId?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown }): Promise<{ ok: true; url: string }> {
+  checkout(input: { plan?: unknown; payment?: unknown; attemptId?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown; hosting?: unknown }): Promise<{ ok: true; url: string }> {
     if (typeof input.attemptId !== 'string' || !/^[a-f0-9-]{36}$/i.test(input.attemptId)) return Promise.reject(Error('A checkout attempt ID is required'));
+    if (input.hosting !== undefined && typeof input.hosting !== 'boolean') return Promise.reject(Error('Invalid hosting choice'));
     const mode = this.billing.config().mode, id = sha(`${mode}:${input.attemptId}`);
     // Requests sharing a network retry identity must also share all inputs.
-    const requestHash = sha(JSON.stringify([input.plan, input.payment, input.licenseId ?? null, input.token ? sha(String(input.token)) : null, input.referral ?? null]));
+    const identity = [input.plan, input.payment, input.licenseId ?? null, input.token ? sha(String(input.token)) : null, input.referral ?? null];
+    const legacyRequestHash = sha(JSON.stringify(identity));
+    if (input.hosting === true) identity.push('hosting-v2');
     const prior = readJson<LaunchIntent | null>(intentPath(this.dataDir,id), null);
+    const requestHash = prior && prior.hostingRequested === undefined && prior.requestHash === legacyRequestHash ? legacyRequestHash : sha(JSON.stringify(identity));
     if (prior && prior.requestHash !== requestHash) return Promise.reject(Error('Checkout attempt already belongs to another request'));
     const flight = this.flights.get(id);
     if (flight) return flight.requestHash === requestHash ? flight.promise : Promise.reject(Error('Checkout attempt already belongs to another request'));
-    const run = this.createCheckout(input, id, requestHash).finally(() => this.flights.delete(id));
+    const run = this.createCheckout(input, id, requestHash, legacyRequestHash).finally(() => this.flights.delete(id));
     this.flights.set(id, { requestHash, promise: run }); return run;
   }
 
-  private async createCheckout(input: { plan?: unknown; payment?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown }, id: string, requestHash: string): Promise<{ ok: true; url: string }> {
+  private async createCheckout(input: { plan?: unknown; payment?: unknown; licenseId?: unknown; token?: unknown; referral?: unknown; hosting?: unknown }, id: string, requestHash: string, legacyRequestHash: string): Promise<{ ok: true; url: string }> {
     const cfg = this.billing.config(), mode = cfg.mode, launch = this.modeConfig(mode), now = this.now();
-    if (!launch.enabled) throw Error('Launch checkout is not enabled yet');
+    let intent = readJson<LaunchIntent | null>(intentPath(this.dataDir, id), null);
+    const withHosting = intent ? !!intent.hosting : input.hosting === true;
+
     const plan = cfg.plans.find(p => p.key === input.plan && BASE_PLANS.includes(p.key) && p.role === 'software') as Plan | undefined;
     if (!plan || (input.payment !== 'card' && input.payment !== 'crypto')) throw Error('Choose a software plan and payment method');
     const crypto = input.payment === 'crypto';
-    if (crypto && (plan.key === 'monthly' || !launch.cryptoEnabled)) throw Error('Crypto is available for Yearly and Lifetime only');
-    const price = launch.prices[plan.key];
-    if (!price || price.amount !== plan.amountCents || price.currency !== plan.currency) throw Error('Plan changed; prepare the checkout prices again');
-    let intent = readJson<LaunchIntent | null>(intentPath(this.dataDir, id), null);
+    if (withHosting && crypto) throw Error('Managed VPS plans require card checkout');
+    if (crypto && (plan.key === 'monthly' || !launch.enabled || !launch.cryptoEnabled)) throw Error('Crypto is available for Yearly and Lifetime only');
+    let price = launch.prices[plan.key];
+    if (!intent && !withHosting && !launch.enabled) {
+      const priceId = cfg.stripe[mode].priceIds[plan.key];
+      if (!priceId) throw Error('Software price is not configured');
+      const actual = await new EarnStripeApi(cfg.stripe[mode].secretKey, this.fetcher).call('GET', '/v1/prices/' + priceId);
+      if (actual.id !== priceId || actual.livemode !== (mode === 'live') || actual.type !== (plan.interval ? 'recurring' : 'one_time') || !/^prod_[A-Za-z0-9]+$/.test(typeof actual.product === 'string' ? actual.product : actual.product?.id) || actual.active !== true || actual.currency !== plan.currency || actual.unit_amount !== plan.amountCents || (actual.recurring?.interval ?? null) !== plan.interval || actual.recurring && actual.recurring.interval_count !== 1) throw Error('Software price differs from the approved catalogue');
+      price = { id: priceId, product: typeof actual.product === 'string' ? actual.product : actual.product?.id, amount: plan.amountCents, currency: plan.currency, interval: plan.interval };
+      if (this.billing.config().mode !== mode || this.billing.config().stripe[mode].priceIds[plan.key] !== priceId) throw Error('Billing prices changed during checkout verification');
+    }
+    if (!withHosting && (!price || price.amount !== plan.amountCents || price.currency !== plan.currency)) throw Error('Plan changed; prepare the checkout prices again');
+    let selectedReferral: { code: string; promotionId: string; discountPercent: number } | null = null;
+    if (!intent && input.referral) {
+      if (typeof input.referral !== 'string' || input.referral.length > 128 || !this.resolveReferral) throw Error('Invalid referral code');
+      selectedReferral = this.resolveReferral(input.referral, mode);
+    }
     let licenseId: string | null = null;
     if (input.licenseId || input.token) {
       const payload = this.licenses.decodeGenuine(typeof input.token === 'string' ? input.token : '');
@@ -214,17 +303,29 @@ export class LaunchBilling {
       if (customer && customer.livemode !== (mode === 'live')) throw Error('This license is already bound in another Stripe mode');
       if (!intent && customer?.subscriptionId && customer.subscriptionStatus !== 'canceled') throw Error('Use Manage subscription for your existing subscription');
       if (!intent && customer?.lifetimeAccess) throw Error('This license already has Lifetime access');
+      intent = await this.confirmHistoricalExpiry(intent);
+      assertHostedCheckoutRetryable(intent, now);
       const file = claimPath(this.dataDir, mode, licenseId);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       let claim = readJson<{ id: string; createdAtMs: number } | null>(file, null);
       if (claim && claim.id !== id) {
-        const old = readJson<LaunchIntent | null>(intentPath(this.dataDir, claim.id), null);
+        let old = readJson<LaunchIntent | null>(intentPath(this.dataDir, claim.id), null);
+        if (old?.id === claim.id && old.mode === mode && old.licenseId === licenseId) old = await this.confirmHistoricalExpiry(old);
         if (old?.sessionId && customer?.chargeIds.includes(`cs:${old.sessionId}`)) {
           fs.unlinkSync(file);
           claim = null;
-        } else if (old?.url && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
-          now - old.createdAtMs < 23 * 3600_000) return { ok: true, url: old.url };
-        else if (old?.sessionId && now - old.createdAtMs >= 24 * 3600_000) {
+        } else if (old?.hosting && old.expiredAtMs !== undefined && old.reservationReleasedAtMs !== undefined && old.id === claim.id && old.mode === mode && old.licenseId === licenseId) {
+          const current = readJson<{ id: string; createdAtMs: number } | null>(file, null);
+          if (current?.id === old.id) fs.rmSync(file);
+          claim = readJson<{ id: string; createdAtMs: number } | null>(file, null);
+        } else {
+          assertHostedCheckoutRetryable(old, now);
+          if (old?.url && (old.requestHash === requestHash || old.hostingRequested === undefined && old.requestHash === legacyRequestHash) && old.mode === mode && old.licenseId === licenseId && old.plan === plan.key && old.payment === input.payment &&
+            now - old.createdAtMs < 23 * 3600_000) return { ok: true, url: old.url };
+        }
+        // Software-only legacy expiry keeps its existing reconciliation. A
+        // hosted claim needs the stronger full expireSession proof above.
+        if (claim && old?.sessionId && !old.hosting && now - old.createdAtMs >= 24 * 3600_000) {
           const priorSession = await this.api(mode).call('GET', `/v1/checkout/sessions/${old.sessionId}`);
           if (priorSession.id === old.sessionId && priorSession.status === 'expired') {
             fs.unlinkSync(file);
@@ -239,27 +340,38 @@ export class LaunchBilling {
       }
       if (!claim || claim.id !== id) throw Error('A checkout is already pending for this license; continue that checkout or contact support');
     }
+    intent = await this.confirmHistoricalExpiry(intent);
+    assertHostedCheckoutRetryable(intent, now);
     if (intent?.url) {
+      if (intent.expiredAtMs) throw Error('This hosted checkout expired; start a new attempt');
       if (now - intent.createdAtMs >= 23 * 3600_000) throw Error('This checkout expired; start a new attempt');
       return { ok: true, url: intent.url };
     }
     if (intent && now - intent.createdAtMs >= 23 * 3600_000) throw Error('Checkout requires reconciliation before retrying');
     if (!intent) {
-      const subscription = !crypto && !!plan.interval;
-      const firstPayment = subscription && now < LAUNCH_FIRST_PAYMENT_MS ? LAUNCH_FIRST_PAYMENT_MS : null;
+      let hosting: LaunchIntent['hosting'];
+      if (withHosting) {
+        if (!this.hosted?.ready()) throw Error('Managed VPS checkout is not available yet');
+        const customer = licenseId ? this.billing.store.findByLicense(licenseId) : null;
+        hosting = await this.hosted.prepare(plan.key, id, customer?.stripeCustomerId);
+        price = { id: hosting.softwarePriceId, product: hosting.softwareProductId, amount: hosting.softwareAmountCents, currency: 'usd', interval: plan.interval };
+      }
+      const softwareSubscription = !crypto && !!plan.interval;
+      const subscription = withHosting || softwareSubscription;
+      const firstPayment = !withHosting && launch.enabled && softwareSubscription && now < LAUNCH_FIRST_PAYMENT_MS ? LAUNCH_FIRST_PAYMENT_MS : null;
       let discount = 0;
       let promotionId = '';
       let referral: { code: string; promotionId: string; discountPercent: number } | null = null;
-      if (input.referral) {
-        if (typeof input.referral !== 'string' || input.referral.length > 128 || !this.resolveReferral) throw Error('Invalid referral code');
-        referral = this.resolveReferral(input.referral, mode);
+      if (selectedReferral) {
+        referral = selectedReferral;
         // Referral coupons cover recurring software. An applied referral
         // occupies Stripe's single promotion slot for this checkout.
-        if (subscription) { discount = referral.discountPercent; promotionId = referral.promotionId; }
+        discount = referral.discountPercent; promotionId = referral.promotionId;
       }
       const metadata: Record<string,string> = { managed_by: 'wh-launch', plan: plan.key, wh_launch_intent: id,
-        ...(promotionId ? { launch_discount_percent: String(discount) } : {}), ...(referral && subscription ? { wh_earn_code: referral.code } : {}), ...(firstPayment ? { first_payment_at_ms: String(firstPayment) } : {}),
-        ...(!subscription ? { non_renewing: 'true', license_days: String(plan.key === 'yearly' ? 365 : plan.licenseDays) } : {}) };
+        ...(promotionId ? { launch_discount_percent: String(discount) } : {}), ...(referral && softwareSubscription ? { wh_earn_code: referral.code } : {}), ...(firstPayment ? { first_payment_at_ms: String(firstPayment) } : {}),
+        ...(hosting ? { bundle: 'software-hosting-v2', reservation: hosting.reservationId } : {}),
+        ...(!softwareSubscription ? { non_renewing: 'true', license_days: String(plan.key === 'yearly' ? 365 : plan.licenseDays) } : {}) };
       const params: StripeObject = { mode: subscription ? 'subscription' : 'payment',
         client_reference_id: id,
         success_url: `${this.origin}/customer?checkout=complete`, cancel_url: 'https://www.wickhunterunleashed.com/unleashed/#pricing',
@@ -274,6 +386,7 @@ export class LaunchBilling {
         params['line_items[0][price_data][unit_amount]'] = price.amount;
         params['line_items[0][price_data][currency]'] = price.currency;
       } else params['line_items[0][price]'] = price.id;
+      if (hosting) { params['line_items[1][price]'] = hosting.hostingPriceId; params['line_items[1][quantity]'] = 1; params.expires_at = hosting.expiresAtMs / 1000; }
       if (subscription) {
         params.payment_method_collection = 'always';
         if (firstPayment) { params['subscription_data[billing_cycle_anchor]'] = firstPayment / 1000; params['subscription_data[proration_behavior]'] = 'none'; }
@@ -285,11 +398,15 @@ export class LaunchBilling {
         if (subscription) params[`subscription_data[metadata][${key}]`] = value;
       }
       params['custom_text[submit][message]'] = subscription ? `${firstPayment ? 'Free until October 15, 2026 (Eastern Time). First charge then. ' : ''}${discount ? `${discount}% off the base subscription price on every renewal while this subscription remains active. ` : ''}Automatically renews ${plan.interval === 'year' ? 'yearly' : 'monthly'} until canceled. Cancel in Manage subscription.` : `One payment. No automatic renewal.${crypto && plan.key === 'yearly' && now < LAUNCH_FIRST_PAYMENT_MS ? ' Access through October 15, 2027.' : ''}`;
+      if (hosting) params['custom_text[submit][message]'] = plan.key === 'lifetime'
+        ? 'Lifetime software is one payment. VPS is charged today and renews at $20/month until canceled. Software promotion codes exclude VPS. VPS plans bill immediately due to VPS provider fees. Canceling VPS does not end paid Lifetime software access.'
+        : `Software and VPS bill today and renew together ${plan.interval === 'year' ? 'yearly' : 'monthly'} until canceled. VPS is ${plan.interval === 'year' ? '$240/year' : '$20/month'}; software promotion codes exclude VPS. VPS plans bill immediately due to VPS provider fees. Cancel in Manage subscription.`;
       intent = { id, mode, plan: plan.key, payment: input.payment as 'card'|'crypto', licenseId, requestHash, createdAtMs: now,
         firstPaymentAtMs: firstPayment, accessUntilMs: crypto && plan.key === 'yearly' && now < LAUNCH_FIRST_PAYMENT_MS ? LAUNCH_YEARLY_END_MS : null,
-        discountPercent: discount, stripeParams: params };
+        discountPercent: discount, hostingRequested: withHosting, ...(hosting ? { hosting } : {}), stripeParams: params };
       writeJsonAtomic(intentPath(this.dataDir,id), intent);
     }
+    if (intent.hosting) this.hosted!.bind(intent.hosting, intent.stripeParams);
     const session = await this.api(mode).call('POST', '/v1/checkout/sessions', intent.stripeParams, { key: `wh-launch-checkout-${id}` });
     let url: URL; try { url = new URL(session.url); } catch { throw Error('Stripe returned an invalid checkout URL'); }
     if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.username || url.password || !/^cs_/.test(session.id)) throw Error('Stripe returned an invalid checkout session');

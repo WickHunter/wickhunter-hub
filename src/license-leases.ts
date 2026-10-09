@@ -1540,6 +1540,34 @@ export class LicenseLeaseService {
       reason: boundedText("reason", reason, 500) }, state.lastHash);
   }
 
+  /** Recovery needs the last signed authority, even when later challenges have
+   * displaced it from the bounded admin display. Read one verified replay so
+   * the audit revision, active bindings and signed lease all share a snapshot.
+   * This is historical grace evidence, not a fresh lease or an expiry bypass.
+   */
+  deviceRecoverySnapshot(licenseId: string): {
+    readonly auditRevision: number;
+    readonly locked: boolean;
+    readonly active: { id: string; revision: number; cachedGraceUntilMs: number }[];
+  } {
+    const id = boundedText("licenseId", licenseId, 128);
+    const state = this.replay();
+    const keyring = this.keyStore.publicKeyring();
+    const active = [...state.activations.values()].filter(a => a.licenseId === id && a.status === "active").map(a => {
+      for (let i = state.events.length - 1; i >= 0; i--) {
+        const event = state.events[i]!;
+        if (!("lease" in event) || !("activation" in event)
+          || event.activation.licenseId !== id || event.activation.id !== a.id || event.activation.revision !== a.revision) continue;
+        const proof = verifyLicenseLease(event.lease.token, keyring);
+        if (!proof.ok || proof.payload.licenseId !== id || proof.payload.activationId !== a.id
+          || proof.payload.sequence !== a.lastSequence) throw new Error("Signed machine grace is invalid");
+        return { id: a.id, revision: a.revision, cachedGraceUntilMs: proof.payload.policy.cachedGraceUntilMs };
+      }
+      throw new Error("Signed machine grace is unavailable");
+    });
+    return { auditRevision: state.events.length, locked: state.adminRecoveryLocked.has(id), active };
+  }
+
   adminSnapshot(licenseId?: string): {
     readonly activeKeyId: string;
     readonly publicKeys: LeasePublicKeyring;

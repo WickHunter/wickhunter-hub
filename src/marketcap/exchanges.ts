@@ -171,6 +171,23 @@ export function parseWeexInstruments(exchangeInfo: unknown, apiTradingSymbols: u
   return { instruments, unparsed };
 }
 
+/** Binance USD-M identity comes from its own base/quote/margin fields.
+ * Never infer an asset by removing the USDT suffix or a numeric multiplier. */
+export function parseBinanceInstruments(body: unknown): { instruments: ExchangeInstrument[]; unparsed: number } {
+  const instruments: ExchangeInstrument[] = [];
+  let unparsed = 0;
+  for (const raw of asArray((body as { symbols?: unknown[] })?.symbols)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) { unparsed++; continue; }
+    const r = raw as Record<string, unknown>;
+    const symbol = str(r.symbol), base = str(r.baseAsset), quote = str(r.quoteAsset);
+    const settle = str(r.marginAsset), status = str(r.status), contractType = str(r.contractType);
+    if (!symbol || !base || !quote || !settle || !status || !contractType) { unparsed++; continue; }
+    if (quote !== "USDT" || settle !== "USDT" || contractType !== "PERPETUAL") continue;
+    instruments.push({ venue: "binance", symbol, base, quote, settle, status, contractType, active: status === "TRADING" });
+  }
+  return { instruments, unparsed };
+}
+
 async function getJson(fetchLike: FetchLike, url: string): Promise<unknown> {
   const res = await fetchLike(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -181,6 +198,10 @@ const BYBIT_MAX_PAGES = 20;
 
 export async function fetchInstruments(venue: MarketCapVenueId, fetchLike: FetchLike): Promise<InstrumentCatalogue> {
   switch (venue) {
+    case "binance": {
+      const r = parseBinanceInstruments(await getJson(fetchLike, "https://fapi.binance.com/fapi/v1/exchangeInfo"));
+      return { venue, ...r };
+    }
     case "bybit": {
       const instruments: ExchangeInstrument[] = [];
       let unparsed = 0;

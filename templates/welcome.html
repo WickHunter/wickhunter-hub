@@ -90,14 +90,14 @@
   {{#if canInstall}}
   <div class="card">
     <h2>1. Get a fresh Ubuntu 22.04+ server</h2>
-    <p class="fine" style="margin:0">Any VPS with 1 GB RAM and root access (Vultr, Hetzner, DigitalOcean, …). <b>One server per licence:</b> a second server using the same licence is put into exit-only mode. Moving? Stop or destroy the old server first; the new one takes over about 30 minutes after the old one goes quiet.</p>
+    <p class="fine" style="margin:0">Any VPS with 1 GB RAM and root access (Vultr, Hetzner, DigitalOcean, …). <b>One server per licence:</b> a second server using the same licence is put into exit-only mode. Moving or resetting a server? Stop the old server and <a href="{{recoverySupportUrl}}">request account recovery</a> before trading on another installation. A new command does not transfer a lost installation key.</p>
   </div>
   <div class="card">
     <h2>2. Run this one command on it</h2>
     <p class="fine" style="margin:0 0 8px"><a href="https://www.youtube.com/watch?v=uaG8oZXLl_I" target="_blank" rel="noopener">▶ Watch the setup video</a> — it starts from the welcome email and ends at your first login.</p>
     <div class="cmd" id="cmd">{{installCommand}}<button class="copy" type="button" data-copy="cmd">Copy</button></div>
     <p class="fine">Installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address and asks you to choose a login password. About three minutes.</p>
-    <p class="fine">This command works <b>once</b> and expires in 24 hours. Reload this page for a fresh one — for example to reinstall on a new server.</p>
+    <p class="fine">This command works <b>once</b> and expires in 24 hours. Reload this page for a fresh command on the same installation. For a reset or replacement server with a lost key, <a href="{{recoverySupportUrl}}">contact support for recovery</a>.</p>
   </div>
   <div class="card">
     <h2>3. Open the dashboard</h2>

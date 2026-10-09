@@ -113,6 +113,7 @@ await test("stale pending marker after state-first crash restores prior state wi
   const prior = stateAt();
   const priorPointer = Buffer.from('{"release":"old"}\n');
   fs.writeFileSync(pointer, priorPointer, { mode: 0o644 });
+  fs.chmodSync(pointer, 0o644); // The declared snapshot mode is explicit even under a private umask.
   writeReleaseControlState(stateFile, prior);
   const priorStateBytes = fs.readFileSync(stateFile);
   const targetState = { ...prior, production: { buildId: "same-build", file: "same.tar.gz",
@@ -150,6 +151,7 @@ await test("pending marker with a signed target pointer and matching state recov
     sig: edSign(null, releaseSigningBytes(unsigned), pair.privateKey).toString("base64url") }] };
   const targetPointer = Buffer.from(JSON.stringify(targetManifest));
   fs.writeFileSync(pointer, targetPointer, { mode: 0o644 });
+  fs.chmodSync(pointer, 0o644); // Establish the exact signed target snapshot mode.
   fs.writeFileSync(path.join(dir, targetManifest.file), artifact);
 
   const prior = stateAt();

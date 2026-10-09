@@ -81,6 +81,9 @@ await test("buildLiqSizePercentiles is byte-identical to the bot's own copy", as
   // stopped generating rows cannot pass this suite vacuously.
   assert.equal(hubTable.windowDays, LIQ_PCTL_WINDOW_DAYS);
   assert.deepEqual(hubTable.stops, [...LIQ_PCTL_STOPS]);
+  assert.deepEqual(hubTable.extendedStops, Array.from({ length: 101 }, (_, i) => i));
+  assert.equal(hubTable.rows["bybit-usdt"]?.BTCUSDT?.long?.extendedUsd?.[10],
+    botTable.rows["bybit-usdt"]?.BTCUSDT?.long?.extendedUsd?.[10], "the 10th percentile is carried separately from the Screener's legacy stops");
   const pairSides = countLiqPercentilePairSides(hubTable);
   assert.ok(pairSides >= 5 * 4 * 2 - 2, `expected close to every (src,symbol,side) populated, got ${pairSides}`);
   // v0.4.23 — the greater of the window and the print floor: at least one
@@ -141,6 +144,7 @@ await test("liqPercentileTableLooksValid refuses a malformed shape", () => {
   assert.equal(liqPercentileTableLooksValid(null), false);
   assert.equal(liqPercentileTableLooksValid({}), false);
   assert.equal(liqPercentileTableLooksValid({ windowDays: 30, generatedAtMs: 1, stops: [50], rows: {} }), true);
+  assert.equal(liqPercentileTableLooksValid({ windowDays: 30, generatedAtMs: 1, stops: [50], extendedStops: [0, 20, 99, 100], rows: {} }), false, "partial tail stop lists are not silently treated as endpoints");
   assert.equal(liqPercentileTableLooksValid({ windowDays: "30", generatedAtMs: 1, stops: [50], rows: {} }), false);
   assert.equal(liqPercentileTableLooksValid({ windowDays: 30, generatedAtMs: 1, stops: "nope", rows: {} }), false);
   assert.equal(liqPercentileTableLooksValid({ windowDays: 30, generatedAtMs: 1, stops: [50] }), false, "rows is required");

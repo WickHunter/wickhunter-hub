@@ -23,6 +23,7 @@ import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, readJson, writeJsonAtomic } from "../jsonfile.js";
+import { committedRecoveryLicenses } from "./install-recovery.js";
 import type { BillingRole } from "./roles.js";
 
 export const CUSTOMERS_FILE = "billing-customers.v1.json";
@@ -72,6 +73,8 @@ export interface CustomerRecord {
   disputed: boolean;
   refunded: boolean;
   lastEventType: string | null;
+  /** Durable identity for recovering an interrupted exact-event application. */
+  lastEventId?: string;
   lastEventAtMs: number | null;
   firstPaymentAtMs?: number | null;
   firstActualPaymentAtMs?: number | null;
@@ -95,6 +98,8 @@ export interface TokenRecord {
   expiresAtMs: number | null;
   usedAtMs: number | null;
   revokedAtMs: number | null;
+  /** Explicit support reissue only. Historical/missing flags remain single-use. */
+  reusable?: true;
 }
 
 // "unclassified" is its OWN outcome, distinct from "ignored": an ignored
@@ -137,6 +142,8 @@ export interface RoleSubscriptionRecord {
   createdAtMs: number;
   updatedAtMs: number;
   lastEventType: string | null;
+  /** Durable identity for recovering an interrupted exact-event application. */
+  lastEventId?: string;
   lastEventAtMs: number | null;
 }
 
@@ -146,6 +153,10 @@ export interface BundleSubscriptionRecord {
   customerId: string;
   planKey: string;
   priceId: string;
+  /** v2 mixed checkout identity; absent on historical one-price bundles. */
+  launchIntentId?: string;
+  /** Exact admitted initial invoice, retained until both role writes and hooks finish. */
+  initialPaidPending?: { eventSha256: string; checkoutWatermarkMs: number };
   latestEventCreatedMs: number;
   pendingStatus: "past_due" | null;
   terminal: boolean;
@@ -179,6 +190,7 @@ export interface CheckoutSessionRecord {
   paymentIntentId?: string;
   launchIntentId?: string;
   paidAtMs?: number;
+  softwarePaid?: boolean;
   /** Verified first-purchase qualification, persisted before issuing a license. */
   starterPackGrantAtMs?: number;
 }
@@ -242,6 +254,7 @@ export class BillingStore {
       (rec.subscriptionId !== undefined && typeof rec.subscriptionId !== "string") ||
       (rec.paymentIntentId !== undefined && typeof rec.paymentIntentId !== "string") ||
       (rec.launchIntentId !== undefined && !/^[a-f0-9]{64}$/.test(rec.launchIntentId)) ||
+      (rec.softwarePaid !== undefined && typeof rec.softwarePaid !== "boolean") ||
       (rec.paidAtMs !== undefined && (!Number.isSafeInteger(rec.paidAtMs) || rec.paidAtMs <= 0)) ||
       (rec.starterPackGrantAtMs !== undefined && (!Number.isSafeInteger(rec.starterPackGrantAtMs) || rec.starterPackGrantAtMs <= 0 || !rec.newCustomer || !rec.launchIntentId)) ||
       (rec.status === "applied" && !rec.licenseId)
@@ -292,6 +305,7 @@ export class BillingStore {
       paymentIntentId: input.paymentIntentId,
       launchIntentId: input.launchIntentId,
       paidAtMs: input.paidAtMs,
+      softwarePaid: input.softwarePaid,
       starterPackGrantAtMs: input.starterPackGrantAtMs,
     };
     writeJsonAtomic(this.checkoutSessionPath(input.sessionId), record);
@@ -378,8 +392,13 @@ export class BillingStore {
   }
 
   findByLicense(licenseId: string): CustomerRecord | null {
-    for (const rec of Object.values(this.customers())) if (rec.licenseId === licenseId) return rec;
+    for (const rec of Object.values(this.customers())) if (rec.licenseId === licenseId || this.historicalLicenseIds(rec).includes(licenseId)) return rec;
     return null;
+  }
+
+  historicalLicenseIds(rec: CustomerRecord): string[] { return committedRecoveryLicenses(this.dataDir, rec); }
+  customerLicenseMatches(rec: CustomerRecord, id: string | null | undefined): boolean {
+    return !!id && (rec.licenseId === id || this.historicalLicenseIds(rec).includes(id));
   }
 
   findByCharge(id: string): CustomerRecord | null {
@@ -554,8 +573,49 @@ export class BillingStore {
     return bare(readJson<Record<string, TokenRecord>>(this.tokensFile, {}));
   }
 
+  /** Rotation never treats an unreadable token file as an empty registry. */
+  private regenerationTokens(): Record<string, TokenRecord> {
+    let all: unknown;
+    try { all = JSON.parse(fs.readFileSync(this.tokensFile, "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return {}; throw new Error("Install token registry needs support review"); }
+    if (!all || typeof all !== "object" || Array.isArray(all)) throw new Error("Install token registry needs support review");
+    for (const [hash, value] of Object.entries(all)) {
+      const t = value as TokenRecord;
+      if (!/^[a-f0-9]{64}$/.test(hash) || !t || typeof t !== "object" || !(t.kind === "install" || t.kind === "page")
+        || typeof t.licenseId !== "string" || typeof t.customerKey !== "string" || !Number.isFinite(t.createdAtMs)
+        || ![t.expiresAtMs, t.usedAtMs, t.revokedAtMs].every(v => v === null || (typeof v === "number" && Number.isFinite(v))))
+        throw new Error("Install token registry needs support review");
+    }
+    return all as Record<string, TokenRecord>;
+  }
+
+  /** Opaque compare-and-swap revision: only this customer's token state is covered.
+   * No raw token or individual token hash is disclosed. */
+  installRevision(customerKey: string): string {
+    const rows = Object.entries(this.regenerationTokens()).filter(([, t]) => t.customerKey === customerKey && t.kind === "install")
+      .sort(([a], [b]) => a.localeCompare(b));
+    return createHash("sha256").update(JSON.stringify({ licenseId: this.getCustomer(customerKey)?.licenseId ?? null, rows })).digest("hex");
+  }
+
+  /** Rotate one customer's install links in one atomic file replacement.
+   * Randomness/serialization failures leave the previous links untouched. */
+  rotateInstall(licenseId: string, customerKey: string, expectedRevision: string, now: number): { raw: string; revoked: number } {
+    if (expectedRevision !== this.installRevision(customerKey)) throw new Error("install command revision changed");
+    const raw = this.randomBytes(32).toString("base64url"), all = this.regenerationTokens(), hash = hashToken(raw);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(raw) || all[hash]) throw new Error("install token source did not provide a fresh token");
+    let revoked = 0;
+    for (const t of Object.values(all)) {
+      if (t.customerKey === customerKey && t.kind === "install" && t.revokedAtMs === null) { t.revokedAtMs = now; revoked++; }
+    }
+    all[hash] = { kind: "install", licenseId, customerKey, createdAtMs: now, expiresAtMs: now + INSTALL_TOKEN_TTL_MS,
+      usedAtMs: null, revokedAtMs: null, reusable: true };
+    writeJsonAtomic(this.tokensFile, all);
+    return { raw, revoked };
+  }
+
   /** Mint a token; returns the RAW value (shown once) and stores its hash. */
-  mint(kind: TokenKind, licenseId: string, customerKey: string, now = Date.now()): string {
+  mint(kind: TokenKind, licenseId: string, customerKey: string, now = Date.now(), options: { reusable?: true } = {}): string {
+    if (options.reusable && kind !== "install") throw new Error("only install tokens can be reusable");
     const raw = this.randomBytes(32).toString("base64url");
     const all = this.tokens();
     if (kind === "install") {
@@ -563,7 +623,7 @@ export class BillingStore {
       // one customer holds — a page reloaded in a loop must not grow the file.
       const open: string[] = [];
       for (const [h, t] of Object.entries(all)) {
-        const dead = t.revokedAtMs !== null || t.usedAtMs !== null || (t.expiresAtMs !== null && t.expiresAtMs <= now);
+        const dead = t.revokedAtMs !== null || (t.reusable !== true && t.usedAtMs !== null) || (t.expiresAtMs !== null && t.expiresAtMs <= now);
         if (dead && t.kind === "install" && (t.usedAtMs === null || now - t.usedAtMs > 30 * 86_400_000)) delete all[h];
         else if (t.kind === "install" && t.customerKey === customerKey && !dead) open.push(h);
       }
@@ -580,6 +640,7 @@ export class BillingStore {
       expiresAtMs: kind === "install" ? now + INSTALL_TOKEN_TTL_MS : null,
       usedAtMs: null,
       revokedAtMs: null,
+      ...(options.reusable ? { reusable: true as const } : {}),
     };
     writeJsonAtomic(this.tokensFile, all);
     return raw;
@@ -593,8 +654,9 @@ export class BillingStore {
     return t && t.kind === "page" && t.revokedAtMs === null ? t : null;
   }
 
-  /** Burn an install token. Exactly one caller ever gets `ok:true` for a
-   *  given token; the second sees `used`. */
+  /** Historical commands burn on first fetch. An explicitly reusable support
+   * command records first use and stays valid until its same 24h expiry or
+   * revocation; every fetch still checks the current licence in the service. */
   consumeInstall(raw: string, now = Date.now()): ConsumeResult {
     if (!/^[A-Za-z0-9_-]{20,128}$/.test(raw)) return { ok: false, reason: "unknown" };
     const all = this.tokens();
@@ -602,12 +664,22 @@ export class BillingStore {
     const t = all[h];
     if (!t || t.kind !== "install") return { ok: false, reason: "unknown" };
     if (t.revokedAtMs !== null) return { ok: false, reason: "revoked" };
-    if (t.usedAtMs !== null) return { ok: false, reason: "used" };
+    if (t.usedAtMs !== null && t.reusable !== true) return { ok: false, reason: "used" };
     if (t.expiresAtMs !== null && t.expiresAtMs <= now) return { ok: false, reason: "expired" };
-    const used: TokenRecord = { ...t, usedAtMs: now };
+    const used: TokenRecord = { ...t, usedAtMs: t.usedAtMs ?? now };
     all[h] = used;
     writeJsonAtomic(this.tokensFile, all);
     return { ok: true, rec: used };
+  }
+
+  /** Revoke a newly prepared command after an email failure, without racing
+   * another customer's or newer command's revocation. Never expose its hash. */
+  revokeInstall(raw: string, now = Date.now()): void {
+    const all = this.tokens();
+    const t = all[hashToken(raw)];
+    if (!t || t.kind !== "install" || t.revokedAtMs !== null) return;
+    t.revokedAtMs = now;
+    writeJsonAtomic(this.tokensFile, all);
   }
 
   /** Revoke every token of one kind for a customer (page rotation, or a

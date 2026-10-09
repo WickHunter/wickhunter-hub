@@ -170,6 +170,8 @@
       <span class="k">Connected accounts</span><span class="v-account-limit"></span>
       <span class="k">Next renewal</span><span class="v-renewal"></span>
     </div>
+    <p class="fine v-preparing-access-note" hidden role="status" style="margin:12px 0 0">Your VPS is being prepared. We'll email your IP address and temporary Unleashed password when it's ready.</p>
+    <p class="fine v-ready-access-note" hidden role="status" style="margin:12px 0 0">Check the email address used for this hosting purchase for your VPS IP address and temporary Unleashed password. Check spam or promotions if you do not see it. You will choose a new Unleashed password when you first sign in.</p>
     <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
     <p class="err v-delete-note" hidden style="margin:6px 0 0"></p>
     <p class="err v-fail-note" hidden style="margin:10px 0 0"></p>
@@ -198,11 +200,15 @@
     </div>
     <p class="err v-lapsed" hidden style="margin:10px 0 0">This licence has lapsed — the bot keeps closing and protecting positions but opens nothing new until it is renewed.</p>
     <div class="row" style="margin-top:14px">
-      <button class="btn v-install" type="button">Get install command</button>
+      <button class="btn v-install" type="button">Regenerate install command</button>
+      <a class="btn quiet v-recovery" href="support" target="_blank" rel="noopener">Recover a reset server</a>
       <button class="btn quiet v-portal" type="button">Manage billing</button>
     </div>
     <div class="cmd v-cmd" hidden></div>
-    <p class="fine v-cmd-note" hidden>This command works once and expires in 24 hours. Ask again for a fresh one — for example to reinstall on a new server.</p>
+    <button class="btn quiet v-replacement-key" type="button" hidden style="margin-top:10px">Show replacement licence key</button>
+    <p class="fine v-key-note" hidden>Already installed on your reset server? Save this key in Settings → License before using the install command. Do not reuse the old server.</p>
+    <div class="cmd v-key" hidden></div>
+    <p class="fine v-cmd-note" hidden>This command can be retried for 24 hours. Previous opaque install commands are invalidated. Your licence, subscription and machine binding stay unchanged. If a VPS reset lost its machine key, contact support before trading.</p>
     <p class="err v-install-err" hidden style="margin:10px 0 0"></p>
     <p class="err v-portal-err" hidden style="margin:10px 0 0"></p>
     <p class="fine">Manage billing opens Stripe's billing portal, which may list other subscriptions on this account too.</p>
@@ -218,6 +224,16 @@
     var body = null;
     try { body = await res.json(); } catch (e) {}
     return { status: res.status, ok: res.ok, body: body };
+  }
+
+  async function boundedApi(path, opts) {
+    var controller = new AbortController(), deadline;
+    try {
+      return await Promise.race([
+        api(path, Object.assign({}, opts, { signal: controller.signal })),
+        new Promise(function (_, reject) { deadline = setTimeout(function () { controller.abort(); reject(new Error("Request timed out")); }, 15000); })
+      ]);
+    } finally { clearTimeout(deadline); }
   }
 
   var loadingEl = document.getElementById("loading");
@@ -236,7 +252,29 @@
     return ["live", "Active"];
   }
 
-  function renderSoftware(list) {
+  function showCopyText(box, text, label) {
+    box.textContent = text;
+    var copy = document.createElement("button");
+    copy.className = "copy";
+    copy.type = "button";
+    copy.textContent = label;
+    copy.addEventListener("click", function () {
+      copy.disabled = true;
+      var timeout;
+      Promise.race([
+        Promise.resolve().then(function () { if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("Clipboard unavailable"); return navigator.clipboard.writeText(text); }),
+        new Promise(function (_, reject) { timeout = setTimeout(function () { reject(new Error("Clipboard timed out")); }, 2000); })
+      ]).then(function () { copy.textContent = "Copied"; }, function () {
+        copy.textContent = "Select and copy manually";
+        var range = document.createRange(); range.selectNodeContents(box.firstChild);
+        var selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      }).finally(function () { clearTimeout(timeout); copy.disabled = false; });
+    });
+    box.appendChild(copy);
+    box.hidden = false;
+  }
+
+  function renderSoftware(list, accountEmail) {
     var host = document.getElementById("softwareCards");
     var tpl = document.getElementById("softwareCardTpl");
     host.innerHTML = "";
@@ -259,33 +297,40 @@
       node.querySelector(".v-sub").textContent = sw.subscriptionStatus || "one-time purchase";
       node.querySelector(".v-lapsed").hidden = !sw.exitOnly;
 
+      node.querySelector(".v-recovery").href = "support#message=" + encodeURIComponent("I reset or replaced my server and lost its installation key. Please help recover my account. Email: " + (accountEmail || "") + ". Account: " + sw.customerKey);
+      var keyBtn=node.querySelector(".v-replacement-key");keyBtn.hidden=!sw.recoveredInstallation || sw.revoked || sw.exitOnly;
+      keyBtn.addEventListener("click",async function(){
+        keyBtn.disabled=true;
+        try{var response=await boundedApi("/api/customer/replacement-license-key",{method:"POST",body:JSON.stringify({customerKey:sw.customerKey})});
+          if(!response.ok || !response.body || !response.body.ok)throw new Error("Replacement licence is unavailable; contact support.");
+          showCopyText(node.querySelector(".v-key"),response.body.licenseKey,"Copy licence key");node.querySelector(".v-key-note").hidden=false;
+        }catch(error){node.querySelector(".v-install-err").textContent=error.message;node.querySelector(".v-install-err").hidden=false;}finally{keyBtn.disabled=false;}
+      });
       var installBtn = node.querySelector(".v-install");
       var installErr = node.querySelector(".v-install-err");
       var cmdBox = node.querySelector(".v-cmd");
       var cmdNote = node.querySelector(".v-cmd-note");
       installBtn.addEventListener("click", async function () {
+        if (!window.confirm("Regenerate this account’s install command? Previous opaque install commands will stop working. Your licence and subscription stay unchanged. This does not transfer or revoke an active machine binding; a lost machine key requires support recovery.")) return;
         installBtn.disabled = true;
         installErr.hidden = true;
-        var r = await api("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey }) });
-        installBtn.disabled = false;
+        cmdBox.hidden = true;
+        cmdNote.hidden = true;
+        try {
+        var r = await boundedApi("/api/customer/install-command", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey, confirmed: true, expectedRevision: sw.installRecovery && sw.installRecovery.revision, acknowledgeMachineBinding: true }) });
         if (!r.ok || !r.body || !r.body.ok) {
           installErr.textContent = (r.body && r.body.error) || "could not get an install command";
           installErr.hidden = false;
           return;
         }
-        cmdBox.textContent = r.body.command;
-        var copy = document.createElement("button");
-        copy.className = "copy";
-        copy.type = "button";
-        copy.textContent = "Copy";
-        copy.addEventListener("click", function () {
-          var done = function () { copy.textContent = "Copied"; setTimeout(function () { copy.textContent = "Copy"; }, 1500); };
-          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(r.body.command).then(done, done);
-          else done();
-        });
-        cmdBox.appendChild(copy);
-        cmdBox.hidden = false;
+        sw.installRecovery = { revision: r.body.revision, binding: r.body.binding };
+        showCopyText(cmdBox, r.body.command, "Copy command");
         cmdNote.hidden = false;
+        } catch (error) {
+          installErr.textContent = "Could not regenerate the command. Reload your dashboard and try again, or use Recover a reset server for help.";
+          installErr.hidden = false;
+        } finally { installBtn.disabled = false; }
+
       });
 
       var portalBtn = node.querySelector(".v-portal");
@@ -368,12 +413,19 @@
     node.querySelector(".v-region").textContent = inst.regionLabel || inst.region;
     node.querySelector(".v-ip").textContent = inst.ip || "—";
     node.querySelector(".v-url").textContent = inst.appUrl || "—";
-    node.querySelector(".v-price-line").textContent = inst.bundleSubscription
+    node.querySelector(".v-price-line").textContent = inst.bundleSubscription && inst.softwareLifetime !== true
       ? inst.billingPriceLabel + "/" + inst.billingInterval + " combined software + hosting"
       : inst.monthlyPriceLabel + "/month hosting";
     node.querySelector(".v-account-limit").textContent = "Up to " + inst.maximumConnectedAccounts;
     node.querySelector(".v-renewal").textContent = fmtDateTime(inst.paidThroughMs);
     node.querySelector(".v-backup").textContent = inst.managedBackupsIncluded ? "Backups are included." : "No managed backups are included — export your settings while the server is active.";
+    node.querySelector(".v-preparing-access-note").hidden = !["ordered", "provisioning", "bootstrapping"].includes(inst.stage);
+    node.querySelector(".v-ready-access-note").hidden = !["ready", "active", "past_due", "cancel_scheduled", "restoring"].includes(inst.stage);
+    if (inst.bundleSubscription && inst.softwareLifetime === true) {
+      var lifetimeBundleNote = node.querySelector(".v-bundle-note");
+      lifetimeBundleNote.textContent = "Your Lifetime software licence is a one-time purchase. The VPS renews separately at " + (inst.monthlyPriceLabel || "$20.00") + "/month; canceling hosting does not cancel your software licence.";
+      lifetimeBundleNote.hidden = false;
+    }
 
     var nowMs = Date.now();
     if (inst.suspendAtMs && inst.stage !== "suspended" && inst.stage !== "deleted") {
@@ -402,27 +454,31 @@
     var resumeBtn = node.querySelector(".v-resume");
     if (inst.stage !== "cancel_scheduled" && inst.stage !== "suspended" && inst.stage !== "deleting" && inst.stage !== "deleted") {
       cancelBtn.hidden = false;
-      if (inst.bundleSubscription) cancelBtn.textContent = "Cancel software + hosting renewal";
+      if (inst.bundleSubscription) cancelBtn.textContent = inst.softwareLifetime === true ? "Cancel VPS renewal" : "Cancel software + hosting renewal";
       cancelBtn.addEventListener("click", async function () {
-        if (inst.bundleSubscription && !window.confirm("Cancel renewal of both your Wick Hunter software and managed VPS at the end of the paid term?")) return;
+        if (inst.bundleSubscription && inst.softwareLifetime !== true && !window.confirm("Cancel renewal of both your Wick Hunter software and managed VPS at the end of the paid term?")) return;
         cancelBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
         var r = await api("/api/hosting/" + inst.id + "/cancel", { method: "POST", body: "{}" });
         cancelBtn.disabled = false;
         if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not schedule cancellation"; errEl.hidden = false; return; }
-        okEl.textContent = (r.body.affectsSoftwareRenewal ? "Combined software + hosting renewal canceled. " : "Hosting cancellation scheduled. ") + "VPS suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + ".";
+        okEl.textContent = inst.softwareLifetime === true
+          ? "VPS cancellation scheduled. Your Lifetime software licence is unchanged. VPS suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + "."
+          : (r.body.affectsSoftwareRenewal ? "Combined software + hosting renewal canceled. " : "Hosting cancellation scheduled. ") + "VPS suspends " + fmtDateTime(r.body.suspendAt) + ", deletes " + fmtDateTime(r.body.deleteAt) + ".";
         okEl.hidden = false;
         setTimeout(function () { boot(); }, 1200);
       });
     }
     if (inst.stage === "cancel_scheduled") {
       resumeBtn.hidden = false;
-      resumeBtn.textContent = inst.bundleSubscription ? "Resume software + hosting renewal" : "Resume renewal";
+      resumeBtn.textContent = inst.bundleSubscription ? (inst.softwareLifetime === true ? "Resume VPS renewal" : "Resume software + hosting renewal") : "Resume renewal";
       resumeBtn.addEventListener("click", async function () {
         resumeBtn.disabled = true; okEl.hidden = true; errEl.hidden = true;
         var r = await api("/api/hosting/" + inst.id + "/resume-renewal", { method: "POST", body: "{}" });
         resumeBtn.disabled = false;
         if (!r.ok || !r.body || !r.body.ok) { errEl.textContent = (r.body && r.body.error) || "could not reverse the cancellation"; errEl.hidden = false; return; }
-        okEl.textContent = inst.bundleSubscription ? "Combined software + hosting renewal resumed." : "Hosting renewal resumed."; okEl.hidden = false;
+        okEl.textContent = inst.softwareLifetime === true
+          ? "VPS renewal resumed. Your Lifetime software licence is unchanged."
+          : inst.bundleSubscription ? "Combined software + hosting renewal resumed." : "Hosting renewal resumed."; okEl.hidden = false;
         setTimeout(function () { boot(); }, 1200);
       });
     }
@@ -434,7 +490,7 @@
     signedOutEl.hidden = true;
     signedInEl.hidden = false;
     document.getElementById("accountEmail").textContent = state.email;
-    renderSoftware(state.software || []);
+    renderSoftware(state.software || [], state.email);
     renderStarterPack(state.starterPack);
     renderHosting(state.hosting);
   }

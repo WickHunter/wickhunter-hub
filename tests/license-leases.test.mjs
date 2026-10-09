@@ -123,6 +123,21 @@ await test("activation binds the install key and returns a strict signed short l
   assert.equal(verifyLicenseLease(`WHL1.${edited}.${sigPart}`, f.service.keyStore.publicKeyring()).reason, "signature");
 });
 
+await test("recovery retains sequence-bound signed authority when renewal attempts to attach an older valid token", () => {
+  const f=serviceFixture(), key=installKey();
+  try {
+    const {result:first}=activate(f,key);
+    const challenge=f.service.challenge(f.issued.token,{purpose:"renew",installId:first.activation.installId,installPublicKey:key.publicKey,activationId:first.activation.id});
+    // Fault injection at signing: the real renewal reaches the audit validator,
+    // but a valid previous token cannot attest the newly advanced sequence.
+    f.service.leaseFor=()=>first.lease;
+    assert.throws(()=>f.service.renew(f.issued.token,challenge.nonce,proof(challenge,key.privateKey)),/payload does not match its activation revision/);
+    const restarted=new LicenseLeaseService(f.dataDir,f.store,{}, {now:()=>f.now});
+    assert.equal(restarted.adminSnapshot(f.issued.payload.id).activations[0].lastSequence,1);
+    assert.deepEqual(restarted.deviceRecoverySnapshot(f.issued.payload.id).active,[{id:first.activation.id,revision:1,cachedGraceUntilMs:first.lease.payload.policy.cachedGraceUntilMs}]);
+  } finally { fs.rmSync(f.dataDir,{recursive:true,force:true}); }
+});
+
 await test("nonce replay is exact and never increments the monotonic sequence", () => {
   const f = serviceFixture();
   const key = installKey();

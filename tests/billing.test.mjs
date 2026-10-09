@@ -141,8 +141,8 @@ await test("admin billing config needs the admin header and starts unconfigured 
   assert.deepEqual(r.body.stripe.test.secretKey, { configured: false, last4: null });
 });
 
-await test("/buy answers 503 until a Payment Link exists, then 302s to the ACTIVE mode's link", async () => {
-  const before = await fetch(`${h.origin}/buy`, { redirect: "manual" });
+await test("/buy?plan=monthly answers 503 until a Payment Link exists, then 302s to the ACTIVE mode's link", async () => {
+  const before = await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" });
   assert.equal(before.status, 503);
   const r = await admin("/admin/api/billing/config", {
     method: "POST",
@@ -159,7 +159,7 @@ await test("/buy answers 503 until a Payment Link exists, then 302s to the ACTIV
   assert.deepEqual(r.body.email.apiKey, { configured: true, last4: "7890" });
   assert.ok(!JSON.stringify(r.body).includes("sk_test_sec222"), "the secret never comes back");
   assert.deepEqual(r.body.ready, { stripeTest: true, stripeLive: false, email: true, release: true });
-  const after = await fetch(`${h.origin}/buy`, { redirect: "manual" });
+  const after = await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" });
   assert.equal(after.status, 302);
   assert.equal(after.headers.get("location"), "https://buy.stripe.com/test_link");
   const billing = await fetch(`${h.origin}/billing`, { redirect: "manual" });
@@ -419,7 +419,7 @@ await test("switching to LIVE: test events are ignored, live events are honoured
   });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.mode, "live");
-  assert.equal((await fetch(`${h.origin}/buy`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/live_link");
+  assert.equal((await fetch(`${h.origin}/buy?plan=monthly`, { redirect: "manual" })).headers.get("location"), "https://buy.stripe.com/live_link");
   // A TEST event now: signature is fine, but it must not mint.
   const t = await postEvent("test", event("checkout.session.completed", checkoutSession({ id: "cs_t2", customer: "cus_T2", customer_details: { email: "t2@example.com", name: "Tester Two" } })));
   assert.equal(t.status, 200);
