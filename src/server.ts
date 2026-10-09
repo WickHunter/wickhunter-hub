@@ -1771,7 +1771,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (req.method === "GET" && /\/earn$/.test(url.pathname)) {
         const view=earn.view(owner,name),stripe=earnStripe.view(owner);
         // A viewing grant does not disclose saved payout destinations or UIDs.
-        if(readOnly){view.member={...view.member,uids:[],payoutPreference:null};stripe.jobs=[];}
+        if(readOnly){view.member={...view.member,uids:[],payoutPreference:null};stripe.jobs=[];stripe.test=undefined;}
         return sendJson(res,200,{ok:true,...view,capabilities:{readOnly},stripe,referralActivity:earnStripe.referralActivity(owner,url.searchParams.get('referralsAfter'))},{'cache-control':'no-store'});
       }
       if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "Method not allowed" });

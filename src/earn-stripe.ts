@@ -191,14 +191,17 @@ export class EarnStripeService {
     const {item,plan}=software[0];if(!plan)throw Error('One-time plan is unavailable');
     if(item.price?.type!=='one_time'||item.price?.recurring!=null||!found.offer.products.includes(id(item.price?.product))||item.quantity!==1||!Number.isSafeInteger(item.amount_discount)||item.amount_discount<=0||!Number.isSafeInteger(item.amount_subtotal)||item.amount_discount>item.amount_subtotal)throw Error('One-time software price, product or applied discount mismatch');
     let payment=id(session.payment_intent);
-    if(!payment&&session.mode==='subscription'){
+    if(session.mode==='subscription'){
      const invoice=id(session.invoice);if(!invoice.startsWith('in_'))throw Error('Mixed one-time purchase has no initial invoice');
      const inv=await api.call('GET','/v1/invoices/'+invoice);
-     if(inv.id!==invoice||inv.livemode!==(mode==='live')||inv.status!=='paid'||id(inv.customer)!==id(session.customer)||id(inv.subscription||inv.parent?.subscription_details?.subscription)!==id(session.subscription))throw Error('Mixed purchase invoice identity mismatch');
+     if(inv.id!==invoice||inv.livemode!==(mode==='live')||inv.status!=='paid'||id(inv.customer)!==id(session.customer)||id(inv.subscription||inv.parent?.subscription_details?.subscription)!==id(session.subscription)||!Number.isSafeInteger(session.amount_total)||session.amount_total<=0||inv.currency!==session.currency||inv.total!==session.amount_total||!Number.isSafeInteger(inv.amount_paid)||inv.amount_paid<session.amount_total)throw Error('Mixed purchase invoice identity or total mismatch');
      const payments=await api.call('GET','/v1/invoice_payments',{invoice,status:'paid',limit:100});
      if(payments.has_more!==false||!Array.isArray(payments.data)||payments.data.length!==1)throw Error('Mixed purchase payment chain is incomplete or ambiguous');
      const paid=payments.data[0];
-     if(paid.invoice!==invoice||paid.livemode!==(mode==='live')||paid.status!=='paid'||paid.payment?.type!=='payment_intent')throw Error('Mixed purchase payment identity mismatch');
+     // A PaymentIntent can fund several invoices. Its overall charge cannot
+     // substitute for the amount actually allocated to this initial invoice.
+     if(!id(paid).startsWith('inpay_')||paid.invoice!==invoice||paid.livemode!==(mode==='live')||paid.status!=='paid'||paid.payment?.type!=='payment_intent'||paid.currency!==session.currency||!Number.isSafeInteger(paid.amount_paid)||paid.amount_paid!==session.amount_total)throw Error('Mixed purchase payment allocation mismatch');
+     if(payment&&payment!==id(paid.payment.payment_intent))throw Error('Mixed Checkout payment disagrees with invoice allocation');
      payment=id(paid.payment.payment_intent);
     }
     if(!payment.startsWith('pi_'))throw Error('One-time purchase has no settled payment');

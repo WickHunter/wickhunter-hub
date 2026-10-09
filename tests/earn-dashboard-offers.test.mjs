@@ -64,10 +64,10 @@ function purchase(f,suffix,{kind='lifetime',mode='payment',customer='cus_friend'
  const pi={id:payment,livemode:true,status:'succeeded',customer,currency:'usd',amount_received:900,latest_charge:charge};
  f.objects.set('/v1/payment_intents/'+payment,pi);
  if(mode==='subscription'){
-  f.objects.set('/v1/invoices/in_'+suffix,{id:'in_'+suffix,livemode:true,status:'paid',customer,parent:{subscription_details:{subscription:'sub_'+suffix}}});
-  f.objects.set('/v1/invoice_payments',{data:[{invoice:'in_'+suffix,livemode:true,status:'paid',payment:{type:'payment_intent',payment_intent:payment}}],has_more:false});
+  f.objects.set('/v1/invoices/in_'+suffix,{id:'in_'+suffix,livemode:true,status:'paid',customer,currency:'usd',total:900,amount_paid:900,parent:{subscription_details:{subscription:'sub_'+suffix}}});
+  f.objects.set('/v1/invoice_payments',{data:[{id:'inpay_'+suffix,invoice:'in_'+suffix,livemode:true,status:'paid',currency:'usd',amount_paid:900,payment:{type:'payment_intent',payment_intent:payment}}],has_more:false});
  }
- return {session,item,pi,charge};
+ return {session,item,pi,charge,invoice:f.objects.get('/v1/invoices/in_'+suffix),allocation:f.objects.get('/v1/invoice_payments')?.data[0]};
 }
 await test('all supported purchase kinds use applied owner code and settled payment facts, never fake subscription state',async()=>{
  const f=fixture();await f.service.adoptExistingOskarasOffers(owner);
@@ -91,6 +91,20 @@ await test('Checkout pages complete before publication; canceled scope, wrong ow
  const before=f.service.referralActivity(owner);f.setCheckoutPages({'':{data:[a.session],has_more:true},cs_first:{data:[],has_more:true}});await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before);
  f.setCheckoutPages(null);a.session.payment_status='unpaid';f.setSessions([a.session]);await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows.length,0,'unpaid attempts are not paid code redemptions');
 });
+await test('mixed purchase proves invoice-specific allocation when one PaymentIntent funds multiple invoices',async()=>{
+ const f=fixture();await f.service.adoptExistingOskarasOffers(owner);const a=purchase(f,'allocated',{mode:'subscription'});
+ // The successful PI/charge includes 700 belonging to other invoices; only
+ // this invoice's explicit 900 allocation proves this Checkout was paid.
+ a.pi.amount_received=1600;a.charge.amount=1600;a.session.payment_intent=a.pi.id;f.setSessions([a.session]);
+ await f.service.refreshReferralStatus(owner);const before=f.service.referralActivity(owner);assert.equal(before.rows[0].status,'paid');
+ for(const corrupt of [x=>delete x.amount_paid,x=>x.amount_paid=null,x=>x.amount_paid=899,x=>x.amount_paid=1600,x=>x.amount_paid=Infinity,x=>x.currency='eur',x=>x.invoice='in_other']){
+  const saved=structuredClone(a.allocation);corrupt(a.allocation);await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before,'larger successful PI must not hide incomplete or foreign allocation');for(const k of Object.keys(a.allocation))delete a.allocation[k];Object.assign(a.allocation,saved);
+ }
+ for(const corrupt of [x=>x.currency='eur',x=>x.total=901,x=>delete x.amount_paid,x=>x.amount_paid=899]){
+  const saved=structuredClone(a.invoice);corrupt(a.invoice);await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before);for(const k of Object.keys(a.invoice))delete a.invoice[k];Object.assign(a.invoice,saved);
+ }
+ assert.equal(f.ledger.admin().entries.length,0,'allocation inspection never replays commission');
+});
 await test('view grants never bind billing identity and cannot mutate any Earn endpoint',async()=>{
  const h=await freshHub();try{
   const e=new EarnService(h.dataDir);e.member(owner,'Verified owner');e.transaction(s=>{s.members[0].uids=[{exchange:'weex',uid:'PRIVATE_UID',verified:true,submittedAt:new Date().toISOString()}];s.members[0].payoutPreference={method:'paypal',address:'private@example.test',revision:'fixture'};});const token=h.store.issueUntil('Different billing license',Date.now()+86400000,'unleashed');
@@ -98,7 +112,9 @@ await test('view grants never bind billing identity and cannot mutate any Earn e
   const headers={'x-license':token.token,'x-wh-earn':'1','content-type':'application/json'};
   assert.equal((await fetch(h.origin+'/api/hub/earn',{headers})).status,404);
   setFlag(h.dataDir,token.payload.id,'earn',true);
-  const got=await(await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(got.member.id,owner);assert.equal(got.capabilities.readOnly,true);assert.deepEqual(got.member.uids,[]);assert.equal(got.member.payoutPreference,null);
+  h.hub.earnStripe.configure({enabled:true,mode:'test'});h.hub.earnStripe.ledger('test').copyMember(e.admin().members[0]);
+  const rawTest=h.hub.earnStripe.view(owner).test;assert.equal(rawTest.member.uids[0].uid,'PRIVATE_UID');assert.equal(rawTest.member.payoutPreference.address,'private@example.test');
+  const got=await(await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(got.member.id,owner);assert.equal(got.capabilities.readOnly,true);assert.deepEqual(got.member.uids,[]);assert.equal(got.member.payoutPreference,null);assert.equal(Object.hasOwn(got.stripe,'test'),false);assert.ok(!JSON.stringify(got).includes('PRIVATE_UID'));assert.ok(!JSON.stringify(got).includes('private@example.test'));
   const before=e.fileVersion();for(const route of ['activate','refresh','onboard','payout-preference','uid'])assert.equal((await fetch(h.origin+'/api/hub/earn/'+route,{method:'POST',headers,body:'{}'})).status,403);
   assert.equal(e.fileVersion(),before);assert.equal(e.boundOwner(['license:'+token.payload.id]),null);
   const outsider=h.store.issueUntil('Unrelated',Date.now()+86400000,'unleashed');setFlag(h.dataDir,outsider.payload.id,'earn',true);
