@@ -21,7 +21,7 @@ export type EarnPayoutPreference = { method: EarnPayoutMethod; address: string; 
 export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string; payoutPreference?: EarnPayoutPreference | null };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
-export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; ownerBindings?: Record<string, string> };
+export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; dashboardGrants?: Record<string, {owner:string;actor:string;at:string}>; ownerBindings?: Record<string, string> };
 export const earnOwner = (identity: string) => createHash('sha256').update(identity).digest('hex');
 export class EarnConflictError extends Error { constructor(message='Payout preference changed; refresh and review it before saving') { super(message); this.name='EarnConflictError'; } }
 /** Historical claims predate revisions. Their stable view token changes as soon
@@ -151,6 +151,25 @@ export class EarnService {
 
   boundOwner(keys: string[]): string | null {
     return boundOwnerFromBindings(this.read().ownerBindings ?? {},keys);
+  }
+
+  /** Operator-authorized viewing only. Never a billing, payout or UID identity. */
+  grantDashboard(licenseId:string,owner:string,actor:string) {
+    if(!licenseId||licenseId.length>300||!actor.trim()||actor.length>200||! /^[a-f0-9]{64}$/.test(owner))throw Error('Invalid dashboard grant');
+    const key=earnOwner('dashboard-license:'+licenseId);
+    this.transactionIfChanged(state=>{
+      if(!state.members.some(m=>m.id===owner))throw Error('Dashboard owner must already exist');
+      const existing=state.dashboardGrants?.[key];
+      if(existing&&existing.owner!==owner)throw Error('Dashboard grant conflict requires review');
+      if(existing)return false;
+      (state.dashboardGrants??={})[key]={owner,actor,at:this.date()};return true;
+    });
+  }
+  dashboardOwner(licenseId:string):string|null {
+    const state=this.read(),grant=state.dashboardGrants?.[earnOwner('dashboard-license:'+licenseId)];
+    if(!grant)return null;
+    if(!state.members.some(m=>m.id===grant.owner))throw Error('Dashboard owner no longer exists');
+    return grant.owner;
   }
 
   view(owner: string, name: string) {

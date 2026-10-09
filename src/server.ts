@@ -1729,7 +1729,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // The app license is useful for viewing earnings, not for minting them.
     if (url.pathname.endsWith('/onboard') && !url.pathname.startsWith('/api/customer/'))
       return sendJson(res, 403, { ok: false, error: 'Sign in at the customer portal to connect payouts' }, { 'cache-control': 'no-store' });
-    let owner = "", name = "", allowed = false;
+    let owner = "", name = "", allowed = false, readOnly = false;
     try {
       if (url.pathname.startsWith("/api/customer/") || (url.pathname === "/earn" && !req.headers["x-license"])) {
         const identity = authenticatedCustomer(req);
@@ -1751,7 +1751,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           owner=earnOwner('license:'+payload.id);
           allowed = flagsFor(cfg.dataDir, payload.id).earn === true;
           const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
-          if (allowed) owner=boundEarnOwner(record?[record]:[],payload.id);
+          if (allowed) {
+            const dashboardOwner=earn.dashboardOwner(payload.id);
+            if(dashboardOwner){owner=dashboardOwner;readOnly=true;}
+            else owner=boundEarnOwner(record?[record]:[],payload.id);
+          }
           name = record?.email || store.get(payload.id)?.name || "WH member";
         }
       }
@@ -1764,8 +1768,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (!allowed) return sendJson(res, 404, { ok: false, error: "Not found" });
     if (url.pathname === "/earn") return sendHtml(res, 200, fs.readFileSync(path.join(cfg.publicDir, "earn.html"), "utf8"));
     try {
-      if (req.method === "GET" && /\/earn$/.test(url.pathname)) return sendJson(res, 200, { ok: true, ...earn.view(owner, name), stripe: earnStripe.view(owner) }, { "cache-control": "no-store" });
+      if (req.method === "GET" && /\/earn$/.test(url.pathname)) {
+        const view=earn.view(owner,name),stripe=earnStripe.view(owner);
+        // A viewing grant does not disclose saved payout destinations or UIDs.
+        if(readOnly){view.member={...view.member,uids:[],payoutPreference:null};stripe.jobs=[];}
+        return sendJson(res,200,{ok:true,...view,capabilities:{readOnly},stripe,referralActivity:earnStripe.referralActivity(owner,url.searchParams.get('referralsAfter'))},{'cache-control':'no-store'});
+      }
       if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "Method not allowed" });
+      if (readOnly) return sendJson(res,403,{ok:false,error:"This dashboard has viewing access only; sign in to the owner’s Hub portal to make changes"});
       if (req.headers["x-wh-earn"] !== "1" || !String(req.headers["content-type"]).startsWith("application/json") || req.headers["sec-fetch-site"] === "cross-site") return sendJson(res, 403, { ok: false, error: "Invalid request origin" });
       const body = await readJsonBody(req, 4096);
       if (!body) return sendJson(res, 400, { ok: false, error: "Invalid request" });
@@ -2546,6 +2556,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       try {
         let result: unknown;
         switch (p) {
+          case "/admin/api/earn/oskaras-link": {
+            // Exact reviewed identity and dashboard license; no billing merge.
+            if(body.email!=='oskarasridikas@gmail.com'||body.confirm!=='LINK EXISTING LIVE OSKARAS OFFERS')throw Error('Exact reviewed Oskaras confirmation required');
+            const records=Object.values(billing.store.customers()).filter(c=>c.livemode&&normalizeCustomerEmail(c.email)===body.email);
+            if(records.length!==1||earnOwner(records[0]!.licenseId)!=='f45acd8c7b1a2482a8ce95e70ffbf1f0c195ef06e520d1470cd6da97efecf9ad'||!records[0]!.stripeCustomerId.startsWith('cus_'))throw Error('Reviewed billing identity changed');
+            const record=records[0]!,target=store.list().find(l=>earnOwner(l.id)==='797f358fdb8a86e06264bdd08075c1fee8eaefdc4190569a30ea67d3a40e2efa');
+            if(!target||target.exp<=Date.now()||!store.get(record.licenseId)||store.get(record.licenseId)!.exp<=Date.now()||store.isRevoked(target.id)||store.isRevoked(record.licenseId))throw Error('Reviewed licenses must remain valid');
+            const keys=earnBillingKeys(record),legacy=[earnOwner('email:'+body.email),...[record.licenseId,...billing.store.historicalLicenseIds(record)].map(v=>earnOwner('license:'+v))];
+            const state=earn.admin(),historical=[...new Set(legacy.filter(v=>state.members.some(m=>m.id===v)||state.entries.some(e=>e.owner===v)||state.months.some(m=>m.rows.some(r=>r.owner===v))))];
+            const existing=earn.boundOwner(keys),owner=existing??historical[0]??earnOwner('stripe:live:'+record.stripeCustomerId);
+            if(historical.length>1||(existing&&historical.length&&historical[0]!==existing))throw Error('Earn identity requires review');
+            const grant=earn.dashboardOwner(target.id);if(grant&&grant!==owner)throw Error('Dashboard grant conflict');
+            await earnStripe.inspectExistingOskarasOffers(owner); // Every provider object before local writes.
+            if(boundEarnOwner([record])!==owner)throw Error('Earn identity changed during preflight');
+            earn.member(owner,body.email);
+            await earnStripe.adoptExistingOskarasOffers(owner);
+            earn.grantDashboard(target.id,owner,'operator: reviewed Oskaras 11122 dashboard association');
+            setFlag(cfg.dataDir,record.licenseId,'earn',true);setFlag(cfg.dataDir,target.id,'earn',true);
+            result={owner,linked:true,dashboardReadOnly:true,payoutsChanged:false};break;
+          }
+          case "/admin/api/earn/referral-status-refresh": result=await earnStripe.refreshReferralStatus(String(body.owner));break;
           case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
           case "/admin/api/earn/stripe-run": result = await earnStripe.run(); break;

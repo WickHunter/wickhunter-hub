@@ -1,3 +1,4 @@
+import {OSKARAS_EXISTING_OFFERS,OSKARAS_EXISTING_PRODUCT,OSKARAS_PROOF_KIND,verifyExistingOskaras} from './earn-oskaras-offers.js';
 import {createHash,randomUUID} from 'node:crypto';
 import path from 'node:path';
 import {EarnService,earnOwner,boundOwnerFromBindings,tierPercent,type EarnState,type Entry,type EarnSource} from './earn.js';
@@ -88,7 +89,76 @@ export class EarnStripeService {
  private syncMember(mode:BillingMode,owner:string){const m=this.liveLedger.admin().members.find(m=>m.id===owner);if(!m)throw Error('Member not found');if(mode==='test')this.testLedger.copyMember(m);return m;}
  view(owner:string){const c=this.settings(),p=this.profile(c.mode,owner),m=this.liveLedger.admin().members.find(x=>x.id===owner),proof=p.verifiedPromotion;
   const confirmed=!!(c.enabled&&p.promotion&&proof?.promotion===p.promotion&&proof?.duration==='forever'&&Number.isInteger(proof?.percent));
-  return {mode:c.mode,enabled:c.enabled,automatic:c.automatic,payoutDay:c.payoutDay,referralUrl:confirmed?`${this.origin}/buy?ref=${encodeURIComponent(p.code)}`:null,appliedDiscountPercent:m?.discountPercent===0?0:confirmed?proof.percent:null,appliedDiscountDuration:confirmed?'forever':null,activationRequired:!!(c.enabled&&m&&m.discountPercent>0&&!confirmed),recipient:!!p.recipient,recipientStatus:p.status||'not_connected',jobs:(book(this.ledger(c.mode).admin()).jobs as Job[]).filter(j=>j.owner===owner).map(j=>({id:j.id,cycle:j.cycle,amount:j.amount,status:j.status,error:j.error})),test:c.mode==='test'?this.testLedger.view(owner,m?.name||'Test member'):undefined};}
+  return {offers:(Array.isArray(p.partnerPromotions)?p.partnerPromotions:[]).filter((x:StripeObject)=>x.proof?.promotion===x.promotion&&x.proof?.percent===x.percent).map((x:StripeObject)=>({code:x.code,percent:x.percent,duration:'forever',url:`${this.origin}/buy?ref=${encodeURIComponent(x.code)}`})),mode:c.mode,enabled:c.enabled,automatic:c.automatic,payoutDay:c.payoutDay,referralUrl:confirmed?`${this.origin}/buy?ref=${encodeURIComponent(p.code)}`:null,appliedDiscountPercent:m?.discountPercent===0?0:confirmed?proof.percent:null,appliedDiscountDuration:confirmed?'forever':null,activationRequired:!!(c.enabled&&m&&m.discountPercent>0&&!confirmed),recipient:!!p.recipient,recipientStatus:p.status||'not_connected',jobs:(book(this.ledger(c.mode).admin()).jobs as Job[]).filter(j=>j.owner===owner).map(j=>({id:j.id,cycle:j.cycle,amount:j.amount,status:j.status,error:j.error})),test:c.mode==='test'?this.testLedger.view(owner,m?.name||'Test member'):undefined};}
+ /** A bounded, owner-filtered status projection, not an earnings calculation.
+  * Customer identifiers are opaque labels; no customer/email join occurs here. */
+ referralActivity(owner:string,after:string|null=null){
+  const c=this.settings(),p=this.profile(c.mode,owner),rows=Array.isArray(p.referralStatus)?p.referralStatus:[];
+  const selected=rows.filter((r:StripeObject)=>r.owner===owner).sort((a:StripeObject,b:StripeObject)=>String(a.id).localeCompare(String(b.id)));
+  if(after!==null&&!/^[a-f0-9]{40}$/.test(after))throw Error('Invalid referral cursor');
+  const page=selected.filter((r:StripeObject)=>!after||r.id>after).slice(0,51),more=page.length>50;
+  return {asOf:p.referralStatusAt??null,stale:!p.referralStatusAt||this.now()-p.referralStatusAt>86400000,
+   rows:page.slice(0,50).map((r:StripeObject)=>({id:r.id,label:r.label,code:r.code,status:r.status,paidThrough:r.paidThrough})),
+   next:more?page[49].id:null};
+ }
+ /** Only metadata on six exact existing objects changes. Preflight every object
+  * and local owner conflict before the first POST; repeat safely after a partial
+  * network failure. This never creates a coupon, payout, or commission entry. */
+ async inspectExistingOskarasOffers(owner:string){
+  const c=this.settings();if(!c.enabled||c.mode!=='live')throw Error('Existing offers require enabled LIVE Earn');
+  for(const spec of OSKARAS_EXISTING_OFFERS){const promo=await this.api('live').call('GET','/v1/promotion_codes/'+spec.promotion),coupon=await this.api('live').call('GET','/v1/coupons/'+spec.coupon,{'expand[0]':'applies_to'});verifyExistingOskaras(owner,promo,coupon,true);}
+  for(const [other,p] of Object.entries(book(this.liveLedger.admin()).profiles))if(other!==owner&&(p as StripeObject).partnerPromotions?.some((x:StripeObject)=>OSKARAS_EXISTING_OFFERS.some(v=>v.promotion===x.promotion||v.code===x.code)))throw Error('Existing local offer belongs to another owner');
+  return {offers:OSKARAS_EXISTING_OFFERS.length};
+ }
+ adoptExistingOskarasOffers(owner:string){return this.serial(async()=>{
+  const c=this.settings();if(!c.enabled||c.mode!=='live')throw Error('Existing offers require enabled LIVE Earn');
+  const m=this.liveLedger.admin().members.find(x=>x.id===owner);if(!m)throw Error('Member not found');
+  const api=this.api('live'),all=[];
+  for(const spec of OSKARAS_EXISTING_OFFERS){
+   const promo=await api.call('GET','/v1/promotion_codes/'+spec.promotion);
+   const coupon=await api.call('GET','/v1/coupons/'+spec.coupon,{'expand[0]':'applies_to'});
+   verifyExistingOskaras(owner,promo,coupon,true);all.push({spec,promo,coupon});
+  }
+  for(const [other,profile] of Object.entries(book(this.liveLedger.admin()).profiles)){
+   if(other!==owner&&(profile as StripeObject).partnerPromotions?.some((x:StripeObject)=>OSKARAS_EXISTING_OFFERS.some(v=>v.promotion===x.promotion||v.code===x.code)))throw Error('Existing local offer belongs to another owner');
+  }
+  for(const {spec} of all){
+   for(const [kind,objectId] of [['promotion_codes',spec.promotion],['coupons',spec.coupon]])
+    await api.call('POST',`/v1/${kind}/${objectId}`,{'metadata[wh_earn_owner]':owner,'metadata[wh_earn_code]':spec.code},{key:'earn_adopt_'+hash(owner+objectId)});
+  }
+  const offers=[];
+  for(const {spec} of all){
+   const promo=await api.call('GET','/v1/promotion_codes/'+spec.promotion),coupon=await api.call('GET','/v1/coupons/'+spec.coupon,{'expand[0]':'applies_to'});
+   verifyExistingOskaras(owner,promo,coupon);
+   offers.push({...spec,products:[OSKARAS_EXISTING_PRODUCT],proof:{...spec,kind:OSKARAS_PROOF_KIND,owner,duration:'forever',products:[OSKARAS_EXISTING_PRODUCT],verifiedAt:this.now()}});
+  }
+  const prior=this.profile('live',owner),other=(prior.partnerPromotions||[]).filter((x:StripeObject)=>!OSKARAS_EXISTING_OFFERS.some(v=>v.code===x.code));
+  this.updateProfile('live',owner,{partnerPromotions:[...other,...offers],partnerOffersUpdatedAt:this.now()});
+  return {owner,offers};
+ });}
+ /** Explicit operator reconciliation of status only. Whole scan must finish;
+  * partial scans never erase the prior snapshot. No invoice/payout replay. */
+ refreshReferralStatus(owner:string){return this.serial(async()=>{
+  const c=this.settings();if(!c.enabled)throw Error('Earn is disabled');this.syncMember(c.mode,owner);
+  const api=this.api(c.mode),rows:StripeObject[]=[];let cursor='';
+  for(let page=0;page<100;page++){
+   const batch=await api.call('GET','/v1/subscriptions',{status:'all',limit:100,'expand[0]':'data.discounts',...(cursor?{starting_after:cursor}:{})});
+   if(!Array.isArray(batch.data)||typeof batch.has_more!=='boolean')throw Error('Incomplete referral subscription page');
+   for(const sub of batch.data){
+    const p=this.profile(c.mode,owner),allowed=[p.promotion,...(p.promotionHistory||[]).map((x:StripeObject)=>x.promotion),...(p.partnerPromotions||[]).map((x:StripeObject)=>x.promotion)].filter(Boolean);
+    const ds=Array.isArray(sub.discounts)?sub.discounts:sub.discount?[sub.discount]:[];
+    if(ds.length!==1||!allowed.includes(id(ds[0]?.promotion_code||ds[0]?.source?.promotion_code)))continue;
+    const found=await this.appliedReferral(c.mode,sub);if(!found||found.owner!==owner)continue;
+    if(typeof sub.id!=='string'||!sub.id.startsWith('sub_')||sub.livemode!==(c.mode==='live')||!id(sub.customer).startsWith('cus_'))throw Error('Incomplete referral subscription identity or mode');
+    rows.push({owner,id:hash(owner+':'+sub.id),label:'Customer '+hash(owner+':'+id(sub.customer)).slice(0,8),code:found.offer.code,
+     status:['active','trialing','past_due','unpaid','canceled','incomplete','incomplete_expired','paused'].includes(sub.status)?sub.status:'unknown',
+     paidThrough:(book(this.ledger(c.mode).admin()).invoices as Record<string,Invoice>)?Object.values(book(this.ledger(c.mode).admin()).invoices as Record<string,Invoice>).filter(x=>x.owner===owner&&x.subscription===sub.id).reduce((v,x)=>Math.max(v,x.paidThrough||0),0)||null:null});
+   }
+   if(!batch.has_more){this.updateProfile(c.mode,owner,{referralStatus:rows,referralStatusAt:this.now()});return {count:rows.length};}
+   const last=id(batch.data.at(-1));if(!last||last===cursor)throw Error('Invalid referral pagination');cursor=last;
+  }
+  throw Error('Referral status scan exceeded its finite page limit; previous snapshot retained');
+ });}
  private async verifyPromotion(mode:BillingMode,owner:string,promotion:string,code:string,percent:number,products:string[]){
   const api=this.api(mode),promo=await api.call('GET','/v1/promotion_codes/'+promotion),couponId=id(promo.coupon);
   if(promo.id!==promotion||promo.active!==true||promo.livemode!==(mode==='live')||String(promo.code||'').toUpperCase()!==code.toUpperCase()||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner||promo.expires_at!=null||promo.max_redemptions!=null||!couponId)throw Error('Stripe referral promotion could not be verified');
@@ -145,6 +215,13 @@ export class EarnStripeService {
    }
    if(!offer){const actualCode=String(promo.code||'');if((p.code===actualCode||Array.isArray(p.legacyCodes)&&p.legacyCodes.includes(actualCode))&&promo.metadata?.wh_earn_owner===owner&&promo.metadata?.managed_by==='wh-earn')offer={promotion,code:actualCode,percent:Number(id(promo.coupon)?NaN:promo.coupon?.percent_off),products:p.products};}
    if(!offer)continue;
+   if(offer.proof?.kind===OSKARAS_PROOF_KIND){
+    if(mode!=='live'||offer.proof.owner!==owner)throw Error('Existing offer proof owner or mode mismatch');
+    const coupon=await this.api(mode).call('GET','/v1/coupons/'+id(promo.coupon),{'expand[0]':'applies_to'});
+    const exact=verifyExistingOskaras(owner,promo,coupon);
+    if(offer.code!==exact.code||offer.percent!==exact.percent||offer.proof.coupon!==exact.coupon||offer.proof.promotion!==exact.promotion||JSON.stringify(offer.products)!==JSON.stringify([OSKARAS_EXISTING_PRODUCT])||JSON.stringify(offer.proof.products)!==JSON.stringify([OSKARAS_EXISTING_PRODUCT]))throw Error('Existing offer proof mismatch');
+    return {owner,member,profile:p,offer};
+   }
    if(promo.id!==promotion||promo.livemode!==(mode==='live')||promo.code!==offer.code||promo.metadata?.managed_by!=='wh-earn'||promo.metadata?.wh_earn_owner!==owner)throw Error('Registered Stripe referral promotion no longer matches its durable offer');
    const couponId=id(promo.coupon);if(!couponId)throw Error('Registered Stripe referral promotion has no coupon');
    // We have a candidate registered offer at this point. Failure to prove its
@@ -280,7 +357,16 @@ export class EarnStripeService {
   const before=ledger.fileVersion(),api=this.api(mode),o=ev.object;
   if(['invoice.paid','invoice.payment_succeeded'].includes(ev.type))await this.invoice(mode,id(o));
   else if(ev.type.startsWith('customer.subscription.')){
-   const tracked=ledger.admin().referrals.find(r=>r.subscription===id(o));if(tracked){const sub=await api.call('GET','/v1/subscriptions/'+id(o));ledger.transaction(s=>{const r=s.referrals.find(r=>r.subscription===sub.id);if(r)r.active=sub.status==='active'&&(Object.values(book(s).invoices) as Invoice[]).some(i=>i.subscription===sub.id&&i.paidThrough>this.now()&&!i.disputed&&i.refunded<i.paid);});}
+   const state=ledger.admin(),tracked=state.referrals.find(r=>r.subscription===id(o));
+   const statusOwners=Object.entries(book(state).profiles).filter(([owner,p])=>(p as StripeObject).referralStatus?.some((r:StripeObject)=>r.owner===owner&&r.id===hash(owner+':'+id(o)))).map(([owner])=>owner);
+   if(tracked||statusOwners.length){
+    const sub=await api.call('GET','/v1/subscriptions/'+id(o));
+    if(id(sub)!==id(o))throw Error('Referral status subscription identity changed');
+    ledger.transaction(s=>{
+     const r=s.referrals.find(r=>r.subscription===sub.id);if(r)r.active=sub.status==='active'&&(Object.values(book(s).invoices) as Invoice[]).some(i=>i.subscription===sub.id&&i.paidThrough>this.now()&&!i.disputed&&i.refunded<i.paid);
+     for(const owner of statusOwners){const row=book(s).profiles[owner]?.referralStatus?.find((r:StripeObject)=>r.owner===owner&&r.id===hash(owner+':'+sub.id));if(row){row.status=['active','trialing','past_due','unpaid','canceled','incomplete','incomplete_expired','paused'].includes(sub.status)?sub.status:'unknown';}}
+    });
+   }
   } else if(['charge.refunded','charge.dispute.created','charge.dispute.closed'].includes(ev.type)){
    const charge=ev.type==='charge.refunded'?id(o):id(o.charge);if(charge){const row=(Object.values(b.invoices) as Invoice[]).find(i=>i.charges.includes(charge));if(row)await this.adjustInvoice(mode,row.id);else{const ch=await api.call('GET','/v1/charges/'+charge);if(id(ch.invoice))await this.invoice(mode,id(ch.invoice));}}
   }
