@@ -1,3 +1,7 @@
+## v0.4.91 — Recoverable initial paid subscription terms
+
+Hosted subscription checkout preserves the initial paid invoice even when Stripe delivers it after a newer checkout event. Exact durable retry admission lets software and hosting finish after an interrupted write while retaining later failure, refund and cancellation guards.
+
 ## v0.4.89 — Recovery after repeated install challenges
 
 Reset recovery reads the existing signed lease from the complete verified audit history, even after more than 250 later challenges. The admin audit display remains capped at 250 events. Signature, machine revision, sequence, audit confirmation and recorded offline grace checks remain enforced; this does not issue extra authority or alter the paid plan, expiry or seat limit.
@@ -1973,6 +1977,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.91 — Recoverable initial paid subscription terms: hosted checkout keeps the initial paid invoice when Stripe delivers it after a newer checkout event, and exact-event durable retry admission lets software and hosting finish after an interrupted write while later payment-failure, refund, dispute and cancellation guards stay in force.
 
 - v0.4.90 — Verified existing Oskaras product-scoped offers, separate read-only dashboard grants, and owner-filtered subscription and one-time purchase status without financial replay.
 

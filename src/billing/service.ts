@@ -638,7 +638,41 @@ export class BillingService {
     // the initial term. Allow that one activation, then restore the newer
     // past-due state; once records exist, stale paid events are inert.
     const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
-    if (stale && !activatingBehindFailure && !lifetimeInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    // Checkout creates a short bootstrap grant but is often timestamped AFTER
+    // its initial paid invoice. Delivery order must not discard that first
+    // paid term. Restrict the exception to checkout-only, active records with
+    // no paid-through date; never bypass a failure, refund or terminal fence.
+    const initialPaidAfterCheckout = !!(stale && !lifetimeHosting && !prior?.pendingStatus
+      && (ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded")
+      && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).billingReason === "subscription_create"
+      && invoiceFacts(ev.object).periodEndMs !== null
+      && knownSoftware?.lastEventType?.startsWith("checkout.session.")
+      && knownSoftware.subscriptionStatus === "active" && knownSoftware.periodEndMs === null
+      && !knownSoftware.disputed && !knownSoftware.refunded
+      && knownHosting?.lastEventType?.startsWith("checkout.session.")
+      && knownHosting.subscriptionStatus === "active" && knownHosting.periodEndMs === null
+      && !knownHosting.disputed && !knownHosting.refunded);
+    const eventSha256 = createHash("sha256").update(JSON.stringify(ev)).digest("hex");
+    const pendingInitial = prior?.initialPaidPending;
+    // The admission is durable before either role changes. A retry may finish
+    // a partial write/hook, but only for exactly that event and while no newer
+    // lifecycle state has superseded the original checkout watermark.
+    const resumingInitialPaid = !!(stale && pendingInitial
+      && pendingInitial.eventSha256 === eventSha256
+      && pendingInitial.checkoutWatermarkMs === prior?.latestEventCreatedMs
+      && !prior?.pendingStatus && !prior?.terminal
+      && knownSoftware?.subscriptionStatus === "active"
+      && knownHosting?.subscriptionStatus === "active"
+      && !knownSoftware.refunded && !knownSoftware.disputed
+      && !knownHosting.refunded && !knownHosting.disputed
+      && [knownSoftware, knownHosting].every(rec =>
+        (rec.lastEventType?.startsWith("checkout.session.") && rec.periodEndMs === null)
+        || (rec.lastEventType === ev.type && rec.lastEventId === ev.id)));
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout && !resumingInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+
+    if (initialPaidAfterCheckout) this.store.putBundleSubscription({
+      ...prior!, initialPaidPending: { eventSha256, checkoutWatermarkMs: prior!.latestEventCreatedMs },
+    });
 
     let softwareEvent = ev;
     if (bundle.hosting && ev.type.startsWith('invoice.')) softwareEvent = { ...ev, object: softwareInvoiceProjection(ev.object, bundle.hosting) };
@@ -885,6 +919,7 @@ export class BillingService {
 
   private touchHosting(rec: RoleSubscriptionRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }
@@ -1545,6 +1580,7 @@ export class BillingService {
 
   private touch(rec: CustomerRecord, ev: StripeEvent, now: number): void {
     rec.lastEventType = ev.type;
+    rec.lastEventId = ev.id;
     rec.lastEventAtMs = now;
     rec.updatedAtMs = now;
   }

@@ -69,7 +69,11 @@ printf '{"ok":true,"version":"%s"}' "$REL_VERSION"
  exe(path.join(bin,'ss'),'printf \'LISTEN 0 100 127.0.0.1:8090 0.0.0.0:* users:(("private",pid=%s,fd=1))\\n\' "${LISTENER_PID:-42}"\n');
  exe(path.join(bin,'journalctl'),'printf "bybit HTTP 403 https://private/?key=never-wh-secret\\n"\n');
  for(const cmd of ['apt-get','rsync','install','tar'])exe(path.join(bin,cmd),`echo "UNSAFE ${cmd}" >> "$OPS"; exit 99\n`);
- const env={...process.env,PATH:bin+':'+process.env.PATH,APP_DIR:app,ENV_FILE:envFile,UNIT_FILE:unit,REAL_NODE:process.execPath,KEY:'retained-license',SERVICE:'wickhunter',PORT:'8090',RELEASE_KEYS_B64U:keyring,REL_VERSION:version,REL_BUILD_ID:doc.buildId,REL_CORE_SHA:files[0].sha256,STARTUP_SINCE:'100',MOCK_MODE:mode,OPS:path.join(dir,'ops'),STARTED:path.join(dir,'started'),OWNER_WITNESS:path.join(dir,'owner-witness'),CHECKS:path.join(dir,'checks')};
+ // The installer refuses ANY NODE_OPTIONS by design (templates/install.sh), so a
+ // test harness that sets one (e.g. --max-old-space-size on CI) must not leak it
+ // into the installer under test; the preload cases below inject it explicitly.
+ const {NODE_OPTIONS:_harnessNodeOptions,...hostEnv}=process.env;
+ const env={...hostEnv,PATH:bin+':'+process.env.PATH,APP_DIR:app,ENV_FILE:envFile,UNIT_FILE:unit,REAL_NODE:process.execPath,KEY:'retained-license',SERVICE:'wickhunter',PORT:'8090',RELEASE_KEYS_B64U:keyring,REL_VERSION:version,REL_BUILD_ID:doc.buildId,REL_CORE_SHA:files[0].sha256,STARTUP_SINCE:'100',MOCK_MODE:mode,OPS:path.join(dir,'ops'),STARTED:path.join(dir,'started'),OWNER_WITNESS:path.join(dir,'owner-witness'),CHECKS:path.join(dir,'checks')};
  // The Linux cgroup root is substituted only in this offline actual-function
  // fixture; production exposes no environment override for ownership proof.
  const code=funcs.replace('root="/sys/fs/cgroup"','root='+JSON.stringify(cg)).replaceAll("'/proc/sys/kernel/random/boot_id'",JSON.stringify(boot));

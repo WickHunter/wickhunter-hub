@@ -4,6 +4,7 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { freshHub, jsonReq, test, summary } from './helpers.mjs';
 import { FakeProvider } from '../dist/src/hosting/provider.js';
+import { createHub } from '../dist/src/server.js';
 import { signStripePayload } from '../dist/src/billing/stripe.js';
 import { BillingService } from '../dist/src/billing/service.js';
 import { LaunchBilling } from '../dist/src/billing/launch.js';
@@ -91,6 +92,15 @@ await test('invalid referral and hosted crypto reserve no slot; Lifetime referra
 await test('old ignored hosting retry identity remains exactly software-only without second Session',async()=>{
   const c=await setup(),attemptId=randomUUID();await c.checkout('monthly',false,{attemptId});const s=c.last(),f=path.join(c.h.dataDir,'billing-launch-intents.v1',hash('live:'+attemptId)+'.json');const i=JSON.parse(fs.readFileSync(f));delete i.hostingRequested;fs.writeFileSync(f,JSON.stringify(i));
   assert.equal((await c.checkout('monthly',true,{attemptId})).body.url,s.url);assert.equal((await c.checkout('monthly',false,{attemptId})).body.url,s.url);assert.equal(c.sessions.size,1);assert.equal(c.h.hub.hosting.store.instances().length,0);await c.h.close();
+});
+await test('mixed hosted initial invoice created before checkout fills both paid terms after checkout delivery',async()=>{
+ const c=await setup();await c.checkout('monthly',true);const s=c.last(),invoice=c.invoice(s),created=c.now();
+ c.advance(2000);assert.equal((await c.post('checkout.session.completed',c.paid(s))).body.outcome,'applied');
+ const before=c.h.hub.billing.store.getCustomer('cus_'+s.id);assert.equal(before.periodEndMs,null);
+ const result=await c.post('invoice.paid',invoice,created);assert.equal(result.body.outcome,'applied',JSON.stringify(result.body));
+ const after=c.h.hub.billing.store.getCustomer('cus_'+s.id);assert.equal(after.licenseId,before.licenseId);assert.equal(after.periodEndMs,invoice.lines.data[0].period.end*1000);
+ assert.equal(c.h.hub.billing.store.getRoleSubscription('cus_'+s.id,'hosting').periodEndMs,invoice.lines.data[1].period.end*1000);
+ assert.equal((await c.post('invoice.payment_succeeded',invoice,created)).body.outcome,'ignored');await c.h.close();
 });
 await test('monthly/yearly mixed webhook discounts display software10%, renew both, and zero software does not start payment clock',async()=>{
   for(const plan of ['monthly','yearly']){
@@ -307,5 +317,74 @@ await test('a deletion racing a held checkout read remains terminal after serial
   const paid=c.post('checkout.session.completed',c.paid(s));await seen;
   const deleted=c.post('customer.subscription.deleted',{id:'sub_'+s.id,customer:'cus_'+s.id,status:'canceled',metadata:s.metadata,items:{data:s.lines.map(l=>({price:l.price}))}});release();
   assert.equal((await paid).status,200);assert.equal((await deleted).status,200);assert.equal(c.h.hub.billing.store.getBundleSubscription('sub_'+s.id).terminal,true);assert.equal(c.h.hub.billing.store.getCustomer('cus_'+s.id).subscriptionStatus,'canceled');await c.h.close();
+});
+// Review additions (2026-10-09). The v2 mixed-checkout identity passes through
+// withBundleLock, the software projection, the reservation hook and a
+// post-software customer write before the hosting write. Each interruption is
+// recovered against the durable files after a full service restart, exactly
+// once, and a newer failure/cancellation/refund/dispute delivered first fences
+// the retry. The v1 loop in hosting-bundle covers only the historical bundle.
+const postRaw=async(c,ev)=>{const body=JSON.stringify(ev);return jsonReq(c.h.origin+'/api/billing/stripe/live',{method:'POST',headers:{'content-type':'application/json','stripe-signature':signStripePayload(body,secret,Math.floor(c.now()/1000))},body});};
+async function mixedOlderInitial(c){
+  await c.checkout('monthly',true);const s=c.last(),object=c.invoice(s),invoice={id:'evt_mixed_initial_'+s.id,object:'event',type:'invoice.paid',livemode:true,created:Math.floor(c.now()/1000),data:{object}};
+  c.advance(2000);assert.equal((await c.post('checkout.session.completed',c.paid(s))).body.outcome,'applied');
+  return {s,invoice,object,key:'cus_'+s.id,sub:'sub_'+s.id,checkoutCreatedMs:Math.floor(c.now()/1000)*1000};
+}
+async function restartHub(c){
+  await c.h.close();
+  const hub=createHub(c.h.cfg,{candleSleep:async()=>{},billingNow:c.now,hostingNow:c.now,hostingProvider:c.provider,launchFetch:c.fake,hostingFetch:c.fake,billingFetch:async()=>({ok:true,status:200,text:async()=>JSON.stringify({id:'mail_fixture'})})});
+  c.h.hub=hub;c.h.close=()=>hub.close();c.h.origin=`http://127.0.0.1:${await hub.listen()}`;return hub;
+}
+for(const [point,fence] of [['reservation-hook',null],['post-software-write',null],['hosting-write',null],['hosting-hook',null],['completion-write',null],['hosting-write','failure'],['hosting-write','cancellation'],['hosting-hook','refund'],['hosting-hook','dispute']]) await test(`mixed older initial invoice restart at ${point}, newer fence=${fence}`,async()=>{
+  const c=await setup();
+  try{
+    const {s,invoice,object,key,sub,checkoutCreatedMs}=await mixedOlderInitial(c),billing=c.h.hub.billing,grace=billing.config().policy.graceDays*86400000;
+    const swEnd=object.lines.data[0].period.end*1000,hostEnd=object.lines.data[1].period.end*1000;
+    const before=billing.store.getCustomer(key);assert.equal(before.periodEndMs,null);const bootstrapExp=c.h.store.get(before.licenseId).exp;
+    if(point==='reservation-hook')billing.onBundleEvent=()=>{throw Error('injected reservation hook refusal');};
+    // The second customer write carrying this invoice's term is the welcome
+    // status or discount write that follows onInvoicePaid's own write.
+    if(point==='post-software-write'){const put=billing.store.putCustomer.bind(billing.store);let n=0;billing.store.putCustomer=rec=>{if(rec.periodEndMs===swEnd&&++n===2)throw Error('injected post-software write refusal');return put(rec);};}
+    if(point==='hosting-write')billing.store.putRoleSubscription=()=>{throw Error('injected hosting write refusal');};
+    if(point==='hosting-hook')billing.onHostingEvent=()=>{throw Error('injected hosting hook refusal');};
+    if(point==='completion-write'){const put=billing.store.putBundleSubscription.bind(billing.store);billing.store.putBundleSubscription=rec=>{if(!rec.initialPaidPending)throw Error('injected completion refusal');return put(rec);};}
+    assert.equal((await postRaw(c,invoice)).status,500);
+    const admitted=billing.store.getBundleSubscription(sub);assert.ok(admitted.initialPaidPending);assert.equal(admitted.initialPaidPending.checkoutWatermarkMs,checkoutCreatedMs);assert.equal(admitted.latestEventCreatedMs,checkoutCreatedMs);
+    assert.equal(billing.store.seenEvent(invoice.id),false);
+    const softwareWritten=point!=='reservation-hook',hostingWritten=['hosting-hook','completion-write'].includes(point);
+    assert.equal(billing.store.getCustomer(key).periodEndMs,softwareWritten?swEnd:null);
+    assert.equal(billing.store.getRoleSubscription(key,'hosting').periodEndMs,hostingWritten?hostEnd:null);
+    assert.equal(c.h.store.get(before.licenseId).exp,softwareWritten?Math.max(bootstrapExp,swEnd+grace):bootstrapExp);
+    const restarted=await restartHub(c);let hookCalls=0;const hook=restarted.billing.onHostingEvent.bind(restarted.billing);restarted.billing.onHostingEvent=(...a)=>{hookCalls++;return hook(...a);};
+    if(fence){
+      c.advance(2000);
+      const later=fence==='failure'?['invoice.payment_failed',{...object,id:'in_failed_'+s.id,paid:false,status:'open',billing_reason:'subscription_cycle'}]
+        :fence==='cancellation'?['customer.subscription.deleted',{id:sub,customer:key,status:'canceled',metadata:s.metadata,items:{data:s.lines.map(l=>({price:l.price}))}}]
+        :fence==='refund'?['charge.refunded',{id:'ch_'+s.id,customer:key,payment_intent:'pi_'+s.id,amount:object.amount_paid,amount_refunded:object.amount_paid,refunded:true}]
+        :['charge.dispute.created',{id:'dp_'+s.id,charge:'ch_'+s.id,payment_intent:'pi_'+s.id,reason:'fraudulent'}];
+      assert.equal((await c.post(...later)).body.outcome,'applied');
+      assert.equal(restarted.billing.store.getBundleSubscription(sub).initialPaidPending,undefined,'a newer protection event retires the pending admission');
+      const hooksAfterFence=hookCalls;
+      assert.equal((await postRaw(c,invoice)).body.outcome,'ignored');
+      const sw=restarted.billing.store.getCustomer(key),host=restarted.billing.store.getRoleSubscription(key,'hosting');
+      assert.equal(sw.licenseId,before.licenseId);
+      if(fence==='failure'){assert.equal(sw.subscriptionStatus,'past_due');assert.equal(host.subscriptionStatus,'past_due');assert.equal(host.periodEndMs,null);}
+      if(fence==='cancellation'){assert.equal(sw.subscriptionStatus,'canceled');assert.equal(host.subscriptionStatus,'canceled');assert.equal(host.periodEndMs,null);assert.equal(restarted.billing.store.getBundleSubscription(sub).terminal,true);}
+      if(fence==='refund'||fence==='dispute'){const flag=fence==='refund'?'refunded':'disputed';assert.equal(sw[flag],true);assert.equal(host[flag],true);assert.equal(c.h.store.isRevoked(before.licenseId),true);assert.equal(c.h.store.get(before.licenseId),null,'the fenced retry re-issues nothing');}
+      assert.equal(hookCalls,hooksAfterFence,'the fenced retry never touches hosting');
+      assert.equal(restarted.billing.store.getBundleSubscription(sub).initialPaidPending,undefined);
+      assert.equal((await postRaw(c,invoice)).body.outcome,'duplicate');
+      return;
+    }
+    assert.equal((await postRaw(c,invoice)).body.outcome,'applied');
+    const sw=restarted.billing.store.getCustomer(key),host=restarted.billing.store.getRoleSubscription(key,'hosting');
+    assert.equal(sw.licenseId,before.licenseId);assert.equal(sw.periodEndMs,swEnd);assert.equal(host.periodEndMs,hostEnd);
+    assert.equal(c.h.store.get(before.licenseId).exp,Math.max(bootstrapExp,swEnd+grace),'one paid term, whichever delivery finished it');
+    assert.equal(hookCalls,1);
+    const done=restarted.billing.store.getBundleSubscription(sub);assert.equal(done.initialPaidPending,undefined);assert.equal(done.latestEventCreatedMs,checkoutCreatedMs,'the watermark never moves backwards');
+    assert.equal((await postRaw(c,invoice)).body.outcome,'duplicate');
+    assert.equal((await postRaw(c,{...invoice,id:'evt_alias_'+s.id,type:'invoice.payment_succeeded'})).body.outcome,'ignored','the alias cannot repeat the established term');
+    assert.equal(hookCalls,1);assert.equal(c.h.store.get(before.licenseId).exp,Math.max(bootstrapExp,swEnd+grace));
+  }finally{await c.h.close();}
 });
 summary('Six-plan billing');

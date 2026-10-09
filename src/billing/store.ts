@@ -73,6 +73,8 @@ export interface CustomerRecord {
   disputed: boolean;
   refunded: boolean;
   lastEventType: string | null;
+  /** Durable identity for recovering an interrupted exact-event application. */
+  lastEventId?: string;
   lastEventAtMs: number | null;
   firstPaymentAtMs?: number | null;
   firstActualPaymentAtMs?: number | null;
@@ -140,6 +142,8 @@ export interface RoleSubscriptionRecord {
   createdAtMs: number;
   updatedAtMs: number;
   lastEventType: string | null;
+  /** Durable identity for recovering an interrupted exact-event application. */
+  lastEventId?: string;
   lastEventAtMs: number | null;
 }
 
@@ -151,6 +155,8 @@ export interface BundleSubscriptionRecord {
   priceId: string;
   /** v2 mixed checkout identity; absent on historical one-price bundles. */
   launchIntentId?: string;
+  /** Exact admitted initial invoice, retained until both role writes and hooks finish. */
+  initialPaidPending?: { eventSha256: string; checkoutWatermarkMs: number };
   latestEventCreatedMs: number;
   pendingStatus: "past_due" | null;
   terminal: boolean;
