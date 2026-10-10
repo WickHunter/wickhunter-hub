@@ -30,6 +30,8 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   admin    POST /admin/api/billing/resend-welcome {customerId}
 //   admin    POST /admin/api/billing/test-email  {to}
 //   admin    GET  /admin/api/billing/events      recent webhook events + outcomes
+//   admin    POST /admin/api/billing/reconcile-subscription {subscriptionId|customerId, dryRun?, by, reason}
+//                                               apply a missed paid term from Stripe (dry run by default)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   keyed    GET  /api/candles/snapshot          signed last-N-closed-candles, whole venue (v1)
 //   keyed    GET  /api/market-data/market-caps/v1 signed market-cap snapshot (contract v1)
@@ -40,7 +42,7 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   admin    GET  /admin                         static admin page (auth lives in its API calls)
 //   admin    GET  /admin/api/licenses            list with last-seen
 //   admin    POST /admin/api/licenses            issue {name, days} -> token
-//   admin    POST /admin/api/licenses/expiry     {id, exp} -> re-minted command
+//   admin    POST /admin/api/licenses/expiry     {id, exp, by?, reason?} -> re-minted command (audited)
 //   admin    POST /admin/api/licenses/revoke     {id}
 //   admin    GET  /admin/api/market-caps       producer health + credit spend
 //   admin    GET  /admin/api/marketplace-config masked allowlisted input state
@@ -116,7 +118,7 @@ import {
   type LeasePurpose,
 } from "./license-leases.js";
 import { HUB_VERSION } from "./version.js";
-import { BillingConfigError, BillingService, type BillingServiceDeps } from "./billing/service.js";
+import { BillingConfigError, BillingService, reconcileHttpStatus, type BillingServiceDeps } from "./billing/service.js";
 import { LaunchBilling, HostedCheckoutExpiryError } from "./billing/launch.js";
 import { HostedOffer } from "./billing/hosted-offer.js";
 import { LaunchBillingReporting } from "./billing/reporting.js";
@@ -3042,10 +3044,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (body === null || typeof body.id !== "string" || !body.id || typeof body.exp !== "number") {
         return sendJson(res, 400, { ok: false, error: "expected {id, exp} with exp a unix-ms timestamp" });
       }
+      const beforeExp = store.get(body.id)?.exp ?? null;
       let payload;
       try { payload = store.setExpiry(body.id, body.exp); }
       catch (e) { return sendJson(res, 400, { ok: false, error: (e as Error).message }); }
       if (!payload) return sendJson(res, 404, { ok: false, error: "unknown or revoked license id" });
+      // 0.4.94: an expiry edit is an entitlement change and is audited in
+      // the billing ledger like every other operator billing action (actor,
+      // optional `by`/`reason`, licence, before/after). Before this a hand
+      // repair left no row anywhere. A ledger write failure is logged and
+      // does not undo the edit that already happened.
+      const bound = billing.store.findByLicense(body.id);
+      const auditAt = (deps.billingNow ?? Date.now)();
+      try {
+        billing.store.appendEvent({ id: `admin-license-expiry:${body.id}:${auditAt}`, type: "admin.license.expiry", livemode: bound?.livemode ?? true, receivedAtMs: auditAt, outcome: "applied",
+          note: JSON.stringify({ actor: "operator", by: typeof body.by === "string" ? body.by.trim().slice(0, 80) || null : null, reason: typeof body.reason === "string" ? body.reason.trim().slice(0, 500) || null : null,
+            licenseId: body.id, customerKey: bound?.key ?? null, before: { exp: beforeExp }, after: { exp: payload.exp } }) });
+      } catch (err) { console.warn(`[admin] licence ${body.id} expiry changed but its audit row could not be written: ${(err as Error).message}`); }
       const token = store.tokenFor(body.id);
       return sendJson(res, 200, {
         ok: true,
@@ -3267,6 +3282,27 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return r.ok
         ? sendJson(res, 200, { ok: true, mode: body.mode, ...r.result }, { "cache-control": "no-store" })
         : sendJson(res, r.status, { ok: false, error: r.error });
+    }
+    // ── 0.4.94 — RECONCILE ONE SUBSCRIPTION'S PAID TERM FROM STRIPE ─────────
+    // `BillingService.reconcileSubscriptionFromStripe`: reads the subscription
+    // and its latest paid invoice (read-only) and applies the paid term
+    // through the same function as the `invoice.paid` webhook. A DRY RUN
+    // unless the body says `dryRun: false`, which also needs `by` and
+    // `reason` (written to the billing audit ledger). The verdict decides
+    // the status: 200 applied / would apply / nothing to apply / no
+    // subscription, 409 a named refusal for operator review (nothing
+    // written), 404 unknown, 400 bad request, 502/503 Stripe unreadable.
+    // `scripts/reconcile-bootstrap-only.mjs` drives this for a list.
+    if (m === "POST" && p === "/admin/api/billing/reconcile-subscription") {
+      const body = await readJsonBody(req);
+      if (body === null) return sendJson(res, 400, { ok: false, verdict: "INVALID_REQUEST", error: "expected {subscriptionId} or {customerId}" }, { "cache-control": "no-store" });
+      const opts = { dryRun: body.dryRun !== false, by: body.by, reason: body.reason };
+      const r = typeof body.subscriptionId === "string" && body.subscriptionId ? await billing.reconcileSubscriptionFromStripe(body.subscriptionId, opts)
+        : typeof body.customerId === "string" && body.customerId ? await billing.reconcileCustomerFromStripe(body.customerId, opts)
+        : null;
+      if (!r) return sendJson(res, 400, { ok: false, verdict: "INVALID_REQUEST", error: "expected {subscriptionId} or {customerId}" }, { "cache-control": "no-store" });
+      const status = reconcileHttpStatus(r.verdict);
+      return sendJson(res, status, { ok: status === 200, ...r }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p === "/admin/api/billing/events") {
       const limit = Number(url.searchParams.get("limit") ?? 100);

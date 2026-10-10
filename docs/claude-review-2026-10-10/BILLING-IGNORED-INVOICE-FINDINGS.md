@@ -344,3 +344,15 @@ is why the script reads the whole file.
   echo), and Stripe's retry byte-equality for the 0.4.91 admission.
 - The public website's checkout UI and default VPS selection.
 - The full `npm test` gate on this branch.
+
+## 6. Follow-up in 0.4.94
+
+The bootstrap-only records this audit lists (section C) are repaired by the
+operator-side reconcile added in Hub 0.4.94
+(`POST /admin/api/billing/reconcile-subscription`,
+`scripts/reconcile-bootstrap-only.mjs`): it reads the subscription and its
+latest paid invoice from Stripe and applies the paid term through the same
+function as the `invoice.paid` webhook, dry run by default, licence expiry
+forward only, audited. Section B now prints each cancellation's current
+instance stage and reads `REVERSED` once the instance is no longer
+`cancel_scheduled`. Procedure: `RECONCILE-BOOTSTRAP-ONLY-RUNBOOK.md`.

@@ -569,16 +569,30 @@ export class HostingService {
         this.notifyLatePayment(priorTerminated, nowMs);
         return;
       }
-      this.log(`[hosting] refusing unreserved hosting payment for ${ownerId}: no customer-bound Checkout reservation exists`);
-      if (sub.subscriptionId) {
-        const rejected = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment, region: this.policy().regions[0]?.id ?? "nrt", planId: this.policy().planId, stripeCustomerId: ownerId, nowMs });
-        if (rejected) {
-          const stopped = this.store.updateInstance(rejected.id, rejected.version, (d) => { d.stage = "deleted"; d.stripeSubscriptionId = sub.subscriptionId; d.failureReason = "unreserved_payment"; }, nowMs);
-          if (stopped) this.enqueueStripeCancellation(stopped, sub.subscriptionId, "unreserved-payment", nowMs);
+      if (!sub.subscriptionId) {
+        // Nothing to cancel and nothing to provision: no Stripe
+        // subscription is bound to this record (e.g. an operator's
+        // complimentary test record whose only instance was irreversibly
+        // deleted), so every tick re-derived the same refusal and logged it
+        // every 30 s. Say it once per owner per process; take no action,
+        // exactly as before.
+        if (!this.quietUnreservedOwners.has(ownerId)) {
+          this.quietUnreservedOwners.add(ownerId);
+          this.log(`[hosting] refusing unreserved hosting payment for ${ownerId}: no customer-bound Checkout reservation exists (no Stripe subscription is bound, so there is nothing to cancel${priorTerminated ? "; every instance for this owner is deleted" : ""}; logged once)`);
         }
+        return;
+      }
+      this.quietUnreservedOwners.delete(ownerId);
+      this.log(`[hosting] refusing unreserved hosting payment for ${ownerId}: no customer-bound Checkout reservation exists`);
+      const subscriptionId = sub.subscriptionId;
+      const rejected = this.store.reserveInstance({ id: this.store.newId("host"), ownerId, environment, region: this.policy().regions[0]?.id ?? "nrt", planId: this.policy().planId, stripeCustomerId: ownerId, nowMs });
+      if (rejected) {
+        const stopped = this.store.updateInstance(rejected.id, rejected.version, (d) => { d.stage = "deleted"; d.stripeSubscriptionId = subscriptionId; d.failureReason = "unreserved_payment"; }, nowMs);
+        if (stopped) this.enqueueStripeCancellation(stopped, subscriptionId, "unreserved-payment", nowMs);
       }
       return;
     }
+    this.quietUnreservedOwners.delete(ownerId);
     const ineligible = this.softwareIneligibility(ownerId, nowMs);
     if (ineligible?.kind === "lapsed" && ineligible.subscriptionActive) {
       // A local licence expiry is not Stripe's word. On 2026-10-09 this
@@ -1069,6 +1083,10 @@ export class HostingService {
    *  itself is re-derived from the durable records on every tick, and a
    *  restart merely logs the still-open episode once more. */
   private readonly withheldCancellations = new Set<string>();
+  /** Owners whose "unreserved hosting payment" refusal has nothing to act
+   *  on (no Stripe subscription bound) and has been logged once by this
+   *  process. Same in-memory, log-only rationale as above. */
+  private readonly quietUnreservedOwners = new Set<string>();
 
   /** Owns its own periodic reconciliation (candles/liq's own `start`/`stop`
    *  shape — src/server.ts's `listen`/`close`), so every hub that
