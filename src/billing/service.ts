@@ -48,7 +48,7 @@ import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEm
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { EarnStripeApi } from "../earn-stripe-api.js";
-import { softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
+import { componentPriceId, softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
 
 import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
 import { loadStarterPack, starterPackEligible, starterPackGrantAt } from "./starter-pack.js";
@@ -151,6 +151,64 @@ export interface WebhookReply {
 export interface ApplyResult {
   outcome: EventOutcome;
   note: string | null;
+}
+
+/** Every answer `reconcileSubscriptionFromStripe` can give. The first four
+ *  are ordinary outcomes; the "review" set is a refusal that writes nothing
+ *  and names why (see `RECONCILE_REVIEW_VERDICTS`); the last three are
+ *  request or Stripe-read failures that also write nothing. */
+export type ReconcileVerdict =
+  | "APPLIED" | "WOULD_APPLY" | "NOTHING_TO_APPLY" | "NO_SUBSCRIPTION"
+  | "NO_PAID_INVOICE_YET" | "SUBSCRIPTION_NOT_ACTIVE" | "LICENSE_REVOKED" | "REFUNDED_OR_DISPUTED" | "RECOVERY_PENDING"
+  | "LIFETIME_NOT_A_TERM" | "MULTIPLE_ACTIVE_SUBSCRIPTIONS" | "LATEST_INVOICE_UNSETTLED" | "INVOICE_HISTORY_INCOMPLETE"
+  | "IDENTITY_MISMATCH" | "INVOICE_LINES_INCOMPLETE" | "PERIOD_MISMATCH" | "CONCURRENT_CHANGE" | "UNKNOWN_SUBSCRIPTION"
+  | "INVALID_REQUEST" | "STRIPE_UNAVAILABLE" | "STRIPE_READ_FAILED";
+export const RECONCILE_REVIEW_VERDICTS: ReadonlySet<ReconcileVerdict> = new Set<ReconcileVerdict>([
+  "NO_PAID_INVOICE_YET", "SUBSCRIPTION_NOT_ACTIVE", "LICENSE_REVOKED", "REFUNDED_OR_DISPUTED", "RECOVERY_PENDING",
+  "LIFETIME_NOT_A_TERM", "MULTIPLE_ACTIVE_SUBSCRIPTIONS", "LATEST_INVOICE_UNSETTLED", "INVOICE_HISTORY_INCOMPLETE",
+  "IDENTITY_MISMATCH", "INVOICE_LINES_INCOMPLETE", "PERIOD_MISMATCH", "CONCURRENT_CHANGE", "UNKNOWN_SUBSCRIPTION",
+]);
+const RECONCILE_ERROR_VERDICTS: ReadonlySet<ReconcileVerdict> = new Set<ReconcileVerdict>(["INVALID_REQUEST", "STRIPE_UNAVAILABLE", "STRIPE_READ_FAILED"]);
+/** The HTTP status the admin route answers for a verdict. */
+export function reconcileHttpStatus(verdict: ReconcileVerdict): number {
+  if (verdict === "INVALID_REQUEST") return 400;
+  if (verdict === "UNKNOWN_SUBSCRIPTION") return 404;
+  if (verdict === "STRIPE_READ_FAILED") return 502;
+  if (verdict === "STRIPE_UNAVAILABLE") return 503;
+  return RECONCILE_REVIEW_VERDICTS.has(verdict) ? 409 : 200;
+}
+export const RECONCILE_EVENT_TYPE = "admin.billing.reconcile-subscription";
+export interface ReconcileOptions { dryRun?: boolean; by?: unknown; reason?: unknown }
+export interface ReconcileFieldChange { before: number | string | null; after: number | string | null; changed: boolean }
+export interface SubscriptionReconcileResult {
+  verdict: ReconcileVerdict;
+  /** A refusal the operator must look at (includes "no paid invoice yet"). */
+  needsReview: boolean;
+  /** Dry run: this call WOULD write. Apply: this call DID write. */
+  changed: boolean;
+  wrote: boolean;
+  dryRun: boolean;
+  note: string;
+  customerKey: string | null;
+  subscriptionId: string | null;
+  licenseId: string | null;
+  mode: BillingMode | null;
+  /** What Stripe said, read through the Hub's Stripe client (null before or without a read). */
+  stripe: null | {
+    status: string; cancelAtPeriodEnd: boolean; currentPeriodEndMs: number | null;
+    /** Subscriptions on the Stripe customer that have not ended (anything but canceled/incomplete_expired). */
+    activeSubscriptionCount: number | null;
+    latestInvoice: { id: string; status: string; billingReason: string } | null;
+    /** The latest invoice with status `paid` and a positive `amount_paid` — the paid term. */
+    paidInvoice: null | { id: string; billingReason: string; amountPaid: number; currency: string; periodStartMs: number | null; periodEndMs: number | null; paidAtMs: number | null };
+  };
+  /** before → after for every field the paid term sets; present from the point the term is evaluated. */
+  changes: null | Record<"periodEndMs" | "paidThroughMs" | "firstActualPaymentAtMs" | "licenseExp" | "subscriptionStatus" | "discountPercent" | "lastEventType", ReconcileFieldChange>;
+  /** The hosting role record of a combined subscription — READ ONLY; this tool never changes it. */
+  hosting: null | { status: string | null; periodEndMs: number | null };
+  auditEventId?: string;
+  /** Present on the request/Stripe-read failure verdicts. */
+  error?: string;
 }
 
 export type WelcomePageResult = { ok: true; html: string } | { ok: false; status: number; text: string };
@@ -1278,7 +1336,7 @@ export class BillingService {
     }
   }
 
-  private async withCheckoutLocks(keys: string[], fn: () => Promise<ApplyResult>): Promise<ApplyResult> {
+  private async withCheckoutLocks<T = ApplyResult>(keys: string[], fn: () => Promise<T>): Promise<T> {
     const unique = [...new Set(keys)].sort();
     const turns: Array<{ key: string; turn: Promise<void>; release: () => void; prior: Promise<void> }> = [];
     for (const key of unique) {
@@ -1304,7 +1362,7 @@ export class BillingService {
     if (f.metadata.wh_launch_intent && !f.customerId) throw Error('Launch invoice is missing its Stripe customer');
     if (!f.customerId && !f.email) return { outcome: "ignored", note: "invoice carried neither a customer nor an email" };
     const now = this.now();
-    const paidThrough = f.periodEndMs !== null ? f.periodEndMs + cfg.policy.graceDays * DAY_MS : null;
+    const paidThrough = this.paidThroughOf(f.periodEndMs, cfg);
     const planKey = this.planKeyOf(f.metadata, cfg);
     const launchInvoice = f.metadata.wh_launch_intent ? launchGrant(this.dataDir, f.metadata, ev.livemode) : null;
     if (f.metadata.wh_launch_intent && !launchInvoice?.sessionId) throw Error('Launch checkout awaits session reconciliation');
@@ -1314,22 +1372,12 @@ export class BillingService {
     }
     const { rec, created } = this.ensureCustomer({ customerId: f.customerId, email: f.email, name: f.name, subscriptionId: f.subscriptionId, livemode: ev.livemode, planKey, metadata: f.metadata, starterPackCandidateAtMs: f.billingReason === 'subscription_create' ? starterPackGrantAt(launchInvoice, ev, true) : null }, cfg, paidThrough ?? now + cfg.policy.bootstrapDays * DAY_MS, now);
     let note = created ? "licence issued" : "customer known";
-    if (paidThrough !== null) {
-      if (this.extendLicense(rec, paidThrough, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? paidThrough).toISOString().slice(0, 10)}`;
-      if (rec.periodEndMs === null || f.periodEndMs! > rec.periodEndMs) rec.periodEndMs = f.periodEndMs;
+    const term = this.applyPaidInvoiceTerm(rec, ev.object, cfg, ev.createdMs, !!launchInvoice?.hosting);
+    if (term.licenseTargetMs !== null) {
+      if (this.extendLicense(rec, term.licenseTargetMs, cfg, now)) note += `; licence extended to ${new Date(this.licenseExp(rec) ?? term.licenseTargetMs).toISOString().slice(0, 10)}`;
     } else {
       note += "; invoice had no period end";
     }
-    rec.subscriptionStatus = "active";
-    if (launchInvoice?.hosting) { const discount = checkoutDiscountPercent(ev.object); if (discount !== null) rec.discountPercent = discount; }
-    const amountPaid = ev.object.amount_paid;
-    if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
-      const transitions = ev.object.status_transitions as Record<string, unknown> | undefined;
-      const paidAt = transitions?.paid_at;
-      this.noteFirstActualPayment(rec, typeof paidAt === 'number' && Number.isSafeInteger(paidAt) && paidAt > 0 ? paidAt * 1000 : ev.createdMs);
-    }
-    this.noteCharge(rec, f.chargeId);
-    this.noteCharge(rec, f.paymentIntentId);
     this.touch(rec, ev, now);
     this.store.putCustomer(rec);
     note += await this.sendWelcomeIfNeeded(rec, cfg, now);
@@ -1561,12 +1609,57 @@ export class BillingService {
    *  and by the format's 3650-day bound). Returns whether anything changed.
    *  A revoked licence is never extended. */
   private extendLicense(rec: CustomerRecord, target: number, cfg: BillingConfig, now: number): boolean {
-    const current = this.licenses.get(rec.licenseId);
-    if (!current) return false;
-    const capped = Math.min(this.capExp(rec, target, cfg), current.iat + MAX_LICENSE_DAYS * DAY_MS);
-    if (capped <= current.exp) return false;
-    this.licenses.setExpiry(rec.licenseId, capped, now);
+    const next = this.extendedLicenseExp(rec, target, cfg);
+    if (next === null) return false;
+    this.licenses.setExpiry(rec.licenseId, next, now);
     return true;
+  }
+
+  /** The expiry `extendLicense` would write for `target`, or null when it
+   *  would write nothing (unknown/revoked licence, or the capped target is
+   *  not later than the current expiry). Pure, so a dry run evaluates the
+   *  exact forward-only rule without touching the registry. */
+  private extendedLicenseExp(rec: CustomerRecord, target: number, cfg: BillingConfig): number | null {
+    const current = this.licenses.get(rec.licenseId);
+    if (!current) return null;
+    const capped = Math.min(this.capExp(rec, target, cfg), current.iat + MAX_LICENSE_DAYS * DAY_MS);
+    return capped > current.exp ? capped : null;
+  }
+
+  /** A paid period end plus the policy's grace: what the licence is owed. */
+  private paidThroughOf(periodEndMs: number | null, cfg: BillingConfig): number | null {
+    return periodEndMs !== null ? periodEndMs + cfg.policy.graceDays * DAY_MS : null;
+  }
+
+  /** THE paid term one paid invoice proves for the software record — the
+   *  single definition shared by the webhook (`onInvoicePaid`, which the
+   *  bundle path also reaches with its software projection) and the
+   *  operator's `reconcileSubscriptionFromStripe`. It moves `periodEndMs`
+   *  forward to the invoice's latest line period end, marks the
+   *  subscription active, takes a hosted launch's software discount from the
+   *  (projected) invoice, records the first actual payment (the earliest
+   *  positive payment's `paid_at`, falling back to `fallbackPaidAtMs`) and
+   *  indexes the charge ids. It mutates `rec` only; the licence target
+   *  (period end + `graceDays`) is returned for the caller to commit through
+   *  the forward-only `extendLicense`, so a dry run can evaluate the very
+   *  same rules without writing. `keepCancellationMarker` (operator path
+   *  only) leaves an existing "active (cancels at period end)" status as it
+   *  is: the reconcile never touches a cancellation. */
+  private applyPaidInvoiceTerm(rec: CustomerRecord, invoice: Record<string, unknown>, cfg: BillingConfig, fallbackPaidAtMs: number, hostedLaunch: boolean, keepCancellationMarker = false): { periodEndMs: number | null; licenseTargetMs: number | null } {
+    const f = invoiceFacts(invoice);
+    const licenseTargetMs = this.paidThroughOf(f.periodEndMs, cfg);
+    if (f.periodEndMs !== null && (rec.periodEndMs === null || f.periodEndMs > rec.periodEndMs)) rec.periodEndMs = f.periodEndMs;
+    if (!(keepCancellationMarker && rec.subscriptionStatus === "active (cancels at period end)")) rec.subscriptionStatus = "active";
+    if (hostedLaunch) { const discount = checkoutDiscountPercent(invoice); if (discount !== null) rec.discountPercent = discount; }
+    const amountPaid = invoice.amount_paid;
+    if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
+      const transitions = invoice.status_transitions as Record<string, unknown> | undefined;
+      const paidAt = transitions?.paid_at;
+      this.noteFirstActualPayment(rec, typeof paidAt === 'number' && Number.isSafeInteger(paidAt) && paidAt > 0 ? paidAt * 1000 : fallbackPaidAtMs);
+    }
+    this.noteCharge(rec, f.chargeId);
+    this.noteCharge(rec, f.paymentIntentId);
+    return { periodEndMs: f.periodEndMs, licenseTargetMs };
   }
 
   private revoke(rec: CustomerRecord, reason: string, now: number): string {
@@ -2113,6 +2206,209 @@ export class BillingService {
     this.licenses.renewLifetimeToken(licenseId, this.now());
   }
 
+  // ── operator: reconcile one subscription's paid term from Stripe ──────────
+  //
+  // 2026-10-10: customers whose initial paid invoice the Hub discarded
+  // (0.4.90, "older bundle lifecycle event ignored"; those event ids are
+  // seen, so neither a resend nor 0.4.91's admission reaches them) kept a
+  // bootstrap-only record — `periodEndMs: null`, `lastEventType`
+  // `checkout.session.*` — even where an operator had already repaired the
+  // licence expiry by hand. This reads the subscription and its latest paid
+  // invoice from Stripe through the same client the rest of billing uses
+  // (`EarnStripeApi` over `launchFetch`) and applies that invoice's paid term
+  // through `applyPaidInvoiceTerm`, the function the `invoice.paid` webhook
+  // uses, with the bundle's software projection exactly as the webhook
+  // projects it. It writes the customer record and (forward only) the
+  // licence registry, and one `admin.billing.reconcile-subscription` row in
+  // the billing audit ledger. It never touches Stripe (read-only GETs), the
+  // cancellation flag, the hosting role record or lifecycle, holds, or email.
+  // A dry run is the default and writes nothing.
+
+  /** Resolve a customer key to its subscription; a customer without one
+   *  (Lifetime, one-time, complimentary) is a clear `NO_SUBSCRIPTION`. */
+  async reconcileCustomerFromStripe(customerKey: string, opts: ReconcileOptions = {}): Promise<SubscriptionReconcileResult> {
+    const dryRun = opts.dryRun !== false;
+    const rec = customerKey ? this.store.getCustomer(customerKey) : null;
+    if (!rec) return this.reconcileOutcome({ dryRun, customerKey: customerKey || null }, "UNKNOWN_SUBSCRIPTION", "no billing customer has this key");
+    if (!rec.subscriptionId) {
+      return this.reconcileOutcome({ dryRun, customerKey: rec.key, licenseId: rec.licenseId, mode: rec.livemode ? "live" : "test" }, "NO_SUBSCRIPTION",
+        `no Stripe subscription is bound to this customer (${rec.lifetimeAccess ? "Lifetime" : rec.planKey ?? "unplanned"}); there is no paid term to reconcile — skipped`);
+    }
+    return this.reconcileSubscriptionFromStripe(rec.subscriptionId, opts);
+  }
+
+  async reconcileSubscriptionFromStripe(subscriptionId: string, opts: ReconcileOptions = {}): Promise<SubscriptionReconcileResult> {
+    const dryRun = opts.dryRun !== false;
+    const by = typeof opts.by === "string" ? opts.by.trim().slice(0, 80) : "";
+    const reason = typeof opts.reason === "string" ? opts.reason.trim().slice(0, 500) : "";
+    const base = { dryRun, subscriptionId: typeof subscriptionId === "string" && subscriptionId ? subscriptionId : null };
+    if (typeof subscriptionId !== "string" || !/^sub_[A-Za-z0-9_]{1,200}$/.test(subscriptionId)) return this.reconcileOutcome(base, "INVALID_REQUEST", "expected a Stripe subscription id (sub_…)");
+    if (!dryRun && (!by || !reason)) return this.reconcileOutcome(base, "INVALID_REQUEST", "an apply needs {by, reason}; a dry run (the default) needs neither");
+    const rec = this.store.findBySubscription(subscriptionId);
+    if (!rec) return this.reconcileOutcome(base, "UNKNOWN_SUBSCRIPTION", "no software customer record carries this subscription");
+    const mode: BillingMode = rec.livemode ? "live" : "test";
+    const hostingRole = this.store.findRoleSubscriptionBySubscription("hosting", subscriptionId);
+    let ctx: Partial<SubscriptionReconcileResult> & { dryRun: boolean } = { ...base, customerKey: rec.key, licenseId: rec.licenseId, mode,
+      hosting: hostingRole ? { status: hostingRole.subscriptionStatus, periodEndMs: hostingRole.periodEndMs } : null };
+    const cfg = this.config();
+    const secretKey = cfg.stripe[mode].secretKey;
+    if (!secretKey) return this.reconcileOutcome(ctx, "STRIPE_UNAVAILABLE", `no ${mode} Stripe secret key is saved on this Hub; nothing was read or written`);
+
+    // ── Stripe (read-only) ──
+    const api = new EarnStripeApi(secretKey, this.launchFetch);
+    let rawSub: Record<string, any>, rawSubs: Record<string, any> | null, rawInvoices: Record<string, any>;
+    try {
+      rawSub = await api.call("GET", `/v1/subscriptions/${subscriptionId}`);
+      rawSubs = rec.stripeCustomerId ? await api.call("GET", "/v1/subscriptions", { customer: rec.stripeCustomerId, status: "all", limit: 20 }) : null;
+      rawInvoices = await api.call("GET", "/v1/invoices", { subscription: subscriptionId, limit: 24 });
+    } catch (err) {
+      return this.reconcileOutcome(ctx, "STRIPE_READ_FAILED", `Stripe read failed (${(err as Error).message}); nothing was written`);
+    }
+    const sf = subscriptionFacts(rawSub);
+    const listed = Array.isArray(rawSubs?.data) ? rawSubs!.data as Record<string, any>[] : null;
+    const invoices = Array.isArray(rawInvoices?.data) ? (rawInvoices.data as Record<string, any>[]).slice().sort((a, b) => (Number(b?.created) || 0) - (Number(a?.created) || 0)) : null;
+    const latest = invoices?.find((i) => i?.status !== "void" && i?.status !== "deleted") ?? null;
+    const paid = invoices?.find((i) => i?.status === "paid" && Number.isSafeInteger(i?.amount_paid) && i.amount_paid > 0) ?? null;
+    const paidPeriod = paid ? linePeriod(paid) : null;
+    const stripe: NonNullable<SubscriptionReconcileResult["stripe"]> = {
+      status: sf.status, cancelAtPeriodEnd: sf.cancelAtPeriodEnd, currentPeriodEndMs: sf.currentPeriodEndMs,
+      activeSubscriptionCount: listed ? listed.filter((s) => !["canceled", "incomplete_expired"].includes(String(s?.status))).length : null,
+      latestInvoice: latest ? { id: String(latest.id ?? ""), status: String(latest.status ?? ""), billingReason: String(latest.billing_reason ?? "") } : null,
+      paidInvoice: paid ? { id: String(paid.id ?? ""), billingReason: String(paid.billing_reason ?? ""), amountPaid: paid.amount_paid, currency: String(paid.currency ?? ""),
+        periodStartMs: paidPeriod!.startMs, periodEndMs: paidPeriod!.endMs, paidAtMs: paidAtOf(paid) } : null,
+    };
+    ctx = { ...ctx, stripe };
+    if (sf.subscriptionId !== subscriptionId || !rec.stripeCustomerId || sf.customerId !== rec.stripeCustomerId || (typeof rawSub.livemode === "boolean" && rawSub.livemode !== rec.livemode)) {
+      return this.reconcileOutcome(ctx, "IDENTITY_MISMATCH", `Stripe's subscription (customer ${sf.customerId || "?"}) does not match this record (customer ${rec.stripeCustomerId || "?"}, ${mode})`);
+    }
+    if (!listed || !invoices) return this.reconcileOutcome(ctx, "STRIPE_READ_FAILED", "Stripe's subscription or invoice list was unreadable; nothing was written");
+
+    // ── refusals, each by name; nothing below writes until every one passed ──
+    if (sf.status !== "active" && sf.status !== "trialing") return this.reconcileOutcome(ctx, "SUBSCRIPTION_NOT_ACTIVE", `Stripe reports this subscription as ${sf.status || "unknown"}, not active or trialing; no paid term is applied`);
+    if (this.licenses.isRevoked(rec.licenseId)) return this.reconcileOutcome(ctx, "LICENSE_REVOKED", `licence ${rec.licenseId} is revoked; a reconcile never restores a revoked licence`);
+    if (!this.licenses.get(rec.licenseId)) return this.reconcileOutcome(ctx, "IDENTITY_MISMATCH", `licence ${rec.licenseId} is not in the registry`);
+    if (rec.refunded || rec.disputed || hostingRole?.refunded || hostingRole?.disputed) {
+      return this.reconcileOutcome(ctx, "REFUNDED_OR_DISPUTED", `a charge on this subscription was ${rec.disputed || hostingRole?.disputed ? "disputed" : "refunded"}; support review first`);
+    }
+    if (this.recoveryPending(rec.key)) return this.reconcileOutcome(ctx, "RECOVERY_PENDING", "a device recovery for this customer is still in progress");
+    const bound = this.store.getBundleSubscription(subscriptionId);
+    if (rec.lifetimeAccess || bound?.planKey === "lifetime") return this.reconcileOutcome(ctx, "LIFETIME_NOT_A_TERM", "Lifetime software is a one-time purchase; its subscription bills hosting only and carries no software term");
+    if ((stripe.activeSubscriptionCount ?? 0) > 1 || rawSubs!.has_more === true) {
+      return this.reconcileOutcome(ctx, "MULTIPLE_ACTIVE_SUBSCRIPTIONS", `Stripe customer ${rec.stripeCustomerId} has ${stripe.activeSubscriptionCount}${rawSubs!.has_more ? "+" : ""} subscriptions that have not ended; reconcile by hand`);
+    }
+    if (latest && latest.status !== "paid") return this.reconcileOutcome(ctx, "LATEST_INVOICE_UNSETTLED", `the latest invoice ${latest.id} is ${latest.status} (${latest.billing_reason ?? "?"}), not paid`);
+    if (!paid) {
+      if (rawInvoices.has_more === true) return this.reconcileOutcome(ctx, "INVOICE_HISTORY_INCOMPLETE", "no positive paid invoice among the newest 24; reconcile by hand");
+      return this.reconcileOutcome(ctx, "NO_PAID_INVOICE_YET", `no paid invoice yet: Stripe has no invoice with a positive amount paid for this subscription${sf.currentPeriodEndMs !== null ? ` (current period ends ${new Date(sf.currentPeriodEndMs).toISOString()})` : ""}; the first paid invoice applies itself through the webhook`);
+    }
+    const pf = invoiceFacts(paid);
+    if (pf.subscriptionId !== subscriptionId || pf.customerId !== rec.stripeCustomerId) {
+      return this.reconcileOutcome(ctx, "IDENTITY_MISMATCH", `invoice ${paid.id} names subscription ${pf.subscriptionId || "?"} / customer ${pf.customerId || "?"}`);
+    }
+    // The webhook's projection: a v2 mixed subscription's invoice reaches the
+    // software term as its software lines only (`applyBundleEvent`).
+    let grant: LaunchIntent | null = null;
+    let termInvoice: Record<string, unknown> = paid;
+    try {
+      if (bound?.launchIntentId) {
+        grant = launchGrant(this.dataDir, { wh_launch_intent: bound.launchIntentId, plan: bound.planKey }, rec.livemode);
+        if (!grant?.hosting || !grant.sessionId || bound.customerId !== rec.stripeCustomerId) throw Error("mixed subscription lacks its durable software/VPS proof");
+        const proof = grant.hosting;
+        const lines = Array.isArray(paid.lines?.data) ? paid.lines.data as Record<string, any>[] : [];
+        if (lines.some((l) => ![proof.softwarePriceId, proof.hostingPriceId].includes(componentPriceId(l)))) throw Error("invoice lines differ from the mixed subscription's approved prices");
+      } else if (pf.metadata.wh_launch_intent) {
+        grant = launchGrant(this.dataDir, pf.metadata, rec.livemode);
+        if (!grant?.sessionId) throw Error("launch checkout awaits session reconciliation");
+      }
+    } catch (err) {
+      return this.reconcileOutcome(ctx, "IDENTITY_MISMATCH", (err as Error).message);
+    }
+    try {
+      if (grant?.hosting) termInvoice = softwareInvoiceProjection(paid, grant.hosting);
+    } catch (err) {
+      return this.reconcileOutcome(ctx, "INVOICE_LINES_INCOMPLETE", (err as Error).message);
+    }
+    const term = linePeriod(termInvoice);
+    if (term.endMs === null || (grant?.hosting && !(termInvoice.lines as any)?.data?.length)) return this.reconcileOutcome(ctx, "INVOICE_LINES_INCOMPLETE", `invoice ${paid.id} carries no software line with a period end`);
+    const cpe = sf.currentPeriodEndMs;
+    if (cpe === null || term.startMs === null || !(term.startMs < cpe && cpe <= term.endMs)) {
+      return this.reconcileOutcome(ctx, "PERIOD_MISMATCH", `the paid invoice ${paid.id} covers ${iso(term.startMs)} → ${iso(term.endMs)}, which does not contain Stripe's current period end ${iso(cpe)}`);
+    }
+
+    // ── the paid term, evaluated by the shared function on a copy ──
+    const lic = this.licenses.get(rec.licenseId)!;
+    const draft: CustomerRecord = structuredClone(rec);
+    const applied = this.applyPaidInvoiceTerm(draft, termInvoice, cfg, paidFallbackMs(paid), !!grant?.hosting, true);
+    const nextExp = applied.licenseTargetMs !== null ? this.extendedLicenseExp(rec, applied.licenseTargetMs, cfg) : null;
+    const grace = cfg.policy.graceDays * DAY_MS;
+    const field = (before: number | string | null | undefined, after: number | string | null | undefined): ReconcileFieldChange =>
+      ({ before: before ?? null, after: after ?? null, changed: (before ?? null) !== (after ?? null) });
+    const termChanged = rec.periodEndMs === null || (applied.periodEndMs !== null && applied.periodEndMs > rec.periodEndMs);
+    const changes = {
+      periodEndMs: field(rec.periodEndMs, draft.periodEndMs),
+      paidThroughMs: field(rec.periodEndMs !== null ? rec.periodEndMs + grace : null, draft.periodEndMs !== null ? draft.periodEndMs + grace : null),
+      firstActualPaymentAtMs: field(rec.firstActualPaymentAtMs, draft.firstActualPaymentAtMs),
+      licenseExp: field(lic.exp, nextExp ?? lic.exp),
+      subscriptionStatus: field(rec.subscriptionStatus, draft.subscriptionStatus),
+      discountPercent: field(rec.discountPercent, draft.discountPercent),
+      lastEventType: field(rec.lastEventType, termChanged ? RECONCILE_EVENT_TYPE : rec.lastEventType),
+    };
+    ctx = { ...ctx, changes };
+    // The paid term this invoice proves is already on the record: nothing to
+    // apply, and nothing else is "tidied" (a first-payment instant a second
+    // earlier, a status spelling) — a record that already carries its term
+    // is never rewritten by this tool.
+    if (!termChanged) {
+      for (const k of Object.keys(changes) as (keyof typeof changes)[]) changes[k] = field(changes[k].before, changes[k].before);
+      return this.reconcileOutcome(ctx, "NOTHING_TO_APPLY", `the paid term through ${iso(rec.periodEndMs)} is already recorded; nothing to apply`);
+    }
+    const summaryNote = `periodEnd ${iso(rec.periodEndMs)} → ${iso(draft.periodEndMs)}; licence exp ${changes.licenseExp.changed ? `${iso(lic.exp)} → ${iso(nextExp)}` : `${iso(lic.exp)} unchanged`}`;
+    if (dryRun) return this.reconcileOutcome(ctx, "WOULD_APPLY", `dry run, nothing written: would apply invoice ${paid.id} — ${summaryNote}`, { changed: true });
+
+    // ── apply: under the same locks the webhook's checkout/bundle paths take ──
+    const commit = async (): Promise<SubscriptionReconcileResult> => {
+      const fresh = this.store.getCustomer(rec.key);
+      const freshLic = this.licenses.get(rec.licenseId);
+      if (!fresh || JSON.stringify(fresh) !== JSON.stringify(rec) || !freshLic || freshLic.exp !== lic.exp) {
+        return this.reconcileOutcome(ctx, "CONCURRENT_CHANGE", "the customer record or licence changed while Stripe was being read; nothing was written — run again");
+      }
+      const now = this.now();
+      const t = this.applyPaidInvoiceTerm(fresh, termInvoice, cfg, paidFallbackMs(paid), !!grant?.hosting, true);
+      if (t.licenseTargetMs !== null) this.extendLicense(fresh, t.licenseTargetMs, cfg, now);
+      fresh.lastEventType = RECONCILE_EVENT_TYPE;
+      fresh.lastEventId = `reconcile:${String(paid.id)}`;
+      fresh.lastEventAtMs = now;
+      fresh.updatedAtMs = now;
+      this.store.putCustomer(fresh);
+      const auditEventId = `admin-billing-reconcile:${subscriptionId}:${now}`;
+      const before = Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.before]));
+      const after = Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.after]));
+      try {
+        this.store.appendEvent({ id: auditEventId, type: RECONCILE_EVENT_TYPE, livemode: rec.livemode, receivedAtMs: now, outcome: "applied",
+          note: JSON.stringify({ actor: "operator", by, reason, customerKey: rec.key, subscriptionId, licenseId: rec.licenseId,
+            invoiceId: paid.id, billingReason: paid.billing_reason ?? null, amountPaid: paid.amount_paid, currency: paid.currency ?? null,
+            stripeStatus: sf.status, currentPeriodEndMs: cpe, before, after }) });
+      } catch (err) {
+        this.log(`[billing] reconcile ${subscriptionId} APPLIED but its audit row could not be written: ${(err as Error).message}`);
+        return this.reconcileOutcome(ctx, "APPLIED", `applied invoice ${paid.id} — ${summaryNote}; WARNING: the audit row could not be written`, { changed: true, wrote: true });
+      }
+      this.log(`[billing] reconcile ${subscriptionId} (${rec.key}) by ${by}: applied invoice ${paid.id} — ${summaryNote}; reason: ${reason}`);
+      return this.reconcileOutcome(ctx, "APPLIED", `applied invoice ${paid.id} — ${summaryNote}`, { changed: true, wrote: true, auditEventId });
+    };
+    const locked = () => this.withCheckoutLocks([rec.key, rec.stripeCustomerId].filter((k): k is string => !!k), commit);
+    return bound?.launchIntentId ? this.withBundleLock(bound.launchIntentId, locked) : locked();
+  }
+
+  private reconcileOutcome(ctx: Partial<SubscriptionReconcileResult> & { dryRun: boolean }, verdict: ReconcileVerdict, note: string, extra: { changed?: boolean; wrote?: boolean; auditEventId?: string } = {}): SubscriptionReconcileResult {
+    return {
+      verdict, needsReview: RECONCILE_REVIEW_VERDICTS.has(verdict), changed: extra.changed === true, wrote: extra.wrote === true, dryRun: ctx.dryRun, note,
+      customerKey: ctx.customerKey ?? null, subscriptionId: ctx.subscriptionId ?? null, licenseId: ctx.licenseId ?? null, mode: ctx.mode ?? null,
+      stripe: ctx.stripe ?? null, changes: ctx.changes ?? null, hosting: ctx.hosting ?? null,
+      ...(extra.auditEventId ? { auditEventId: extra.auditEventId } : {}),
+      ...(RECONCILE_ERROR_VERDICTS.has(verdict) ? { error: note } : {}),
+    };
+  }
+
   // ── admin views ───────────────────────────────────────────────────────────
 
   customersView(roster: Record<string, RosterEntry>): Record<string, unknown>[] {
@@ -2165,3 +2461,28 @@ export function renderTemplate(template: string, vars: Record<string, string>, f
 }
 
 function normalizeInstallEmail(value: string): string { return value.trim().toLowerCase(); }
+
+// ── reconcile helpers (Stripe invoice reading; pure) ─────────────────────────
+const iso = (ms: number | null | undefined): string => (typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : "null");
+/** The service period an invoice's own lines cover: the earliest line
+ *  `period.start` and the latest `period.end` (the same lines
+ *  `invoiceFacts.periodEndMs` reads). Seconds on the wire, ms here. */
+function linePeriod(invoice: Record<string, any>): { startMs: number | null; endMs: number | null } {
+  let start: number | null = null, end: number | null = null;
+  for (const line of Array.isArray(invoice?.lines?.data) ? invoice.lines.data : []) {
+    const s = line?.period?.start, e = line?.period?.end;
+    if (typeof s === "number" && Number.isFinite(s) && (start === null || s < start)) start = s;
+    if (typeof e === "number" && Number.isFinite(e) && (end === null || e > end)) end = e;
+  }
+  return { startMs: start === null ? null : start * 1000, endMs: end === null ? null : end * 1000 };
+}
+function paidAtOf(invoice: Record<string, any>): number | null {
+  const paidAt = invoice?.status_transitions?.paid_at;
+  return typeof paidAt === "number" && Number.isSafeInteger(paidAt) && paidAt > 0 ? paidAt * 1000 : null;
+}
+/** `applyPaidInvoiceTerm`'s fallback when an invoice has no `paid_at`: the
+ *  webhook passes its event's `created`; a read invoice has its own. */
+function paidFallbackMs(invoice: Record<string, any>): number {
+  const created = invoice?.created;
+  return typeof created === "number" && Number.isSafeInteger(created) && created > 0 ? created * 1000 : 0;
+}

@@ -127,8 +127,18 @@ const cancellations = cancellationJobs.map((j) => {
   const fact = factOf(String(j.payload.subscriptionId ?? ""));
   const stripeActiveAtQueue = !!fact && ACTIVE.has(fact.status) && (typeof fact.currentPeriodEndMs !== "number" || fact.currentPeriodEndMs > j.createdAtMs);
   const hubOriginatedCancellationScheduled = j.status === "sent" && !!row && row.cancellationReason === "intentional_cancellation" && (c?.cancelAtPeriodEnd === true || (hostingOf(owner ?? "")?.subscriptionStatus ?? "") === "active (cancels at period end)");
+  // The job row keeps its own status ("sent") forever; what the instance
+  // says NOW is what matters. An instance that is no longer
+  // cancel_scheduled after a sent cancellation was reversed (the customer's
+  // or the operator's resume-renewal); suspended/deleting/deleted means the
+  // cancellation took effect.
+  const verdict = !row ? "INSTANCE_MISSING"
+    : row.stage === "cancel_scheduled" ? "CANCELLATION_SCHEDULED"
+    : ["suspended", "deleting", "deleted"].includes(row.stage) ? "ENDED"
+    : j.status === "sent" ? "REVERSED"
+    : `JOB_${String(j.status ?? "unknown").toUpperCase()}`;
   return {
-    jobId: j.id, status: j.status, queuedAt: iso(j.createdAtMs), lastAttemptAt: iso(j.updatedAtMs), attempts: j.attemptCount ?? null, lastError: j.lastErrorCode ?? null,
+    jobId: j.id, status: j.status, verdict, queuedAt: iso(j.createdAtMs), lastAttemptAt: iso(j.updatedAtMs), attempts: j.attemptCount ?? null, lastError: j.lastErrorCode ?? null,
     subscriptionId: j.payload.subscriptionId ?? null, instanceId: j.hostingInstanceId, ownerKey: owner,
     instance: row ? { stage: row.stage, cancellationReason: row.cancellationReason ?? null, suspendAt: iso(row.suspendAtMs), deleteAt: iso(row.deleteAtMs), onHold: !!row.deletionHold } : null,
     customer: c ? customerState(c) : null,
@@ -147,6 +157,7 @@ const summary = {
   softwareIneligibleCancellations: cancellations.length,
   cancellationsWhileStripeActive: cancellations.filter((x) => x.flags.stripeActiveAtQueue).length,
   hubOriginatedCancellationsScheduled: cancellations.filter((x) => x.flags.hubOriginatedCancellationScheduled).length,
+  reversedCancellations: cancellations.filter((x) => x.verdict === "REVERSED").length,
   bootstrapOnlyCustomers: bootstrapOnly.length, bootstrapOnlyLapsed: bootstrapOnly.filter((x) => x.verdict === "LAPSED_WHILE_SUBSCRIBED").length,
   notes,
 };
@@ -168,10 +179,10 @@ for (const g of groups.values()) {
 }
 for (const o of orphans) line(`  orphan ignored ${o.type} ${o.eventId} received ${o.receivedAt}`);
 line();
-line(`B. software-ineligible Stripe cancellations queued by the Hub: ${summary.softwareIneligibleCancellations} (${summary.cancellationsWhileStripeActive} while Stripe reported active/paid; ${summary.hubOriginatedCancellationsScheduled} now mirrored as the customer's own cancellation)`);
-for (const x of cancellations) line(`  job ${x.jobId} ${x.status} queued ${x.queuedAt} sub ${x.subscriptionId} owner ${x.ownerKey ?? "?"} VPS ${x.instanceId} ${x.instance?.stage ?? "?"}${x.instance?.cancellationReason ? ` (${x.instance.cancellationReason}, suspend ${x.instance.suspendAt}, delete ${x.instance.deleteAt})` : ""}; software ${x.customer?.software.status ?? "?"} exp ${x.customer?.licence.exp ?? "?"}; Stripe ${x.stripeFact ? `${x.stripeFact.status}${x.stripeFact.cancelAtPeriodEnd ? " cancel_at_period_end" : ""} to ${x.stripeFact.currentPeriodEnd}` : "no fact"}; flags ${Object.entries(x.flags).filter(([, v]) => v).map(([k]) => k).join(",") || "none"}`);
+line(`B. software-ineligible Stripe cancellations queued by the Hub: ${summary.softwareIneligibleCancellations} (${summary.cancellationsWhileStripeActive} while Stripe reported active/paid; ${summary.hubOriginatedCancellationsScheduled} now mirrored as the customer's own cancellation; ${summary.reversedCancellations} reversed)`);
+for (const x of cancellations) line(`  job ${x.jobId} ${x.status} queued ${x.queuedAt} sub ${x.subscriptionId} owner ${x.ownerKey ?? "?"} → ${x.verdict}${x.verdict === "REVERSED" ? " (reversed: the instance is no longer cancel_scheduled)" : ""}; VPS ${x.instanceId} now stage ${x.instance?.stage ?? "?"}, cancellationReason ${x.instance?.cancellationReason ?? "none"}${x.instance?.cancellationReason ? ` (suspend ${x.instance.suspendAt}, delete ${x.instance.deleteAt})` : ""}; software ${x.customer?.software.status ?? "?"} exp ${x.customer?.licence.exp ?? "?"}; Stripe ${x.stripeFact ? `${x.stripeFact.status}${x.stripeFact.cancelAtPeriodEnd ? " cancel_at_period_end" : ""} to ${x.stripeFact.currentPeriodEnd}` : "no fact"}; flags ${Object.entries(x.flags).filter(([, v]) => v).map(([k]) => k).join(",") || "none"}`);
 line();
 line(`C. customers still on a bootstrap-only grant (no paid-through applied): ${summary.bootstrapOnlyCustomers} (${summary.bootstrapOnlyLapsed} already lapsed while their subscription is active)`);
 for (const s of bootstrapOnly) line(`  ${s.customerKey} licence ${s.licenseId} sub ${s.subscriptionId} exp ${s.licence.exp} software ${s.software.status} → ${s.verdict}${s.stripeFact ? `; Stripe ${s.stripeFact.status} to ${s.stripeFact.currentPeriodEnd}` : "; no Stripe fact"}`);
 line();
-line("Nothing was written. Repair path for a short licence: POST /admin/api/licenses/expiry {id, exp: paidThrough + graceDays}; a Hub-originated cancellation is reversed by the customer's Resume renewal action (or Stripe cancel_at_period_end=false plus the instance reset it performs).");
+line("Nothing was written. Repair path for a bootstrap-only record (Hub >= 0.4.94): scripts/reconcile-bootstrap-only.mjs --from-audit=<this report as --json> (dry run first; applies the Stripe paid term through the invoice.paid code path); a Hub-originated cancellation is reversed by POST /admin/api/hosting/instances/:id/resume-renewal or the customer's Resume renewal action.");

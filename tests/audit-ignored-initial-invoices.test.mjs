@@ -101,6 +101,8 @@ await test("the incident-shaped fixture: the two ignored invoice events are grou
   const job = softwareIneligibleCancellations[0];
   assert.equal(job.jobId, "job_fx_cancel"); assert.equal(job.status, "sent"); assert.equal(job.queuedAt, "2026-10-09T03:40:15.000Z"); assert.equal(job.ownerKey, "cus_fx_affected");
   assert.deepEqual(job.flags, { stripeActiveAtQueue: true, hubOriginatedCancellationScheduled: true, noStripeFact: false });
+  assert.equal(job.verdict, "CANCELLATION_SCHEDULED", "the instance is still cancel_scheduled");
+  assert.equal(job.instance.stage, "cancel_scheduled"); assert.equal(job.instance.cancellationReason, "intentional_cancellation");
   assert.equal(s.cancellationsWhileStripeActive, 1); assert.equal(s.hubOriginatedCancellationsScheduled, 1);
   assert.equal(s.bootstrapOnlyCustomers, 1); assert.equal(bootstrapOnly[0].customerKey, "cus_fx_bootstrap"); assert.equal(bootstrapOnly[0].verdict, "AT_RISK_UNTIL_PAID_PERIOD_APPLIED"); assert.equal(s.bootstrapOnlyLapsed, 0);
   assert.ok(!JSON.stringify(r.json).includes("cus_fx_test"), "test-mode records are out of a live audit");
@@ -114,6 +116,37 @@ await test("the incident-shaped fixture: the two ignored invoice events are grou
   assert.equal(sinceRun.json.summary.ignoredInitialInvoiceEvents, 0, "--since bounds the ledger scan"); assert.equal(sinceRun.json.summary.softwareIneligibleCancellations, 1);
   const testRun = run(dir, "--json", "--test");
   assert.equal(testRun.json.summary.bootstrapOnlyCustomers, 1); assert.equal(testRun.json.bootstrapOnly[0].customerKey, "cus_fx_test");
+});
+
+await test("section B after a resume-renewal: the job row still says sent, the instance is ready again — the row prints the instance's current stage and cancellationReason and reads REVERSED, not scheduled", async () => {
+  const dir = incidentFixture();
+  const edit = (name, fn) => { const f = path.join(dir, name); const v = JSON.parse(fs.readFileSync(f, "utf8")); fn(v); fs.writeFileSync(f, JSON.stringify(v)); };
+  // The state the operator's admin resume-renewal leaves (2026-10-10): row
+  // back to ready, schedule cleared, Stripe's un-cancel echo applied.
+  edit("hosting-db.v1.json", (db) => Object.assign(db.instances.host_fx_affected, { stage: "ready", cancellationReason: null, suspendAtMs: null, deleteAtMs: null, lifecycleVersion: 4 }));
+  edit("billing-customers.v1.json", (c) => Object.assign(c.cus_fx_affected, { subscriptionStatus: "active", cancelAtPeriodEnd: false }));
+  edit("billing-role-subscriptions.v1.json", (r) => Object.assign(r["cus_fx_affected::hosting"], { subscriptionStatus: "active" }));
+  const before = snapshot(dir);
+  const r = run(dir, "--json");
+  assert.equal(r.status, 0, r.stderr);
+  const job = r.json.softwareIneligibleCancellations[0];
+  assert.equal(job.jobId, "job_fx_cancel"); assert.equal(job.status, "sent", "the job row itself is history and still says sent");
+  assert.equal(job.verdict, "REVERSED");
+  assert.equal(job.instance.stage, "ready"); assert.equal(job.instance.cancellationReason, null);
+  assert.equal(job.flags.hubOriginatedCancellationScheduled, false);
+  assert.equal(r.json.summary.reversedCancellations, 1); assert.equal(r.json.summary.hubOriginatedCancellationsScheduled, 0);
+  assert.equal(r.json.ignoredInitialInvoices[0].candidates[0].verdict, "HEALED", "a healed, resumed customer is no longer a scheduled cancellation");
+  const text = run(dir);
+  assert.match(text.stdout, /B\. .*: 1 \(1 while Stripe reported active\/paid; 0 now mirrored as the customer's own cancellation; 1 reversed\)/);
+  assert.match(text.stdout, /job job_fx_cancel sent queued 2026-10-09T03:40:15\.000Z sub sub_fx_affected owner cus_fx_affected → REVERSED \(reversed: the instance is no longer cancel_scheduled\); VPS host_fx_affected now stage ready, cancellationReason none;/);
+  assert.deepEqual(snapshot(dir), before, "read-only");
+  // Every other current state gets its own verdict, never "reversed".
+  for (const [stage, verdict] of [["cancel_scheduled", "CANCELLATION_SCHEDULED"], ["suspended", "ENDED"], ["deleted", "ENDED"]]) {
+    edit("hosting-db.v1.json", (db) => { db.instances.host_fx_affected.stage = stage; });
+    assert.equal(run(dir, "--json").json.softwareIneligibleCancellations[0].verdict, verdict, stage);
+  }
+  edit("hosting-db.v1.json", (db) => { db.instances.host_fx_affected.stage = "ready"; db.outbox.job_fx_cancel.status = "pending"; });
+  assert.equal(run(dir, "--json").json.softwareIneligibleCancellations[0].verdict, "JOB_PENDING", "a cancellation not yet sent was never in force, so it is not 'reversed'");
 });
 
 await test("an empty data directory and a hermetic hub's own data directory both audit clean, read-only", async () => {
