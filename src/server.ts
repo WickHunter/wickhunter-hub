@@ -3364,6 +3364,20 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const r = hosting.adminReleaseHold(id, rateLimitNow());
       return r.ok ? sendJson(res, 200, { ok: true }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error });
     }
+    // Operator-side reversal of a scheduled cancellation
+    // (`HostingService.adminResumeRenewal`): the customer's own
+    // `/api/hosting/:id/resume-renewal` with operator admission. Stripe
+    // must confirm first; a Stripe refusal/timeout is 503 so the operator
+    // retries, every other refusal is 409 with its code.
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/resume-renewal")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/resume-renewal".length);
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by.trim().slice(0, 80) : "";
+      const reason = typeof body?.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+      const r = await hosting.adminResumeRenewal(id, by, reason, rateLimitNow());
+      if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, stage: r.value.stage, changed: r.value.changed, note: r.value.changed ? "Stripe confirmed cancel_at_period_end=false; the scheduled end, its pending jobs and any deletion hold were cleared" : "nothing was scheduled on this instance; no change" }, { "cache-control": "no-store" });
+    }
     sendJson(res, 404, { ok: false, error: "not found" });
   }
 

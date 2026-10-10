@@ -129,7 +129,11 @@ export type HostingActionError =
   | "NOT_FOUND"
   | "RESTORATION_UNAVAILABLE"
   | "NOT_CANCELLABLE"
-  | "PROVIDER_STATUS_UNKNOWN";
+  | "PROVIDER_STATUS_UNKNOWN"
+  /** Renewal cannot be resumed: the Hub's mirror of Stripe says the
+   *  subscription is not being billed, or a charge on it was refunded or
+   *  disputed (see `reverseScheduledCancellation`). */
+  | "SUBSCRIPTION_NOT_ACTIVE";
 
 export type HostingActionResult<T> = { ok: true; value: T } | { ok: false; code: HostingActionError; error: string };
 
@@ -824,15 +828,77 @@ export class HostingService {
     if (row.stage !== "cancel_scheduled" || (row.suspendAtMs !== null && nowMs >= row.suspendAtMs)) {
       return { ok: false, code: "RESTORATION_UNAVAILABLE", error: "this cancellation can no longer be reversed from here — the hosting window has passed" };
     }
-    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
-    if (!sub?.subscriptionId || !(await this.setStripeCancellation(sub.subscriptionId, false))) {
+    return this.reverseScheduledCancellation(row, { origin: "customer", by: ownerId, reason: "" }, nowMs);
+  }
+
+  /** POST /admin/api/hosting/instances/:id/resume-renewal. The operator-side
+   *  twin of the customer's `resumeRenewal`, for a scheduled cancellation
+   *  the customer did not ask for (2026-10-09: the Hub's own
+   *  `software-ineligible` cancellation, echoed back by Stripe and recorded
+   *  as `intentional_cancellation`). It runs the SAME
+   *  `reverseScheduledCancellation` the customer path runs — Stripe first,
+   *  then the row — and differs only in admission: an operator may reverse
+   *  while the row is still `cancel_scheduled` even after the customer's
+   *  "still reversible" window closed, as long as the suspend job has not
+   *  run (the stage is the proof). A row with nothing scheduled answers
+   *  `changed: false` so a repeat is inert; a nonpayment schedule
+   *  (`renewal_unpaid`) is not a cancellation and is refused — payment
+   *  reverses that one. */
+  async adminResumeRenewal(instanceId: string, by: string, reason: string, nowMs = this.now()): Promise<HostingActionResult<{ stage: HostingStage; changed: boolean }>> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
+    if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this instance is already deleting or deleted" };
+    if (row.stage !== "cancel_scheduled" && row.cancellationReason === null && row.suspendAtMs === null && row.deleteAtMs === null) {
+      return { ok: true, value: { stage: row.stage, changed: false } };
+    }
+    if (row.stage !== "cancel_scheduled" || row.cancellationReason !== "intentional_cancellation") {
+      return { ok: false, code: "RESTORATION_UNAVAILABLE", error: `not a scheduled cancellation (stage ${row.stage}, reason ${row.cancellationReason ?? "none"}) — a nonpayment schedule is reversed by payment, a suspended server by its restore path` };
+    }
+    const r = await this.reverseScheduledCancellation(row, { origin: "operator", by: by || "admin", reason }, nowMs);
+    return r.ok ? { ok: true, value: { stage: r.value.stage, changed: true } } : r;
+  }
+
+  /** The one implementation behind the customer's `resumeRenewal` and the
+   *  operator's `adminResumeRenewal`. Stripe is asked for
+   *  `cancel_at_period_end=false` FIRST, through the same `setStripeCancellation`
+   *  the cancel path uses (an idempotent Stripe update: already-false is a
+   *  no-op), and only Stripe's confirmation changes anything locally: the
+   *  row goes back to `ready`, its scheduled end and any admin deletion
+   *  hold are cleared (a hold pauses a pipeline that no longer exists, and
+   *  would otherwise keep showing "on hold by support"), the lifecycle
+   *  version moves so every pending suspend/delete/reminder job is
+   *  obsoleted, and the reversal is written to the billing audit ledger with
+   *  its origin. Refused before the Stripe call when the Hub's mirror of
+   *  the subscription says Stripe is not billing it (`past_due`, `canceled`,
+   *  no subscription) or a charge on it was refunded or disputed — resuming
+   *  renewal of a subscription Stripe is not renewing would promise a
+   *  server the customer has not paid for. */
+  private async reverseScheduledCancellation(row: HostingInstanceRow, origin: { origin: "customer" | "operator"; by: string; reason: string }, nowMs: number): Promise<HostingActionResult<{ stage: HostingStage }>> {
+    const sub = this.billing.store.getRoleSubscription(row.ownerId, "hosting");
+    if (!sub?.subscriptionId) return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "no Stripe subscription is bound to this hosting instance; nothing to resume" };
+    if (sub.refunded || sub.disputed) return { ok: false, code: "SUBSCRIPTION_NOT_ACTIVE", error: `a charge on this subscription was ${sub.disputed ? "disputed" : "refunded"}; renewal cannot be resumed without support review` };
+    if (!ACTIVE_SUBSCRIPTION_STATUSES.has(sub.subscriptionStatus ?? "")) return { ok: false, code: "SUBSCRIPTION_NOT_ACTIVE", error: `Stripe reports this subscription as ${sub.subscriptionStatus ?? "unknown"}, not active; renewal cannot be resumed` };
+    const software = this.billing.store.getCustomer(row.ownerId);
+    if (software && software.subscriptionId === sub.subscriptionId && (software.refunded || software.disputed)) return { ok: false, code: "SUBSCRIPTION_NOT_ACTIVE", error: `the combined subscription's software charge was ${software.disputed ? "disputed" : "refunded"}; renewal cannot be resumed without support review` };
+    if (!(await this.setStripeCancellation(sub.subscriptionId, false))) {
       return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "Stripe did not confirm renewal; the existing cancellation schedule remains unchanged" };
     }
+    const hadHold = row.deletionHold;
     const fresh = this.store.updateInstance(row.id, row.version, (d) => {
-      d.cancellationReason = null; d.suspendAtMs = null; d.deleteAtMs = null; d.stage = "ready"; d.lifecycleVersion += 1;
+      d.cancellationReason = null; d.suspendAtMs = null; d.deleteAtMs = null; d.stage = "ready"; d.deletionHold = null; d.lifecycleVersion += 1;
     }, nowMs);
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "this hosting instance changed underneath the request — reload and try again" };
-    this.store.obsoletePendingJobsOlderThan(fresh.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+    const obsoleted = this.store.obsoletePendingJobsOlderThan(fresh.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+    // The audit ledger is the admin page's event list (the same place
+    // `admin.install.*` actions record themselves). It is append-only and
+    // is not a customer or licence record, so the file-header rule — this
+    // class never writes billing's customer state — still holds.
+    this.billing.store.appendEvent({
+      id: `hosting-resume-renewal:${fresh.id}:${nowMs}`, type: origin.origin === "operator" ? "admin.hosting.resume-renewal" : "customer.hosting.resume-renewal", livemode: fresh.environment === "live",
+      receivedAtMs: this.now(), outcome: "applied",
+      note: JSON.stringify({ actor: origin.origin, by: origin.by, reason: origin.reason, instanceId: fresh.id, ownerId: fresh.ownerId, subscriptionId: sub.subscriptionId, obsoletedJobs: obsoleted, releasedHold: hadHold ? { by: hadHold.by, atMs: hadHold.atMs } : null, stage: fresh.stage }),
+    });
+    this.log(`[hosting] ${fresh.id}: scheduled cancellation reversed by ${origin.origin}${origin.origin === "operator" ? ` (${origin.by})` : ""} — Stripe cancel_at_period_end=false confirmed for ${sub.subscriptionId}; ${obsoleted} pending end job(s) obsoleted${hadHold ? "; deletion hold released" : ""}${origin.reason ? `; reason: ${origin.reason}` : ""}`);
     return { ok: true, value: { stage: fresh.stage } };
   }
 

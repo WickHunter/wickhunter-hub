@@ -142,16 +142,37 @@ the Hub's is the suspect one.
     refuse.
 - `src/billing/service.ts`: comment only — the exact clock mechanics above,
   next to `initialPaidAfterCheckout`.
+- Operator-side reversal (added on the operator's instruction, since a
+  customer cannot be relied on to click "Resume renewal"):
+  `HostingService.adminResumeRenewal` behind
+  `POST /admin/api/hosting/instances/:id/resume-renewal` (admin token; body
+  `{by, reason}`; 404 unknown, 503 when Stripe does not confirm, 409 with a
+  code otherwise) and a "Resume renewal" button on `cancel_scheduled` rows
+  of the admin page. The customer's `resumeRenewal` and the admin action
+  now share one implementation, `reverseScheduledCancellation`: refuse
+  (`SUBSCRIPTION_NOT_ACTIVE`) when the hosting record is not
+  active/trialing/"active (cancels at period end)" or a charge is refunded
+  or disputed (also the combined subscription's software charge); Stripe
+  `cancel_at_period_end=false` first through the existing
+  `setStripeCancellation`; only on confirmation reset the row to `ready`,
+  clear the scheduled end and any deletion hold, bump the lifecycle version
+  (pending suspend/delete/reminder jobs become `obsolete`), and append an
+  `admin.hosting.resume-renewal` / `customer.hosting.resume-renewal` row
+  to the billing audit ledger (the same ledger `admin.install.*` uses)
+  naming actor, `by`, reason, instance, subscription, obsoleted jobs and any
+  released hold. Admission differs only in the window: the operator may
+  reverse while the row is still `cancel_scheduled`; a row with nothing
+  scheduled answers `changed: false` (idempotent repeat); a `renewal_unpaid`
+  schedule is refused (`RESTORATION_UNAVAILABLE`), payment reverses that.
 - Not done, on purpose: the Hub does not auto-resume a cancellation it
   queued itself. It cannot tell, after the fact, its own cancellation from
-  one the customer made in the portal in between; the customer's "Resume
-  renewal" remains the reversal. Recording `hubOriginated` on the instance
-  row would make a safe auto-resume possible later; it is a design change,
-  not part of this correction.
+  one the customer made in the portal in between. Recording `hubOriginated`
+  on the instance row would make a safe auto-resume possible later; it is a
+  design change, not part of this correction.
 - Version: `package.json`, `package-lock.json`, `src/version.ts` → 0.4.93;
   README narrative and changelog entries (pinned by `tests/server.test.mjs`).
 
-### Regression coverage — `tests/hosting-paid-term-guard.test.mjs` (8 checks)
+### Regression coverage — `tests/hosting-paid-term-guard.test.mjs` (11 checks)
 
 Offline fixtures only (signed test webhook secret, FakeProvider, no network
 beyond loopback), live-mode mixed v2 checkout with the live box's
@@ -180,6 +201,23 @@ subscription update at 03:40:16Z, $59.40 discounted software + $20 VPS.
 7. Separate hosting subscription next to a software-only subscription:
    lapse while active → held until the software `invoice.paid`.
 8. Same shape, Stripe ends the software subscription → cancelled as before.
+9. Operator reversal on the incident fixture (checkout, lapse, Stripe's
+   echo with `cancel_at_period_end: true`, the Hub's `cancel_scheduled` row
+   with the Nov 6 suspend / Nov 13 delete, an admin hold): one Stripe
+   `cancel_at_period_end=false`, row `ready`, no pending end job, hold
+   released, licence unchanged at Nov 9, audit row with actor/by/reason,
+   the un-cancel echo and three ticks change nothing, a repeat answers
+   `changed: false` with no Stripe call and no second audit row.
+10. Refusals: no admin token (401), unknown instance (404), Stripe not
+    confirming (503; row, hold and jobs untouched; no audit row), refunded /
+    disputed / canceled / past-due subscription (409
+    `SUBSCRIPTION_NOT_ACTIVE`, Stripe never asked), a running row
+    (`changed: false`), a `renewal_unpaid` schedule (409
+    `RESTORATION_UNAVAILABLE`).
+11. The customer path and the admin path call the shared core exactly once
+    each and produce identical row, job and Stripe-call outcomes; only the
+    audit origin differs; the customer path now shares the refusals; the
+    admin page wires the action on `cancel_scheduled` rows.
 
 Mutation evidence (scratch copy of `dist` only; the real `dist/src/hosting/service.js`
 sha256 `5bf7b975…` untouched): with the hold removed (`if (false)` at both

@@ -19,6 +19,7 @@
 // secret; the provider is FakeProvider; no network leaves 127.0.0.1.
 // Identifiers are fixture values, never the customer's.
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { freshHub, jsonReq, test, summary } from "./helpers.mjs";
 import { FakeProvider, hashBootstrapToken } from "../dist/src/hosting/provider.js";
@@ -55,16 +56,21 @@ async function readyInstance(h, row, nowMs) {
 }
 
 // ── the mixed v2 (software + VPS, one subscription) fixture ─────────────────
-async function setup() {
+async function setup(over = {}) {
   let clock = CHECKOUT_COMPLETED - 60_000, n = 0;
-  const sessions = new Map(), calls = [], logs = [];
+  const sessions = new Map(), calls = [], logs = [], stripeCalls = [];
   const provider = new FakeProvider({ now: () => clock });
   let h;
   const fake = async (input, init = {}) => {
     const url = new URL(input), p = url.pathname, params = new URLSearchParams(init.body ?? "");
     calls.push({ p, method: init.method, params });
     let out;
-    if (p.startsWith("/v1/prices/")) {
+    if (p.startsWith("/v1/subscriptions/") && init.method === "POST") {
+      // The hosting service's own Stripe control path (`setStripeCancellation`).
+      stripeCalls.push({ subscriptionId: decodeURIComponent(p.split("/").at(-1)), body: init.body });
+      if (over.stripeRefuses) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }), text: async () => "unavailable" };
+      out = { id: p.split("/").at(-1), object: "subscription", cancel_at_period_end: params.get("cancel_at_period_end") === "true" };
+    } else if (p.startsWith("/v1/prices/")) {
       const id = p.split("/").at(-1), host = id.startsWith("price_host"), annual = id === "price_yearly" || id === "price_hostyear", life = id === "price_lifetime";
       out = { id, active: true, livemode: true, type: life ? "one_time" : "recurring", currency: "usd", unit_amount: host ? (annual ? 24000 : VPS_CENTS) : life ? 99900 : annual ? 69900 : SOFTWARE_CENTS, product: host ? "prod_vps" : "prod_software", recurring: life ? null : { interval: annual ? "year" : "month", interval_count: 1 } };
     } else if (p === "/v1/account") out = { capabilities: { crypto_payments: "active" } };
@@ -119,7 +125,8 @@ async function setup() {
   const cancellations = s => h.hub.hosting.store.outboxFor(instance(s).id).filter(j => j.jobType === "billing_reconcile");
   const exp = s => h.store.get(h.hub.billing.store.getCustomer(key(s)).licenseId)?.exp ?? null;
   const tick = () => h.hub.hosting.tick(clock);
-  return { h, provider, logs, calls, checkout, last, key, sub, completed, invoice, subscriptionObject, post, instance, cancellations, exp, tick, set: ms => { clock = ms; }, advance: ms => { clock += ms; }, now: () => clock };
+  const audit = type => h.hub.billing.store.recentEvents(200).filter(e => e.type === type).map(e => ({ ...e, note: JSON.parse(e.note) }));
+  return { h, provider, logs, calls, stripeCalls, admin, audit, checkout, last, key, sub, completed, invoice, subscriptionObject, post, instance, cancellations, exp, tick, set: ms => { clock = ms; }, advance: ms => { clock += ms; }, now: () => clock };
 }
 
 /** Checkout API call, then the incident's `checkout.session.completed` at 03:39:59. */
@@ -393,6 +400,183 @@ await test("separate subscriptions: once Stripe ends the software subscription a
     assert.equal(c.logs.filter(l => l.includes("withholding software-ineligible cancellation")).length, 0);
     assert.ok(c.logs.some(l => l.includes("refusing paid hosting provisioning") && l.includes("(lapsed, subscription canceled)")));
   } finally { await c.h.close(); }
+});
+
+// ── the operator-side reversal (`adminResumeRenewal`) ──────────────────────
+// The customer's record set as the incident left it: checkout, the discarded
+// invoice, the lapse, then Stripe's state after the 0.4.90 Hub's own
+// `cancel_at_period_end=true` (modelled by the echo update with
+// `cancel_at_period_end: true`, which is exactly what Stripe sent back),
+// which the Hub mirrored as `intentional_cancellation` with the Nov 6
+// suspend and Nov 13 delete, plus the admin deletion hold the proposal
+// places first.
+const END_JOB_KEYS = /^(suspend|delete|email:three_days|email:one_day|email:cancel_scheduled):/;
+async function incidentCancelled(c, { hold = true, paid = false } = {}) {
+  const { s } = await checkedOut(c);
+  // `paid`: the initial invoice applied (charges indexed on both records), for
+  // cases that need a charge-level event to be attributable to this bundle.
+  // The default is the incident's own state: the invoice never applied.
+  if (paid) assert.equal((await c.post("invoice.paid", c.invoice(s), INVOICE_CREATED)).body.outcome, "applied");
+  await provisioned(c, s);
+  c.set(FIRST_TICK_AFTER_LAPSE); await c.tick();
+  c.set(ECHO_UPDATE);
+  assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s, { cancel_at_period_end: true }), ECHO_UPDATE)).body.outcome, "applied");
+  assert.equal(c.exp(s), PAID_TERM_EXP, "the echo extended the licence to the paid term");
+  await c.tick(); c.advance(30_000); await c.tick();
+  const row = c.instance(s);
+  assert.equal(row.stage, "cancel_scheduled"); assert.equal(row.cancellationReason, "intentional_cancellation");
+  assert.equal(row.suspendAtMs, PERIOD_END); assert.equal(row.deleteAtMs, PERIOD_END + 7 * DAY);
+  const pendingEnd = c.h.hub.hosting.store.outboxFor(row.id).filter(j => j.status === "pending" && END_JOB_KEYS.test(j.dedupeKey));
+  assert.deepEqual(pendingEnd.map(j => j.dedupeKey.split(":")[0]).sort(), ["delete", "email", "email", "email", "suspend"], "the incident's pending end jobs");
+  assert.equal(c.h.hub.billing.store.getCustomer(c.key(s)).subscriptionStatus, "active (cancels at period end)");
+  if (hold) { assert.equal(c.h.hub.hosting.adminHoldDeletion(row.id, "operator", "Hub-originated cancellation under review", c.now()).ok, true); }
+  c.stripeCalls.length = 0;
+  return { s, row: c.instance(s) };
+}
+const adminResume = (c, id, body = { by: "operator", reason: "2026-10-09 initial-invoice defect" }) => c.admin(`/admin/api/hosting/instances/${id}/resume-renewal`, body);
+const rowView = (c, s) => { const r = c.instance(s); return { stage: r.stage, cancellationReason: r.cancellationReason, suspendAtMs: r.suspendAtMs, deleteAtMs: r.deleteAtMs, deletionHold: r.deletionHold, lifecycleVersion: r.lifecycleVersion, paidThroughMs: r.paidThroughMs }; };
+const jobStatuses = (c, s) => Object.fromEntries(c.h.hub.hosting.store.outboxFor(c.instance(s).id).map(j => [j.dedupeKey, j.status]).sort());
+
+await test("operator reversal of the incident's scheduled cancellation: Stripe first, then the row back to running, end jobs obsoleted, hold released, licence unchanged at the paid term, audited as operator-originated; the echo and later ticks change nothing", async () => {
+  const c = await setup();
+  try {
+    const { s, row } = await incidentCancelled(c);
+    assert.ok(row.deletionHold, "the proposal's hold is in place");
+    c.advance(60_000);
+    const r = await adminResume(c, row.id);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual({ ok: r.body.ok, stage: r.body.stage, changed: r.body.changed }, { ok: true, stage: "ready", changed: true });
+    assert.deepEqual(c.stripeCalls, [{ subscriptionId: c.sub(s), body: "cancel_at_period_end=false" }], "exactly one Stripe update, through the existing control path");
+    const after = c.instance(s);
+    assert.equal(after.stage, "ready"); assert.equal(after.cancellationReason, null); assert.equal(after.suspendAtMs, null); assert.equal(after.deleteAtMs, null);
+    assert.equal(after.deletionHold, null, "the operator's hold is released by the reversal");
+    assert.equal(after.lifecycleVersion, row.lifecycleVersion + 1); assert.equal(after.paidThroughMs, PERIOD_END);
+    const jobs = c.h.hub.hosting.store.outboxFor(row.id);
+    assert.equal(jobs.filter(j => j.status === "pending" && END_JOB_KEYS.test(j.dedupeKey)).length, 0, "no pending suspend/delete/reminder job remains");
+    assert.deepEqual(jobs.filter(j => END_JOB_KEYS.test(j.dedupeKey) && j.status === "obsolete").map(j => j.dedupeKey.split(":")[0]).sort(), ["delete", "email", "email", "email", "suspend"], "every still-pending end job (suspend, delete, the two reminders and this fixture's undrained cancellation email) is obsolete");
+    assert.equal(c.exp(s), PAID_TERM_EXP, "the licence keeps the paid term; nothing is shortened or extended");
+    const audit = c.audit("admin.hosting.resume-renewal");
+    assert.equal(audit.length, 1); assert.equal(audit[0].outcome, "applied"); assert.equal(audit[0].livemode, true);
+    assert.equal(audit[0].note.actor, "operator"); assert.equal(audit[0].note.by, "operator"); assert.equal(audit[0].note.reason, "2026-10-09 initial-invoice defect");
+    assert.equal(audit[0].note.instanceId, row.id); assert.equal(audit[0].note.subscriptionId, c.sub(s)); assert.equal(audit[0].note.obsoletedJobs, 5); assert.equal(audit[0].note.releasedHold.by, "operator");
+    assert.ok(c.logs.some(l => l.includes(`${row.id}: scheduled cancellation reversed by operator (operator)`) && l.includes("deletion hold released")));
+    assert.equal(c.h.hub.hosting.customerView(c.key(s)).instance.onHold, false);
+    // Stripe's echo of the un-cancel, then ordinary ticks.
+    c.advance(1000);
+    assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s, { cancel_at_period_end: false }), c.now())).body.outcome, "applied");
+    const sw = c.h.hub.billing.store.getCustomer(c.key(s));
+    assert.equal(sw.subscriptionStatus, "active"); assert.equal(sw.cancelAtPeriodEnd, false); assert.equal(sw.periodEndMs, PERIOD_END);
+    assert.equal(c.h.hub.billing.store.getRoleSubscription(c.key(s), "hosting").subscriptionStatus, "active");
+    const settled = rowView(c, s), settledJobs = jobStatuses(c, s);
+    for (let i = 0; i < 3; i++) { c.advance(30_000); await c.tick(); }
+    assert.deepEqual(rowView(c, s), settled); assert.deepEqual(jobStatuses(c, s), settledJobs);
+    assert.equal(c.exp(s), PAID_TERM_EXP); assert.equal(c.cancellations(s).length, 0);
+    // Idempotent repeat: nothing scheduled any more, no Stripe call, no second audit row.
+    const again = await adminResume(c, row.id);
+    assert.equal(again.status, 200); assert.deepEqual({ changed: again.body.changed, stage: again.body.stage }, { changed: false, stage: "ready" });
+    assert.equal(c.stripeCalls.length, 1); assert.deepEqual(rowView(c, s), settled); assert.equal(c.audit("admin.hosting.resume-renewal").length, 1);
+  } finally { await c.h.close(); }
+});
+
+await test("operator reversal refusals: admin token required, unknown instance, Stripe not confirming (row and hold untouched), refunded / disputed / canceled / past-due subscriptions, a nonpayment schedule, and a row with nothing scheduled", async () => {
+  // Stripe refuses: nothing local changes and the operator can retry.
+  {
+    const c = await setup({ stripeRefuses: true });
+    try {
+      const { s, row } = await incidentCancelled(c);
+      const before = rowView(c, s), jobs = jobStatuses(c, s);
+      const r = await adminResume(c, row.id);
+      assert.equal(r.status, 503); assert.equal(r.body.code, "PROVIDER_STATUS_UNKNOWN");
+      assert.equal(c.stripeCalls.length, 1, "Stripe was asked");
+      assert.deepEqual(rowView(c, s), before, "the schedule and the hold are unchanged"); assert.deepEqual(jobStatuses(c, s), jobs);
+      assert.equal(c.audit("admin.hosting.resume-renewal").length, 0);
+      const unauthed = await jsonReq(`${c.h.origin}/admin/api/hosting/instances/${row.id}/resume-renewal`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      assert.equal(unauthed.status, 401);
+      assert.equal((await adminResume(c, "host_nonexistent")).status, 404);
+    } finally { await c.h.close(); }
+  }
+  // Stripe's own word against the subscription refuses before any Stripe call.
+  for (const word of ["refunded", "disputed", "canceled", "past_due"]) {
+    const c = await setup();
+    try {
+      const { s, row } = await incidentCancelled(c, { paid: word === "refunded" || word === "disputed" });
+      c.advance(60_000);
+      const total = SOFTWARE_CENTS - SOFTWARE_DISCOUNT_CENTS + VPS_CENTS;
+      if (word === "refunded") assert.equal((await c.post("charge.refunded", { id: "ch_" + s.id, customer: c.key(s), payment_intent: "pi_" + s.id, amount: total, amount_refunded: total, refunded: true })).body.outcome, "applied");
+      if (word === "disputed") assert.equal((await c.post("charge.dispute.created", { id: "dp_" + s.id, charge: "ch_" + s.id, payment_intent: "pi_" + s.id, reason: "fraudulent" })).body.outcome, "applied");
+      if (word === "canceled") assert.equal((await c.post("customer.subscription.deleted", c.subscriptionObject(s, { status: "canceled", cancel_at_period_end: false }))).body.outcome, "applied");
+      if (word === "past_due") assert.equal((await c.post("invoice.payment_failed", c.invoice(s, { id: "in_fail_" + s.id, paid: false, status: "open", billing_reason: "subscription_cycle" }))).body.outcome, "applied");
+      const host = c.h.hub.billing.store.getRoleSubscription(c.key(s), "hosting");
+      if (word === "refunded" || word === "disputed") assert.equal(host[word], true); else assert.equal(host.subscriptionStatus, word);
+      assert.equal(c.instance(s).stage, "cancel_scheduled", "the scheduled cancellation is still what the row says");
+      const before = rowView(c, s);
+      const r = await adminResume(c, row.id);
+      assert.equal(r.status, 409, `${word}: ${JSON.stringify(r.body)}`); assert.equal(r.body.code, "SUBSCRIPTION_NOT_ACTIVE");
+      assert.match(r.body.error, new RegExp(word));
+      assert.equal(c.stripeCalls.length, 0, `${word}: Stripe is never asked`);
+      assert.deepEqual(rowView(c, s), before); assert.equal(c.audit("admin.hosting.resume-renewal").length, 0);
+    } finally { await c.h.close(); }
+  }
+  // A nonpayment schedule is not a cancellation; a running row has nothing to reverse.
+  {
+    const c = await setup();
+    try {
+      const { s } = await checkedOut(c);
+      assert.equal((await c.post("invoice.paid", c.invoice(s), INVOICE_CREATED)).body.outcome, "applied");
+      await provisioned(c, s);
+      const running = await adminResume(c, c.instance(s).id);
+      assert.equal(running.status, 200); assert.equal(running.body.changed, false); assert.equal(c.stripeCalls.length, 0);
+      c.set(ECHO_UPDATE);
+      assert.equal((await c.post("invoice.payment_failed", c.invoice(s, { id: "in_fail_" + s.id, paid: false, status: "open", billing_reason: "subscription_cycle" }))).body.outcome, "applied");
+      await c.tick();
+      const row = c.instance(s);
+      assert.equal(row.stage, "past_due"); assert.equal(row.cancellationReason, "renewal_unpaid");
+      const before = rowView(c, s);
+      const r = await adminResume(c, row.id);
+      assert.equal(r.status, 409); assert.equal(r.body.code, "RESTORATION_UNAVAILABLE"); assert.match(r.body.error, /nonpayment schedule is reversed by payment/);
+      assert.equal(c.stripeCalls.length, 0); assert.deepEqual(rowView(c, s), before); assert.equal(c.instance(s).stage, "past_due");
+    } finally { await c.h.close(); }
+  }
+});
+
+await test("the customer's resume-renewal and the operator's reversal share one implementation and produce the same row, jobs and Stripe call; only the audit origin differs", async () => {
+  const outcomes = {};
+  for (const path of ["customer", "operator"]) {
+    const c = await setup();
+    try {
+      const { s, row } = await incidentCancelled(c, { hold: false, paid: true });
+      let shared = 0;
+      const core = c.h.hub.hosting.reverseScheduledCancellation.bind(c.h.hub.hosting);
+      c.h.hub.hosting.reverseScheduledCancellation = (...a) => { shared++; return core(...a); };
+      c.advance(60_000);
+      if (path === "customer") {
+        const r = await c.h.hub.hosting.resumeRenewal(c.key(s), row.id, c.now());
+        assert.equal(r.ok, true); assert.equal(r.value.stage, "ready");
+      } else {
+        const r = await adminResume(c, row.id, { by: "op", reason: "pin" });
+        assert.equal(r.status, 200); assert.equal(r.body.changed, true);
+      }
+      assert.equal(shared, 1, `${path}: exactly one call into the shared core`);
+      const customerAudit = c.audit("customer.hosting.resume-renewal"), operatorAudit = c.audit("admin.hosting.resume-renewal");
+      assert.equal(customerAudit.length, path === "customer" ? 1 : 0); assert.equal(operatorAudit.length, path === "operator" ? 1 : 0);
+      const audit = (customerAudit[0] ?? operatorAudit[0]).note;
+      assert.equal(audit.actor, path); assert.equal(audit.instanceId, row.id); assert.equal(audit.subscriptionId, c.sub(s));
+      outcomes[path] = { row: rowView(c, s), jobs: Object.fromEntries(Object.entries(jobStatuses(c, s)).map(([k, v]) => [k.replace(row.id, "<id>"), v])), stripe: c.stripeCalls.map(x => ({ ...x, subscriptionId: "<sub>" })), exp: c.exp(s), obsoleted: audit.obsoletedJobs };
+      // The shared refusals apply to the customer path too.
+      if (path === "customer") {
+        const total = SOFTWARE_CENTS - SOFTWARE_DISCOUNT_CENTS + VPS_CENTS;
+        await c.h.hub.hosting.cancel(c.key(s), row.id, c.now());
+        assert.equal(c.instance(s).stage, "cancel_scheduled");
+        assert.equal((await c.post("charge.refunded", { id: "ch_" + s.id, customer: c.key(s), payment_intent: "pi_" + s.id, amount: total, amount_refunded: total, refunded: true })).body.outcome, "applied");
+        const refused = await c.h.hub.hosting.resumeRenewal(c.key(s), row.id, c.now());
+        assert.equal(refused.ok, false); assert.equal(refused.code, "SUBSCRIPTION_NOT_ACTIVE");
+      }
+    } finally { await c.h.close(); }
+  }
+  assert.deepEqual(outcomes.operator, outcomes.customer, "identical outcome from either entry point");
+  assert.equal(outcomes.operator.exp, PAID_TERM_EXP);
+  const adminPage = fs.readFileSync(new URL("../public/admin.html", import.meta.url), "utf8");
+  assert.ok(adminPage.includes("/resume-renewal") && adminPage.includes("hostingResumeRenewalAction") && adminPage.includes('inst.stage === "cancel_scheduled"'), "the admin page offers the reversal on cancel_scheduled rows");
 });
 
 summary("hosting-paid-term-guard");
