@@ -3327,6 +3327,18 @@ async function hostingReleaseHoldAction(id) {
     if (e.message !== "unauthorized") alert(e.message);
   }
 }
+async function hostingResumeRenewalAction(id) {
+  if (!confirm("Resume renewal of " + id + "? Stripe is asked to remove the scheduled cancellation first; only on its confirmation are the suspend/delete deadlines, their pending jobs and any deletion hold cleared. The subscription then renews as normal.")) return;
+  const by = prompt("Your name/initials (written to the audit log):", "") || "admin";
+  const reason = prompt("Reason (written to the audit log, e.g. the ticket or the incident):", "") || "";
+  try {
+    const r = await api("/admin/api/hosting/instances/" + encodeURIComponent(id) + "/resume-renewal", { method: "POST", body: JSON.stringify({ by: by, reason: reason }) });
+    if (r && r.note) alert(r.note);
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") alert(e.message);
+  }
+}
 function fmtCents(cents) { return "$" + (cents / 100).toFixed(2); }
 async function hostingRefresh() {
   const meta = document.getElementById("hostingMeta");
@@ -3381,6 +3393,12 @@ async function hostingRefresh() {
     const deleteBtn = document.createElement("button"); deleteBtn.type = "button"; deleteBtn.textContent = "Force delete";
     deleteBtn.onclick = () => hostingInstanceAction(inst.id, "force-delete", "PERMANENTLY delete " + inst.id + " and its server data? This cannot be undone.");
     actions.appendChild(retryBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(suspendBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(deleteBtn);
+    if (inst.stage === "cancel_scheduled") {
+      const resumeBtn = document.createElement("button"); resumeBtn.type = "button"; resumeBtn.textContent = "Resume renewal";
+      resumeBtn.title = "Operator-side reversal of a scheduled cancellation: Stripe cancel_at_period_end=false first, then the scheduled end, its jobs and any hold are cleared";
+      resumeBtn.onclick = () => hostingResumeRenewalAction(inst.id);
+      actions.appendChild(document.createTextNode(" ")); actions.appendChild(resumeBtn);
+    }
     if (inst.stage !== "deleted") {
       actions.appendChild(document.createTextNode(" "));
       if (hold) {

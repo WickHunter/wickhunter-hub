@@ -639,9 +639,17 @@ export class BillingService {
     // past-due state; once records exist, stale paid events are inert.
     const activatingBehindFailure = !!(stale && confirmed && !hasEntitlements && prior?.pendingStatus === "past_due");
     // Checkout creates a short bootstrap grant but is often timestamped AFTER
-    // its initial paid invoice. Delivery order must not discard that first
-    // paid term. Restrict the exception to checkout-only, active records with
-    // no paid-through date; never bypass a failure, refund or terminal fence.
+    // its initial paid invoice: Stripe creates the subscription and pays its
+    // first invoice before it marks the Checkout Session complete, so the
+    // `invoice.paid`/`invoice.payment_succeeded` events carry a `created`
+    // (one-second resolution, `createdMs` above) at least one second before
+    // the `checkout.session.completed` event's, yet Stripe delivers the
+    // checkout first. The watermark the checkout wrote then makes both
+    // invoice events `stale` under the strict `<` above (2026-10-09: the
+    // bootstrap grant ran out three days later and hosting cancelled the paid
+    // subscription). Delivery order must not discard that first paid term.
+    // Restrict the exception to checkout-only, active records with no
+    // paid-through date; never bypass a failure, refund or terminal fence.
     const initialPaidAfterCheckout = !!(stale && !lifetimeHosting && !prior?.pendingStatus
       && (ev.type === "invoice.paid" || ev.type === "invoice.payment_succeeded")
       && invoiceFacts(ev.object).paid && invoiceFacts(ev.object).billingReason === "subscription_create"
