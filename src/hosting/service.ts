@@ -69,6 +69,21 @@ const realFetch: EmailFetch = async (url, init) => {
 export interface PublicHealthResponse { ok: boolean; status: number; body: string }
 export type PublicHealthFetch = (url: string, signal: AbortSignal) => Promise<PublicHealthResponse>;
 
+/** See `HostingService.softwareIneligibility`. */
+export type SoftwareIneligibility =
+  | { kind: "unbound" }
+  | { kind: "revoked" }
+  | { kind: "lapsed"; licenseExp: number; subscriptionStatus: string | null; subscriptionActive: boolean };
+
+/** The `CustomerRecord.subscriptionStatus` spellings under which Stripe is
+ *  still billing the software subscription: `onSubscriptionCheckout`/
+ *  `onInvoicePaid` write `active`, `onSubscriptionUpdated` mirrors Stripe's
+ *  `active`/`trialing` and spells a pending period-end cancellation as
+ *  `active (cancels at period end)` (still paid through the period). Every
+ *  other spelling (`past_due`, `canceled`, `unpaid`, `incomplete*`, null for
+ *  a one-time purchase) is Stripe's own word that the term is not paid. */
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set<string>(["active", "trialing", "active (cancels at period end)"]);
+
 /** Dedicated transport for the customer-controlled public endpoint. It
  * never follows redirects and stops reading as soon as the tiny health
  * response exceeds its cap; the caller's AbortSignal covers both headers
@@ -182,11 +197,38 @@ export class HostingService {
    *  this exact owner key. Read-only over billing.store — never mutated
    *  from here (see file header). */
   softwareEligible(ownerId: string, nowMs = this.now()): boolean {
+    return this.softwareIneligibility(ownerId, nowMs) === null;
+  }
+
+  /** WHY `softwareEligible` is false, when it is — `null` while eligible.
+   *  `reconcileOwner` needs the reason, not just the verdict, because the
+   *  verdict mixes two different kinds of fact:
+   *
+   *  - `unbound` / `revoked`: no software customer or licence is bound to
+   *    this owner, or the licence was revoked (a full refund, a dispute, or
+   *    an operator's `revoke`). Those are Stripe's word or the operator's,
+   *    and hosting may act on them.
+   *  - `lapsed`: the licence registry's `exp` has passed on the Hub's own
+   *    clock. That `exp` is DERIVED by src/billing/service.ts from the
+   *    events the Hub managed to apply — the three-day bootstrap grant
+   *    `onSubscriptionCheckout` writes, then every paid period it sees. If a
+   *    paid invoice was never applied (2026-10-09, "older bundle lifecycle
+   *    event ignored"), `exp` lapses three days after checkout while Stripe
+   *    still holds an active, paid subscription. `subscriptionActive` is
+   *    the Hub's mirror of Stripe's status for that same customer
+   *    (`subscriptionStatus`, written by every checkout/invoice/
+   *    subscription webhook); when it is active and the only thing against
+   *    the customer is the local clock, the Hub's records contradict each
+   *    other and the suspect one is the Hub's, not Stripe's. */
+  softwareIneligibility(ownerId: string, nowMs = this.now()): SoftwareIneligibility | null {
     const rec = this.billing.store.getCustomer(ownerId);
-    if (!rec) return false;
+    if (!rec) return { kind: "unbound" };
+    if (this.licenses.isRevoked(rec.licenseId)) return { kind: "revoked" };
     const lic = this.licenses.get(rec.licenseId);
-    if (!lic || this.licenses.isRevoked(rec.licenseId)) return false;
-    return lic.exp === undefined || lic.exp === null || lic.exp > nowMs;
+    if (!lic) return { kind: "unbound" };
+    if (lic.exp === undefined || lic.exp === null || lic.exp > nowMs) return null;
+    const subscriptionActive = !!rec.subscriptionId && ACTIVE_SUBSCRIPTION_STATUSES.has(rec.subscriptionStatus ?? "") && !rec.refunded && !rec.disputed;
+    return { kind: "lapsed", licenseExp: lic.exp, subscriptionStatus: rec.subscriptionStatus, subscriptionActive };
   }
 
   hostingPlanKeys(): string[] {
@@ -533,8 +575,37 @@ export class HostingService {
       }
       return;
     }
-    if (!this.softwareEligible(ownerId, nowMs)) {
-      this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer`);
+    const ineligible = this.softwareIneligibility(ownerId, nowMs);
+    if (ineligible?.kind === "lapsed" && ineligible.subscriptionActive) {
+      // A local licence expiry is not Stripe's word. On 2026-10-09 this
+      // branch's predecessor cancelled a paid, active combined software+VPS
+      // subscription — software and hosting together, with the customer's
+      // "cancellation scheduled" email — because the Hub had discarded the
+      // subscription's initial paid invoice and the three-day bootstrap
+      // grant ran out. Stripe then echoed the Hub's own cancellation back
+      // as `customer.subscription.updated`, which the record mirrored as
+      // the customer's intent; nothing in this service un-cancels. The
+      // `software-ineligible` cancellation is therefore WITHHELD while the
+      // software subscription that pays for the licence is still active
+      // (and unrefunded, undisputed) at Stripe: either a paid period the
+      // Hub failed to apply is about to arrive (`onSubscriptionUpdated`/
+      // `onInvoicePaid` extend the licence and the next tick resumes), or
+      // Stripe will itself say `past_due`/`canceled`, which the branch
+      // below acts on. Nothing is provisioned for the lapsed licence
+      // either (`bootstrapLicenseToken` would refuse the install anyway);
+      // an already-provisioned instance keeps deriving its own hosting
+      // lifecycle from its own record, exactly as before.
+      if (!this.withheldCancellations.has(ownerId)) {
+        this.withheldCancellations.add(ownerId);
+        this.log(`[hosting] withholding software-ineligible cancellation for ${ownerId} (${instance.id}): the software licence lapsed at ${new Date(ineligible.licenseExp).toISOString()} on the Hub's clock, but its subscription ${sub.subscriptionId ?? "?"} is still ${ineligible.subscriptionStatus ?? "?"} at Stripe — a paid period was not applied. Repair the licence expiry (POST /admin/api/licenses/expiry) or let the next paid event extend it; no Stripe cancellation and no provisioning until then`);
+      }
+      if (instance.stage === "ordered" && !instance.providerInstanceId) return;
+      this.applyBillingSignal(instance, sub, nowMs);
+      return;
+    }
+    if (this.withheldCancellations.delete(ownerId)) this.log(`[hosting] ${ownerId} (${instance.id}): software licence hold ended (${ineligible ? ineligible.kind : "eligible again"})`);
+    if (ineligible) {
+      this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer (${ineligible.kind}${ineligible.kind === "lapsed" ? `, subscription ${ineligible.subscriptionStatus ?? "none"}` : ""})`);
       if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
       if (instance.stage === "ordered" && !instance.providerInstanceId) this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
       return;
@@ -926,6 +997,12 @@ export class HostingService {
   // ── outbox draining (the durable job worker) ────────────────────────────
 
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Owners whose `software-ineligible` cancellation `reconcileOwner` is
+   *  currently withholding (see there). In-memory on purpose: it only
+   *  bounds the journal line to once per episode per process; the decision
+   *  itself is re-derived from the durable records on every tick, and a
+   *  restart merely logs the still-open episode once more. */
+  private readonly withheldCancellations = new Set<string>();
 
   /** Owns its own periodic reconciliation (candles/liq's own `start`/`stop`
    *  shape — src/server.ts's `listen`/`close`), so every hub that
@@ -1015,6 +1092,15 @@ export class HostingService {
       }, nowMs);
       return;
     }
+    // The same hold `reconcileOwner` applies before enqueueing: a provision
+    // job queued while the licence was still valid (or while provisioning
+    // was switched off) must not create a server for a licence that has
+    // since lapsed on the Hub's clock while Stripe still bills its
+    // subscription — the install would be refused by `bootstrapLicenseToken`
+    // and the provider resource would be paid for nothing. Retryable, like
+    // the master switch: the job waits for the paid period to be applied.
+    const held = this.softwareIneligibility(row.ownerId, nowMs);
+    if (held?.kind === "lapsed" && held.subscriptionActive) throw new Error("software licence lapsed while its subscription is still active at Stripe — provisioning waits for the paid period to be applied");
     if (row.provisionAttempts >= MAX_PROVISION_ATTEMPTS) { this.failProvisioning(row, `setup failed after ${row.provisionAttempts} attempts`, nowMs); return; }
     await this.captureProviderPlanQuote(row, provider, nowMs);
     // Quote capture updates this same row. Refresh before the stage/attempt
