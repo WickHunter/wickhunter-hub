@@ -14,10 +14,10 @@ import { writeJsonAtomic, readJson } from "../jsonfile.js";
 // a new subscription `invoice.paid` and `checkout.session.completed` race.
 // Every handler therefore starts from "make sure this customer has a licence"
 // and then moves its expiry FORWARD to what the event proves was paid for.
-// Nothing here ever moves an expiry back: the bot only accepts a LATER key at
-// check-in, so a shortened registry date would change nothing on the box.
-// Cutting a customer off early is revocation, and only a dispute or a full
-// refund does that automatically.
+// Webhook status updates never grant a term. A separate, audited operator
+// repair can shorten an erroneous registry expiry after reading Stripe history.
+// The app receives a signed billing ceiling so an already-issued longer token
+// cannot bypass the corrected deadline; closing and protection remain available.
 //
 // TEST MODE IS A SANDBOX WITH TEETH. A test-mode event mints a working
 // licence (the operator must be able to install for real from a 4242 card),
@@ -561,7 +561,7 @@ export class BillingService {
       case "invoice.payment_succeeded":
         return this.onInvoicePaid(ev, cfg);
       case "invoice.payment_failed":
-        return this.onInvoiceFailed(ev);
+        return this.onInvoiceFailed(ev, cfg);
       case "customer.subscription.updated":
         return this.onSubscriptionUpdated(ev, cfg);
       case "customer.subscription.deleted":
@@ -804,7 +804,7 @@ export class BillingService {
           const rec = this.store.getCustomer(bundle.customerId); if (rec) { this.noteCharge(rec, f.chargeId); this.noteCharge(rec, f.paymentIntentId); this.store.putCustomer(rec); }
         } else software = await this.onInvoicePaid(softwareEvent, cfg);
         break;
-      case "invoice.payment_failed": software = this.onInvoiceFailed(softwareEvent); break;
+      case "invoice.payment_failed": software = this.onInvoiceFailed(softwareEvent, cfg); break;
       case "customer.subscription.updated": software = this.onSubscriptionUpdated(softwareEvent, cfg); break;
       case "customer.subscription.deleted": software = this.onSubscriptionDeleted(ev); break;
       case "charge.succeeded": software = this.onChargeSucceeded(ev); break;
@@ -1384,11 +1384,22 @@ export class BillingService {
     return { outcome: "applied", note };
   }
 
-  private onInvoiceFailed(ev: StripeEvent): ApplyResult {
+  private onInvoiceFailed(ev: StripeEvent, cfg: BillingConfig): ApplyResult {
     const f = invoiceFacts(ev.object);
     const rec = this.findCustomer(f.customerId, f.email, ev.livemode);
     if (!rec) return { outcome: "ignored", note: "customer not known" };
-    if (rec.launchManaged && rec.subscriptionId && f.subscriptionId && rec.subscriptionId !== f.subscriptionId) return { outcome: 'ignored', note: 'failure belongs to an older subscription' };
+    if (rec.subscriptionId && f.subscriptionId && rec.subscriptionId !== f.subscriptionId) return { outcome: 'ignored', note: 'failure belongs to an older subscription' };
+    const start = linePeriod(ev.object).startMs;
+    if (start !== null && Number.isSafeInteger(start) && start > 0) {
+      // A delayed failure for an already settled term cannot undo payment.
+      if (rec.paidPeriodEndMs !== undefined && rec.paidPeriodEndMs > start) {
+        return { outcome: "ignored", note: "failure belongs to an already paid term" };
+      }
+      rec.unpaidPeriodStartMs = Math.min(rec.unpaidPeriodStartMs ?? start, start);
+      const paid = rec.paidPeriodEndMs ?? rec.unpaidPeriodStartMs;
+      rec.accessEndsAtMs = Math.min(rec.accessEndsAtMs ?? Infinity,
+        this.licenses.get(rec.licenseId)?.exp ?? Infinity, paid + cfg.policy.graceDays * DAY_MS);
+    }
     rec.subscriptionStatus = "past_due";
     this.touch(rec, ev, this.now());
     this.store.putCustomer(rec);
@@ -1405,10 +1416,9 @@ export class BillingService {
     rec.cancelAtPeriodEnd = f.cancelAtPeriodEnd;
     rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
     let note = `status ${rec.subscriptionStatus}`;
-    if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null) {
-      if (this.extendLicense(rec, f.currentPeriodEndMs + cfg.policy.graceDays * DAY_MS, cfg, now)) note += "; licence extended";
-      if (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs) rec.periodEndMs = f.currentPeriodEndMs;
-    }
+    // Stripe can advance an active period before collecting its invoice.
+    // Status and cancellation metadata cannot renew a software entitlement.
+    // Only invoice.paid (or a verified Checkout purchase) grants a new term.
     this.touch(rec, ev, now);
     this.store.putCustomer(rec);
     return { outcome: "applied", note };
@@ -1648,8 +1658,14 @@ export class BillingService {
   private applyPaidInvoiceTerm(rec: CustomerRecord, invoice: Record<string, unknown>, cfg: BillingConfig, fallbackPaidAtMs: number, hostedLaunch: boolean, keepCancellationMarker = false): { periodEndMs: number | null; licenseTargetMs: number | null } {
     const f = invoiceFacts(invoice);
     const licenseTargetMs = this.paidThroughOf(f.periodEndMs, cfg);
+    if (f.periodEndMs !== null) {
+      rec.paidPeriodEndMs = Math.max(rec.paidPeriodEndMs ?? 0, f.periodEndMs);
+      rec.accessEndsAtMs = rec.paidPeriodEndMs + cfg.policy.graceDays * DAY_MS;
+      if (rec.unpaidPeriodStartMs !== undefined && rec.paidPeriodEndMs > rec.unpaidPeriodStartMs) delete rec.unpaidPeriodStartMs;
+    }
     if (f.periodEndMs !== null && (rec.periodEndMs === null || f.periodEndMs > rec.periodEndMs)) rec.periodEndMs = f.periodEndMs;
-    if (!(keepCancellationMarker && rec.subscriptionStatus === "active (cancels at period end)")) rec.subscriptionStatus = "active";
+    if (rec.unpaidPeriodStartMs !== undefined) rec.subscriptionStatus = "past_due";
+    else if (!(keepCancellationMarker && rec.subscriptionStatus === "active (cancels at period end)")) rec.subscriptionStatus = "active";
     if (hostedLaunch) { const discount = checkoutDiscountPercent(invoice); if (discount !== null) rec.discountPercent = discount; }
     const amountPaid = invoice.amount_paid;
     if (typeof amountPaid === 'number' && Number.isSafeInteger(amountPaid) && amountPaid > 0) {
@@ -2193,6 +2209,87 @@ export class BillingService {
       nonRenewing: rec.nonRenewing ?? (!rec.subscriptionId && rec.planKey === 'lifetime'),
       cancelAtPeriodEnd: rec.cancelAtPeriodEnd ?? false,
     };
+  }
+
+  /** Repair an already over-extended unpaid licence from fresh Stripe facts.
+   * Dry-run first; the apply uses the Hub's own writer and durable audit. */
+  async repairUnpaidGrace(subscriptionId: string, opts: ReconcileOptions = {}): Promise<Record<string, unknown>> {
+    const dryRun = opts.dryRun !== false;
+    const by = typeof opts.by === "string" ? opts.by.trim().slice(0, 120) : "";
+    const reason = typeof opts.reason === "string" ? opts.reason.trim().slice(0, 500) : "";
+    if (!/^sub_[A-Za-z0-9_]{1,200}$/.test(subscriptionId) || (!dryRun && (!by || !reason))) throw Error("expected subscriptionId; apply requires by and reason");
+    const rec = this.store.findBySubscription(subscriptionId);
+    if (!rec || !rec.subscriptionId || rec.lifetimeAccess || rec.refunded || rec.disputed || this.recoveryPending(rec.key)) throw Error("customer is not eligible for unpaid-grace repair");
+    // Mixed invoices require software-line projection; never guess from VPS money.
+    if (this.store.getBundleSubscription(subscriptionId) || this.store.findRoleSubscriptionBySubscription("hosting", subscriptionId)) throw Error("mixed hosting subscription requires software-line reconciliation");
+    const license = this.licenses.get(rec.licenseId);
+    if (!license || this.licenses.isRevoked(rec.licenseId)) throw Error("licence is unavailable");
+    const cfg = this.config(), key = cfg.stripe[rec.livemode ? "live" : "test"].secretKey;
+    if (!key) throw Error("Stripe is not configured");
+    const api = new EarnStripeApi(key, this.launchFetch);
+    const sub = await api.call("GET", `/v1/subscriptions/${subscriptionId}`);
+    const sf = subscriptionFacts(sub);
+    if (sf.subscriptionId !== subscriptionId || sf.customerId !== rec.stripeCustomerId || sub.livemode !== rec.livemode
+      || !["past_due", "unpaid", "canceled", "incomplete_expired"].includes(sf.status)) throw Error("fresh Stripe identity/status does not prove an unpaid subscription");
+    let after: string | undefined, complete = false;
+    const invoices: Record<string, any>[] = [];
+    for (let page = 0; page < 10; page++) {
+      const result = await api.call("GET", "/v1/invoices", { subscription: subscriptionId, limit: 100, ...(after ? { starting_after: after } : {}) });
+      if (!Array.isArray(result.data) || typeof result.has_more !== "boolean") throw Error("invoice history is malformed");
+      for (const invoice of result.data) {
+        const f = invoiceFacts(invoice);
+        if (f.customerId !== rec.stripeCustomerId || f.subscriptionId !== subscriptionId || invoice.livemode !== rec.livemode
+          || invoice.lines?.has_more === true || !Array.isArray(invoice.lines?.data)) throw Error("invoice identity or line history is incomplete");
+        invoices.push(invoice);
+      }
+      if (!result.has_more) { complete = true; break; }
+      after = result.data.at(-1)?.id;
+      if (!after) throw Error("invoice pagination did not advance");
+    }
+    if (!complete) throw Error("invoice history exceeded the bounded reader; nothing changed");
+    const paidEnds = invoices.filter(i => i.status === "paid" && invoiceFacts(i).paid)
+      .map(i => linePeriod(i).endMs).filter((n): n is number => n !== null);
+    const paidEnd = paidEnds.length ? Math.max(...paidEnds) : (!rec.firstActualPaymentAtMs ? rec.firstPaymentAtMs ?? null : null);
+    if (paidEnd === null) throw Error("no verified paid/free initial term; manual reconciliation required");
+    const exp = Math.min(paidEnd + cfg.policy.graceDays * DAY_MS, license.exp);
+    if (exp <= license.iat) throw Error("verified boundary predates licence issue; manual reconciliation required");
+    const result = { dryRun, subscriptionId, licenseId: license.id, previousExpiryMs: license.exp, expiresAtMs: exp,
+      paidPeriodEndMs: paidEnd, graceDays: cfg.policy.graceDays, changed: license.exp !== exp || rec.accessEndsAtMs !== exp, wrote: false };
+    if (dryRun) return result;
+    return this.withCheckoutLocks([rec.key, rec.stripeCustomerId], async () => {
+      if (JSON.stringify(this.store.getCustomer(rec.key)) !== JSON.stringify(rec) || this.licenses.get(license.id)?.exp !== license.exp) throw Error("customer changed while Stripe was read; run again");
+      const now = this.now(), id = `unpaid-grace:${subscriptionId}:${now}`;
+      // Record intent first: an interrupted apply is visible and replayable.
+      this.store.appendEvent({ id: `${id}:intent`, type: "admin.billing.repair-unpaid-grace", livemode: rec.livemode,
+        receivedAtMs: now, outcome: "applied", note: JSON.stringify({ phase: "intent", by, reason, ...result }) });
+      if (license.exp !== exp) this.licenses.setExpiry(license.id, exp, now);
+      rec.periodEndMs = paidEnd;
+      rec.paidPeriodEndMs = paidEnd;
+      rec.accessEndsAtMs = exp;
+      rec.subscriptionStatus = sf.status;
+      rec.updatedAtMs = now;
+      this.store.putCustomer(rec);
+      this.store.appendEvent({ id, type: "admin.billing.repair-unpaid-grace", livemode: rec.livemode,
+        receivedAtMs: now, outcome: "applied", note: JSON.stringify({ phase: "complete", by, reason, ...result }) });
+      return { ...result, wrote: true };
+    });
+  }
+
+  /** The app verifies this ceiling with the same pinned licence signer.
+   * Never infer payment from Stripe's active status or an unverified period. */
+  signedBillingAccessFor(licenseId: string): string | null {
+    const rec = this.store.findByLicense(licenseId);
+    if (!rec) return null;
+    // Legacy periodEndMs may be the unpaid next month. Leave it untrusted
+    // until the explicit Stripe-history repair establishes the paid boundary.
+    const end = rec.lifetimeAccess || !rec.subscriptionId
+      ? this.licenses.get(licenseId)?.exp
+      : rec.paidPeriodEndMs !== undefined ? rec.paidPeriodEndMs + this.config().policy.graceDays * DAY_MS
+        : rec.accessEndsAtMs;
+    if (!Number.isSafeInteger(end) || !(end! > 0)) return null;
+    const payload = Buffer.from(JSON.stringify({ schema: "wickhunter.billing-access.v1", licenseId,
+      expiresAtMs: Math.min(end!, this.licenses.get(licenseId)?.exp ?? end!), issuedAtMs: this.now() }));
+    return `WHBA1.${payload.toString("base64url")}.${this.licenses.sign(payload).toString("base64url")}`;
   }
 
   /** Lifetime is a purchase entitlement, not an unbounded token format.

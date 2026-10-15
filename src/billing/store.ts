@@ -63,6 +63,12 @@ export interface CustomerRecord {
   subscriptionStatus: string | null;
   /** What the customer has paid THROUGH (Stripe's period end), before grace. */
   periodEndMs: number | null;
+  /** Invoice-paid evidence only; subscription.updated is never payment proof. */
+  paidPeriodEndMs?: number;
+  /** Earliest unpaid period start, retained across retries and status events. */
+  unpaidPeriodStartMs?: number;
+  /** Signed check-in ceiling, separate from an already-issued longer token. */
+  accessEndsAtMs?: number;
   /** Charge / payment-intent ids seen for this customer, so a dispute (which
    *  names only the charge) can be attributed without calling Stripe. */
   chargeIds: string[];

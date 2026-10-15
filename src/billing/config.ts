@@ -150,7 +150,7 @@ const EMPTY_MODE: StripeModeConfig = { publishableKey: "", secretKey: "", webhoo
 const EMPTY_ROLES: ModeRoleConfig = { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } };
 
 export const DEFAULT_BILLING_POLICY: BillingPolicy = {
-  graceDays: 7,
+  graceDays: 1,
   bootstrapDays: 3,
   oneOffDays: 365,
   testMaxDays: 14,
