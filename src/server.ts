@@ -1243,6 +1243,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         if (token) renewal = { token, exp: current.exp };
       }
     }
+    const billingAccess = !revoked ? billing.signedBillingAccessFor(body.licenseId) : null;
     sendJson(res, 200, {
       ok: true,
       ...(revoked ? { revoked: true } : {}),
@@ -1251,6 +1252,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       ...(latest ? { latest } : {}),
       flags,
       subscription,
+      ...(billingAccess ? { billingAccess } : {}),
       ...(renewal ? { token: renewal.token, exp: renewal.exp } : {}),
     });
   }
@@ -3293,6 +3295,14 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // subscription, 409 a named refusal for operator review (nothing
     // written), 404 unknown, 400 bad request, 502/503 Stripe unreadable.
     // `scripts/reconcile-bootstrap-only.mjs` drives this for a list.
+    if (m === "POST" && p === "/admin/api/billing/repair-unpaid-grace") {
+      const body = await readJsonBody(req);
+      if (!body || typeof body.subscriptionId !== "string") return sendJson(res, 400, { ok: false, error: "expected subscriptionId" });
+      try {
+        const result = await billing.repairUnpaidGrace(body.subscriptionId, { dryRun: body.dryRun !== false, by: body.by, reason: body.reason });
+        return sendJson(res, 200, { ok: true, ...result }, { "cache-control": "no-store" });
+      } catch (error) { return sendJson(res, 409, { ok: false, error: (error as Error).message }, { "cache-control": "no-store" }); }
+    }
     if (m === "POST" && p === "/admin/api/billing/reconcile-subscription") {
       const body = await readJsonBody(req);
       if (body === null) return sendJson(res, 400, { ok: false, verdict: "INVALID_REQUEST", error: "expected {subscriptionId} or {customerId}" }, { "cache-control": "no-store" });

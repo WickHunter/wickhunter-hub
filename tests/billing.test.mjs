@@ -432,7 +432,7 @@ await test("switching to LIVE: test events are ignored, live events are honoured
   assert.ok(licenseB);
   tokenB = h.store.tokenFor(licenseB.id);
   assert.equal(licenseB.plan, "unleashed");
-  assert.equal(licenseB.exp, clock + 37 * DAY, "30-day period + 7 grace, no test cap");
+  assert.equal(licenseB.exp, clock + 31 * DAY, "30-day period + 1 grace, no test cap");
   assert.equal(emailCalls().length, 2, "the welcome went out on the first event that created the licence");
   assert.doesNotMatch(lastEmail().subject, /TEST/);
   pageTokenB = pageTokenFromEmail();
@@ -502,7 +502,7 @@ await test("subscription lifecycle events update status without touching the exp
   assert.equal(licenses().find((l) => l.id === licenseA.id).exp, before, "nothing is ever shortened; it lapses on its own");
   assert.equal(licenses().find((l) => l.id === licenseA.id).revoked, false);
   const failed = await postEvent("test", event("invoice.payment_failed", invoice({ id: "in_A9", paid: false, status: "open" })));
-  assert.equal(failed.body.outcome, "applied");
+  assert.equal(failed.body.outcome, "ignored", "late failure cannot undo a settled term");
   const unknown = await postEvent("test", event("customer.created", { id: "cus_Z", object: "customer" }));
   assert.equal(unknown.body.outcome, "ignored");
 });

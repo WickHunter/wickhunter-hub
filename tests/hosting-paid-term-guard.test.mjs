@@ -199,7 +199,7 @@ await test("the incident's event order (newer checkout, then the older paid invo
   } finally { await c.h.close(); }
 });
 
-await test("a bootstrap-only bundle whose initial invoice was discarded (the pre-0.4.91 state) is held, not cancelled, when the grant lapses; the hold is logged once; Stripe's next word lifts it", async () => {
+await test("a bootstrap-only bundle whose initial invoice was discarded (the pre-0.4.91 state) is held, not cancelled, when the grant lapses; the hold is logged once; only a settled invoice lifts it", async () => {
   const c = await setup();
   try {
     const { s } = await checkedOut(c);
@@ -218,7 +218,9 @@ await test("a bootstrap-only bundle whose initial invoice was discarded (the pre
 
     c.set(ECHO_UPDATE);
     assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s), ECHO_UPDATE)).body.outcome, "applied");
-    assert.equal(c.exp(s), PAID_TERM_EXP, "Stripe's active subscription with its period end extends the licence to the paid term");
+    assert.equal(c.exp(s), BOOTSTRAP_EXP, "active status alone cannot extend an unpaid licence");
+    assert.equal((await c.post("invoice.paid", c.invoice(s), ECHO_UPDATE)).body.outcome, "applied");
+    assert.equal(c.exp(s), PAID_TERM_EXP, "the settled invoice proves the paid term");
     await c.tick();
     assert.equal(c.logs.filter(l => l.includes("software licence hold ended")).length, 1);
     assert.equal(c.cancellations(s).length, 0);
@@ -263,6 +265,8 @@ await test("an order still unprovisioned when the grant lapses is neither cancel
     assert.equal(job.status, "pending"); assert.match(job.lastErrorCode, /software licence lapsed while its subscription is still active/);
     c.set(ECHO_UPDATE);
     assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s), ECHO_UPDATE)).body.outcome, "applied");
+    assert.equal(c.exp(s), BOOTSTRAP_EXP, "status cannot grant unpaid access");
+    assert.equal((await c.post("invoice.paid", c.invoice(s), ECHO_UPDATE)).body.outcome, "applied");
     c.advance(31_000); // the job's retry backoff
     await c.tick();
     assert.equal(c.provider.createCalls.length, 1);
@@ -421,7 +425,16 @@ async function incidentCancelled(c, { hold = true, paid = false } = {}) {
   c.set(FIRST_TICK_AFTER_LAPSE); await c.tick();
   c.set(ECHO_UPDATE);
   assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s, { cancel_at_period_end: true }), ECHO_UPDATE)).body.outcome, "applied");
-  assert.equal(c.exp(s), PAID_TERM_EXP, "the echo extended the licence to the paid term");
+  // Seed the historical pre-fix overextension explicitly. Current code must
+  // never reproduce it from an active status event (asserted above).
+  if (!paid) {
+    assert.equal(c.exp(s), BOOTSTRAP_EXP, "the fixed handler grants no unpaid term");
+    const sw = c.h.hub.billing.store.getCustomer(c.key(s));
+    c.h.store.setExpiry(sw.licenseId, PAID_TERM_EXP, c.now());
+    sw.periodEndMs = PERIOD_END;
+    c.h.hub.billing.store.putCustomer(sw);
+  }
+  assert.equal(c.exp(s), PAID_TERM_EXP, "historical incident fixture carries the extended term");
   await c.tick(); c.advance(30_000); await c.tick();
   const row = c.instance(s);
   assert.equal(row.stage, "cancel_scheduled"); assert.equal(row.cancellationReason, "intentional_cancellation");
