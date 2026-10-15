@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicKey, verify } from 'node:crypto';
 import { rmSync } from 'node:fs';
-import { freshStore } from './helpers.mjs';
+import { freshStore, freshHub } from './helpers.mjs';
 import { BillingService } from '../dist/src/billing/service.js';
 const DAY=86400000, anchor=Date.parse('2026-10-15T04:00:00Z');
 function setup(){
@@ -68,4 +68,17 @@ test('existing unpaid repair uses complete Stripe history, is dry by default, th
   await assert.rejects(()=>f.service.repairUnpaidGrace('sub_fixture',{dryRun:false,by:'test',reason:'test'}),/bounded reader/);
   assert.equal(f.store.get(f.payload.id).exp,anchor+DAY);
  }finally{rmSync(f.dataDir,{recursive:true,force:true});}
+});
+
+test('authenticated check-in carries the corrected canonical key alongside its signed billing deadline',async()=>{
+ const f=setup(),h=await freshHub({}, {billingNow:()=>anchor+3600000});
+ try{
+  const issued=h.store.issueUntil('Offline check-in',anchor+34*DAY,'unleashed-monthly',anchor-14*DAY);
+  const rec=f.service.store.getCustomer('cus_fixture');rec.licenseId=issued.payload.id;rec.accessEndsAtMs=anchor+DAY;rec.paidPeriodEndMs=anchor;
+  h.hub.billing.store.putCustomer(rec);h.store.setExpiry(rec.licenseId,anchor+DAY);
+  const response=await fetch(h.origin+'/api/license/checkin',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({licenseId:rec.licenseId,installId:'fixture-install',version:'0.91.2',ts:anchor,token:issued.token})});
+  assert.equal(response.status,200);const reply=await response.json();
+  assert.equal(h.store.decodeGenuine(reply.token).exp,anchor+DAY);
+  assert.equal(JSON.parse(Buffer.from(reply.billingAccess.split('.')[1],'base64url')).expiresAtMs,anchor+DAY);
+ }finally{await h.close();rmSync(f.dataDir,{recursive:true,force:true});}
 });

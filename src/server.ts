@@ -1235,15 +1235,15 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // token is, and only a holder of the current token gets its successor.
     // A revoked or deleted id gets nothing, and a registry date that is not
     // later hands back nothing.
+    const billingAccess = !revoked ? billing.signedBillingAccessFor(body.licenseId) : null;
     let renewal: { token: string; exp: number } | null = null;
     if (!revoked) {
       const current = store.get(body.licenseId);
-      if (current && current.exp > presented.exp) {
+      if (current && (current.exp > presented.exp || (billingAccess && current.exp < presented.exp))) {
         const token = store.tokenFor(body.licenseId);
         if (token) renewal = { token, exp: current.exp };
       }
     }
-    const billingAccess = !revoked ? billing.signedBillingAccessFor(body.licenseId) : null;
     sendJson(res, 200, {
       ok: true,
       ...(revoked ? { revoked: true } : {}),
