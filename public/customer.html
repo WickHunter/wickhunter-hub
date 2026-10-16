@@ -205,6 +205,10 @@
       <button class="btn quiet v-portal" type="button">Manage billing</button>
     </div>
     <div class="cmd v-cmd" hidden></div>
+    <button class="btn quiet v-license-key" type="button" style="margin-top:10px">Show license key</button>
+    <p class="fine v-license-note" hidden>Keep your key private. Use it only in your own Unleashed installation. Viewing it does not move your licence to another server.</p>
+    <div class="cmd v-license-value" hidden></div>
+    <p class="err v-license-error" role="status" hidden></p>
     <button class="btn quiet v-replacement-key" type="button" hidden style="margin-top:10px">Show replacement licence key</button>
     <p class="fine v-key-note" hidden>Already installed on your reset server? Save this key in Settings → License before using the install command. Do not reuse the old server.</p>
     <div class="cmd v-key" hidden></div>
@@ -298,6 +302,29 @@
       node.querySelector(".v-lapsed").hidden = !sw.exitOnly;
 
       node.querySelector(".v-recovery").href = "support#message=" + encodeURIComponent("I reset or replaced my server and lost its installation key. Please help recover my account. Email: " + (accountEmail || "") + ". Account: " + sw.customerKey);
+      var licenseBtn = node.querySelector(".v-license-key");
+      var licenseValue = node.querySelector(".v-license-value");
+      var licenseNote = node.querySelector(".v-license-note");
+      var licenseError = node.querySelector(".v-license-error");
+      licenseBtn.disabled = sw.revoked || sw.exitOnly;
+      if (licenseBtn.disabled) licenseBtn.textContent = "License key unavailable — licence inactive";
+      licenseBtn.addEventListener("click", async function () {
+        licenseError.hidden = true;
+        if (!licenseValue.hidden) {
+          licenseValue.textContent = ""; licenseValue.hidden = true; licenseNote.hidden = true;
+          licenseBtn.textContent = "Show license key"; return;
+        }
+        licenseBtn.disabled = true;
+        try {
+          var response = await boundedApi("/api/customer/license-key", { method: "POST", body: JSON.stringify({ customerKey: sw.customerKey }) });
+          if (!response.ok || !response.body || response.body.ok !== true || typeof response.body.licenseKey !== "string") {
+            throw new Error(response.status === 401 ? "Your session expired. Sign in again to view your key." : "Could not load your license key. Reload your dashboard or contact support.");
+          }
+          showCopyText(licenseValue, response.body.licenseKey, "Copy license key");
+          licenseNote.hidden = false; licenseBtn.textContent = "Hide license key";
+        } catch (error) { licenseError.textContent = error.message; licenseError.hidden = false; }
+        finally { licenseBtn.disabled = false; }
+      });
       var keyBtn=node.querySelector(".v-replacement-key");keyBtn.hidden=!sw.recoveredInstallation || sw.revoked || sw.exitOnly;
       keyBtn.addEventListener("click",async function(){
         keyBtn.disabled=true;

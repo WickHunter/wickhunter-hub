@@ -756,7 +756,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // unauthenticated POST here shares. The three cookie-authenticated
       // routes are here too, for the same defence-in-depth reason
       // /api/billing/portal-session (licence-token-authenticated) is.
-      if (p === "/api/customer/signin" || (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key")
+      if (p === "/api/customer/signin" || (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key" || p === "/api/customer/license-key")
         || p === "/api/customer/portal" || p === "/api/customer/signout") return true;
       // Hosting customer actions (cookie-session-authenticated, like the
       // three above) and the bootstrap-token-authenticated readiness
@@ -796,7 +796,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // Stripe webhooks, public bundle checkout, and server-authenticated
     // hosting callbacks have separate trust contracts and are not in this set.
     const customerCookieWrite = m === "POST" && (
-      (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key") || p === "/api/customer/portal"
+      (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key" || p === "/api/customer/license-key") || p === "/api/customer/portal"
       || p === "/api/customer/signout" || p === "/api/hosting/checkout"
       || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal")))
     );
@@ -1103,6 +1103,24 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
     if (m === "GET" && p === "/api/customer/state") return customerState(req, res);
     if (m === "POST" && p === "/api/customer/install-command") return customerInstallCommand(req, res);
+    if (m === "POST" && p === "/api/customer/license-key") {
+      const headers = { "cache-control": "no-store", "pragma": "no-cache" };
+      const identity = authenticatedCustomer(req);
+      if (!identity) return sendJson(res, 401, { ok: false, error: "Sign in required" }, headers);
+      const body = await readJsonBody(req);
+      const rec = typeof body?.customerKey === "string" ? billing.store.getCustomer(body.customerKey) : null;
+      if (!rec || !rec.livemode || normalizeCustomerEmail(rec.email) !== normalizeCustomerEmail(identity.email)
+        || rec.refunded || rec.disputed) {
+        return sendJson(res, 403, { ok: false, error: "No active licence for this account" }, headers);
+      }
+      // Return only this owner's current key. Never issue a new licence,
+      // rotate an installation command, or change the machine binding here.
+      const key = store.tokenFor(rec.licenseId);
+      if (!key || !store.verify(key, customerSessions.nowMs()).ok) {
+        return sendJson(res, 403, { ok: false, error: "Licence is inactive; renew or contact support" }, headers);
+      }
+      return sendJson(res, 200, { ok: true, licenseKey: key }, headers);
+    }
     if(m === "POST" && p === "/api/customer/replacement-license-key") {
       const identity=authenticatedCustomer(req);if(!identity)return sendJson(res,401,{ok:false,error:"Sign in required"},{"cache-control":"no-store"});
       const body=await readJsonBody(req), rec=typeof body?.customerKey==="string"?billing.store.getCustomer(body.customerKey):null;
