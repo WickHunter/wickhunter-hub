@@ -1,4 +1,12 @@
+## v0.4.96 — Reconcile recurring referral earnings
+
+Explicit admin reconciliation verifies complete Stripe subscription and paid-invoice pages, backfills eligible missing recurring software commissions through the existing invoice checks, and corrects recorded invoices to the reviewed member rate. Corrections retain original earnings as immutable history and adjust the stored refund basis atomically, so repeated runs and later refunds/disputes do not duplicate credit. Lifetime software and VPS-only charges remain excluded. Run a dry run before applying, then refresh the referral status snapshot.
+
+
+Hosting fees may be enabled for an explicitly selected member only. They append one USD line item per calendar month to referral earnings, with gross commission, VPS hosting and net earnings shown separately. The minute reconciliation assesses due months even when automatic payouts are paused. This feature never charges a card or sends a payout.
+
 ## v0.4.95 — Paid renewals and one-day exit-only grace
+
 
 Only settled invoices extend a subscription's paid term. Subscription status updates and failed invoices cannot renew software access. The default grace period is one day; authenticated check-ins carry a signed access deadline and a matching corrected licence key so an older cached key or a code rollback cannot restore an overextended deadline. The admin-only unpaid-grace repair reads complete Stripe invoice history, previews the exact correction by default, and requires an audited explicit apply. It does not change Stripe subscriptions, hosting lifecycle or email delivery.
 
@@ -1993,6 +2001,8 @@ Tests are hermetic: each suite builds its own temp data/releases dirs and a
 real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
+
+- v0.4.96 — Reconcile missed recurring referral invoices and reviewed commission rates; support explicit member-only monthly VPS deductions and a gross/hosting/net earnings statement.
 
 - v0.4.95 — Renew only from settled invoices, default to one-day grace, deliver signed billing deadlines and matching canonical licence corrections, and add audited dry-run-first unpaid-grace repair from complete Stripe history.
 - v0.4.94 — Operator reconcile of a subscription's paid term from Stripe (`POST /admin/api/billing/reconcile-subscription`, `scripts/reconcile-bootstrap-only.mjs`): read-only Stripe reads, the `invoice.paid` webhook's own paid-term function, dry run by default, forward-only licence expiry, audited, named refusals for inactive, refunded/disputed, multi-subscription, unsettled, period-mismatched and not-yet-paid subscriptions; admin licence expiry edits are audited; the audit script marks reversed Hub-originated cancellations; a hosting record without a subscription logs its refusal once.

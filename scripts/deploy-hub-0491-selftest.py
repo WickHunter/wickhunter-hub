@@ -139,7 +139,9 @@ class FakeHost(op.Host):
         self.calls = []
 
     def euid(self):
-        return 0
+        # Fixture files belong to the invoking user, who acts as the trusted
+        # operator in this isolated host. Production still requires uid 0.
+        return os.getuid()
 
     def trusted_uid(self):
         return os.getuid()

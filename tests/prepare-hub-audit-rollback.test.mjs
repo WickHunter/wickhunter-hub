@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const script = new URL('../scripts/prepare-hub-audit-rollback.mjs', import.meta.url);
 const ledger = 'license-lease-audit.v1.jsonl';
@@ -34,7 +35,7 @@ function fixture(t) {
   }));
   const output = path.join(dir, 'rollback-ledger.jsonl');
   const run = (pid = '99999999') => spawnSync(process.execPath,
-    [script.pathname, '--data-dir', dir, '--output', output, '--stopped-pid', pid], { encoding: 'utf8' });
+    [fileURLToPath(script), '--data-dir', dir, '--output', output, '--stopped-pid', pid], { encoding: 'utf8' });
   return { dir, output, run, first, second };
 }
 

@@ -13,4 +13,9 @@ await test('actual portal renders exact offers and honest status, escapes text, 
  d.getElementById('moreReferrals').click();await until(()=>calls.length===2&&d.getElementById('moreReferrals').hidden);assert.match(calls[1].url,/referralsAfter=a{40}$/);assert.match(d.getElementById('referralRows').textContent,/Customer a/);assert.match(d.getElementById('referralRows').textContent,/Customer b/);assert.equal(calls.some(c=>c.init?.method==='POST'),false);assert.deepEqual(errors,[]);
  }finally{dom.window.close();}
 });
+await test('selected member sees gross, hosting and net line items without any payment request',async()=>{
+ const d=structuredClone(state);d.member.commissionPercent=50;d.commissionPercent=50;d.hostingStatement={monthlyCents:2000,rows:[{period:'2026-10',grossCents:10000,hostingCents:2000,netCents:8000}]};const calls=[];
+ const dom=new JSDOM(html,{url:'https://hub.test/earn',runScripts:'dangerously',beforeParse(w){w.fetch=async(url,init)=>{calls.push({url,init});return {ok:true,json:async()=>d};};}});
+ try{const doc=dom.window.document;await until(()=>!doc.getElementById('content').hidden);assert.equal(doc.getElementById('hostingStatementCard').hidden,false);const text=doc.getElementById('hostingStatementCard').textContent;assert.match(text,/Gross commission/);assert.match(text,/VPS hosting/);assert.match(text,/100.00/);assert.match(text,/-\$20.00/);assert.match(text,/80.00/);assert.match(text,/No separate card charge/);assert.match(doc.getElementById('nextTier').textContent,/agreed commission rate is 50%/);assert.equal(calls.some(c=>c.init?.method==='POST'),false);}finally{dom.window.close();}
+});
 summary('earn-dashboard-ui');
