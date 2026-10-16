@@ -1,3 +1,7 @@
+## v0.4.98 — Recognize settled crypto charge identifiers
+
+Referral purchase status accepts Stripe charge IDs with either the `ch_` or `py_` prefix. Crypto purchases retain the same exact PaymentIntent, customer, currency, collected amount and refund/dispute validation. A missing or contradictory payment fact still retains the prior complete snapshot; this change never creates earnings or provider writes. [Stripe charge ID reference](https://support.stripe.com/questions/getting-started-with-stripe-through-a-third-party-platform?locale=en-GB).
+
 ## v0.4.97 — Retry a transient referral-provider read
 
 Stripe GET reads retry one timeout or recognized connection failure, with a fresh 15-second deadline. A second failure remains unknown and prevents a partial status snapshot. Writes, HTTP errors, invalid JSON and redirect failures are never retried.
@@ -2006,6 +2010,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.98 — Recognize validated crypto `py_` charge IDs in referral purchase status while preserving every payment/refund guard.
 - v0.4.97 — Retry one transient Stripe GET failure without replaying writes or accepting incomplete referral evidence.
 - v0.4.96 — Reconcile missed recurring referral invoices and reviewed commission rates; support explicit member-only monthly VPS deductions and a gross/hosting/net earnings statement.
 

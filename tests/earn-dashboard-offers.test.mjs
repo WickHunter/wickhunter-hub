@@ -82,6 +82,21 @@ await test('all supported purchase kinds use applied owner code and settled paym
  c.charge.disputed=false;c.charge.amount_refunded=50;await f.service.refreshReferralStatus(owner);assert.ok(f.service.referralActivity(owner).rows.some(r=>r.status==='refund_allocation_unknown'),'mixed partial refund does not invent software refund allocation');
  assert.equal(f.calls.filter(x=>x.method==='POST').length,6,'status scans never write provider or replay commission');
 });
+await test('crypto py_ charges retain the same identity, settlement and refund requirements as card charges',async()=>{
+ const f=fixture();await f.service.adoptExistingOskarasOffers(owner);const a=purchase(f,'crypto');
+ a.charge.id='py_crypto';a.charge.object='charge';a.charge.payment_method_details={type:'crypto'};f.setSessions([a.session]);
+ const financial=structuredClone(f.ledger.admin().entries);await f.service.refreshReferralStatus(owner);
+ assert.equal(f.service.referralActivity(owner).rows[0].status,'paid');
+ a.charge.amount_refunded=100;await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows[0].status,'partially_refunded');
+ a.charge.disputed=true;await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows[0].status,'disputed');
+ a.charge.disputed=false;a.charge.amount_refunded=900;await f.service.refreshReferralStatus(owner);assert.equal(f.service.referralActivity(owner).rows[0].status,'refunded');
+ const prior=f.service.referralActivity(owner);
+ for(const corrupt of [c=>c.id='pi_wrong',c=>c.id='pyr_wrong',c=>delete c.amount_refunded,c=>c.payment_intent='pi_foreign',c=>c.customer='cus_foreign',c=>c.currency='eur',c=>c.paid=false]){
+  const saved=structuredClone(a.charge);corrupt(a.charge);await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),prior);
+  for(const k of Object.keys(a.charge))delete a.charge[k];Object.assign(a.charge,saved);
+ }
+ assert.deepEqual(f.ledger.admin().entries,financial);assert.equal(f.calls.filter(x=>x.method==='POST').length,6,'provider reads do not charge a card or replay earnings');
+});
 await test('Checkout pages complete before publication; canceled scope, wrong owner/product/payment and partial pages retain complete prior rows',async()=>{
  for(const corrupt of [x=>x.item.price.product='prod_other',x=>x.session.livemode=false,x=>x.session.total_details.breakdown.discounts[0].discount.coupon='coupon_wrong',x=>x.item.amount_discount=0,x=>x.pi.customer='cus_other',x=>delete x.pi.amount_received,x=>x.charge.livemode=false,x=>x.charge.payment_intent='pi_other',x=>x.charge.amount_refunded=901]){
   const f=fixture();await f.service.adoptExistingOskarasOffers(owner);const a=purchase(f,'complete');f.setSessions([a.session]);await f.service.refreshReferralStatus(owner);const before=f.service.referralActivity(owner);corrupt(a);await assert.rejects(f.service.refreshReferralStatus(owner));assert.deepEqual(f.service.referralActivity(owner),before);
