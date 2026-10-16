@@ -18,7 +18,7 @@ export type EarnSource = 'referral' | 'exchange' | 'marketplace';
 type UID = { exchange: string; uid: string; verified: boolean; submittedAt: string; revision?: string };
 export type EarnPayoutMethod = 'usdt-bep20' | 'usdt-polygon' | 'paypal';
 export type EarnPayoutPreference = { method: EarnPayoutMethod; address: string; revision: string };
-export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string; payoutPreference?: EarnPayoutPreference | null };
+export type Member = { id: string; name: string; code: string; uids: UID[]; discountPercent: number; commissionPercent: number | null; rebatePercent: number; createdAt: string; payoutPreference?: EarnPayoutPreference | null; hostingFee?: {monthlyCents:number;startPeriod:string}|null };
 export type Entry = { id: string; owner: string; source: EarnSource; kind: 'earning' | 'adjustment' | 'payout' | 'reversal' | 'hold' | 'release'; cents: number; currency: 'USD'; period: string; reference: string; note: string; method: string; createdAt: string; actor: string; reverses?: string; paidAt?: string };
 type Month = { period: string; digest: string; rows: { owner: string; commissionCents: number; rebateCents: number; qualified: boolean; rate: number }[] };
 export type EarnState = { members: Member[]; entries: Entry[]; months: Month[]; audit?: { at: string; actor: string; owner: string; before: Member; after: Member }[]; referrals: { code: string; subscription: string; customer: string; active: boolean; paidThrough?: number }[]; stripe?: Record<string, any>; dashboardGrants?: Record<string, {owner:string;actor:string;at:string}>; ownerBindings?: Record<string, string> };
@@ -176,7 +176,15 @@ export class EarnService {
     const m=this.member(owner,name), s=this.read(), entries=s.entries.filter(e=>e.owner===owner);
     const active=s.referrals.filter(r=>r.code===m.code && r.active && (r.paidThrough===undefined || r.paidThrough>this.now())).length;
     const member={...m,payoutPreference:m.payoutPreference??null,uids:m.uids.map(u=>({...u,revision:uidRevision(m.id,u)}))};
-    return { member, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
+    const original=(e:Entry)=>e.reverses?s.entries.find(o=>o.id===e.reverses):e;
+    const hosting=(e:Entry)=>original(e)?.reference.startsWith('hosting-fee:')===true;
+    const statementEntries=entries.filter(e=>e.source==='referral'&&['earning','adjustment','reversal'].includes(e.kind)&&original(e)?.kind!=='payout');
+    const statementPeriods=[...new Set(statementEntries.map(e=>e.period))].sort().reverse();
+    const hostingStatement=m.hostingFee||statementEntries.some(hosting)?{
+      monthlyCents:m.hostingFee?.monthlyCents??0,
+      rows:statementPeriods.map(period=>{const rows=statementEntries.filter(e=>e.period===period),grossCents=rows.filter(e=>!hosting(e)).reduce((n,e)=>n+e.cents,0),hostingCents=-rows.filter(hosting).reduce((n,e)=>n+e.cents,0)||0;return {period,grossCents,hostingCents,netCents:grossCents-hostingCents};}),
+    }:null;
+    return { member, hostingStatement, activeSubscribers:active, commissionPercent:m.commissionPercent ?? tierPercent(active),
       exchanges:EXCHANGES, bybitHelp:BYBIT_HELP, minimumRebateCents:1500,
       balances:Object.fromEntries(['referral','exchange','marketplace'].map(src=>[src,entries.filter(e=>e.source===src).reduce((a,e)=>a+e.cents,0)])),
       paidCents: -entries.filter(e=>e.kind==='payout' || (e.kind==='reversal' && s.entries.find(o=>o.id===e.reverses)?.kind==='payout')).reduce((a,e)=>a+e.cents,0) || 0,
@@ -245,6 +253,15 @@ export class EarnService {
     if(input.discountPercent!==undefined)m.discountPercent=percent(input.discountPercent);
     if(input.commissionPercent!==undefined)m.commissionPercent=input.commissionPercent===null?null:percent(input.commissionPercent);
     if(input.rebatePercent!==undefined)m.rebatePercent=percent(input.rebatePercent);
+    if(input.hostingFee!==undefined){
+      if(input.hostingFee===null)m.hostingFee=null;
+      else {
+        const fee=input.hostingFee as Record<string,unknown>;
+        if(typeof fee!=='object'||Array.isArray(fee))throw Error('Invalid hosting fee');
+        const monthlyCents=cents(fee.monthlyCents);if(monthlyCents<=0)throw Error('Hosting fee must be positive');
+        m.hostingFee={monthlyCents,startPeriod:period(fee.startPeriod)};
+      }
+    }
     if(input.exchange!==undefined) {const u=m.uids.find(u=>u.exchange===input.exchange && u.uid===input.uid);if(!u || typeof input.verified!=='boolean')throw new Error('UID not found');
       if(u.verified!==input.verified){
         if(typeof input.expectedRevision!=='string' || input.expectedRevision!==uidRevision(m.id,u))
@@ -255,6 +272,26 @@ export class EarnService {
       }}
     (s.audit??=[]).push({at:this.date(),actor:'hub-admin',owner:m.id,before,after:structuredClone(m)});
     this.save(s);
+    this.assessHostingFees();
+  }
+  /** Explicit member opt-in only. One immutable debit per calendar month;
+   * no Stripe charge, no payout, no change to anybody else's commission. */
+  assessHostingFees(){
+    const current=this.date().slice(0,7);let count=0;
+    this.transactionIfChanged(s=>{
+      for(const m of s.members){
+        const fee=m.hostingFee;if(!fee||fee.startPeriod>current)continue;
+        const start=period(fee.startPeriod),amount=cents(fee.monthlyCents);if(amount<=0)throw Error('Invalid stored hosting fee');
+        const [y,mo]=start.split('-').map(Number),[cy,cm]=current.split('-').map(Number);
+        const from=y*12+mo-1,to=cy*12+cm-1;if(to-from>=120)throw Error('Hosting fee history requires review');
+        for(let at=from;at<=to;at++){
+          const p=`${Math.floor(at/12)}-${String(at%12+1).padStart(2,'0')}`,reference=`hosting-fee:${m.id}:${p}`;
+          if(s.entries.some(e=>e.reference===reference))continue;
+          s.entries.push({id:randomUUID(),owner:m.id,source:'referral',kind:'adjustment',cents:-amount,currency:'USD',period:p,reference,note:`VPS hosting — $${(amount/100).toFixed(2)}/month`,method:'',createdAt:this.date(),actor:'hub-hosting-deduction'});count++;
+        }
+      }
+      return count>0;
+    });return {count};
   }
   record(input: Record<string,unknown>, actor='hub-admin') {
     const s=this.read(), owner=text(input.owner,100), src=source(input.source), kind=input.kind;

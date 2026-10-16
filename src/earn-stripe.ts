@@ -162,6 +162,64 @@ export class EarnStripeService {
   }
   throw Error('Referral status scan exceeded its finite page limit; previous snapshot retained');
  });}
+ /** Operator-requested backfill. Every subscription and invoice is read from
+  * Stripe before admission; existing invoice and refund guards remain the
+  * authority. Corrections append ledger entries and update the refund basis
+  * together, so replay and a later refund cannot pay the difference twice. */
+ reconcileReferralInvoices(owner:string,expectedRate:number,dryRun=true){return this.serial(async()=>{
+  const c=this.settings();if(!c.enabled)throw Error('Earn is disabled');
+  const member=this.liveLedger.admin().members.find(m=>m.id===owner);
+  if(!member||!Number.isInteger(expectedRate)||expectedRate<0||expectedRate>100||member.commissionPercent!==expectedRate)throw Error('Reviewed commission rate changed');
+  const api=this.api(c.mode),selected:StripeObject[]=[];let cursor='';
+  for(let page=0;page<100;page++){
+   const batch=await api.call('GET','/v1/subscriptions',{status:'all',limit:100,'expand[0]':'data.discounts',...(cursor?{starting_after:cursor}:{})});
+   if(!Array.isArray(batch.data)||typeof batch.has_more!=='boolean')throw Error('Incomplete referral subscription page');
+   for(const sub of batch.data){
+    const p=this.profile(c.mode,owner),allowed=[p.promotion,...(p.promotionHistory||[]).map((x:StripeObject)=>x.promotion),...(p.partnerPromotions||[]).map((x:StripeObject)=>x.promotion)].filter(Boolean);
+    const discounts=Array.isArray(sub.discounts)?sub.discounts:sub.discount?[sub.discount]:[];
+    if(discounts.length!==1||!allowed.includes(id(discounts[0]?.promotion_code||discounts[0]?.source?.promotion_code)))continue;
+    const found=await this.appliedReferral(c.mode,sub);if(!found||found.owner!==owner)continue;
+    if(!id(sub).startsWith('sub_')||sub.livemode!==(c.mode==='live')||!id(sub.customer).startsWith('cus_'))throw Error('Incomplete referral subscription identity or mode');
+    selected.push(sub);
+   }
+   if(!batch.has_more)break;
+   const last=id(batch.data.at(-1));if(!last||last===cursor||page===99)throw Error('Referral subscription pagination did not finish');cursor=last;
+  }
+  const invoices=new Map<string,string>();
+  for(const sub of selected){
+   cursor='';
+   for(let page=0;page<100;page++){
+    const batch=await api.call('GET','/v1/invoices',{subscription:sub.id,status:'paid',limit:100,...(cursor?{starting_after:cursor}:{})});
+    if(!Array.isArray(batch.data)||typeof batch.has_more!=='boolean')throw Error('Incomplete paid invoice page');
+    for(const inv of batch.data){
+     if(!id(inv).startsWith('in_')||id(inv.customer)!==id(sub.customer)||id(inv.parent?.subscription_details?.subscription||inv.subscription)!==sub.id||inv.status!=='paid'||inv.livemode!==(c.mode==='live'))throw Error('Referral invoice identity changed');
+     if(invoices.has(inv.id)&&invoices.get(inv.id)!==sub.id)throw Error('Referral invoice has conflicting subscriptions');
+     invoices.set(inv.id,sub.id);
+    }
+    if(!batch.has_more)break;
+    const last=id(batch.data.at(-1));if(!last||last===cursor||page===99)throw Error('Referral invoice pagination did not finish');cursor=last;
+   }
+  }
+  const ledger=this.ledger(c.mode),prior=book(ledger.admin()).invoices as Record<string,Invoice>;
+  for(const invoiceId of invoices.keys())if(prior[invoiceId]&&prior[invoiceId].owner!==owner)throw Error('Referral invoice owner conflict');
+  if(dryRun)return {dryRun:true,owner,rate:expectedRate,subscriptions:selected.length,invoices:[...invoices.keys()],alreadyRecorded:[...invoices.keys()].filter(i=>prior[i]).length};
+  const checkRate=()=>{if(this.liveLedger.admin().members.find(m=>m.id===owner)?.commissionPercent!==expectedRate||this.settings().mode!==c.mode)throw Error('Reviewed commission rate or mode changed');};
+  let admitted=0,skipped=0,adjusted=0,deltaCents=0;
+  for(const invoiceId of invoices.keys()){
+   checkRate();await this.invoice(c.mode,invoiceId);checkRate();
+   ledger.transactionIfChanged(s=>{
+    const row=(book(s).invoices as Record<string,Invoice>)[invoiceId];if(!row){skipped++;return false;}
+    if(row.owner!==owner)throw Error('Referral invoice owner conflict');admitted++;
+    if(row.rate===expectedRate)return false;
+    const commission=Math.floor(row.basis*expectedRate/100);
+    const net=(n:number)=>row.disputed?0:n-Math.min(n,Math.floor(n*Math.min(row.refunded,row.paid)/row.paid));
+    const delta=net(commission)-net(row.commission);
+    if(delta)s.entries.push(entry(owner,'referral','adjustment',delta,'stripe:rate:'+invoiceId+':'+randomUUID(),row.period,`${row.rate}% to ${expectedRate}% recurring referral commission correction`,this.now()));
+    row.rate=expectedRate;row.commission=commission;adjusted++;deltaCents+=delta;return true;
+   });
+  }
+  return {dryRun:false,owner,rate:expectedRate,subscriptions:selected.length,paidInvoices:invoices.size,admitted,skipped,adjusted,deltaCents};
+ });}
  /** Complete Checkout redemptions are purchase facts, never subscription or
   * commission entries. The provider's applied promotion, configured one-time
   * software price/product, and settled payment chain must all agree. */
@@ -562,6 +620,7 @@ export class EarnStripeService {
  stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
  run(){return this.serial(async()=>{
   const c=this.settings();const mode=c.mode,ledger=this.ledger(mode);let jobs:Job[];
+  if(c.enabled&&mode==='live')this.liveLedger.assessHostingFees();
   // Reconcile even when automatic dispatch is paused. Submitted money still needs accounting.
   for(const rail of ['test','live'] as const){
    const own=this.ledger(rail),version=own.fileVersion(),memo=this.payoutScan[rail],at=this.now();
