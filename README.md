@@ -1,3 +1,7 @@
+## v0.4.97 — Retry a transient referral-provider read
+
+Stripe GET reads retry one timeout or recognized connection failure, with a fresh 15-second deadline. A second failure remains unknown and prevents a partial status snapshot. Writes, HTTP errors, invalid JSON and redirect failures are never retried.
+
 ## v0.4.96 — Reconcile recurring referral earnings
 
 Explicit admin reconciliation verifies complete Stripe subscription and paid-invoice pages, backfills eligible missing recurring software commissions through the existing invoice checks, and corrects recorded invoices to the reviewed member rate. Corrections retain original earnings as immutable history and adjust the stored refund basis atomically, so repeated runs and later refunds/disputes do not duplicate credit. Lifetime software and VPS-only charges remain excluded. Run a dry run before applying, then refresh the referral status snapshot.
@@ -2002,6 +2006,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.97 — Retry one transient Stripe GET failure without replaying writes or accepting incomplete referral evidence.
 - v0.4.96 — Reconcile missed recurring referral invoices and reviewed commission rates; support explicit member-only monthly VPS deductions and a gross/hosting/net earnings statement.
 
 - v0.4.95 — Renew only from settled invoices, default to one-day grace, deliver signed billing deadlines and matching canonical licence corrections, and add audited dry-run-first unpaid-grace repair from complete Stripe history.
