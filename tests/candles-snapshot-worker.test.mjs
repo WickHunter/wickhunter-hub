@@ -460,4 +460,50 @@ await test("a build queued behind busy slots past a boundary folds the window of
   assert.equal(again, r);
 });
 
+await test("the repair back-off resets: a filling repair zeroes its escalation, and an expired back-off whose hole is gone is forgotten", async () => {
+  const dataDir = tmpDir("repairreset");
+  const s = new CandleStore(path.join(dataDir, "candles"));
+  const end = newestClosedOpenMs(BG_NOW) - MINUTE_MS;
+  const hole = end - 4 * DAY_MS;
+  const rows = [];
+  for (let t = end - 5 * DAY_MS; t <= end; t += MINUTE_MS) if (t !== hole) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
+  s.write("bitget", "RSTUSDT", rows);
+  let clock = BG_NOW;
+  const missing = new Set([hole]);
+  const venue = stub({ symbols: ["RSTUSDT"], now: clock, missing: { RSTUSDT: missing }, since: end - 5 * DAY_MS });
+  const svc = new CandleService(
+    { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 5 }, tickMs: 60_000 },
+    { sign, fetchLike: venue.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
+  );
+  const col = svc.collector("bitget");
+  const tick = async (n) => { for (let i = 0; i < n; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; } };
+  await tick(6);
+  assert.equal(col.repairBackoff("RSTUSDT")?.failures, 1, "the unanswerable hole backed off once");
+  // Twice more, so the escalation is real.
+  clock = col.repairBackoff("RSTUSDT").until + 1; await tick(3);
+  assert.equal(col.repairBackoff("RSTUSDT")?.failures, 2);
+  // The venue publishes the minute after all. Once the back-off expires the
+  // repair fills it; the escalation is gone with the hole.
+  missing.clear();
+  clock = col.repairBackoff("RSTUSDT").until + 1; await tick(4);
+  assert.equal(s.readWindow("bitget", "RSTUSDT", hole, hole).rows.length, 1, "the repair filled the hole");
+  assert.equal(col.repairBackoff("RSTUSDT"), null, "nothing left to back off from: forgotten, so the next hole starts at the base interval");
+
+  // A filling repair of a younger hole zeroes the counter of a symbol whose
+  // older hole is still proven empty.
+  const old = end - 3 * DAY_MS, young = end - 2 * DAY_MS;
+  const r2 = rows.filter((x) => x.openMs !== old && x.openMs !== young);
+  const d2 = tmpDir("repairreset2");
+  new CandleStore(path.join(d2, "candles")).write("bitget", "TWOUSDT", r2);
+  const v2 = stub({ symbols: ["TWOUSDT"], now: clock, missing: { TWOUSDT: new Set([old]) }, since: end - 5 * DAY_MS });
+  const svc2 = new CandleService(
+    { dataDir: d2, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 5 }, tickMs: 60_000 },
+    { sign, fetchLike: v2.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
+  );
+  for (let i = 0; i < 8; i++) { v2.state.now = clock; await svc2.tickAll(clock); clock += 60_000; }
+  const b2 = svc2.collector("bitget").repairBackoff("TWOUSDT");
+  assert.ok(b2 && b2.afterMs > old, "the old hole is still skipped");
+  assert.equal(b2.failures, 0, "but the younger hole's filling repair reset the escalation");
+});
+
 summary("candles-snapshot-worker");

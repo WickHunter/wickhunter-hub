@@ -763,8 +763,18 @@ export class VenueCollector {
     try {
       gap = from <= cov.lastClosedMs ? this.store.firstGap(this.venue, symbol, from, cov.lastClosedMs) : null;
     } catch { gap = null; }
+    // An EXPIRED back-off whose skipped region no longer holds a hole is
+    // finished: forget it, so a future unanswerable hole starts again at the
+    // base interval instead of inheriting this one's escalation.
+    if (skip && skipAfter === null && (gap === null || gap[0] >= skip.afterMs)) this.repairSkip.delete(symbol);
     this.holeCache.set(symbol, { at: now, gap, skipAfter });
     return gap;
+  }
+
+  /** The symbol's repair back-off, for diagnostics and tests. */
+  repairBackoff(symbol: string): { afterMs: number; until: number; failures: number } | null {
+    const skip = this.repairSkip.get(symbol);
+    return skip ? { ...skip } : null;
   }
 
   /** A repair page filled nothing: the venue has no candles for the part of
@@ -801,6 +811,8 @@ export class VenueCollector {
       if (rec.delisted || !rec.tradable) continue;
       const cov = this.coverageCache.get(rec.symbol);
       const cached = this.holeCache.get(rec.symbol);
+      // No hole left anywhere: any repair back-off for it is finished.
+      if (cov && cov.interiorMissing <= 0 && this.repairSkip.has(rec.symbol)) this.repairSkip.delete(rec.symbol);
       const skip = this.repairSkip.get(rec.symbol);
       const skipAfter = skip && now < skip.until ? skip.afterMs : null;
       if (cov && cov.interiorMissing > 0
@@ -1328,7 +1340,14 @@ export class VenueCollector {
         }
         // A write may have closed the hole we were chasing; make the next pass
         // look again rather than re-requesting a range that is now filled.
-        if (item.kind === "repair" && w.newlyFilled > 0) this.holeCache.delete(item.symbol);
+        if (item.kind === "repair" && w.newlyFilled > 0) {
+          this.holeCache.delete(item.symbol);
+          // The venue answered a repair for this symbol: its next refusal
+          // backs off from the base interval again. The proven-empty region
+          // (if any) stays skipped until it expires.
+          const skip = this.repairSkip.get(item.symbol);
+          if (skip) skip.failures = 0;
+        }
         else if (item.kind === "repair") this.noteFutileRepair(item.symbol, item, now);
         if (item.kind === "backfill" && page.empty) {
           // The venue has no more history here. Recorded in a SEPARATE floor,
