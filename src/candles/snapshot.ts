@@ -154,12 +154,24 @@ export function snapshotBucketMs(intervalMinutes: number): number {
  *  two pairs in one response describe different stretches of time, which is
  *  exactly the comparison a volatility rule is making. A symbol that cannot
  *  fill this window is skipped rather than served a window of its own. */
+/** ── v0.4.99 — THE SETTLE LAG NEVER EXCEEDS ONE BUCKET ─────────────────────
+ *
+ *  A flat 90 s lag on a ONE-minute bucket put the served window two minutes
+ *  behind the clock for 30 s of every minute and the app's verifier (which
+ *  accepts the newest closed bucket, or the one before it near a boundary)
+ *  refused every 1m snapshot (found by the app contract test, 2026-10-25).
+ *  Capped at one bucket the 1m anchor is minute M−2 at every second of M and
+ *  expires exactly at M+1; every interval of 3 minutes or more keeps 90 s. */
+export function snapshotSettleLagMs(intervalMinutes: number): number {
+  return Math.min(SNAPSHOT_SETTLE_LAG_MS, snapshotBucketMs(intervalMinutes));
+}
+
 export function newestCompleteBucketOpenMs(now: number, intervalMinutes: number): number {
   const bucketMs = snapshotBucketMs(intervalMinutes);
   // The newest minute that is closed at (now - lag); +MINUTE_MS is the instant
   // it closed, and the boundary at or before that instant ends a bucket whose
   // every minute is closed.
-  const closedAt = newestClosedOpenMs(now - SNAPSHOT_SETTLE_LAG_MS) + MINUTE_MS;
+  const closedAt = newestClosedOpenMs(now - snapshotSettleLagMs(intervalMinutes)) + MINUTE_MS;
   return Math.floor(closedAt / bucketMs) * bucketMs - bucketMs;
 }
 
@@ -167,7 +179,7 @@ export function newestCompleteBucketOpenMs(now: number, intervalMinutes: number)
  *  boundary after next, plus the settle lag. Before that instant a rebuild can
  *  only reproduce the same window. */
 export function snapshotExpiresAtMs(lastClosedMs: number, intervalMinutes: number): number {
-  return lastClosedMs + 2 * snapshotBucketMs(intervalMinutes) + SNAPSHOT_SETTLE_LAG_MS;
+  return lastClosedMs + 2 * snapshotBucketMs(intervalMinutes) + snapshotSettleLagMs(intervalMinutes);
 }
 
 export type SymbolFold =

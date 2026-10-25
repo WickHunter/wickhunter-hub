@@ -14,7 +14,7 @@ import { VenueCollector, DEFAULT_COLLECTOR_OPTIONS } from "../dist/src/candles/c
 import { CandleService } from "../dist/src/candles/service.js";
 import { canonicalBytes } from "../dist/src/candles/seed.js";
 import {
-  canonicalSnapshotBytes, newestCompleteBucketOpenMs, snapshotExpiresAtMs, SNAPSHOT_SETTLE_LAG_MS,
+  canonicalSnapshotBytes, newestCompleteBucketOpenMs, snapshotExpiresAtMs, SNAPSHOT_SETTLE_LAG_MS, snapshotSettleLagMs,
 } from "../dist/src/candles/snapshot.js";
 import { SNAPSHOT_CACHE_PER_VENUE, SNAPSHOT_RETRIES_PER_BUCKET } from "../dist/src/candles/service.js";
 import { VENUE_IDS } from "../dist/src/candles/venues.js";
@@ -1381,7 +1381,7 @@ const SNAP_DAY = Date.parse("2026-08-02T00:00:00.000Z");
 const FIVE_MS = 5 * MINUTE_MS;
 /** The clock at which `lastClosedMs` is the newest COMPLETE bucket. */
 const snapClockFor = (lastClosedMs, intervalMinutes) =>
-  lastClosedMs + intervalMinutes * MINUTE_MS + SNAPSHOT_SETTLE_LAG_MS;
+  lastClosedMs + intervalMinutes * MINUTE_MS + snapshotSettleLagMs(intervalMinutes);
 
 // A hub with an injectable candle clock: the cache turns over on bucket
 // boundaries, which are minutes to a day apart, and a suite must be able to
@@ -1806,7 +1806,7 @@ await test("the request path never waits on the collector: no venue request, wha
   // is set so its window ends there rather than one minute past the last thing
   // any collector could have written — in production the 90 s settle lag is
   // longer than that grace, which is what makes this the ordinary case.
-  const collectorNow = NOW + SNAPSHOT_SETTLE_LAG_MS - MINUTE_MS;
+  const collectorNow = NOW + snapshotSettleLagMs(1) - MINUTE_MS;
   const hub = await freshHub(
     { candleVenues: ["bitget"] },
     { candleFetch: venue.fetchLike, candleNow: () => collectorNow, candleLog: () => {} },

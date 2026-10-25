@@ -17,7 +17,7 @@ import { buildSeed, canonicalBytes, SEED_CANONICAL_KEY_ORDER } from "../dist/src
 import {
   buildSnapshot, canonicalSnapshotBytes, foldSymbolWindow, newestCompleteBucketOpenMs,
   snapshotExpiresAtMs, SNAPSHOT_CANONICAL_KEY_ORDER, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
-  SNAPSHOT_SETTLE_LAG_MS,
+  SNAPSHOT_SETTLE_LAG_MS, snapshotSettleLagMs,
 } from "../dist/src/candles/snapshot.js";
 
 // ── FROZEN CLOCK ────────────────────────────────────────────────────────────
@@ -536,7 +536,7 @@ const SNAP_DAY = Date.parse("2026-08-02T00:00:00.000Z");
  *  past it, plus the settle lag. Derived rather than typed, so the fixtures
  *  cannot drift from the rule the module actually applies. */
 function clockFor(lastClosedMs, intervalMinutes) {
-  return lastClosedMs + intervalMinutes * MINUTE_MS + SNAPSHOT_SETTLE_LAG_MS;
+  return lastClosedMs + intervalMinutes * MINUTE_MS + snapshotSettleLagMs(intervalMinutes);
 }
 
 function snapDeps(store, sign, symbols) {

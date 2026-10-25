@@ -7,10 +7,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
 import { test, summary, tmpDir } from "./helpers.mjs";
+import { pathToFileURL } from "node:url";
 import { CandleStore, MINUTE_MS, DAY_MS, RECORD_BYTES, newestClosedOpenMs } from "../dist/src/candles/store.js";
 import {
   buildSnapshot, canonicalSnapshotBytes, foldSnapshot, newestCompleteBucketOpenMs, signedSnapshotBody,
-  snapshotWindow, SNAPSHOT_INTERVALS,
+  snapshotExpiresAtMs, snapshotSettleLagMs, snapshotWindow, SNAPSHOT_INTERVALS, SNAPSHOT_SETTLE_LAG_MS,
 } from "../dist/src/candles/snapshot.js";
 import {
   CandleService, runSnapshotWorker, SNAPSHOT_FAILURE_TTL_MS, SNAPSHOT_WORKER_CONCURRENCY, HEALTH_GAP_WINDOW_DAYS,
@@ -383,6 +384,48 @@ await test("after a refusal the rate recovers only to 80% of the refused rate fo
   clock = refusedAt + RATE_REFUSED_MEMORY_MS + 1;
   for (let i = 0; i < 30 && col.health(clock).effectiveRps < 4; i++) { clock += 60_000; venue.state.now = clock; await svc.tickAll(clock); }
   assert.equal(col.health(clock).effectiveRps, 4, "after the hour it probes the configured ceiling again");
+});
+
+await test("1m settle lag is one bucket: at every second of minute M the anchor is M-2 and it expires exactly at M+1; >=3m keep 90 s", async () => {
+  assert.equal(snapshotSettleLagMs(1), MINUTE_MS);
+  for (const i of SNAPSHOT_INTERVALS.filter((x) => x >= 3)) assert.equal(snapshotSettleLagMs(i), SNAPSHOT_SETTLE_LAG_MS, `${i}m unchanged`);
+  const M = Date.UTC(2026, 9, 24, 21, 30);
+  for (let ms = 0; ms < MINUTE_MS; ms += 250) {
+    const anchor = newestCompleteBucketOpenMs(M + ms, 1);
+    assert.equal(anchor, M - 2 * MINUTE_MS, `second ${ms / 1000}`);
+    assert.equal(snapshotExpiresAtMs(anchor, 1), M + MINUTE_MS);
+  }
+  assert.equal(newestCompleteBucketOpenMs(M + MINUTE_MS - 1, 1), M - 2 * MINUTE_MS);
+  assert.equal(newestCompleteBucketOpenMs(M + MINUTE_MS, 1), M - MINUTE_MS, "and rolls exactly on the boundary");
+});
+
+// The app's real verifier, when this box has the app build (it is not a
+// dependency of the Hub; CI without it skips this one check, loudly).
+const APP_VERIFIER = process.env.WH_APP_VOLHUB_MODULE ?? "/root/wh-0916-release/build-user/dist/engine/volatility-hub-seed.js";
+await test("the app's own verifier accepts the Hub's 1m snapshot at every second of a minute (and 3m/5m across their buckets)", async () => {
+  if (!fs.existsSync(APP_VERIFIER)) { console.log(`    (SKIPPED: no app build at ${APP_VERIFIER})`); return; }
+  const { verifyVolatilityHubSnapshot, volatilityHubKeyFor } = await import(pathToFileURL(APP_VERIFIER).href);
+  const { publicKey, privateKey: pk } = generateKeyPairSync("ed25519");
+  const pub = publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("base64url");
+  const dir = tmpDir("app1m");
+  const st = new CandleStore(path.join(dir, "candles"));
+  const M = Date.UTC(2026, 9, 24, 21, 30);
+  const rows = [];
+  for (let t = M - 3 * DAY_MS; t <= M + 20 * MINUTE_MS; t += MINUTE_MS) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
+  st.write("bybit", "BTCUSDT", rows);
+  let checked = 0;
+  for (const [interval, depth, span] of [[1, 30, MINUTE_MS], [3, 10, 3 * MINUTE_MS], [5, 10, 5 * MINUTE_MS]]) {
+    for (let ms = 0; ms < span; ms += 1000) {
+      const now = M + 5 * MINUTE_MS + ms;
+      const out = buildSnapshot({ venue: "bybit", interval, depth, now }, { store: st, keyId: "seed-1", sign: (b) => edSign(null, b, pk), symbols: () => ["BTCUSDT"] });
+      assert.equal(out.ok, true);
+      const body = JSON.parse(JSON.stringify(out.payload));
+      const v = verifyVolatilityHubSnapshot(body, { venue: "bybit", tfMinutes: interval, depth, now, keyFor: (id) => volatilityHubKeyFor(id, pub) });
+      assert.equal(v.ok, true, `${interval}m at +${ms / 1000}s: ${v.reason}`);
+      checked++;
+    }
+  }
+  console.log(`    (the app verifier accepted ${checked} snapshots across every second of the 1m, 3m and 5m phases)`);
 });
 
 summary("candles-snapshot-worker");
