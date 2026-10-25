@@ -444,11 +444,11 @@ export class VenueCollector {
   coverage(symbol: string): SymbolCoverage {
     let c = this.coverageCache.get(symbol);
     if (!c) {
-      const detail = this.store.coverageDetail(this.venue, symbol, true);
-      c = detail.coverage;
+      // `heldByDayOut` is filled by the same deep scan (v0.4.99).
+      const byDay = new Map<number, number>();
+      c = this.store.coverage(this.venue, symbol, true, byDay);
       this.coverageCache.set(symbol, c);
-      if (detail.heldByDay) this.heldByDay.set(symbol, detail.heldByDay);
-      else this.heldByDay.delete(symbol);
+      this.heldByDay.set(symbol, byDay);
     }
     return c;
   }

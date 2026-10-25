@@ -46,7 +46,11 @@
 // silently mistaken for data, because the slot's own timestamp will not match
 // the position it was read from, and `readWindow` drops it as absent.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+/** Typed-array fast paths read doubles in host byte order. */
+const LITTLE_ENDIAN = os.endianness() === "LE";
 
 export const MINUTE_MS = 60_000;
 
@@ -376,8 +380,10 @@ export class CandleStore {
   /** What we hold for one symbol. Scans day files from each end, so a healthy
    *  symbol costs two file reads; `count`/`interiorMissing` need the full scan
    *  and are only asked for by the admin status panel. */
-  coverage(venue: string, symbol: string, deep = false): SymbolCoverage {
-    return this.coverageDetail(venue, symbol, deep).coverage;
+  coverage(venue: string, symbol: string, deep = false, heldByDayOut?: Map<number, number>): SymbolCoverage {
+    const detail = this.coverageDetail(venue, symbol, deep);
+    if (heldByDayOut && detail.heldByDay) for (const [d, n] of detail.heldByDay) heldByDayOut.set(d, n);
+    return detail.coverage;
   }
 
   /** `coverage`, plus — for a deep scan — how many candles each day file holds
@@ -515,37 +521,69 @@ export class CandleStore {
     if (windowStart % MINUTE_MS !== 0 || windowEnd % MINUTE_MS !== 0 || windowEnd < windowStart) {
       return { ok: false, reason: "short" };
     }
-    const at = (openMs: number): { buf: Buffer; i: number; d: number } | null => {
-      const d = dayStartOf(openMs);
-      const buf = day(d);
-      if (!buf) return null;
-      const i = (openMs - d) / MINUTE_MS;
-      return this.hasSlot(buf, i, d) ? { buf, i, d } : null;
+    // The window's day buffers, oldest first, read once; minutes are then
+    // walked with a running (day, slot) cursor — no per-minute allocation.
+    const firstDay = dayStartOf(windowStart);
+    const bufs: Array<Buffer | null> = [];
+    for (let d = firstDay; d <= windowEnd; d += DAY_MS) bufs.push(day(d));
+    const present = (openMs: number): boolean => {
+      const k = Math.floor((openMs - firstDay) / DAY_MS);
+      const d = firstDay + k * DAY_MS;
+      const buf = bufs[k];
+      return !!buf && this.hasSlot(buf, (openMs - d) / MINUTE_MS, d);
     };
     // `foldSymbolWindow` step 1/2: an empty window is "short"; a window whose
     // first minute is absent is "gap" (history provably reaches past it).
-    if (!at(windowStart)) {
+    if (!present(windowStart)) {
       for (let m = windowStart + MINUTE_MS; m <= windowEnd; m += MINUTE_MS) {
-        if (at(m)) return { ok: false, reason: "gap" };
+        if (present(m)) return { ok: false, reason: "gap" };
       }
       return { ok: false, reason: "short" };
     }
     const bucketMs = intervalMinutes * MINUTE_MS;
     const out: Row[] = [];
+    // Typed views over each day buffer: a record is 6 x 8 bytes, so on a
+    // little-endian host element 6*slot+j IS the double `readDoubleLE` would
+    // return at byte 48*slot+8*j (same bits, no conversion), and the two
+    // 32-bit halves of the openMs are u32[12*slot] and u32[12*slot+1] — the
+    // exact test `hasSlot` makes. A misaligned or big-endian buffer falls back
+    // to the Buffer readers.
+    const views = bufs.map((buf) => (buf && LITTLE_ENDIAN && buf.byteOffset % 8 === 0
+      ? { f64: new Float64Array(buf.buffer, buf.byteOffset, SLOTS_PER_DAY * 6), u32: new Uint32Array(buf.buffer, buf.byteOffset, SLOTS_PER_DAY * 12) }
+      : null));
+    let k = 0;
+    let dayMs = firstDay;
+    let slot = (windowStart - firstDay) / MINUTE_MS;
+    let lo = 0, hi = 0;
+    const expect = (): void => {
+      const e = dayMs + slot * MINUTE_MS;
+      lo = e >>> 0; hi = Math.floor(e / 0x1_0000_0000) >>> 0;
+    };
     for (let b = 0; b < depth; b++) {
       const start = windowStart + b * bucketMs;
       let open = NaN, high = -Infinity, low = Infinity, close = NaN, volume = 0;
       for (let m = 0; m < intervalMinutes; m++) {
-        const slot = at(start + m * MINUTE_MS);
-        if (!slot) return { ok: false, reason: "gap" };
-        const off = slot.i * RECORD_BYTES;
-        const h = slot.buf.readDoubleLE(off + 16);
-        const l = slot.buf.readDoubleLE(off + 24);
-        if (m === 0) open = slot.buf.readDoubleLE(off + 8);
+        const buf = bufs[k];
+        if (!buf) return { ok: false, reason: "gap" };
+        const v = views[k];
+        let o: number, h: number, l: number, c: number, vol: number;
+        if (v) {
+          expect();
+          if (v.u32[12 * slot] !== lo || v.u32[12 * slot + 1] !== hi || dayMs + slot * MINUTE_MS === 0) return { ok: false, reason: "gap" };
+          const f = 6 * slot;
+          o = v.f64[f + 1]!; h = v.f64[f + 2]!; l = v.f64[f + 3]!; c = v.f64[f + 4]!; vol = v.f64[f + 5]!;
+        } else {
+          if (!this.hasSlot(buf, slot, dayMs)) return { ok: false, reason: "gap" };
+          const off = slot * RECORD_BYTES;
+          o = buf.readDoubleLE(off + 8); h = buf.readDoubleLE(off + 16); l = buf.readDoubleLE(off + 24);
+          c = buf.readDoubleLE(off + 32); vol = buf.readDoubleLE(off + 40);
+        }
+        if (m === 0) open = o;
         if (h > high) high = h;
         if (l < low) low = l;
-        close = slot.buf.readDoubleLE(off + 32);
-        volume += slot.buf.readDoubleLE(off + 40);
+        close = c;
+        volume += vol;
+        if (++slot === SLOTS_PER_DAY) { slot = 0; k++; dayMs += DAY_MS; }
       }
       out.push([start, open, high, low, close, volume]);
     }

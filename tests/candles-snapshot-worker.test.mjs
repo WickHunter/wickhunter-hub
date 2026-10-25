@@ -98,7 +98,7 @@ await test("the fast fold equals the reference fold, byte for byte, on every int
     );
   }
   assert.ok(compared > 60, `compared ${compared} windows`);
-  const sample = foldSnapshot({ venue: "bitget", interval: 60, depth: 30, now: NOW }, { store, keyId: "seed-1", symbols: () => roster });
+  const sample = foldSnapshot({ venue: "bitget", interval: 1440, depth: 9, now: NOW }, { store, keyId: "seed-1", symbols: () => roster });
   const reasons = new Set(sample.payload.skipped.map(([, why]) => why));
   assert.ok(reasons.has("gap") && reasons.has("short"), `the fixture exercises both skip reasons: ${JSON.stringify(sample.payload.skipped)}`);
 });
@@ -226,21 +226,22 @@ await test("a partial window is rechecked by fingerprint: identical files hold i
   fs.cpSync(store.rootDir, path.join(dir, "candles"), { recursive: true });
   const s2 = new CandleStore(path.join(dir, "candles"));
   const { svc, logs, setClock } = storeService(dir, { snapshotFold: fold, clock: NOW });
-  const first = await svc.snapshot("bitget", 60, 24);
+  // A daily window: five and ten minutes later are still inside it.
+  const first = await svc.snapshot("bitget", 1440, 9);
   assert.equal(first.ok, true);
   assert.ok(first.payload.skipped.length > 0, "precondition: a partial window");
   setClock(NOW + 5 * MINUTE_MS + 1);
-  const same = await svc.snapshot("bitget", 60, 24);
+  const same = await svc.snapshot("bitget", 1440, 9);
   assert.equal(same, first, "nothing moved: the very same result");
   assert.equal(calls, 1);
-  assert.match(logs.at(-1), /^rechecked bitget 60m x24: \d+ skipped pair\(s\) unchanged/);
+  assert.match(logs.at(-1), /^rechecked bitget 1440m x9: \d+ skipped pair\(s\) unchanged/);
   // Rewrite one skipped pair's window file without changing a value.
   const [victim] = first.payload.skipped.find(([, why]) => why === "gap");
-  const { windowEnd } = snapshotWindow(NOW, 60, 24);
+  const { windowEnd } = snapshotWindow(NOW, 1440, 9);
   const keep = s2.readWindow("bitget", victim, windowEnd - 3 * 3_600_000, windowEnd).rows.at(-1);
   s2.write("bitget", victim, [{ openMs: keep[0], open: keep[1], high: keep[2], low: keep[3], close: keep[4], volume: keep[5] }]);
   setClock(NOW + 10 * MINUTE_MS + 2);
-  const again = await svc.snapshot("bitget", 60, 24);
+  const again = await svc.snapshot("bitget", 1440, 9);
   assert.equal(calls, 2, "a moved file is a real retry");
   assert.ok(again.ok && again.payload.generatedAtMs === NOW + 10 * MINUTE_MS + 2);
   setClock(NOW);
