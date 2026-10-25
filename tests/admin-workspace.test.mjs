@@ -28,6 +28,17 @@ w.eval('token="test";loadHubPage("overview",true)');await settle();
 assert.match(doc.getElementById('briefBugs').textContent,/Red · 1 open/);
 assert.match(doc.getElementById('briefFeatures').textContent,/Amber · 1 open/);
 assert.equal(doc.getElementById('briefCandles').textContent,'Green');
+// v0.4.99 — old holes never trip Amber; a handful of live ones does not; many do.
+{const run={state:'running',lastSuccessAt:Date.now()};
+ const venue=(counts,live,old)=>({enabled:true,venues:[{venue:'bitget',configured:true,health:run,counts:{active:850,empty:0,warming:0,...counts},liveMissingMinutes:live,oldMissingMinutes:old,totalMissingMinutes:live+old,gapWindowDays:30}]});
+ w.renderBriefCandles(venue({gapped:0,oldGapped:143},0,2157));assert.equal(doc.getElementById('briefCandles').textContent,'Green','only holes older than the served window');
+ w.renderBriefCandles(venue({gapped:5,oldGapped:140},12,2145));assert.equal(doc.getElementById('briefCandles').textContent,'Green','a handful of live single-minute holes');
+ w.renderBriefCandles(venue({gapped:40,oldGapped:100},300,1800));assert.equal(doc.getElementById('briefCandles').textContent,'Amber','over 2% of active symbols gapped in the window');
+ assert.match(doc.getElementById('briefDataList').textContent,/40 gapped \(300 min in the last 30 d\) · 100 with older holes only/);
+ w.renderBriefCandles(venue({gapped:2,oldGapped:0},5000,0));assert.equal(doc.getElementById('briefCandles').textContent,'Amber','a long live outage on few symbols');
+ w.renderBriefCandles({enabled:true,venues:[{venue:'bitget',configured:true,health:{state:'stalled',lastSuccessAt:Date.now()},counts:{active:850,gapped:0,empty:0,warming:0},liveMissingMinutes:0,oldMissingMinutes:0,gapWindowDays:30}]});
+ assert.equal(doc.getElementById('briefCandles').textContent,'Red','Red rules are unchanged');
+ w.renderBriefCandles({enabled:true,venues:[{venue:'bybit',configured:true,health:run,counts:{gapped:0,empty:0}}]});}
 assert.match(doc.getElementById('briefSupport').textContent,/Red · 1 waiting/);
 assert.match(doc.getElementById('supportBudgetSummary').textContent,/\$12.00 used.*\$50.00.*\$38.00 remaining/);
 assert.equal(calls.some(x=>x.includes('/billing/config')),false,'do not fetch settings on entry');

@@ -29,7 +29,7 @@
 import path from "node:path";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
 import {
-  CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs, settledOpenMs, type Candle, type SymbolCoverage,
+  CandleStore, DAY_MS, dayStartOf, MINUTE_MS, newestClosedOpenMs, settledOpenMs, type Candle, type SymbolCoverage,
 } from "./store.js";
 import {
   ADAPTERS, dropUnclosed, fetchNativeTimeframeKlines, isRateLimit, nativeTimeframePageLimit,
@@ -175,6 +175,32 @@ export function seedableMaxTailAgeMs(opts: Pick<CollectorOptions, "tailFillMinut
 const RATE_RECOVER_AFTER_SUCCESSES = 120;
 const RATE_RECOVER_FACTOR = 1.25;
 
+/** ── v0.4.99 — REMEMBER THE RATE THAT WAS REFUSED ──────────────────────────
+ *
+ *  Halve-and-creep alone is a sawtooth: from 3.9/s, 120 clean requests take
+ *  30 s, so the rate is back at the refused figure within a few minutes and is
+ *  refused again. That is what 2,750 Bitget refusals in eight days on the
+ *  operator's Hub were (status 2026-10-24: "throttled to 3.91/s of 10/s").
+ *  After a refusal at rate R the recovery now stops at 80% of R for an hour,
+ *  then may probe the configured ceiling again. Never above the configured
+ *  ceiling, never below the floor. */
+export const RATE_REFUSED_CEILING_FACTOR = 0.8;
+export const RATE_REFUSED_MEMORY_MS = 3_600_000;
+
+/** ── v0.4.99 — A REPAIR THE VENUE CANNOT ANSWER IS NOT RETRIED EVERY MINUTE ─
+ *
+ *  An interior hole the venue itself has no candles for (a halted minute, a
+ *  listing pause) used to be re-requested on EVERY tick, forever, and because
+ *  only the oldest hole is chased, it also blocked every younger hole behind
+ *  it. On the operator's Hub that was ~140 Bitget and ~95 Bitunix requests a
+ *  minute returning nothing. A repair page that fills nothing now sets the
+ *  symbol's repair search past that hole for a doubling interval (15 min up
+ *  to 6 h), so younger holes are repaired next and the old one is still
+ *  retried a few times a day. Holes inside the last `tailFillMinutes` are
+ *  exempt: the venue may simply not have published them yet. */
+export const REPAIR_BACKOFF_BASE_MS = 15 * 60_000;
+export const REPAIR_BACKOFF_MAX_MS = 6 * 3_600_000;
+
 /** What we know about one tracked symbol. Persisted so `firstSeenAt` — which
  *  the admin panel uses to answer "what appeared today" — survives a restart. */
 export interface TrackedSymbol {
@@ -295,6 +321,16 @@ export class VenueCollector {
   private consecutiveRateLimits = 0;
   private rateLimitHits = 0;
   private successStreak = 0;
+  /** See RATE_REFUSED_CEILING_FACTOR. */
+  private refusedCeiling: { rps: number; until: number } | null = null;
+  /** See REPAIR_BACKOFF_BASE_MS: per symbol, holes ending before `afterMs`
+   *  are not chased again until `until`. */
+  private repairSkip = new Map<string, { afterMs: number; until: number; failures: number }>();
+  /** v0.4.99 — candles held per UTC day inside [first, last], per symbol, kept
+   *  exactly beside `coverageCache` (deep scan, then each write's per-day
+   *  `newlyFilledByDay`). Absent = unknown: health then counts every hole as
+   *  live rather than guessing. */
+  private heldByDay = new Map<string, Map<number, number>>();
   /** A recent page that did not contain an existing tail's first missing
    *  minute. The next pass uses bounded history instead of retrying the same
    *  newest page or jumping over the gap. */
@@ -408,8 +444,11 @@ export class VenueCollector {
   coverage(symbol: string): SymbolCoverage {
     let c = this.coverageCache.get(symbol);
     if (!c) {
-      c = this.store.coverage(this.venue, symbol, true);
+      const detail = this.store.coverageDetail(this.venue, symbol, true);
+      c = detail.coverage;
       this.coverageCache.set(symbol, c);
+      if (detail.heldByDay) this.heldByDay.set(symbol, detail.heldByDay);
+      else this.heldByDay.delete(symbol);
     }
     return c;
   }
@@ -417,6 +456,32 @@ export class VenueCollector {
   /** Status may report only rows whose exact coverage is already known. */
   cachedCoverage(symbol: string): SymbolCoverage | null {
     return this.coverageCache.get(symbol) ?? null;
+  }
+
+  /** ── v0.4.99 — MISSING MINUTES INSIDE THE SERVED WINDOW ─────────────────
+   *
+   *  `interiorMissing` counts holes across the whole retention (63 days on
+   *  the operator's Hub), but nothing the Hub serves reaches past ~30 days,
+   *  so a September single-minute hole kept a venue Amber for weeks after it
+   *  stopped mattering. This splits the same exact count at `fromMs` (aligned
+   *  down to its UTC day): `live` is missing minutes from that day to the
+   *  newest held candle, `old` the rest. Null when the per-day split is not
+   *  known for this symbol — the caller must then treat every hole as live. */
+  missingSplit(symbol: string, fromMs: number): { live: number; old: number } | null {
+    const cov = this.coverageCache.get(symbol);
+    const byDay = this.heldByDay.get(symbol);
+    if (!cov || !byDay) return null;
+    if (cov.firstClosedMs === null || cov.lastClosedMs === null) return { live: 0, old: 0 };
+    const cutoff = dayStartOf(fromMs);
+    const liveFrom = Math.max(cov.firstClosedMs, cutoff);
+    let live = 0;
+    if (cov.lastClosedMs >= liveFrom) {
+      let held = 0;
+      for (const [d, n] of byDay) if (d >= dayStartOf(liveFrom)) held += n;
+      live = Math.max(0, (cov.lastClosedMs - liveFrom) / MINUTE_MS + 1 - held);
+    }
+    live = Math.min(live, cov.interiorMissing);
+    return { live, old: Math.max(0, cov.interiorMissing - live) };
   }
 
   /** ── WILL THIS SNAPSHOT SKIP CHANGE BEFORE THE BUCKET TURNS OVER? (v0.4.92)
@@ -437,10 +502,35 @@ export class VenueCollector {
    *  only down to the retention horizon. Unknown coverage is treated as still
    *  changing: that is the direction that re-folds, never the one that hides
    *  a pair until tomorrow. */
-  snapshotSkipIsTransient(symbol: string, reason: "gap" | "short", windowStartMs: number, now: number): boolean {
+  snapshotSkipIsTransient(
+    symbol: string, reason: "gap" | "short", windowStartMs: number, now: number,
+    /** v0.4.99 — the window's newest minute. Omitted = the newest settled one. */
+    windowEndMs?: number,
+  ): boolean {
     const rec = this.tracked.get(symbol);
     if (!rec || rec.delisted || !rec.tradable) return false;
-    if (reason === "gap") return true;
+    if (reason === "gap") {
+      // ── v0.4.99 — A GAP IS TRANSIENT ONLY WHILE WORK IS PENDING FOR IT ──
+      // A tail behind the window's end is this collector's next page. An
+      // interior hole is transient while a repair can still reach it, and
+      // structural once every hole up to the window's end has been proved
+      // unanswerable by the venue (the repair back-off above). Unknown
+      // coverage, or a cache that disagrees with the fold, re-folds — the
+      // snapshot cache's fingerprint check keeps that cheap when nothing moved.
+      const cov = this.coverageCache.get(symbol);
+      if (!cov || cov.lastClosedMs === null) return true;
+      const end = windowEndMs ?? settledOpenMs(now);
+      if (cov.lastClosedMs < end) return true;
+      if (cov.interiorMissing <= 0) return true;
+      const skip = this.repairSkip.get(symbol);
+      if (skip && now < skip.until) {
+        const hole = this.holeCache.get(symbol);
+        // Every hole that can touch the window lies behind the proven-empty
+        // marker, and no younger hole is known to be waiting for repair.
+        if (skip.afterMs > end || (hole && (hole.gap === null || hole.gap[0] > end))) return false;
+      }
+      return true;
+    }
     const horizon = settledOpenMs(now) - this.opts.retentionDays * DAY_MS;
     if (windowStartMs < horizon) return false;
     const cov = this.coverageCache.get(symbol);
@@ -512,10 +602,12 @@ export class VenueCollector {
    *  (tail/backfill/repair/reconcile, inside `tick()`). `noteStoredCandles`
    *  below is the websocket's entry point and deliberately does not call this
    *  — see `restFrontier`'s doc comment for why the two must stay separate. */
-  private noteCoverage(symbol: string, candles: readonly Candle[], newlyFilled: number): void {
+  private noteCoverage(
+    symbol: string, candles: readonly Candle[], newlyFilled: number, newlyFilledByDay?: ReadonlyMap<number, number>,
+  ): void {
     if (candles.length === 0) return;
     const c = this.coverage(symbol);
-    this.updateCoverage(symbol, c, candles, newlyFilled);
+    this.updateCoverage(symbol, c, candles, newlyFilled, newlyFilledByDay);
     this.noteRestFrontier(symbol, candles);
   }
 
@@ -523,7 +615,10 @@ export class VenueCollector {
    *  primed row exactly; leave an unprimed row absent so its later disk scan
    *  observes the complete file without doing deep synchronous work in a
    *  websocket callback. */
-  noteStoredCandles(symbol: string, candles: readonly Candle[], written: number, newlyFilled: number): void {
+  noteStoredCandles(
+    symbol: string, candles: readonly Candle[], written: number, newlyFilled: number,
+    newlyFilledByDay?: ReadonlyMap<number, number>,
+  ): void {
     if (candles.length === 0 || written === 0) return;
     const knownGap = this.holeCache.get(symbol)?.gap;
     const touchesKnownGap = !!knownGap && candles.some((c) => c.openMs >= knownGap[0] && c.openMs <= knownGap[1]);
@@ -542,12 +637,13 @@ export class VenueCollector {
     // candle that is not on disk. Drop a primed row for the next yielding scan.
     if (written !== candles.length) {
       this.coverageCache.delete(symbol);
+      this.heldByDay.delete(symbol);
       this.holeCache.delete(symbol);
       return;
     }
     const c = this.coverageCache.get(symbol);
     if (c) {
-      this.updateCoverage(symbol, c, candles, newlyFilled);
+      this.updateCoverage(symbol, c, candles, newlyFilled, newlyFilledByDay);
       // A normal websocket append does not change the oldest interior hole.
       // Evict only if it fills that hole or creates a new one, else busy
       // streams would force a 30-day rescan on every tick.
@@ -557,7 +653,18 @@ export class VenueCollector {
     }
   }
 
-  private updateCoverage(symbol: string, c: SymbolCoverage, candles: readonly Candle[], newlyFilled: number): void {
+  private updateCoverage(
+    symbol: string, c: SymbolCoverage, candles: readonly Candle[], newlyFilled: number,
+    newlyFilledByDay?: ReadonlyMap<number, number>,
+  ): void {
+    // The per-day split stays exact only while every write reports its own
+    // split; one that does not makes it unknown, never approximately right.
+    const byDay = this.heldByDay.get(symbol);
+    if (byDay) {
+      if (newlyFilled === 0) { /* nothing gained anywhere */ }
+      else if (!newlyFilledByDay) this.heldByDay.delete(symbol);
+      else for (const [d, n] of newlyFilledByDay) byDay.set(d, (byDay.get(d) ?? 0) + n);
+    }
     let first = c.firstClosedMs;
     let last = c.lastClosedMs;
     for (const k of candles) {
@@ -623,7 +730,7 @@ export class VenueCollector {
   /** Oldest known interior hole per symbol, memoised. Enumerating one costs a
    *  full-window scan of that symbol's day files, so it is done once per hole
    *  and re-done only after the hole has been written into. */
-  private holeCache = new Map<string, { at: number; gap: [number, number] | null }>();
+  private holeCache = new Map<string, { at: number; gap: [number, number] | null; skipAfter?: number | null }>();
 
   /** Oldest minute we have PROVEN the venue has no history for, per symbol.
    *  Deliberately NOT folded into coverage: it is a fact about the venue's
@@ -641,19 +748,38 @@ export class VenueCollector {
    *  `firstClosedMs`, so a hole inside the held range is permanent until
    *  something goes and gets it. This is that something. */
   private oldestHole(symbol: string, now: number): [number, number] | null {
+    const skip = this.repairSkip.get(symbol);
+    const skipAfter = skip && now < skip.until ? skip.afterMs : null;
     const cached = this.holeCache.get(symbol);
-    if (cached && now - cached.at < 10 * 60_000) return cached.gap;
+    if (cached && now - cached.at < 10 * 60_000 && (cached.skipAfter ?? null) === skipAfter) return cached.gap;
     const cov = this.coverage(symbol);
     if (cov.firstClosedMs === null || cov.lastClosedMs === null || cov.interiorMissing <= 0) {
-      this.holeCache.set(symbol, { at: now, gap: null });
+      this.holeCache.set(symbol, { at: now, gap: null, skipAfter });
       return null;
     }
     let gap: [number, number] | null = null;
+    const from = skipAfter === null ? cov.firstClosedMs : Math.max(cov.firstClosedMs, skipAfter);
     try {
-      gap = this.store.firstGap(this.venue, symbol, cov.firstClosedMs, cov.lastClosedMs);
+      gap = from <= cov.lastClosedMs ? this.store.firstGap(this.venue, symbol, from, cov.lastClosedMs) : null;
     } catch { gap = null; }
-    this.holeCache.set(symbol, { at: now, gap });
+    this.holeCache.set(symbol, { at: now, gap, skipAfter });
     return gap;
+  }
+
+  /** A repair page filled nothing: the venue has no candles for the part of
+   *  the hole it covered. See REPAIR_BACKOFF_BASE_MS. */
+  private noteFutileRepair(symbol: string, item: CandleWorkItem, now: number): void {
+    const hole = this.holeCache.get(symbol)?.gap;
+    if (!hole || hole[0] !== item.startMs) return;
+    const recentFloor = settledOpenMs(now) - Math.max(1, this.opts.tailFillMinutes) * MINUTE_MS;
+    if (hole[1] >= recentFloor) return;
+    const prev = this.repairSkip.get(symbol);
+    const failures = (prev?.failures ?? 0) + 1;
+    const provedTo = Math.min(hole[1], item.endMs);
+    const afterMs = prev && now < prev.until ? Math.max(prev.afterMs, provedTo + MINUTE_MS) : provedTo + MINUTE_MS;
+    const wait = Math.min(REPAIR_BACKOFF_MAX_MS, REPAIR_BACKOFF_BASE_MS * 2 ** Math.min(20, failures - 1));
+    this.repairSkip.set(symbol, { afterMs, until: now + wait, failures });
+    this.holeCache.delete(symbol);
   }
 
   /** Deep hole discovery is separate from queue assembly. Every tick visits a
@@ -674,7 +800,10 @@ export class VenueCollector {
       if (rec.delisted || !rec.tradable) continue;
       const cov = this.coverageCache.get(rec.symbol);
       const cached = this.holeCache.get(rec.symbol);
-      if (cov && cov.interiorMissing > 0 && (!cached || now - cached.at >= 10 * 60_000)) {
+      const skip = this.repairSkip.get(rec.symbol);
+      const skipAfter = skip && now < skip.until ? skip.afterMs : null;
+      if (cov && cov.interiorMissing > 0
+        && (!cached || now - cached.at >= 10 * 60_000 || (cached.skipAfter ?? null) !== skipAfter)) {
         this.oldestHole(rec.symbol, now);
         scanned++;
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -969,6 +1098,10 @@ export class VenueCollector {
     this.rateLimitHits++;
     this.consecutiveRateLimits++;
     this.successStreak = 0;
+    this.refusedCeiling = {
+      rps: Math.max(this.opts.minRequestsPerSecond, this.effectiveRps * RATE_REFUSED_CEILING_FACTOR),
+      until: clockNow + RATE_REFUSED_MEMORY_MS,
+    };
     this.effectiveRps = Math.max(this.opts.minRequestsPerSecond, this.effectiveRps / 2);
     const backoff = Math.min(
       this.opts.rateLimitMaxCooldownMs,
@@ -989,12 +1122,14 @@ export class VenueCollector {
 
   /** A clean request. After a long clean run, creep the rate back toward the
    *  configured ceiling — never above it. */
-  private noteSuccess(): void {
+  private noteSuccess(clockNow: number): void {
     this.consecutiveRateLimits = 0;
     this.successStreak++;
-    if (this.successStreak >= RATE_RECOVER_AFTER_SUCCESSES && this.effectiveRps < this.opts.requestsPerSecond) {
+    const remembered = this.refusedCeiling && clockNow < this.refusedCeiling.until ? this.refusedCeiling.rps : Infinity;
+    const ceiling = Math.min(this.opts.requestsPerSecond, remembered);
+    if (this.successStreak >= RATE_RECOVER_AFTER_SUCCESSES && this.effectiveRps < ceiling) {
       this.successStreak = 0;
-      this.effectiveRps = Math.min(this.opts.requestsPerSecond, this.effectiveRps * RATE_RECOVER_FACTOR);
+      this.effectiveRps = Math.min(ceiling, this.effectiveRps * RATE_RECOVER_FACTOR);
     }
   }
 
@@ -1032,7 +1167,7 @@ export class VenueCollector {
         await this.refreshSymbols(fetchLike, now);
         this.lastSuccessAt = now;
         this.consecutiveFailures = 0;
-        this.noteSuccess();
+        this.noteSuccess(clock());
       } catch (err) {
         if (isRateLimit(err)) {
           this.noteRateLimited(err, clock(), now, "symbol list");
@@ -1108,7 +1243,7 @@ export class VenueCollector {
             this.noteRateLimited(page.slowDown, clock(), now, `${item.symbol} ${item.interval}m`);
             break;
           }
-          this.noteSuccess();
+          this.noteSuccess(clock());
           continue;
         }
         if (item.kind === "reconcile") this.reconcileAfterSymbol = item.symbol;
@@ -1180,7 +1315,7 @@ export class VenueCollector {
         }
         written += w.written;
         this.candlesWritten += w.newlyFilled;
-        this.noteCoverage(item.symbol, closed, w.newlyFilled);
+        this.noteCoverage(item.symbol, closed, w.newlyFilled, w.newlyFilledByDay);
         // Aggregate caches listen only to admitted REST rows. This call follows
         // noteCoverage so the minute REST frontier already covers the rows it
         // may fold, and it touches only buckets overlapping this page.
@@ -1193,6 +1328,7 @@ export class VenueCollector {
         // A write may have closed the hole we were chasing; make the next pass
         // look again rather than re-requesting a range that is now filled.
         if (item.kind === "repair" && w.newlyFilled > 0) this.holeCache.delete(item.symbol);
+        else if (item.kind === "repair") this.noteFutileRepair(item.symbol, item, now);
         if (item.kind === "backfill" && page.empty) {
           // The venue has no more history here. Recorded in a SEPARATE floor,
           // never by moving `firstClosedMs`.
@@ -1228,7 +1364,7 @@ export class VenueCollector {
           this.noteRateLimited(page.slowDown, clock(), now, item.symbol);
           break;
         }
-        this.noteSuccess();
+        this.noteSuccess(clock());
       } catch (err) {
         if (isRateLimit(err)) {
           // Stop the pass dead. Spending the rest of the budget on requests the
@@ -1262,6 +1398,7 @@ export class VenueCollector {
       // so keep their exact coverage instead of repeating a cold roster scan.
       if (symbolRemoved > 0) {
         this.coverageCache.delete(symbol);
+        this.heldByDay.delete(symbol);
         // The oldest cached repair gap may have belonged to a deleted day.
         // Re-evaluate it before repair can recreate expired history.
         this.holeCache.delete(symbol);

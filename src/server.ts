@@ -2423,22 +2423,24 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 400, { ok: false, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` });
     }
     const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+    // v0.4.99 — the build is awaited (it runs in a worker thread) BEFORE a
+    // gzip slot is reserved: holding a compression reservation across a fold
+    // would let a few waiting snapshot requests refuse every other gzip route.
+    const current = await candles.snapshot(venue, interval, depth);
+    // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
+    // means "ask me again", which is a different sentence from "this venue has
+    // nothing on it".
+    if (!current.ok) {
+      return sendJson(res, current.code, { ok: false, error: current.error });
+    }
+    const inm = String(req.headers["if-none-match"] ?? "");
+    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+      return void res.end();
+    }
     const reservation = wantsGzip ? responseGzip.reserve() : null;
     if (wantsGzip && !reservation) return compressionBusy(res);
     try {
-      const current = candles.snapshot(venue, interval, depth);
-      // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
-      // means "ask me again", which is a different sentence from "this venue has
-      // nothing on it".
-      if (!current.ok) {
-        return sendJson(res, current.code, { ok: false, error: current.error });
-      }
-
-      const inm = String(req.headers["if-none-match"] ?? "");
-      if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
-        res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
-        return void res.end();
-      }
       // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
       // roughly an order of magnitude off it, exactly as it does for a seed.
       const bytes = reservation ? await compressedBytes(current.body, reservation, res) : current.body;

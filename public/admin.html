@@ -1894,7 +1894,8 @@ async function cdRefresh() {
     html += '<div class="buckets">'
       + '<span class="bkt b-seedable"><b>' + v.counts.seedable + "</b> seedable</span>"
       + '<span class="bkt b-backfilling"><b>' + v.counts.backfilling + "</b> backfilling</span>"
-      + '<span class="bkt b-gapped"><b>' + v.counts.gapped + "</b> gapped</span>"
+      + '<span class="bkt b-gapped"><b>' + v.counts.gapped + "</b> gapped" + (v.gapWindowDays ? " (last " + v.gapWindowDays + " d)" : "") + "</span>"
+      + (v.counts.oldGapped ? '<span class="bkt b-empty"><b>' + v.counts.oldGapped + "</b> older holes only</span>" : "")
       + '<span class="bkt b-empty"><b>' + v.counts.empty + "</b> empty</span>"
       + (v.counts.warming ? '<span class="bkt b-new"><b>' + v.counts.warming + "</b> coverage warming</span>" : "")
       + (v.counts.inactive ? '<span class="bkt b-empty"><b>' + v.counts.inactive + "</b> inactive</span>" : "")
@@ -1911,7 +1912,10 @@ async function cdRefresh() {
       + "<dt>Symbol list</dt><dd>" + when(h.lastSymbolRefreshAt) + "</dd>"
       + "<dt>" + (v.counts.warming ? "Oldest known candle" : "Oldest candle") + "</dt><dd>" + (v.oldestClosedMs ? fmt(v.oldestClosedMs) + " UTC" : "—") + "</dd>"
       + "<dt>" + (v.counts.warming ? "Newest known candle" : "Newest candle") + "</dt><dd>" + (v.newestClosedMs ? fmt(v.newestClosedMs) + " UTC (" + ago(v.newestClosedMs) + ")" : "—") + "</dd>"
-      + "<dt>" + (v.counts.warming ? "Known missing minutes" : "Missing minutes") + "</dt><dd>" + v.totalMissingMinutes.toLocaleString() + "</dd>"
+      + "<dt>" + (v.counts.warming ? "Known missing minutes" : "Missing minutes") + "</dt><dd>"
+        + (typeof v.liveMissingMinutes === "number"
+          ? v.liveMissingMinutes.toLocaleString() + " in the last " + v.gapWindowDays + " d · " + v.oldMissingMinutes.toLocaleString() + " older"
+          : v.totalMissingMinutes.toLocaleString()) + "</dd>"
       + "<dt>Requests</dt><dd>" + h.requestsMade.toLocaleString() + " · " + h.candlesWritten.toLocaleString() + " candles</dd>"
       // The rate is stated whenever the collector is not at full speed, because
       // "slow" and "broken" look identical from the bucket counts alone.
@@ -3473,19 +3477,34 @@ async function openReport(r) {
   const button = [...document.querySelectorAll('[data-view-report]')].find(b => b.dataset.viewReport === r.id);
   if (button) { button.click(); button.closest('tr').scrollIntoView({block:'center'}); }
 }
+// v0.4.99 — Amber on gaps only when holes INSIDE the served window are more
+// than a handful: over 2% of active symbols, or over 0.01% of the window's
+// symbol-minutes. Holes older than the window cannot reach a seed or snapshot
+// and never count. Red (failing/stalled/no recent success) is unchanged.
+const CANDLE_AMBER_GAPPED_SYMBOL_RATIO = 0.02;
+const CANDLE_AMBER_MISSING_MINUTE_RATIO = 0.0001;
+function candleGapsMatter(v) {
+  const active = Math.max(1, v.counts?.active || 0);
+  const gapped = v.counts?.gapped || 0;
+  if (typeof v.liveMissingMinutes !== 'number') return gapped > 0; // an older Hub: previous rule
+  const windowMinutes = active * (v.gapWindowDays || 30) * 1440;
+  return gapped / active > CANDLE_AMBER_GAPPED_SYMBOL_RATIO || v.liveMissingMinutes / windowMinutes > CANDLE_AMBER_MISSING_MINUTE_RATIO;
+}
 function renderBriefCandles(data) {
   const venues = (data.venues || []).filter(v => v.configured);
-  const problems = venues.filter(v => v.health?.state !== 'running' || v.counts?.gapped > 0 || v.counts?.empty > 0 || v.counts?.warming > 0 || !v.health?.lastSuccessAt || Date.now()-v.health.lastSuccessAt > 10*60*1000);
+  const problems = venues.filter(v => v.health?.state !== 'running' || candleGapsMatter(v) || v.counts?.empty > 0 || v.counts?.warming > 0 || !v.health?.lastSuccessAt || Date.now()-v.health.lastSuccessAt > 10*60*1000);
   const failing = problems.some(v => ['failing','stalled'].includes(v.health?.state) || (v.health?.lastSuccessAt && Date.now()-v.health.lastSuccessAt>10*60*1000));
   const state = !data.enabled || !venues.length ? 'unknown' : failing ? 'red' : problems.length ? 'amber' : 'green';
   setBrief('Candles', state, state[0].toUpperCase()+state.slice(1), !venues.length ? 'No collectors configured' : (venues.length-problems.length)+'/'+venues.length+' exchanges healthy');
   const box = document.getElementById('briefDataList'); box.textContent = '';
   if (!venues.length) box.textContent = 'Candle collection is not configured.';
-  else if (!problems.length) box.textContent = 'All configured collectors are running with complete coverage and no gapped or empty symbols reported.';
+  else if (!problems.length) box.textContent = 'All configured collectors are running; holes inside the served window are within tolerance and no empty symbols are reported.';
   for (const v of problems) {
     const item=document.createElement('div'); item.className='inbox-item';
     const name=document.createElement('strong'); name.textContent=v.venue.toUpperCase()+' · '+(v.health?.state || 'unknown');
-    const detail=document.createElement('p'); detail.textContent=(v.health?.detail || 'Collector status unavailable')+' · '+(v.counts?.gapped || 0)+' gapped · '+(v.counts?.empty || 0)+' empty · '+(v.counts?.warming || 0)+' pending coverage';
+    const live = typeof v.liveMissingMinutes === 'number' ? ' ('+v.liveMissingMinutes.toLocaleString()+' min in the last '+(v.gapWindowDays || 30)+' d)' : '';
+    const old = v.counts?.oldGapped ? ' · '+v.counts.oldGapped+' with older holes only' : '';
+    const detail=document.createElement('p'); detail.textContent=(v.health?.detail || 'Collector status unavailable')+' · '+(v.counts?.gapped || 0)+' gapped'+live+old+' · '+(v.counts?.empty || 0)+' empty · '+(v.counts?.warming || 0)+' pending coverage';
     item.append(name,detail); box.appendChild(item);
   }
 }

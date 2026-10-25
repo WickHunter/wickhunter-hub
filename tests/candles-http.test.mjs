@@ -68,11 +68,15 @@ function stubVenue(opts = {}) {
     const startMs = Number(u.searchParams.get("startTime"));
     const endMs = Number(u.searchParams.get("endTime"));
     const since = state.listedSince[symbol] ?? 0;
+    // v0.4.99 — minutes this venue itself has no candle for (a halted minute):
+    // the repair back-off tests need a hole no request can fill.
+    const missing = state.missing?.[symbol];
     const data = [];
     // The forming minute is included on purpose — the collector must drop it.
     const cap = Math.min(endMs, Math.floor(state.now / MINUTE_MS) * MINUTE_MS);
     for (let t = Math.max(startMs, since); t <= cap; t += MINUTE_MS) {
       if (t % MINUTE_MS !== 0) continue;
+      if (missing && missing.has(t)) continue;
       const i = t / MINUTE_MS;
       data.push([String(t), String(100 + (i % 7)), String(102 + (i % 7)), String(99 + (i % 7)), String(101 + (i % 7)), "5.5", "550"]);
       if (data.length >= 200) break;
@@ -1667,7 +1671,7 @@ await test("v0.4.92 — a skip the collector will not change is STRUCTURAL: a pa
   assert.equal(col.snapshotSkipIsTransient("UNKNOWNUSDT", "short", windowStart, clock), false, "an untracked spelling gets no work: structural");
 
   const before = logs.filter((l) => /^built bitget 60m x2/.test(l)).length;
-  const first = svc.snapshot("bitget", interval, depth);
+  const first = await svc.snapshot("bitget", interval, depth);
   assert.equal(first.ok, true, JSON.stringify(first));
   assert.ok(first.payload.skipped.some(([symbol, reason]) => symbol === "NEWUSDT" && reason === "short"), "the young pair is named short");
   assert.ok(first.payload.symbols.some(([symbol]) => symbol === "BTCUSDT"), "the deep pair is served");
@@ -1675,7 +1679,7 @@ await test("v0.4.92 — a skip the collector will not change is STRUCTURAL: a pa
   assert.equal(builtLines().length, before + 1);
   assert.match(builtLines().at(-1), /held until the window turns over \(0 of \d+ skipped pair\(s\) still changing\)/, builtLines().at(-1));
   clock += 5 * MINUTE_MS + 1;
-  const again = svc.snapshot("bitget", interval, depth);
+  const again = await svc.snapshot("bitget", interval, depth);
   assert.equal(again.ok, true);
   assert.equal(builtLines().length, before + 1, "five minutes later the same window is served from the cache: nothing about it can change before the boundary");
 
@@ -1687,37 +1691,69 @@ await test("v0.4.92 — a skip the collector will not change is STRUCTURAL: a pa
   assert.equal(col.symbols().find((r) => r.symbol === "GONEUSDT")?.delisted, true, "precondition: the venue's list no longer carries it");
   const anchor2 = newestCompleteBucketOpenMs(clock, interval);
   assert.equal(col.snapshotSkipIsTransient("GONEUSDT", "gap", anchor2 - (depth - 1) * interval * MINUTE_MS, clock), false, "a delisted pair's gap will never close: structural");
-  const later = svc.snapshot("bitget", interval, depth);
+  const later = await svc.snapshot("bitget", interval, depth);
   assert.equal(later.ok, true, JSON.stringify(later));
   assert.ok(later.payload.skipped.some(([symbol, reason]) => symbol === "GONEUSDT" && reason === "gap"), `the delisted pair is named gap: ${JSON.stringify(later.payload.skipped)}`);
   const line = builtLines().at(-1);
   assert.match(line, /held until the window turns over/, line);
 });
 
-await test("v0.4.92 — a window that keeps a TRANSIENT skip is re-folded on the five-minute retry at most SNAPSHOT_RETRIES_PER_BUCKET times, then held until the boundary", async () => {
+await test("v0.4.99 — a partial window whose skipped pairs' files have NOT changed is rechecked, not re-folded, and serves the identical bytes", async () => {
   // No collector on this hub (a store-only roster), so every skip reads as
-  // transient — the pre-v0.4.92 behaviour, now bounded.
+  // transient. Before v0.4.99 that meant six byte-identical re-folds per
+  // window; now the fingerprint check proves nothing moved and holds it.
   const retryStart = snapClock;
   const interval = 60, depth = 2;
-  // Start at the instant the [120,180) hour settles, so the window lives a
-  // full hour: eleven five-minute polls fit inside it.
   snapClock = snapClockFor(SNAP_DAY + 120 * MINUTE_MS, interval);
   const q = { venue: "bitget", interval, depth, key: snapToken };
   const anchor = newestCompleteBucketOpenMs(snapClock, interval);
   assert.equal(anchor, SNAP_DAY + 120 * MINUTE_MS);
   const before = snapLog.length;
+  const firstRes = await fetch(snapUrl(q));
+  assert.equal(firstRes.status, 200);
+  const firstBytes = Buffer.from(await firstRes.arrayBuffer());
+  const first = JSON.parse(firstBytes.toString("utf8"));
+  assert.ok(first.skipped.some(([symbol, reason]) => symbol === "LATEUSDT" && reason === "short"), "the late listing is skipped inside this window");
+  assert.match(snapLog.at(-1), /re-fold in 5 min \(\d+ of \d+ skipped pair\(s\) still changing; retry 1 of 6\)/, snapLog.at(-1));
+  for (let poll = 0; poll < 11; poll++) {
+    snapClock += 5 * MINUTE_MS + 1;
+    assert.equal(newestCompleteBucketOpenMs(snapClock, interval), anchor, "every poll stays inside the same window");
+    const r = await fetch(snapUrl(q));
+    assert.equal(r.status, 200);
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(firstBytes), "the served bytes are exactly the first build's");
+  }
+  const lines = snapLog.slice(before);
+  assert.equal(lines.filter((l) => /^built bitget 60m x2/.test(l)).length, 1, `one fold for the whole window: ${lines.join(" / ")}`);
+  assert.ok(lines.filter((l) => /^rechecked bitget 60m x2: \d+ skipped pair\(s\) unchanged since the last fold/.test(l)).length >= 2,
+    "each expired retry was a cheap recheck, logged as such");
+  snapClock = retryStart;
+});
+
+await test("v0.4.92/v0.4.99 — a window whose skipped pair KEEPS being rewritten is re-folded at most SNAPSHOT_RETRIES_PER_BUCKET times, then held until the boundary", async () => {
+  const retryStart = snapClock;
+  const interval = 60, depth = 2;
+  snapClock = snapClockFor(SNAP_DAY + 120 * MINUTE_MS, interval);
+  const q = { venue: "bitget", interval, depth: 3, key: snapToken };
+  const anchor = newestCompleteBucketOpenMs(snapClock, interval);
+  const store = new CandleStore(`${snapHub.dataDir}/candles`);
+  const before = snapLog.length;
   const first = await jsonReq(snapUrl(q));
   assert.equal(first.status, 200, JSON.stringify(first.body).slice(0, 200));
-  assert.ok(first.body.skipped.some(([symbol, reason]) => symbol === "LATEUSDT" && reason === "short"), "the late listing is skipped inside this window");
-  assert.equal(snapLog.length, before + 1);
-  assert.match(snapLog.at(-1), /re-fold in 5 min \(\d+ of \d+ skipped pair\(s\) still changing; retry 1 of 6\)/, snapLog.at(-1));
+  assert.match(snapLog.at(-1), /retry 1 of 6\)/, snapLog.at(-1));
   let builds = 1;
   for (let poll = 0; poll < 11; poll++) {
+    // An idempotent rewrite of a skipped pair's newest minute: the data is
+    // identical but its file is new, so the fold must be allowed to run.
+    const newest = anchor + (interval - 1) * MINUTE_MS;
+    const late = store.readWindow("bitget", "LATEUSDT", newest, newest);
+    assert.equal(late.rows.length, 1);
+    const [openMs, open, high, low, close, volume] = late.rows[0];
+    store.write("bitget", "LATEUSDT", [{ openMs, open, high, low, close, volume }]);
     snapClock += 5 * MINUTE_MS + 1;
     assert.equal(newestCompleteBucketOpenMs(snapClock, interval), anchor, "every poll stays inside the same window");
     const r = await jsonReq(snapUrl(q));
     assert.equal(r.status, 200);
-    builds = snapLog.length - before;
+    builds = snapLog.slice(before).filter((l) => /^built bitget 60m x3/.test(l)).length;
   }
   assert.equal(builds, 1 + SNAPSHOT_RETRIES_PER_BUCKET, `one fold plus the bounded retries, never one per poll (${builds})`);
   assert.match(snapLog.at(-1), /held until the window turns over \(.*; retry bound reached\)/, snapLog.at(-1));
