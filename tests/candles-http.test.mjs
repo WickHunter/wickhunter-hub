@@ -1760,6 +1760,17 @@ await test("v0.4.92/v0.4.99 — a window whose skipped pair KEEPS being rewritte
   snapClock = retryStart;
 });
 
+await test("v0.4.99 — many simultaneous gzip requests for one snapshot share one build and one compression: all 200, identical bytes", async () => {
+  const q = { venue: "bitget", interval: 15, depth: 3, key: snapToken }; // a key no earlier test built
+  const before = snapLog.length;
+  const all = await Promise.all(Array.from({ length: 20 }, () => fetch(snapUrl(q), { headers: { "accept-encoding": "gzip" } })));
+  assert.deepEqual([...new Set(all.map((r) => r.status))], [200], "no caller is told compression is busy");
+  const bodies = await Promise.all(all.map(async (r) => Buffer.from(await r.arrayBuffer())));
+  assert.ok(bodies.every((b) => b.equals(bodies[0])), "every caller got the same bytes");
+  assert.equal(new Set(all.map((r) => r.headers.get("etag"))).size, 1);
+  assert.equal(snapLog.slice(before).filter((l) => /^built bitget 15m x3/.test(l)).length, 1, "one fold for twenty callers");
+});
+
 await test("the cache is bounded per venue, and evicts the LEAST RECENTLY USED combination", async () => {
   // A caller chooses the interval and the depth, so an unbounded map lets one
   // licence make the hub fold thousands of windows and hold them all.

@@ -2275,6 +2275,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     });
   }
 
+  /** Gzipped snapshot bodies, keyed by the exact served buffer. */
+  const snapshotGzip = new WeakMap<Buffer, Promise<Buffer>>();
+
   async function compressedBytes(body: Buffer, reservation: GzipReservation, res: ServerResponse): Promise<Buffer | null> {
     try {
       return await reservation.compress(body);
@@ -2438,12 +2441,33 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
       return void res.end();
     }
-    const reservation = wantsGzip ? responseGzip.reserve() : null;
-    if (wantsGzip && !reservation) return compressionBusy(res);
+    // v0.4.99 — ONE COMPRESSION PER BUILT SNAPSHOT. A shared build now
+    // finishes for every waiting caller at the same instant; each taking its
+    // own gzip slot for the identical body overran the bounded queue and
+    // answered the late ones "compression is busy" (503). The compressed bytes
+    // are memoised against the exact body buffer (zlib is deterministic, so
+    // they are the bytes each caller would have produced), concurrent callers
+    // await the one in flight, and the entry dies with the cached result.
+    let reservation: GzipReservation | null = null;
+    let gz = wantsGzip ? snapshotGzip.get(current.body) : undefined;
+    if (wantsGzip && !gz) {
+      reservation = responseGzip.reserve();
+      if (!reservation) return compressionBusy(res);
+      const r = reservation;
+      gz = r.compress(current.body);
+      snapshotGzip.set(current.body, gz);
+      gz.catch(() => { if (snapshotGzip.get(current.body) === gz) snapshotGzip.delete(current.body); });
+    }
     try {
       // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
       // roughly an order of magnitude off it, exactly as it does for a seed.
-      const bytes = reservation ? await compressedBytes(current.body, reservation, res) : current.body;
+      let bytes: Buffer | null = current.body;
+      if (gz) {
+        try { bytes = await gz; } catch (error) {
+          if (error instanceof GzipCapacityError) { compressionBusy(res); return; }
+          throw error;
+        }
+      }
       if (!bytes) return;
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",

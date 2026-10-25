@@ -192,8 +192,9 @@ export const RATE_REFUSED_MEMORY_MS = 3_600_000;
  *  An interior hole the venue itself has no candles for (a halted minute, a
  *  listing pause) used to be re-requested on EVERY tick, forever, and because
  *  only the oldest hole is chased, it also blocked every younger hole behind
- *  it. On the operator's Hub that was ~140 Bitget and ~95 Bitunix requests a
- *  minute returning nothing. A repair page that fills nothing now sets the
+ *  it. On the operator's Hub (143 gapped Bitget, 95 gapped Bitunix symbols)
+ *  that is up to one empty request per gapped symbol per minute (inferred
+ *  from the gapped counts; repairs are not logged per request). A repair page that fills nothing now sets the
  *  symbol's repair search past that hole for a doubling interval (15 min up
  *  to 6 h), so younger holes are repaired next and the old one is still
  *  retried a few times a day. Holes inside the last `tailFillMinutes` are
