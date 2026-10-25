@@ -428,4 +428,36 @@ await test("the app's own verifier accepts the Hub's 1m snapshot at every second
   console.log(`    (the app verifier accepted ${checked} snapshots across every second of the 1m, 3m and 5m phases)`);
 });
 
+await test("a build queued behind busy slots past a boundary folds the window of NOW, not of when it was asked", async () => {
+  let clock = NOW - 3 * 3_600_000; // early enough that the rolled hour is still held
+  const jobs = [];
+  const gates = [];
+  const fold = async (job) => {
+    jobs.push(job);
+    if (gates.length < SNAPSHOT_WORKER_CONCURRENCY) await new Promise((r) => gates.push(r));
+    return runSnapshotWorker(job);
+  };
+  const dir = tmpDir("snapqueue");
+  fs.cpSync(store.rootDir, path.join(dir, "candles"), { recursive: true });
+  const svc = new CandleService(
+    { dataDir: dir, venues: [], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS }, tickMs: 60_000 },
+    { sign, now: () => clock, log: () => {}, snapshotFold: fold },
+  );
+  const blockers = [svc.snapshot("bitget", 1440, 3), svc.snapshot("bitget", 1440, 4)];
+  while (gates.length < SNAPSHOT_WORKER_CONCURRENCY) await new Promise((r) => setImmediate(r));
+  const asked = newestCompleteBucketOpenMs(clock, 60);
+  const queued = svc.snapshot("bitget", 60, 5); // waits for a slot
+  await new Promise((r) => setImmediate(r));
+  clock += 60 * MINUTE_MS; // the hour rolls while it waits
+  for (const g of gates) g();
+  await Promise.all(blockers);
+  const r = await queued;
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(jobs.at(-1).now, clock, "the fold was given the clock at the moment it got a slot");
+  assert.equal(r.payload.lastClosedMs, asked + 60 * MINUTE_MS, "and answers the rolled window");
+  // An identical later request inside that window is a cache hit.
+  const again = await svc.snapshot("bitget", 60, 5);
+  assert.equal(again, r);
+});
+
 summary("candles-snapshot-worker");

@@ -524,46 +524,59 @@ export class CandleService {
     const flying = this.snapshotInflight.get(flightKey);
     if (flying) return flying;
 
-    const anchor = this.snapshotWindowAnchor(now, interval);
-    const boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
-    const { windowStart, windowEnd } = snapshotWindow(now, interval, depth);
-    const transientOf = (skipped: ReadonlyArray<[string, "gap" | "short"]>): number => skipped
-      .filter(([symbol, reason]) => collector
-        ? collector.snapshotSkipIsTransient(symbol, reason, windowStart, now, windowEnd)
-        : true).length;
+    // The recheck AND the build run inside one single-flight promise, so
+    // callers arriving during the (async) fingerprint recheck share it too.
+    const run = (async (): Promise<CandleSnapshotResult> => {
+      const anchor = this.snapshotWindowAnchor(now, interval);
+      const boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
+      const { windowStart, windowEnd } = snapshotWindow(now, interval, depth);
+      const transientOf = this.transientCounter(venue, now, windowStart, windowEnd);
 
-    // ── v0.4.99 — A RETRY THAT CANNOT CHANGE THE ANSWER IS NOT A FOLD ──────
-    // Same window, same roster, a served partial result: re-fold only if a
-    // skipped pair could now fold differently, i.e. one of its files moved.
-    if (held && held.result.ok && held.fingerprints && held.anchor === anchor && held.rosterSig === rosterSig) {
-      const transient = transientOf(held.skipped);
-      const bounded = held.retries >= SNAPSHOT_RETRIES_PER_BUCKET;
-      let changed: string | null = null;
-      if (transient > 0 && !bounded) {
-        for (const [symbol] of held.skipped) {
-          let print: string;
-          try { print = this.store.windowFingerprint(venue, symbol, windowStart, windowEnd); } catch { print = "unreadable"; }
-          if (print !== held.fingerprints[symbol]) { changed = symbol; break; }
+      // ── v0.4.99 — A RETRY THAT CANNOT CHANGE THE ANSWER IS NOT A FOLD ──────
+      // Same window, same roster, a served partial result: re-fold only if a
+      // skipped pair could now fold differently, i.e. one of its files moved.
+      if (held && held.result.ok && held.fingerprints && held.anchor === anchor && held.rosterSig === rosterSig) {
+        const transient = transientOf(held.skipped);
+        const bounded = held.retries >= SNAPSHOT_RETRIES_PER_BUCKET;
+        let changed: string | null = null;
+        if (transient > 0 && !bounded) {
+          // v0.4.99 — the recheck's stat calls go through fs.promises, so even
+          // a large skipped list never holds the event loop.
+          for (const [symbol] of held.skipped) {
+            let print: string;
+            try { print = await this.store.windowFingerprintAsync(venue, symbol, windowStart, windowEnd); } catch { print = "unreadable"; }
+            if (print !== held.fingerprints[symbol]) { changed = symbol; break; }
+          }
+        }
+        if (changed === null) {
+          const holdToBoundary = transient === 0 || bounded;
+          held.expiresAt = holdToBoundary ? boundaryExpiry : Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
+          perVenue.delete(key);
+          perVenue.set(key, held);
+          this.log(`rechecked ${venue} ${interval}m x${depth}: ${held.skipped.length} skipped pair(s) unchanged since the last fold; ${holdToBoundary
+            ? `held until the window turns over (${transient} of ${held.skipped.length} skipped pair(s) still changing${bounded ? "; retry bound reached" : ""})`
+            : `checked again in ${Math.round(SNAPSHOT_RETRY_TTL_MS / MINUTE_MS)} min (${transient} of ${held.skipped.length} skipped pair(s) still changing)`}`);
+          return held.result;
         }
       }
-      if (changed === null) {
-        const holdToBoundary = transient === 0 || bounded;
-        held.expiresAt = holdToBoundary ? boundaryExpiry : Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
-        perVenue.delete(key);
-        perVenue.set(key, held);
-        this.log(`rechecked ${venue} ${interval}m x${depth}: ${held.skipped.length} skipped pair(s) unchanged since the last fold; ${holdToBoundary
-          ? `held until the window turns over (${transient} of ${held.skipped.length} skipped pair(s) still changing${bounded ? "; retry bound reached" : ""})`
-          : `checked again in ${Math.round(SNAPSHOT_RETRY_TTL_MS / MINUTE_MS)} min (${transient} of ${held.skipped.length} skipped pair(s) still changing)`}`);
-        return held.result;
-      }
-    }
-
-    const run = this.buildSnapshotEntry({
-      venue, interval, depth, now, symbols, rosterSig, key, held, anchor, boundaryExpiry, transientOf,
-    });
+      return this.buildSnapshotEntry({
+        venue, interval, depth, now, symbols, rosterSig, key, held, anchor, boundaryExpiry, transientOf,
+      });
+    })();
     this.snapshotInflight.set(flightKey, run);
     try { return await run; }
     finally { if (this.snapshotInflight.get(flightKey) === run) this.snapshotInflight.delete(flightKey); }
+  }
+
+  /** How many of `skipped` the venue's collector will change before the
+   *  window `[windowStart, windowEnd]` (built at `now`) turns over. */
+  private transientCounter(venue: VenueId, now: number, windowStart: number, windowEnd: number):
+    (skipped: ReadonlyArray<[string, "gap" | "short"]>) => number {
+    const collector = this.collectors.get(venue);
+    return (skipped) => skipped
+      .filter(([symbol, reason]) => collector
+        ? collector.snapshotSkipIsTransient(symbol, reason, windowStart, now, windowEnd)
+        : true).length;
   }
 
   private async buildSnapshotEntry(b: {
@@ -571,11 +584,24 @@ export class CandleService {
     key: string; held: SnapshotCacheEntry | undefined; anchor: number; boundaryExpiry: number;
     transientOf: (skipped: ReadonlyArray<[string, "gap" | "short"]>) => number;
   }): Promise<CandleSnapshotResult> {
-    const { venue, interval, depth, now, symbols, rosterSig, key, held, anchor, boundaryExpiry } = b;
+    const { venue, interval, depth, symbols, rosterSig, key } = b;
+    let { now, held, anchor, boundaryExpiry, transientOf } = b;
     const startedAt = Date.now();
     let reply: SnapshotWorkerReply;
     await this.acquireSnapshotSlot();
     try {
+      // ── v0.4.99 — RE-SAMPLE THE CLOCK ONCE A SLOT IS OURS ───────────────
+      // A build may have queued behind two others for tens of seconds; the
+      // window it was asked for can have rolled meanwhile. Fold for the
+      // window of NOW, never of when the request arrived, and answer from
+      // the cache if a build that finished while we waited already did.
+      now = (this.deps.now ?? Date.now)();
+      anchor = this.snapshotWindowAnchor(now, interval);
+      boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
+      const w = snapshotWindow(now, interval, depth);
+      transientOf = this.transientCounter(venue, now, w.windowStart, w.windowEnd);
+      held = this.snapshotCache.get(venue)?.get(key) ?? held;
+      if (held && now < held.expiresAt && held.rosterSig === rosterSig) return held.result;
       reply = await (this.deps.snapshotFold ?? runSnapshotWorker)({
         rootDir: this.store.rootDir, venue, interval, depth, now, keyId: this.cfg.keyId, symbols,
       });
@@ -629,7 +655,7 @@ export class CandleService {
       // change it before the boundary (see `snapshotSkipIsTransient`). With no
       // collector for the venue (a store-only roster) nothing can answer that,
       // and every skip is treated as transient, exactly as before.
-      const transient = b.transientOf(reply.skipped);
+      const transient = transientOf(reply.skipped);
       const retryAgain = transient > 0 && retries < SNAPSHOT_RETRIES_PER_BUCKET;
       const skipped = reply.skipped.length;
       // ONE line per fold, the expiry decision on it: an operator reading

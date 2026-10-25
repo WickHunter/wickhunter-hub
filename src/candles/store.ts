@@ -472,6 +472,36 @@ export class CandleStore {
     return parts.join("|");
   }
 
+  /** `windowFingerprint` through fs.promises: the same string, built without
+   *  a synchronous syscall on the caller's thread (the snapshot cache's
+   *  recheck runs on the Hub's event loop). */
+  async windowFingerprintAsync(venue: string, symbol: string, fromMs: number, toMs: number): Promise<string> {
+    const dir = this.symbolDir(venue, symbol);
+    let names: string[];
+    try {
+      names = (await fs.promises.readdir(dir)).filter((n) => n.endsWith(CANDLE_FILE_EXT)).sort();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw err;
+    }
+    const parts: string[] = [names.join(",")];
+    if (Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs) {
+      const days: number[] = [];
+      for (let d = dayStartOf(fromMs); d <= toMs; d += DAY_MS) days.push(d);
+      const stats = await Promise.all(days.map(async (d) => {
+        try {
+          const st = await fs.promises.stat(this.dayFile(venue, symbol, d), { bigint: true });
+          return `${d}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          return `${d}:-`;
+        }
+      }));
+      parts.push(...stats);
+    }
+    return parts.join("|");
+  }
+
   /** ── v0.4.99 — ONE SYMBOL'S SNAPSHOT FOLD, STRAIGHT FROM THE DAY FILES ────
    *
    *  Exactly the decision `buildSnapshot` makes from `coverage` +
