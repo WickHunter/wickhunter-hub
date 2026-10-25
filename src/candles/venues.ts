@@ -341,8 +341,14 @@ const bitunix: VenueAdapter = {
 const bitget: VenueAdapter = {
   id: "bitget",
   pageLimit: 200,
-  // Documented 20 times/1s per IP for market data. Half of it.
-  publicRequestsPerSecond: 10,
+  // Documented 20 times/1s per IP for market data. v0.4.99: a QUARTER of it.
+  // At 10/s the operator's Hub was refused 2,750 times in eight days, the
+  // refusals arriving around 7.8/s (the panel read "throttled to 3.91/s"
+  // straight after a halving) — the IP is not this collector's alone, and
+  // history-candles evidently counts tighter than the headline figure. Five
+  // is still ~30x what an 870-pair tail needs (one page per pair per ~100
+  // minutes); backfill of a new listing takes a few minutes longer.
+  publicRequestsPerSecond: 5,
   klineEndpoint: "GET /api/v2/mix/market/history-candles (granularity=1m)",
   async listSymbols(fetchLike) {
     const body = (await getJson(fetchLike, "https://api.bitget.com/api/v2/mix/market/contracts?productType=usdt-futures")) as { data?: unknown[] };

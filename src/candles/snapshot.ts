@@ -154,12 +154,24 @@ export function snapshotBucketMs(intervalMinutes: number): number {
  *  two pairs in one response describe different stretches of time, which is
  *  exactly the comparison a volatility rule is making. A symbol that cannot
  *  fill this window is skipped rather than served a window of its own. */
+/** ── v0.4.99 — THE SETTLE LAG NEVER EXCEEDS ONE BUCKET ─────────────────────
+ *
+ *  A flat 90 s lag on a ONE-minute bucket put the served window two minutes
+ *  behind the clock for 30 s of every minute and the app's verifier (which
+ *  accepts the newest closed bucket, or the one before it near a boundary)
+ *  refused every 1m snapshot (found by the app contract test, 2026-10-25).
+ *  Capped at one bucket the 1m anchor is minute M−2 at every second of M and
+ *  expires exactly at M+1; every interval of 3 minutes or more keeps 90 s. */
+export function snapshotSettleLagMs(intervalMinutes: number): number {
+  return Math.min(SNAPSHOT_SETTLE_LAG_MS, snapshotBucketMs(intervalMinutes));
+}
+
 export function newestCompleteBucketOpenMs(now: number, intervalMinutes: number): number {
   const bucketMs = snapshotBucketMs(intervalMinutes);
   // The newest minute that is closed at (now - lag); +MINUTE_MS is the instant
   // it closed, and the boundary at or before that instant ends a bucket whose
   // every minute is closed.
-  const closedAt = newestClosedOpenMs(now - SNAPSHOT_SETTLE_LAG_MS) + MINUTE_MS;
+  const closedAt = newestClosedOpenMs(now - snapshotSettleLagMs(intervalMinutes)) + MINUTE_MS;
   return Math.floor(closedAt / bucketMs) * bucketMs - bucketMs;
 }
 
@@ -167,7 +179,7 @@ export function newestCompleteBucketOpenMs(now: number, intervalMinutes: number)
  *  boundary after next, plus the settle lag. Before that instant a rebuild can
  *  only reproduce the same window. */
 export function snapshotExpiresAtMs(lastClosedMs: number, intervalMinutes: number): number {
-  return lastClosedMs + 2 * snapshotBucketMs(intervalMinutes) + SNAPSHOT_SETTLE_LAG_MS;
+  return lastClosedMs + 2 * snapshotBucketMs(intervalMinutes) + snapshotSettleLagMs(intervalMinutes);
 }
 
 export type SymbolFold =
@@ -266,7 +278,39 @@ export interface SnapshotDeps {
   symbols(venue: VenueId): readonly string[];
 }
 
-export function buildSnapshot(req: SnapshotRequest, deps: SnapshotDeps): SnapshotOutcome {
+/** What the fold half of a build produces: the unsigned payload in canonical
+ *  key order, or the same 400/503 refusal `buildSnapshot` answers with.
+ *  `fingerprints` (v0.4.99) names, for each SKIPPED symbol, what its fold
+ *  depended on (`CandleStore.windowFingerprint`), captured BEFORE its files
+ *  were read — so a write racing the fold can only cause an extra rebuild,
+ *  never hide a change. */
+export type SnapshotFold =
+  | { ok: true; payload: SnapshotUnsigned; fingerprints: Record<string, string> }
+  | { ok: false; code: 400 | 503; error: string };
+
+export interface SnapshotFoldDeps {
+  store: CandleStore;
+  keyId: string;
+  symbols(venue: VenueId): readonly string[];
+  /** Fold straight from the day-file buffers (`CandleStore.foldSnapshotSymbol`)
+   *  instead of materialising every minute. Same answer, proved by test. */
+  fast?: boolean;
+  /** Record skipped symbols' fingerprints. Off for the reference path. */
+  fingerprints?: boolean;
+}
+
+/** The snapshot window a build at `now` answers for. */
+export function snapshotWindow(now: number, interval: number, depth: number): { lastClosedMs: number; windowStart: number; windowEnd: number } {
+  const bucketMs = snapshotBucketMs(interval);
+  const lastClosedMs = newestCompleteBucketOpenMs(now, interval);
+  const windowStart = lastClosedMs - (depth - 1) * bucketMs;
+  return { lastClosedMs, windowStart, windowEnd: lastClosedMs + bucketMs - MINUTE_MS };
+}
+
+/** The FOLD half of `buildSnapshot`: everything except the signature. This
+ *  is what the snapshot worker runs off the event loop (v0.4.99); the main
+ *  thread signs `canonicalSnapshotBytes` of the result. */
+export function foldSnapshot(req: SnapshotRequest, deps: SnapshotFoldDeps): SnapshotFold {
   const { venue, interval, depth, now } = req;
   if (!isSnapshotInterval(interval)) {
     return { ok: false, code: 400, error: `interval must be one of ${SNAPSHOT_INTERVALS.join(",")} minutes` };
@@ -277,38 +321,44 @@ export function buildSnapshot(req: SnapshotRequest, deps: SnapshotDeps): Snapsho
   if (!Number.isFinite(now)) {
     return { ok: false, code: 400, error: "the build clock is not a finite epoch-ms number" };
   }
-  const bucketMs = snapshotBucketMs(interval);
-  const lastClosedMs = newestCompleteBucketOpenMs(now, interval);
-  const windowStart = lastClosedMs - (depth - 1) * bucketMs;
+  const { lastClosedMs, windowStart, windowEnd } = snapshotWindow(now, interval, depth);
   if (lastClosedMs < 0 || windowStart < 0) {
     return { ok: false, code: 503, error: `no complete ${interval}m window of ${depth} candles exists yet` };
   }
-  const windowEnd = lastClosedMs + bucketMs - MINUTE_MS;
 
   const symbols: SnapshotSymbolRows[] = [];
   const skipped: SnapshotSkipped[] = [];
+  const fingerprints: Record<string, string> = {};
   for (const symbol of [...deps.symbols(venue)].sort()) {
-    // ── THE CHEAP REFUSALS COME FIRST, AND THEY ANSWER THE SAME WAY THE FOLD
-    // WOULD ─────────────────────────────────────────────────────────────────
-    // `coverage` is a readdir and at most two day-file reads; reading the whole
-    // window is up to `depth * interval` minutes of day files PER SYMBOL, and a
-    // 500-deep daily request across a 500-pair venue would do that for pairs
-    // whose history provably cannot reach. These two tests are steps 1-3 of
-    // `foldSymbolWindow` asked of the coverage summary rather than of the rows,
-    // in the same order, so the label cannot depend on which path answered.
-    const cov = deps.store.coverage(venue, symbol);
-    if (cov.lastClosedMs === null || cov.firstClosedMs === null || cov.firstClosedMs > windowStart) {
-      skipped.push([symbol, "short"]);
-      continue;
+    const print = deps.fingerprints ? deps.store.windowFingerprint(venue, symbol, windowStart, windowEnd) : "";
+    let folded: SymbolFold;
+    if (deps.fast) {
+      folded = deps.store.foldSnapshotSymbol(venue, symbol, windowStart, windowEnd, depth, interval);
+    } else {
+      // ── THE CHEAP REFUSALS COME FIRST, AND THEY ANSWER THE SAME WAY THE FOLD
+      // WOULD ───────────────────────────────────────────────────────────────
+      // `coverage` is a readdir and at most two day-file reads; reading the
+      // whole window is up to `depth * interval` minutes of day files PER
+      // SYMBOL, and a 500-deep daily request across a 500-pair venue would do
+      // that for pairs whose history provably cannot reach. These two tests
+      // are steps 1-3 of `foldSymbolWindow` asked of the coverage summary
+      // rather than of the rows, in the same order, so the label cannot depend
+      // on which path answered.
+      const cov = deps.store.coverage(venue, symbol);
+      if (cov.lastClosedMs === null || cov.firstClosedMs === null || cov.firstClosedMs > windowStart) {
+        folded = { ok: false, reason: "short" };
+      } else if (cov.lastClosedMs < windowEnd) {
+        folded = { ok: false, reason: "gap" };
+      } else {
+        const { rows } = deps.store.readWindow(venue, symbol, windowStart, windowEnd);
+        folded = foldSymbolWindow(rows, windowStart, depth, interval, cov.firstClosedMs);
+      }
     }
-    if (cov.lastClosedMs < windowEnd) {
-      skipped.push([symbol, "gap"]);
-      continue;
-    }
-    const { rows } = deps.store.readWindow(venue, symbol, windowStart, windowEnd);
-    const folded = foldSymbolWindow(rows, windowStart, depth, interval, cov.firstClosedMs);
     if (folded.ok) symbols.push([symbol, folded.rows]);
-    else skipped.push([symbol, folded.reason]);
+    else {
+      skipped.push([symbol, folded.reason]);
+      if (deps.fingerprints) fingerprints[symbol] = print;
+    }
   }
 
   // ── NEVER 200 WITH NO SYMBOLS ───────────────────────────────────────────
@@ -323,17 +373,40 @@ export function buildSnapshot(req: SnapshotRequest, deps: SnapshotDeps): Snapsho
     };
   }
 
-  const payload: SnapshotUnsigned = {
-    v: SNAPSHOT_WIRE_VERSION,
-    venue,
-    interval,
-    depth,
-    generatedAtMs: now,
-    lastClosedMs,
-    symbols,
-    skipped,
-    keyId: deps.keyId,
+  return {
+    ok: true,
+    payload: {
+      v: SNAPSHOT_WIRE_VERSION,
+      venue,
+      interval,
+      depth,
+      generatedAtMs: now,
+      lastClosedMs,
+      symbols,
+      skipped,
+      keyId: deps.keyId,
+    },
+    fingerprints,
   };
+}
+
+/** The served bytes of a signed snapshot, from its canonical bytes and its
+ *  base64 signature, WITHOUT re-serialising the rows: the wire object is the
+ *  canonical object plus `sig` as its last key, so the wire JSON is the
+ *  canonical JSON with `,"sig":"…"` spliced in before the closing brace.
+ *  Byte-identical to `JSON.stringify({ ...payload, sig })` (proved by test). */
+export function signedSnapshotBody(canonical: Uint8Array, sigB64: string): Buffer {
+  const head = Buffer.from(canonical.buffer, canonical.byteOffset, canonical.byteLength);
+  if (head.length < 2 || head[head.length - 1] !== 0x7d) throw new Error("canonical snapshot bytes do not end in }");
+  return Buffer.concat([head.subarray(0, head.length - 1), Buffer.from(`,"sig":${JSON.stringify(sigB64)}}`, "utf8")]);
+}
+
+export function buildSnapshot(req: SnapshotRequest, deps: SnapshotDeps): SnapshotOutcome {
+  const folded = foldSnapshot(req, { store: deps.store, keyId: deps.keyId, symbols: deps.symbols });
+  if (!folded.ok) return folded.code === 400
+    ? { ok: false, code: 400, error: folded.error }
+    : { ok: false, code: 503, error: folded.error };
+  const payload = folded.payload;
   const sig = deps.sign(canonicalSnapshotBytes(payload)).toString("base64");
   // `sig` last: the wire object is the canonical object plus the signature.
   return { ok: true, payload: { ...payload, sig } };

@@ -4,6 +4,7 @@
 // for this venue+symbol" and "what is each exchange's status right now".
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import { CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs } from "./store.js";
 import {
   DEFAULT_COLLECTOR_OPTIONS, VenueCollector, seedableMaxTailAgeMs,
@@ -17,10 +18,13 @@ import {
   TimeframeHistory, isTimeframeInterval, type TimeframeInterval, type TimeframeOutcome,
 } from "./timeframe.js";
 import {
-  buildSnapshot, isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs,
-  snapshotBucketMs, snapshotExpiresAtMs, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
+  isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs, signedSnapshotBody,
+  snapshotBucketMs, snapshotExpiresAtMs, snapshotWindow, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
   type SnapshotSigned,
 } from "./snapshot.js";
+import type { SnapshotWorkerJob, SnapshotWorkerReply } from "./snapshot-worker.js";
+
+export type { SnapshotWorkerJob, SnapshotWorkerReply };
 
 // v0.2.4 — the seedable tail ceiling is no longer a constant here. It is
 // DERIVED from the collector's `tailFillMinutes` (see `seedableMaxTailAgeMs` in
@@ -43,6 +47,11 @@ export interface SymbolStatus {
   lastClosedMs: number | null;
   heldMinutes: number | null;
   missingMinutes: number | null;
+  /** v0.4.99 — `missingMinutes` split at the served window (HEALTH_GAP_WINDOW_DAYS):
+   *  `liveMissingMinutes` inside it, `oldMissingMinutes` older. When the exact
+   *  split is not known yet every missing minute is reported live. */
+  liveMissingMinutes: number | null;
+  oldMissingMinutes: number | null;
   newlyListed: boolean;
   delisted: boolean;
   tradable: boolean;
@@ -68,6 +77,9 @@ export interface VenueStatus {
     delisted: number;
     newLast24h: number;
     newLast24hBackfilling: number;
+    /** v0.4.99 — active symbols whose only holes are OLDER than the served
+     *  window. Not in `gapped`: nothing the Hub serves can read them. */
+    oldGapped: number;
   };
   /** Oldest and newest closed candle held for active symbols in this venue. */
   oldestClosedMs: number | null;
@@ -75,6 +87,12 @@ export interface VenueStatus {
   /** Known missing minutes inside held ranges. `counts.warming` says whether
    *  this is still a partial total; unknown symbols are never counted as zero. */
   totalMissingMinutes: number;
+  /** v0.4.99 — `totalMissingMinutes` split at the served window: inside the
+   *  last `gapWindowDays` days (what a seed or snapshot can hit) and older
+   *  (retained history only). `live + old === total`. */
+  liveMissingMinutes: number;
+  oldMissingMinutes: number;
+  gapWindowDays: number;
   /** Symbols with the most missing minutes — a venue quietly accumulating gaps
    *  is the failure that poisons seeds without ever throwing an error. */
   worstGaps: Array<{ symbol: string; missingMinutes: number }>;
@@ -92,8 +110,53 @@ export type CandleSnapshotResult =
 /** Distinct (interval, depth) combinations cached per venue. See `snapshot`. */
 export const SNAPSHOT_CACHE_PER_VENUE = 16;
 
+/** ── v0.4.99 — HEALTH COUNTS HOLES THE HUB CAN SERVE ────────────────────────
+ *  The deepest window anything asks of this Hub: the app's 1m seed is capped
+ *  at 30 days (43,200 minutes) and its deepest snapshot is 1d x 30. A hole
+ *  older than this is still reported (`oldMissingMinutes`, `oldGapped`) but no
+ *  longer makes a symbol `gapped`. */
+export const HEALTH_GAP_WINDOW_DAYS = 30;
+
+/** ── v0.4.99 — THE SNAPSHOT FOLD RUNS IN A WORKER THREAD ────────────────────
+ *  At most this many folds run at once across all venues (each is a bounded
+ *  but large read); further builds queue. A build that has not answered in
+ *  SNAPSHOT_WORKER_TIMEOUT_MS is terminated and answered 503, never served
+ *  partially. A failure is cached for SNAPSHOT_FAILURE_TTL_MS so a broken
+ *  build cannot be retried by every poll. */
+export const SNAPSHOT_WORKER_CONCURRENCY = 2;
+export const SNAPSHOT_WORKER_TIMEOUT_MS = 300_000;
+export const SNAPSHOT_FAILURE_TTL_MS = 60_000;
+
+/** Run one fold in a fresh worker thread. Exported for tests. */
+export function runSnapshotWorker(job: SnapshotWorkerJob, timeoutMs = SNAPSHOT_WORKER_TIMEOUT_MS): Promise<SnapshotWorkerReply> {
+  return new Promise<SnapshotWorkerReply>((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(new URL("./snapshot-worker.js", import.meta.url), {
+      workerData: job,
+      // A fold is buffers and small row arrays; a runaway one must not take
+      // the Hub's memory with it.
+      resourceLimits: { maxOldGenerationSizeMb: 1024 },
+    });
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+      void worker.terminate().catch(() => undefined);
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error(`snapshot fold exceeded ${timeoutMs}ms`))), timeoutMs);
+    worker.once("message", (m: SnapshotWorkerReply) => finish(() => resolve(m)));
+    worker.once("error", (err) => finish(() => reject(err)));
+    worker.once("exit", (code) => finish(() => reject(new Error(`snapshot worker exited (${code}) without an answer`))));
+  });
+}
+
 interface SnapshotCacheEntry {
   result: CandleSnapshotResult;
+  /** v0.4.99 — per skipped symbol, `CandleStore.windowFingerprint` taken
+   *  before the fold read it; null for a refusal or failure. */
+  fingerprints: Record<string, string> | null;
+  skipped: Array<[string, "gap" | "short"]>;
   /** Next boundary expiry, or an earlier retry for unavailable rows. */
   expiresAt: number;
   /** Sorted tracked symbols folded into this result. A changed roster must
@@ -144,6 +207,9 @@ export interface CandleServiceDeps {
   /** Injectable websocket transport keeps service wiring testable without
    * opening a public socket. Production uses the runner's native factory. */
   streamSocket?: SocketFactory;
+  /** v0.4.99 — where a snapshot fold runs. Defaults to a fresh worker thread
+   *  (`runSnapshotWorker`); a suite injects a failing or slow one. */
+  snapshotFold?: (job: SnapshotWorkerJob) => Promise<SnapshotWorkerReply>;
 }
 
 const realFetch: FetchLike = async (url: string) => {
@@ -267,7 +333,7 @@ export class CandleService {
         symbols: () => collector.symbols().filter((t) => !t.delisted).map((t) => t.symbol),
         write: (symbol, candles, notAfterMs) => {
           const result = this.store.write(v, symbol, candles, notAfterMs);
-          collector.noteStoredCandles(symbol, candles, result.written, result.newlyFilled);
+          collector.noteStoredCandles(symbol, candles, result.written, result.newlyFilled, result.newlyFilledByDay);
         },
         now: this.deps.now,
         log: (m) => console.log(`[candles·stream] ${m}`),
@@ -397,13 +463,35 @@ export class CandleService {
   // venue pays it once.
   private readonly snapshotCache = new Map<VenueId, Map<string, SnapshotCacheEntry>>();
 
+  /** Concurrent requests for one venue+key share one build (v0.4.99). */
+  private readonly snapshotInflight = new Map<string, Promise<CandleSnapshotResult>>();
+  private snapshotSlotsInUse = 0;
+  private readonly snapshotSlotWaiters: Array<() => void> = [];
+
+  private async acquireSnapshotSlot(): Promise<void> {
+    if (this.snapshotSlotsInUse < SNAPSHOT_WORKER_CONCURRENCY) { this.snapshotSlotsInUse++; return; }
+    await new Promise<void>((resolve) => this.snapshotSlotWaiters.push(resolve));
+  }
+
+  private releaseSnapshotSlot(): void {
+    const next = this.snapshotSlotWaiters.shift();
+    if (next) next(); // the slot passes straight to the next waiter
+    else this.snapshotSlotsInUse--;
+  }
+
   /** A signed snapshot for one venue/timeframe/depth, its ETag and its bytes.
    *
    *  NEVER BLOCKS ON THE COLLECTOR: the roster is read from the collector's
    *  in-memory tracked set and the candles come off the store's own day files.
    *  A venue that is rate-limited, cooling or mid-tick answers from what is
-   *  already on disk rather than making a request path wait for it. */
-  snapshot(venue: VenueId, interval: number, depth: number): CandleSnapshotResult {
+   *  already on disk rather than making a request path wait for it.
+   *
+   *  v0.4.99 — NOR ON THE EVENT LOOP. The fold runs in a worker thread and
+   *  only the signature is computed here; concurrent callers of one
+   *  venue+key await the same build. A partial window whose skipped pairs'
+   *  files have not changed since its fold is HELD rather than re-folded,
+   *  because the fold could only reproduce it. */
+  async snapshot(venue: VenueId, interval: number, depth: number): Promise<CandleSnapshotResult> {
     // Validated here as well as at the route: the route owns the 404 for a
     // venue nobody collects, this owns the shape of the two numbers, and a
     // malformed pair must never reach the cache and occupy a slot.
@@ -432,55 +520,159 @@ export class CandleService {
       perVenue.set(key, held);
       return held.result;
     }
+    const flightKey = `${venue}\u0000${key}`;
+    const flying = this.snapshotInflight.get(flightKey);
+    if (flying) return flying;
 
+    // The recheck AND the build run inside one single-flight promise, so
+    // callers arriving during the (async) fingerprint recheck share it too.
+    const run = (async (): Promise<CandleSnapshotResult> => {
+      const anchor = this.snapshotWindowAnchor(now, interval);
+      const boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
+      const { windowStart, windowEnd } = snapshotWindow(now, interval, depth);
+      const transientOf = this.transientCounter(venue, now, windowStart, windowEnd);
+
+      // ── v0.4.99 — A RETRY THAT CANNOT CHANGE THE ANSWER IS NOT A FOLD ──────
+      // Same window, same roster, a served partial result: re-fold only if a
+      // skipped pair could now fold differently, i.e. one of its files moved.
+      if (held && held.result.ok && held.fingerprints && held.anchor === anchor && held.rosterSig === rosterSig) {
+        const transient = transientOf(held.skipped);
+        const bounded = held.retries >= SNAPSHOT_RETRIES_PER_BUCKET;
+        let changed: string | null = null;
+        if (transient > 0 && !bounded) {
+          // v0.4.99 — the recheck's stat calls go through fs.promises, so even
+          // a large skipped list never holds the event loop.
+          for (const [symbol] of held.skipped) {
+            let print: string;
+            try { print = await this.store.windowFingerprintAsync(venue, symbol, windowStart, windowEnd); } catch { print = "unreadable"; }
+            if (print !== held.fingerprints[symbol]) { changed = symbol; break; }
+          }
+        }
+        if (changed === null) {
+          const holdToBoundary = transient === 0 || bounded;
+          held.expiresAt = holdToBoundary ? boundaryExpiry : Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
+          perVenue.delete(key);
+          perVenue.set(key, held);
+          this.log(`rechecked ${venue} ${interval}m x${depth}: ${held.skipped.length} skipped pair(s) unchanged since the last fold; ${holdToBoundary
+            ? `held until the window turns over (${transient} of ${held.skipped.length} skipped pair(s) still changing${bounded ? "; retry bound reached" : ""})`
+            : `checked again in ${Math.round(SNAPSHOT_RETRY_TTL_MS / MINUTE_MS)} min (${transient} of ${held.skipped.length} skipped pair(s) still changing)`}`);
+          return held.result;
+        }
+      }
+      return this.buildSnapshotEntry({
+        venue, interval, depth, now, symbols, rosterSig, key, held, anchor, boundaryExpiry, transientOf,
+      });
+    })();
+    this.snapshotInflight.set(flightKey, run);
+    try { return await run; }
+    finally { if (this.snapshotInflight.get(flightKey) === run) this.snapshotInflight.delete(flightKey); }
+  }
+
+  /** How many of `skipped` the venue's collector will change before the
+   *  window `[windowStart, windowEnd]` (built at `now`) turns over. */
+  private transientCounter(venue: VenueId, now: number, windowStart: number, windowEnd: number):
+    (skipped: ReadonlyArray<[string, "gap" | "short"]>) => number {
+    const collector = this.collectors.get(venue);
+    return (skipped) => skipped
+      .filter(([symbol, reason]) => collector
+        ? collector.snapshotSkipIsTransient(symbol, reason, windowStart, now, windowEnd)
+        : true).length;
+  }
+
+  private async buildSnapshotEntry(b: {
+    venue: VenueId; interval: number; depth: number; now: number; symbols: string[]; rosterSig: string;
+    key: string; held: SnapshotCacheEntry | undefined; anchor: number; boundaryExpiry: number;
+    transientOf: (skipped: ReadonlyArray<[string, "gap" | "short"]>) => number;
+  }): Promise<CandleSnapshotResult> {
+    const { venue, interval, depth, symbols, rosterSig, key } = b;
+    let { now, held, anchor, boundaryExpiry, transientOf } = b;
     const startedAt = Date.now();
-    const outcome = buildSnapshot({ venue, interval, depth, now }, {
-      store: this.store,
-      keyId: this.cfg.keyId,
-      sign: this.deps.sign,
-      // The request's roster was captured above, so the signature and fold
-      // cannot disagree if a listing refresh runs between those operations.
-      symbols: () => symbols,
-    });
+    let reply: SnapshotWorkerReply;
+    await this.acquireSnapshotSlot();
+    try {
+      // ── v0.4.99 — RE-SAMPLE THE CLOCK ONCE A SLOT IS OURS ───────────────
+      // A build may have queued behind two others for tens of seconds; the
+      // window it was asked for can have rolled meanwhile. Fold for the
+      // window of NOW, never of when the request arrived, and answer from
+      // the cache if a build that finished while we waited already did.
+      now = (this.deps.now ?? Date.now)();
+      anchor = this.snapshotWindowAnchor(now, interval);
+      boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
+      const w = snapshotWindow(now, interval, depth);
+      transientOf = this.transientCounter(venue, now, w.windowStart, w.windowEnd);
+      held = this.snapshotCache.get(venue)?.get(key) ?? held;
+      if (held && now < held.expiresAt && held.rosterSig === rosterSig) return held.result;
+      reply = await (this.deps.snapshotFold ?? runSnapshotWorker)({
+        rootDir: this.store.rootDir, venue, interval, depth, now, keyId: this.cfg.keyId, symbols,
+      });
+    } catch (err) {
+      reply = { ok: false, code: 500, error: (err as Error)?.message ?? String(err) };
+    } finally {
+      this.releaseSnapshotSlot();
+    }
+    let perVenue = this.snapshotCache.get(venue);
+    if (!perVenue) this.snapshotCache.set(venue, perVenue = new Map());
 
-    const anchor = this.snapshotWindowAnchor(now, interval);
-    const boundaryExpiry = snapshotExpiresAtMs(anchor, interval);
     // The same window with the same roster, folded again: a retry. Anything
     // else is a first fold and starts the count over.
     const retries = held && held.anchor === anchor && held.rosterSig === rosterSig ? held.retries + 1 : 0;
-    // A skip is transient only when the collector says its own work will
-    // change it before the boundary (see `snapshotSkipIsTransient`). With no
-    // collector for the venue (a store-only roster) nothing can answer that,
-    // and every skip is treated as transient, exactly as before.
-    const windowStart = anchor - (depth - 1) * snapshotBucketMs(interval);
-    const transient = outcome.ok
-      ? outcome.payload.skipped.filter(([symbol, reason]) => collector
-        ? collector.snapshotSkipIsTransient(symbol, reason, windowStart, now)
-        : true).length
-      : 0;
-    const retryAgain = !outcome.ok || (transient > 0 && retries < SNAPSHOT_RETRIES_PER_BUCKET);
-    const expiresAt = retryAgain ? Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS) : boundaryExpiry;
+    let entry: SnapshotCacheEntry;
     let result: CandleSnapshotResult;
-    if (outcome.ok) {
-      const body = Buffer.from(JSON.stringify(outcome.payload), "utf8");
+    if (!reply.ok && reply.code === 500) {
+      // ── A FAILED BUILD NEVER SERVES ANYTHING IT DID NOT FINISH ───────────
+      // A complete earlier answer for this SAME window is still exactly right
+      // and is kept; otherwise the caller gets a 503 (its client retries).
+      this.log(`built ${venue} ${interval}m x${depth}: FAILED (${reply.error}) after ${Date.now() - startedAt}ms`);
+      if (held && held.result.ok && held.anchor === anchor && held.rosterSig === rosterSig) {
+        held.expiresAt = Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS);
+        perVenue.set(key, held);
+        return held.result;
+      }
+      result = { ok: false, code: 503, error: `snapshot for ${venue} ${interval}m x${depth} could not be built; retry shortly` };
+      entry = { result, fingerprints: null, skipped: [], expiresAt: Math.min(boundaryExpiry, now + SNAPSHOT_FAILURE_TTL_MS), rosterSig, anchor, retries };
+    } else if (!reply.ok) {
+      result = { ok: false, code: reply.code, error: reply.error };
+      this.log(`built ${venue} ${interval}m x${depth}: ${reply.code} ${reply.error}`
+        + ` (${Date.now() - startedAt}ms)`);
+      // A FAILED result (503, nothing to serve) keeps the unbounded retry.
+      entry = { result, fingerprints: null, skipped: [], expiresAt: Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS), rosterSig, anchor, retries };
+    } else {
+      // Signed HERE, on the main thread: the worker never holds key material.
+      const canonical = Buffer.from(reply.canonical.buffer, reply.canonical.byteOffset, reply.canonical.byteLength);
+      const sig = this.deps.sign(canonical).toString("base64");
+      const body = signedSnapshotBody(canonical, sig);
       // The ETag is over the SERVED BYTES, so a 304 hands the client exactly
       // what a 200 would have.
       const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 32)}"`;
-      result = { ok: true, payload: outcome.payload, etag, body };
-      const skipped = outcome.payload.skipped.length;
+      let parsed: SnapshotSigned | null = null;
+      // `payload` is parsed from the served bytes only if someone reads it
+      // (tests, diagnostics); the route serves `body` directly.
+      result = {
+        ok: true, etag, body,
+        get payload(): SnapshotSigned { return parsed ??= JSON.parse(body.toString("utf8")) as SnapshotSigned; },
+      };
+      // A skip is transient only when the collector says its own work will
+      // change it before the boundary (see `snapshotSkipIsTransient`). With no
+      // collector for the venue (a store-only roster) nothing can answer that,
+      // and every skip is treated as transient, exactly as before.
+      const transient = transientOf(reply.skipped);
+      const retryAgain = transient > 0 && retries < SNAPSHOT_RETRIES_PER_BUCKET;
+      const skipped = reply.skipped.length;
       // ONE line per fold, the expiry decision on it: an operator reading
       // "built … every five minutes" can see which skipped pairs kept it
       // re-folding, and when the bound stopped it.
-      this.log(`built ${venue} ${interval}m x${depth}: ${outcome.payload.symbols.length} symbols`
+      this.log(`built ${venue} ${interval}m x${depth}: ${reply.symbolCount} symbols`
         + ` (${skipped} skipped), ${body.length} bytes in ${Date.now() - startedAt}ms; ${retryAgain
           ? `re-fold in ${Math.round(SNAPSHOT_RETRY_TTL_MS / MINUTE_MS)} min (${transient} of ${skipped} skipped pair(s) still changing; retry ${retries + 1} of ${SNAPSHOT_RETRIES_PER_BUCKET})`
           : `held until the window turns over (${transient} of ${skipped} skipped pair(s) still changing${retries >= SNAPSHOT_RETRIES_PER_BUCKET ? "; retry bound reached" : ""})`}`);
-    } else {
-      result = outcome;
-      this.log(`built ${venue} ${interval}m x${depth}: ${outcome.code} ${outcome.error}`
-        + ` (${Date.now() - startedAt}ms)`);
+      entry = {
+        result, fingerprints: reply.fingerprints, skipped: reply.skipped,
+        expiresAt: retryAgain ? Math.min(boundaryExpiry, now + SNAPSHOT_RETRY_TTL_MS) : boundaryExpiry,
+        rosterSig, anchor, retries,
+      };
     }
-    perVenue.set(key, { result, expiresAt, rosterSig, anchor, retries });
+    perVenue.delete(key);
+    perVenue.set(key, entry);
     while (perVenue.size > SNAPSHOT_CACHE_PER_VENUE) {
       const oldest = perVenue.keys().next();
       if (oldest.done) break;
@@ -565,9 +757,10 @@ export class CandleService {
         venue, configured: false, health: null, klineEndpoint,
         counts: {
           tracked: 0, active: 0, inactive: 0, seedable: 0, backfilling: 0, gapped: 0, empty: 0, warming: 0,
-          delisted: 0, newLast24h: 0, newLast24hBackfilling: 0,
+          delisted: 0, newLast24h: 0, newLast24hBackfilling: 0, oldGapped: 0,
         },
         oldestClosedMs: null, newestClosedMs: null, totalMissingMinutes: 0,
+        liveMissingMinutes: 0, oldMissingMinutes: 0, gapWindowDays: HEALTH_GAP_WINDOW_DAYS,
         worstGaps: [], newlyListed: [],
       };
     }
@@ -576,11 +769,13 @@ export class CandleService {
     const counts = {
       tracked: per.length, active: 0, inactive: 0,
       seedable: 0, backfilling: 0, gapped: 0, empty: 0, warming: 0, delisted: 0,
-      newLast24h: 0, newLast24hBackfilling: 0,
+      newLast24h: 0, newLast24hBackfilling: 0, oldGapped: 0,
     };
     let oldestClosedMs: number | null = null;
     let newestClosedMs: number | null = null;
     let totalMissingMinutes = 0;
+    let liveMissingMinutes = 0;
+    let oldMissingMinutes = 0;
 
     for (const s of per) {
       counts[s.bucket]++;
@@ -594,6 +789,9 @@ export class CandleService {
         if (s.bucket !== "seedable" && s.bucket !== "warming") counts.newLast24hBackfilling++;
       }
       totalMissingMinutes += s.missingMinutes ?? 0;
+      liveMissingMinutes += s.liveMissingMinutes ?? 0;
+      oldMissingMinutes += s.oldMissingMinutes ?? 0;
+      if ((s.oldMissingMinutes ?? 0) > 0 && (s.liveMissingMinutes ?? 0) === 0) counts.oldGapped++;
       if (s.firstClosedMs !== null && (oldestClosedMs === null || s.firstClosedMs < oldestClosedMs)) {
         oldestClosedMs = s.firstClosedMs;
       }
@@ -626,7 +824,8 @@ export class CandleService {
 
     return {
       venue, configured: true, health: collector.health(now), klineEndpoint,
-      counts, oldestClosedMs, newestClosedMs, totalMissingMinutes, worstGaps, newlyListed,
+      counts, oldestClosedMs, newestClosedMs, totalMissingMinutes,
+      liveMissingMinutes, oldMissingMinutes, gapWindowDays: HEALTH_GAP_WINDOW_DAYS, worstGaps, newlyListed,
     };
   }
 
@@ -636,6 +835,10 @@ export class CandleService {
       const cov = collector.cachedCoverage(t.symbol);
       const heldMinutes = cov?.count ?? null;
       const missingMinutes = cov?.interiorMissing ?? null;
+      // Unknown split: every hole counts as live, the direction that warns.
+      const split = cov ? collector.missingSplit(t.symbol, now - HEALTH_GAP_WINDOW_DAYS * DAY_MS) : null;
+      const liveMissingMinutes = missingMinutes === null ? null : split ? split.live : missingMinutes;
+      const oldMissingMinutes = missingMinutes === null ? null : split ? split.old : 0;
       // ── ONE BUCKET PER SYMBOL, IN PRIORITY ORDER ────────────────────────
       // The buckets are reported as plain counts and never rolled into a
       // health score: an operator needs to know WHICH of these is wrong, and a
@@ -647,9 +850,11 @@ export class CandleService {
         bucket = "warming";
       } else if (cov.lastClosedMs === null) {
         bucket = "empty";
-      } else if (missingMinutes !== null && missingMinutes > 0) {
+      } else if (liveMissingMinutes !== null && liveMissingMinutes > 0) {
         // Holes inside the range we hold. Said first because a gapped symbol
         // is the one that can poison a seed while looking deep and current.
+        // v0.4.99 — only holes inside the served window: an older one cannot
+        // reach any seed or snapshot, and is reported as `oldMissingMinutes`.
         bucket = "gapped";
       } else if (
         heldMinutes === null || heldMinutes < SEEDABLE_MIN_MINUTES ||
@@ -666,6 +871,8 @@ export class CandleService {
         lastClosedMs: cov?.lastClosedMs ?? null,
         heldMinutes,
         missingMinutes,
+        liveMissingMinutes,
+        oldMissingMinutes,
         newlyListed: now - t.firstSeenAt < NEW_SYMBOL_WINDOW_MS,
         delisted: t.delisted,
         tradable: t.tradable,

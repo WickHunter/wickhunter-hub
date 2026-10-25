@@ -138,8 +138,8 @@ const MONO = "ui-monospace,'SF Mono',Menlo,Consolas,monospace";
 const SETUP_STEPS: ReadonlyArray<readonly [string, string]> = [
   ["Get a server", "A fresh Ubuntu 22.04 or newer VPS with 1 GB RAM and root access — Vultr, Hetzner and DigitalOcean all work. One server per licence."],
   ["Run the one-line command", "Open your install page, press Copy, and paste the command into an SSH session as root. It installs Node, the signed Unleashed release and HTTPS, then prints your dashboard address and asks you to choose a password. About three minutes."],
-  ["Connect your exchange", "Sign in to the dashboard and add an API key with trade permission only — withdrawals off, IP allowlist on. Supported: Bybit, Bitget, Bitunix, Binance, Aster. Bybit and Bitget offer demo accounts; start there if you can."],
-  ["Start small", "Let the guided setup create your first bot, run it in demo or with small sizes, and grow from there."],
+  ["Connect your exchange", "Sign in to the dashboard and add an API key with trade permission only — withdrawals off, IP allowlist on. Supported: Bybit, Bitunix, Bitget, Binance, Aster and WEEX. Demo accounts are not available in the current release."],
+  ["Start small", "Let the guided setup create your first bot, start on your live account with the smallest sizes, and grow from there."],
 ];
 
 const GOOD_TO_KNOW: readonly string[] = [

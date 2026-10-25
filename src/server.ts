@@ -2275,6 +2275,9 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     });
   }
 
+  /** Gzipped snapshot bodies, keyed by the exact served buffer. */
+  const snapshotGzip = new WeakMap<Buffer, Promise<Buffer>>();
+
   async function compressedBytes(body: Buffer, reservation: GzipReservation, res: ServerResponse): Promise<Buffer | null> {
     try {
       return await reservation.compress(body);
@@ -2423,25 +2426,48 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 400, { ok: false, error: `depth must be an integer 1..${SNAPSHOT_MAX_DEPTH}` });
     }
     const wantsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
-    const reservation = wantsGzip ? responseGzip.reserve() : null;
-    if (wantsGzip && !reservation) return compressionBusy(res);
+    // v0.4.99 — the build is awaited (it runs in a worker thread) BEFORE a
+    // gzip slot is reserved: holding a compression reservation across a fold
+    // would let a few waiting snapshot requests refuse every other gzip route.
+    const current = await candles.snapshot(venue, interval, depth);
+    // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
+    // means "ask me again", which is a different sentence from "this venue has
+    // nothing on it".
+    if (!current.ok) {
+      return sendJson(res, current.code, { ok: false, error: current.error });
+    }
+    const inm = String(req.headers["if-none-match"] ?? "");
+    if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
+      res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
+      return void res.end();
+    }
+    // v0.4.99 — ONE COMPRESSION PER BUILT SNAPSHOT. A shared build now
+    // finishes for every waiting caller at the same instant; each taking its
+    // own gzip slot for the identical body overran the bounded queue and
+    // answered the late ones "compression is busy" (503). The compressed bytes
+    // are memoised against the exact body buffer (zlib is deterministic, so
+    // they are the bytes each caller would have produced), concurrent callers
+    // await the one in flight, and the entry dies with the cached result.
+    let reservation: GzipReservation | null = null;
+    let gz = wantsGzip ? snapshotGzip.get(current.body) : undefined;
+    if (wantsGzip && !gz) {
+      reservation = responseGzip.reserve();
+      if (!reservation) return compressionBusy(res);
+      const r = reservation;
+      gz = r.compress(current.body);
+      snapshotGzip.set(current.body, gz);
+      gz.catch(() => { if (snapshotGzip.get(current.body) === gz) snapshotGzip.delete(current.body); });
+    }
     try {
-      const current = candles.snapshot(venue, interval, depth);
-      // NEVER A 200 WITH NO SYMBOLS — see snapshot.ts. A cold hub says 503 and
-      // means "ask me again", which is a different sentence from "this venue has
-      // nothing on it".
-      if (!current.ok) {
-        return sendJson(res, current.code, { ok: false, error: current.error });
-      }
-
-      const inm = String(req.headers["if-none-match"] ?? "");
-      if (inm && inm.split(",").some((t) => t.trim() === current.etag)) {
-        res.writeHead(304, { etag: current.etag, "cache-control": "public, max-age=60" });
-        return void res.end();
-      }
       // A 500-pair daily snapshot is megabytes of mostly-decimal JSON; gzip takes
       // roughly an order of magnitude off it, exactly as it does for a seed.
-      const bytes = reservation ? await compressedBytes(current.body, reservation, res) : current.body;
+      let bytes: Buffer | null = current.body;
+      if (gz) {
+        try { bytes = await gz; } catch (error) {
+          if (error instanceof GzipCapacityError) { compressionBusy(res); return; }
+          throw error;
+        }
+      }
       if (!bytes) return;
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",

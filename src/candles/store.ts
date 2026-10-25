@@ -46,7 +46,11 @@
 // silently mistaken for data, because the slot's own timestamp will not match
 // the position it was read from, and `readWindow` drops it as absent.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+/** Typed-array fast paths read doubles in host byte order. */
+const LITTLE_ENDIAN = os.endianness() === "LE";
 
 export const MINUTE_MS = 60_000;
 
@@ -111,6 +115,10 @@ export interface WriteResult {
    *  store gained, which is what keeps the collector's count truthful without
    *  a rescan. Re-fetching a range is idempotent and adds zero. */
   newlyFilled: number;
+  /** v0.4.99 — `newlyFilled` split by UTC day start. Additive: lets the
+   *  collector keep an exact per-day held count (and so a health figure for
+   *  the served window alone) without rescanning the files it just wrote. */
+  newlyFilledByDay: Map<number, number>;
 }
 
 export interface SymbolCoverage {
@@ -282,7 +290,9 @@ export class CandleStore {
     }
     let written = 0;
     let newlyFilled = 0;
+    const newlyFilledByDay = new Map<number, number>();
     for (const [dayStartMs, list] of byDay) {
+      const filledBefore = newlyFilled;
       const file = this.dayFile(venue, symbol, dayStartMs);
       const buf = this.readDay(venue, symbol, dayStartMs) ?? Buffer.alloc(DAY_FILE_BYTES);
       for (const c of list) {
@@ -301,12 +311,13 @@ export class CandleStore {
         buf.writeDoubleLE(c.volume, off + 40);
         written++;
       }
+      if (newlyFilled > filledBefore) newlyFilledByDay.set(dayStartMs, newlyFilled - filledBefore);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.tmp.${process.pid}`;
       fs.writeFileSync(tmp, buf);
       fs.renameSync(tmp, file);
     }
-    return { written, newlyFilled };
+    return { written, newlyFilled, newlyFilledByDay };
   }
 
   /** Rows present in [fromMs, toMs] (inclusive, minute-aligned internally),
@@ -369,7 +380,17 @@ export class CandleStore {
   /** What we hold for one symbol. Scans day files from each end, so a healthy
    *  symbol costs two file reads; `count`/`interiorMissing` need the full scan
    *  and are only asked for by the admin status panel. */
-  coverage(venue: string, symbol: string, deep = false): SymbolCoverage {
+  coverage(venue: string, symbol: string, deep = false, heldByDayOut?: Map<number, number>): SymbolCoverage {
+    const detail = this.coverageDetail(venue, symbol, deep);
+    if (heldByDayOut && detail.heldByDay) for (const [d, n] of detail.heldByDay) heldByDayOut.set(d, n);
+    return detail.coverage;
+  }
+
+  /** `coverage`, plus — for a deep scan — how many candles each day file holds
+   *  inside [firstClosedMs, lastClosedMs]. Same single pass; the per-day split
+   *  is what lets the health panel count holes inside the SERVED window apart
+   *  from old ones that only retention still remembers (v0.4.99). */
+  coverageDetail(venue: string, symbol: string, deep = false): { coverage: SymbolCoverage; heldByDay: Map<number, number> | null } {
     const days = this.days(venue, symbol);
     let firstClosedMs: number | null = null;
     let lastClosedMs: number | null = null;
@@ -393,22 +414,210 @@ export class CandleStore {
       if (lastClosedMs !== null) break;
     }
     if (firstClosedMs === null || lastClosedMs === null) {
-      return { firstClosedMs: null, lastClosedMs: null, count: 0, interiorMissing: 0 };
+      return {
+        coverage: { firstClosedMs: null, lastClosedMs: null, count: 0, interiorMissing: 0 },
+        heldByDay: deep ? new Map() : null,
+      };
     }
     if (!deep) {
-      return { firstClosedMs, lastClosedMs, count: 0, interiorMissing: 0 };
+      return { coverage: { firstClosedMs, lastClosedMs, count: 0, interiorMissing: 0 }, heldByDay: null };
     }
+    const heldByDay = new Map<number, number>();
     for (const d of days) {
       const buf = this.readDay(venue, symbol, d);
       if (!buf) continue;
+      let held = 0;
       for (let i = 0; i < SLOTS_PER_DAY; i++) {
         const openMs = d + i * MINUTE_MS;
         if (openMs < firstClosedMs || openMs > lastClosedMs) continue;
-        if (this.hasSlot(buf, i, d)) count++;
+        if (this.hasSlot(buf, i, d)) held++;
       }
+      if (held > 0) heldByDay.set(d, held);
+      count += held;
     }
     const span = (lastClosedMs - firstClosedMs) / MINUTE_MS + 1;
-    return { firstClosedMs, lastClosedMs, count, interiorMissing: span - count };
+    return { coverage: { firstClosedMs, lastClosedMs, count, interiorMissing: span - count }, heldByDay };
+  }
+
+  /** ── v0.4.99 — WHAT A SNAPSHOT FOLD OF THIS SYMBOL DEPENDS ON ─────────────
+   *
+   *  The day-file names held for the symbol, plus the inode, size and
+   *  nanosecond mtime of every day file overlapping [fromMs, toMs]. Every
+   *  store write is tmp-then-rename, so a write to any of those files changes
+   *  its inode and mtime, and a new or pruned day changes the names. The
+   *  snapshot cache records this for each SKIPPED symbol before reading it,
+   *  and re-folds a partial window only when one of them moved: two identical
+   *  fingerprints mean the fold would reproduce the result it already holds. */
+  windowFingerprint(venue: string, symbol: string, fromMs: number, toMs: number): string {
+    const dir = this.symbolDir(venue, symbol);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir).filter((n) => n.endsWith(CANDLE_FILE_EXT)).sort();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw err;
+    }
+    const parts: string[] = [names.join(",")];
+    if (Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs) {
+      for (let d = dayStartOf(fromMs); d <= toMs; d += DAY_MS) {
+        try {
+          const st = fs.statSync(this.dayFile(venue, symbol, d), { bigint: true });
+          parts.push(`${d}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          parts.push(`${d}:-`);
+        }
+      }
+    }
+    return parts.join("|");
+  }
+
+  /** `windowFingerprint` through fs.promises: the same string, built without
+   *  a synchronous syscall on the caller's thread (the snapshot cache's
+   *  recheck runs on the Hub's event loop). */
+  async windowFingerprintAsync(venue: string, symbol: string, fromMs: number, toMs: number): Promise<string> {
+    const dir = this.symbolDir(venue, symbol);
+    let names: string[];
+    try {
+      names = (await fs.promises.readdir(dir)).filter((n) => n.endsWith(CANDLE_FILE_EXT)).sort();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw err;
+    }
+    const parts: string[] = [names.join(",")];
+    if (Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs >= fromMs) {
+      const days: number[] = [];
+      for (let d = dayStartOf(fromMs); d <= toMs; d += DAY_MS) days.push(d);
+      const stats = await Promise.all(days.map(async (d) => {
+        try {
+          const st = await fs.promises.stat(this.dayFile(venue, symbol, d), { bigint: true });
+          return `${d}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          return `${d}:-`;
+        }
+      }));
+      parts.push(...stats);
+    }
+    return parts.join("|");
+  }
+
+  /** ── v0.4.99 — ONE SYMBOL'S SNAPSHOT FOLD, STRAIGHT FROM THE DAY FILES ────
+   *
+   *  Exactly the decision `buildSnapshot` makes from `coverage` +
+   *  `readWindow` + `foldSymbolWindow`, in the same order and with the same
+   *  arithmetic in the same minute order — so every double it emits is the
+   *  same bits — but without allocating a Candle and a Row per held minute.
+   *  A 30-day daily snapshot of an 800-pair venue was ~35 million of those
+   *  objects and most of a minute of garbage collection. Each day file is
+   *  read once per symbol (the coverage ends and the window share buffers).
+   *  `tests/candles-snapshot-worker.test.mjs` proves equality against the
+   *  reference path on holes, torn files, mismatched slots and every depth. */
+  foldSnapshotSymbol(
+    venue: string, symbol: string, windowStart: number, windowEnd: number, depth: number, intervalMinutes: number,
+  ): { ok: true; rows: Row[] } | { ok: false; reason: "gap" | "short" } {
+    const cache = new Map<number, Buffer | null>();
+    const day = (d: number): Buffer | null => {
+      if (cache.has(d)) return cache.get(d)!;
+      const b = this.readDay(venue, symbol, d);
+      cache.set(d, b);
+      return b;
+    };
+    const days = this.days(venue, symbol);
+    let firstClosedMs: number | null = null;
+    let lastClosedMs: number | null = null;
+    for (const d of days) {
+      const buf = day(d);
+      if (!buf) continue;
+      for (let i = 0; i < SLOTS_PER_DAY; i++) {
+        if (this.hasSlot(buf, i, d)) { firstClosedMs = d + i * MINUTE_MS; break; }
+      }
+      if (firstClosedMs !== null) break;
+    }
+    for (let k = days.length - 1; k >= 0; k--) {
+      const d = days[k]!;
+      const buf = day(d);
+      if (!buf) continue;
+      for (let i = SLOTS_PER_DAY - 1; i >= 0; i--) {
+        if (this.hasSlot(buf, i, d)) { lastClosedMs = d + i * MINUTE_MS; break; }
+      }
+      if (lastClosedMs !== null) break;
+    }
+    if (lastClosedMs === null || firstClosedMs === null || firstClosedMs > windowStart) return { ok: false, reason: "short" };
+    if (lastClosedMs < windowEnd) return { ok: false, reason: "gap" };
+
+    // The reference reads the window ceil/floor-aligned; both ends are
+    // minute-aligned here by construction, asserted rather than assumed.
+    if (windowStart % MINUTE_MS !== 0 || windowEnd % MINUTE_MS !== 0 || windowEnd < windowStart) {
+      return { ok: false, reason: "short" };
+    }
+    // The window's day buffers, oldest first, read once; minutes are then
+    // walked with a running (day, slot) cursor — no per-minute allocation.
+    const firstDay = dayStartOf(windowStart);
+    const bufs: Array<Buffer | null> = [];
+    for (let d = firstDay; d <= windowEnd; d += DAY_MS) bufs.push(day(d));
+    const present = (openMs: number): boolean => {
+      const k = Math.floor((openMs - firstDay) / DAY_MS);
+      const d = firstDay + k * DAY_MS;
+      const buf = bufs[k];
+      return !!buf && this.hasSlot(buf, (openMs - d) / MINUTE_MS, d);
+    };
+    // `foldSymbolWindow` step 1/2: an empty window is "short"; a window whose
+    // first minute is absent is "gap" (history provably reaches past it).
+    if (!present(windowStart)) {
+      for (let m = windowStart + MINUTE_MS; m <= windowEnd; m += MINUTE_MS) {
+        if (present(m)) return { ok: false, reason: "gap" };
+      }
+      return { ok: false, reason: "short" };
+    }
+    const bucketMs = intervalMinutes * MINUTE_MS;
+    const out: Row[] = [];
+    // Typed views over each day buffer: a record is 6 x 8 bytes, so on a
+    // little-endian host element 6*slot+j IS the double `readDoubleLE` would
+    // return at byte 48*slot+8*j (same bits, no conversion), and the two
+    // 32-bit halves of the openMs are u32[12*slot] and u32[12*slot+1] — the
+    // exact test `hasSlot` makes. A misaligned or big-endian buffer falls back
+    // to the Buffer readers.
+    const views = bufs.map((buf) => (buf && LITTLE_ENDIAN && buf.byteOffset % 8 === 0
+      ? { f64: new Float64Array(buf.buffer, buf.byteOffset, SLOTS_PER_DAY * 6), u32: new Uint32Array(buf.buffer, buf.byteOffset, SLOTS_PER_DAY * 12) }
+      : null));
+    let k = 0;
+    let dayMs = firstDay;
+    let slot = (windowStart - firstDay) / MINUTE_MS;
+    let lo = 0, hi = 0;
+    const expect = (): void => {
+      const e = dayMs + slot * MINUTE_MS;
+      lo = e >>> 0; hi = Math.floor(e / 0x1_0000_0000) >>> 0;
+    };
+    for (let b = 0; b < depth; b++) {
+      const start = windowStart + b * bucketMs;
+      let open = NaN, high = -Infinity, low = Infinity, close = NaN, volume = 0;
+      for (let m = 0; m < intervalMinutes; m++) {
+        const buf = bufs[k];
+        if (!buf) return { ok: false, reason: "gap" };
+        const v = views[k];
+        let o: number, h: number, l: number, c: number, vol: number;
+        if (v) {
+          expect();
+          if (v.u32[12 * slot] !== lo || v.u32[12 * slot + 1] !== hi || dayMs + slot * MINUTE_MS === 0) return { ok: false, reason: "gap" };
+          const f = 6 * slot;
+          o = v.f64[f + 1]!; h = v.f64[f + 2]!; l = v.f64[f + 3]!; c = v.f64[f + 4]!; vol = v.f64[f + 5]!;
+        } else {
+          if (!this.hasSlot(buf, slot, dayMs)) return { ok: false, reason: "gap" };
+          const off = slot * RECORD_BYTES;
+          o = buf.readDoubleLE(off + 8); h = buf.readDoubleLE(off + 16); l = buf.readDoubleLE(off + 24);
+          c = buf.readDoubleLE(off + 32); vol = buf.readDoubleLE(off + 40);
+        }
+        if (m === 0) open = o;
+        if (h > high) high = h;
+        if (l < low) low = l;
+        close = c;
+        volume += vol;
+        if (++slot === SLOTS_PER_DAY) { slot = 0; k++; dayMs += DAY_MS; }
+      }
+      out.push([start, open, high, low, close, volume]);
+    }
+    return { ok: true, rows: out };
   }
 
   /** Delete whole day files older than the retention horizon. Day-sized chunks
