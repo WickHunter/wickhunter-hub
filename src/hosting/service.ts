@@ -623,11 +623,34 @@ export class HostingService {
     }
     if (this.withheldCancellations.delete(ownerId)) this.log(`[hosting] ${ownerId} (${instance.id}): software licence hold ended (${ineligible ? ineligible.kind : "eligible again"})`);
     if (ineligible) {
-      this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer (${ineligible.kind}${ineligible.kind === "lapsed" ? `, subscription ${ineligible.subscriptionStatus ?? "none"}` : ""})`);
-      if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
-      if (instance.stage === "ordered" && !instance.providerInstanceId) this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      // Once per owner and reason per process: this branch re-derives the
+      // same verdict on every 30-second tick, and on 2026-10-29 two owners
+      // wrote ~1,000 identical journal lines in two hours.
+      const quietKey = `${ownerId}:${ineligible.kind}:${ineligible.kind === "lapsed" ? ineligible.subscriptionStatus ?? "none" : ""}`;
+      if (!this.quietIneligibleOwners.has(quietKey)) {
+        for (const k of this.quietIneligibleOwners) if (k.startsWith(`${ownerId}:`)) this.quietIneligibleOwners.delete(k);
+        this.quietIneligibleOwners.add(quietKey);
+        this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer (${ineligible.kind}${ineligible.kind === "lapsed" ? `, subscription ${ineligible.subscriptionStatus ?? "none"}` : ""}); logged once per reason`);
+      }
+      if (instance.stage === "ordered" && !instance.providerInstanceId) {
+        if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
+        this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+        return;
+      }
+      // A server that already exists still follows its own hosting billing
+      // record. Returning here (as before) meant the Stripe echo of this
+      // branch's own cancellation ("active (cancels at period end)") and the
+      // later "canceled" never scheduled suspend/delete, so the provider
+      // server outlived the paid hosting period indefinitely. The signal is
+      // applied in end-only mode — no provisioning, no restore — and BEFORE
+      // the cancellation is queued, so a schedule change cannot obsolete
+      // the queued cancellation (dedupe keys are permanent).
+      this.applyBillingSignal(instance, sub, nowMs, { endOnly: true });
+      const current = this.store.getInstance(instance.id) ?? instance;
+      if (sub.subscriptionId) this.enqueueStripeCancellation(current, sub.subscriptionId, "software-ineligible", nowMs);
       return;
     }
+    this.quietIneligibleOwners.forEach((k) => { if (k.startsWith(`${ownerId}:`)) this.quietIneligibleOwners.delete(k); });
     this.applyBillingSignal(instance, sub, nowMs);
   }
 
@@ -656,7 +679,13 @@ export class HostingService {
   /** Compute the target stage from the billing record and move the instance
    *  toward it. Every branch is a no-op if the instance is already there —
    *  the property that makes re-running this on every tick safe. */
-  private applyBillingSignal(instance: HostingInstanceRow, sub: RoleSubscriptionRecord, nowMs: number): void {
+  /** `endOnly` (an owner without an eligible software licence whose server
+   *  already exists): only the end-of-service transitions apply — a
+   *  scheduled cancellation, nonpayment or an ended subscription schedules
+   *  suspend/delete. No provision job, restore or paid-through renewal is
+   *  derived for an ineligible owner. */
+  private applyBillingSignal(instance: HostingInstanceRow, sub: RoleSubscriptionRecord, nowMs: number, opts: { endOnly?: boolean } = {}): void {
+    const endOnly = opts.endOnly === true;
     const policy = this.policy();
     const signal: BillingSignal = { subscriptionStatus: sub.subscriptionStatus, periodEndMs: sub.periodEndMs, refunded: sub.refunded, disputed: sub.disputed };
 
@@ -678,7 +707,7 @@ export class HostingService {
     // paid+ordered state on every reconciliation; the lifecycle-scoped dedupe
     // key makes repeats inert while still allowing a replacement if a real
     // lifecycle transition obsoletes an older job.
-    if (instance.stage === "ordered" && !instance.providerInstanceId && paidEvidenceExists(sub)) {
+    if (!endOnly && instance.stage === "ordered" && !instance.providerInstanceId && paidEvidenceExists(sub)) {
       this.enqueueProvisionJob(instance, nowMs);
     }
 
@@ -690,10 +719,11 @@ export class HostingService {
     // direction: never an invented FAILURE either). The operator acts on
     // it from the admin page's audit list.
     if ((signal.refunded || signal.disputed) && instance.failureReason !== hostingBillingFlagNote(signal)) {
-      this.store.updateInstance(instance.id, instance.version, (d) => { d.failureReason = hostingBillingFlagNote(signal); }, nowMs);
+      const flagged = this.store.updateInstance(instance.id, instance.version, (d) => { d.failureReason = hostingBillingFlagNote(signal); }, nowMs);
+      if (flagged) instance = flagged;
     }
 
-    const paidThroughAdvanced = signal.periodEndMs !== null && (instance.paidThroughMs === null || signal.periodEndMs > instance.paidThroughMs);
+    const paidThroughAdvanced = !endOnly && signal.periodEndMs !== null && (instance.paidThroughMs === null || signal.periodEndMs > instance.paidThroughMs);
     const scheduledCancel = signal.subscriptionStatus === "active (cancels at period end)";
     const nonpaying = signal.subscriptionStatus === "past_due";
     const ended = signal.subscriptionStatus === "canceled";
@@ -1087,6 +1117,10 @@ export class HostingService {
    *  on (no Stripe subscription bound) and has been logged once by this
    *  process. Same in-memory, log-only rationale as above. */
   private readonly quietUnreservedOwners = new Set<string>();
+  /** `${ownerId}:${kind}:${status}` of each "refusing paid hosting
+   *  provisioning" verdict already logged by this process. Log-only, like
+   *  the two sets above; a changed reason logs again. */
+  private readonly quietIneligibleOwners = new Set<string>();
 
   /** Owns its own periodic reconciliation (candles/liq's own `start`/`stop`
    *  shape — src/server.ts's `listen`/`close`), so every hub that
@@ -1638,11 +1672,27 @@ export class HostingService {
     const cfg = this.billing.config();
     const key = cfg.stripe[cfg.mode].secretKey;
     if (!key) return false;
+    const url = `https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`;
     try {
-      const response = await this.stripeFetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.stripeFetch(url, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: `cancel_at_period_end=${cancelAtPeriodEnd ? "true" : "false"}`,
       });
-      return response.ok;
+      if (response.ok) return true;
+    } catch { /* fall through to Stripe's own read below */ }
+    if (!cancelAtPeriodEnd) return false;
+    // Stripe refuses any cancel_at_period_end update on a subscription that
+    // has already ended (HTTP 400). A billing_reconcile job queued for such
+    // a subscription then failed every minute, forever (2026-10-15..29: four
+    // jobs on two ended subscriptions, ~16,000 attempts each). An ended
+    // subscription can bill nothing more, which is all the cancellation was
+    // for, so confirm it from a fresh read of that exact subscription only.
+    try {
+      const read = await this.stripeFetch(url, { method: "GET", headers: { authorization: `Bearer ${key}` } });
+      if (!read.ok) return false;
+      const body = JSON.parse(await read.text()) as { id?: unknown; status?: unknown };
+      if (body.id !== subscriptionId || (body.status !== "canceled" && body.status !== "incomplete_expired")) return false;
+      this.log(`[hosting] Stripe subscription ${subscriptionId} has already ended (${String(body.status)}); its cancellation request is complete`);
+      return true;
     } catch { return false; }
   }
 

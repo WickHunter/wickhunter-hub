@@ -151,8 +151,8 @@ export interface InvoiceFacts {
    *  subscription's own `current_period_end`, which moved in 2025. */
   periodEndMs: number | null;
   /** Every price/product id named on the invoice's own lines — a line's
-   *  `price` object is inline in the webhook payload (no fetch needed) and
-   *  is what the billing-role dispatcher (roles.ts) classifies this event
+   *  `price` object (pre-basil) or `pricing.price_details` (basil and
+   *  later) is inline in the webhook payload (no fetch needed) and is what the billing-role dispatcher (roles.ts) classifies this event
    *  against. Deduplicated; empty when no line carries a readable price. */
   priceIds: string[];
   productIds: string[];
@@ -178,10 +178,18 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
     const l = asObj(line);
     const end = asNum(asObj(l.period).end);
     if (end !== null && (periodEnd === null || end > periodEnd)) periodEnd = end;
+    // Pre-basil lines carry an inline `price` object. From 2025-03-31.basil
+    // (the live endpoint renders 2026-08-26.dahlia) `price` is null and the
+    // ids live under `pricing.price_details`. Reading only `price` left every
+    // live invoice with no ids, so the role dispatcher fell back to the role
+    // index, which an initial invoice that arrives before its
+    // checkout.session.completed cannot have yet: the paid term was recorded
+    // "unclassified", marked seen and never applied (2026-10-23).
     const price = asObj(l.price);
-    const priceId = asStr(price.id);
+    const details = asObj(asObj(l.pricing).price_details);
+    const priceId = asId(l.price) || asId(details.price);
     if (priceId) priceIds.add(priceId);
-    const productId = asId(price.product);
+    const productId = asId(price.product) || asId(details.product);
     if (productId) productIds.add(productId);
   }
   // 2025-03-31.basil moved `invoice.subscription` under `parent`; read both.
