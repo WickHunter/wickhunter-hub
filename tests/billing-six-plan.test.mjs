@@ -176,7 +176,7 @@ await test('concurrent mixed-plan hosted admission permits 30 buyers, refuses31,
   const results=await Promise.all(buyers.map(b=>c.checkout(b.plan,true,{attemptId:b.attemptId})));
   assert.equal(results.filter(r=>r.status===200).length,30);assert.equal(results.filter(r=>r.status===503).length,1);
   const refused=results.find(r=>r.status===503);assert.equal(refused.body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(refused.body.retryAfterSeconds,60);assert.match(refused.body.error,/temporarily at capacity/);
-  assert.equal(c.sessions.size,30);assert.equal(c.h.hub.hosting.store.instances().length,30);assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:30000});
+  assert.equal(c.sessions.size,30);assert.equal(c.h.hub.hosting.store.instances().length,30);assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:45000});
   const acceptedIndex=results.findIndex(r=>r.status===200),buyer=buyers[acceptedIndex];
   assert.equal((await c.checkout(buyer.plan,true,{attemptId:buyer.attemptId})).body.url,results[acceptedIndex].body.url);assert.equal(c.sessions.size,30);
   const direct=await fetch(c.h.origin+'/buy?plan=lifetime&hosting=true',{redirect:'manual'});assert.equal(direct.status,503);assert.equal(direct.headers.get('retry-after'),'60');assert.equal(direct.headers.get('cache-control'),'no-store');assert.equal((await direct.json()).code,'HOSTED_CHECKOUT_CAPACITY');
@@ -185,16 +185,16 @@ await test('concurrent mixed-plan hosted admission permits 30 buyers, refuses31,
   assert.equal(c.h.hub.hosting.store.instances().filter(r=>r.stage==='ordered').length,30);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
 await test('provider cost ceiling refuses hosted admission before30 without changing or charging existing reservations',async()=>{
-  const c=await setup({costCeiling:5000}),attemptId=randomUUID();let first;
+  const c=await setup({costCeiling:7500}),attemptId=randomUUID();let first;
   for(let i=0;i<5;i++){const r=await c.checkout(['monthly','yearly','lifetime'][i%3],true,i===0?{attemptId}:{});assert.equal(r.status,200);first??=r.body.url;}
-  assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:5000});
+  assert.deepEqual(c.h.hub.hosting.projectedMonthlyProviderCostCents(),{known:true,cents:7500});
   const before=c.h.hub.hosting.store.instances();const refused=await c.checkout('lifetime',true);
   assert.equal(refused.status,503);assert.equal(refused.body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(refused.body.retryAfterSeconds,60);
   assert.deepEqual(c.h.hub.hosting.store.instances(),before);assert.equal(c.sessions.size,5);
   assert.equal((await c.checkout('monthly',true,{attemptId})).body.url,first);assert.equal(c.sessions.size,5);assert.equal(c.provider.createCalls.length,0);await c.h.close();
 });
 await test('hosted /buy inactive referral fallback retains stable capacity503 and Retry-After',async()=>{
-  const c=await setup({costCeiling:1000});assert.equal((await c.checkout()).status,200);
+  const c=await setup({costCeiling:1500});assert.equal((await c.checkout()).status,200);
   const configured=await jsonReq(c.h.origin+'/admin/api/earn/stripe-configure',{method:'POST',headers:{'x-hub-admin':'test-admin-token','x-wh-earn':'1','content-type':'application/json'},body:JSON.stringify({enabled:true,mode:'live'})});assert.equal(configured.status,200);
   const response=await fetch(c.h.origin+'/buy?plan=lifetime&hosting=true&ref=INACTIVE_OFFER',{redirect:'manual'}),body=await response.json();
   assert.equal(response.status,503);assert.equal(body.code,'HOSTED_CHECKOUT_CAPACITY');assert.equal(body.retryAfterSeconds,60);

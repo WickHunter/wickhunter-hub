@@ -3224,6 +3224,7 @@ document.getElementById("billingEventsRefresh").onclick = billingEventsRefresh;
 // ── hosting (H4/H5/H6) ──────────────────────────────────────────────────
 const HOSTING_POLICY_NUMBER_FIELDS = [
   ["monthlyPriceCents", "Monthly price (cents)", "Proposed price — see the delivery report for the launch-input status."],
+  ["minimumMonthlyMarginCents", "Minimum margin over provider cost (cents/mo)", "Checkout and provisioning refuse a plan whose verified cost plus this margin exceeds the monthly price. Default 300."],
   ["renewalGraceHours", "Renewal grace (hours)", "Nonpayment grace before suspension. Default 72."],
   ["retentionHours", "Retention (hours)", "How long a suspended instance is retained before deletion. Default 168."],
   ["readinessRecheckHours", "Readiness recheck (hours)", "How often a ready instance's region is re-probed."],
@@ -3241,8 +3242,8 @@ function renderHostingPolicyCard(policy, secrets) {
     input.value = policy[name] != null ? policy[name] : "";
     wrap.appendChild(billingConfigField(label, input, help));
   }
-  wrap.appendChild(billingConfigField("Plan id", billingTextField("planId", policy.planId, "vc2-1c-2gb")));
-  wrap.appendChild(billingConfigField("Plan label", billingTextField("planLabel", policy.planLabel, "1 vCPU / 2 GB RAM / 55 GB SSD")));
+  wrap.appendChild(billingConfigField("Plan id", billingTextField("planId", policy.planId, "vc2-2c-2gb")));
+  wrap.appendChild(billingConfigField("Plan label", billingTextField("planLabel", policy.planLabel, "2 vCPU / 2 GB RAM / 65 GB SSD")));
   wrap.appendChild(billingConfigField("OS id", billingTextField("osId", policy.osId, "required before provisioning can be enabled")));
   wrap.appendChild(billingConfigField("Release ref", billingTextField("releaseRef", policy.releaseRef, "the signed customer artifact SHA-256 — never “latest”")));
   wrap.appendChild(billingConfigField("Provider account ref", billingTextField("providerAccountRef", policy.providerAccountRef, "")));

@@ -14,9 +14,11 @@
 // deliberately NOT defaulted-to for a Binance USD-M customer until a live
 // readiness probe from a box in that region actually returns 200 (Binance's
 // documented NL/DE futures withdrawal is a real, unverified-by-IP risk).
-// Plan `vc2-1c-2gb` (1 vCPU / 2 GB / 55 GB SSD, $10/mo at the time of that
-// research) — the 1 GB floor is disqualified by this repo's own v0.90.63
-// crash-loop incident (CLAUDE.md, liqhunter-private).
+// Plan `vc2-2c-2gb` (2 vCPU / 2 GB / 65 GB SSD, $15/mo on the live Vultr
+// catalogue 2026-10-29, available in nrt and itm) since v0.4.100, by operator
+// decision; it was `vc2-1c-2gb` (1 vCPU, $10/mo) before. The 1 GB floor is
+// disqualified by this repo's own v0.90.63 crash-loop incident (CLAUDE.md,
+// liqhunter-private). Instances keep the plan they were reserved with.
 import path from "node:path";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
 
@@ -80,15 +82,32 @@ export const DEFAULT_REGIONS: readonly HostingRegion[] = Object.freeze([
   { id: "itm", label: "Osaka" },
 ]);
 
-export const DEFAULT_PLAN_ID = "vc2-1c-2gb";
-export const DEFAULT_MONTHLY_PRICE_CENTS = 2000; // 2x the verified $10/month provider plan
+export const DEFAULT_PLAN_ID = "vc2-2c-2gb";
+export const DEFAULT_PLAN_LABEL = "2 vCPU / 2 GB RAM / 65 GB SSD";
+export const DEFAULT_MONTHLY_PRICE_CENTS = 2000; // approved $20 retail (operator, unchanged in v0.4.100)
+/** Retail must cover the provider's monthly cost plus at least this margin. */
+export const DEFAULT_MINIMUM_MONTHLY_MARGIN_CENTS = 300;
+
+/** v0.4.100 — replaces the old "retail must equal exactly twice the provider
+ *  cost" rule (operator decision 2026-10-29). A plan whose verified cost plus
+ *  the configured margin exceeds retail is still refused, so the Hub never
+ *  sells hosting at a loss; any unverified (non-integer, zero or negative)
+ *  cost is refused rather than treated as zero. */
+export function hostingPriceCoversCost(priceCents: unknown, costCents: unknown, marginCents: unknown): boolean {
+  return Number.isSafeInteger(priceCents) && Number.isSafeInteger(costCents) && Number.isSafeInteger(marginCents)
+    && (costCents as number) > 0 && (marginCents as number) >= 0
+    && (priceCents as number) >= (costCents as number) + (marginCents as number);
+}
 
 export interface HostingPolicy {
   version: number;
   currency: "usd";
   /** Retail price. Customer-bound checkout verifies this against Stripe and
-   *  requires it to equal twice the provider's current monthly plan quote. */
+   *  requires it to cover the provider's current monthly plan quote plus
+   *  `minimumMonthlyMarginCents` (hostingPriceCoversCost). */
   monthlyPriceCents: number;
+  /** Minimum monthly margin of retail over the verified provider cost. */
+  minimumMonthlyMarginCents: number;
   renewalGraceHours: number;
   retentionHours: number;
   reminderHoursBeforeDelete: readonly number[];
@@ -155,6 +174,7 @@ export function defaultHostingPolicy(): HostingPolicy {
     version: 1,
     currency: "usd",
     monthlyPriceCents: DEFAULT_MONTHLY_PRICE_CENTS,
+    minimumMonthlyMarginCents: DEFAULT_MINIMUM_MONTHLY_MARGIN_CENTS,
     renewalGraceHours: 72,
     retentionHours: 168,
     reminderHoursBeforeDelete: [72, 24],
@@ -164,7 +184,7 @@ export function defaultHostingPolicy(): HostingPolicy {
     managedBackupsIncluded: false,
     regions: DEFAULT_REGIONS,
     planId: DEFAULT_PLAN_ID,
-    planLabel: "1 vCPU / 2 GB RAM / 55 GB SSD",
+    planLabel: DEFAULT_PLAN_LABEL,
     probeVenues: DEFAULT_PROBE_VENUES,
     readinessRecheckHours: 24,
     provisioningEnabled: false,
@@ -221,6 +241,11 @@ export function readHostingPolicy(dataDir: string): HostingPolicy {
     version: num(raw.version, d.version),
     currency: "usd",
     monthlyPriceCents: num(raw.monthlyPriceCents, d.monthlyPriceCents),
+    // Absent keeps the default; a present but malformed margin is not
+    // silently accepted as a smaller one — it reads as the default floor.
+    minimumMonthlyMarginCents: Number.isSafeInteger(raw.minimumMonthlyMarginCents) && (raw.minimumMonthlyMarginCents as number) >= 0
+      ? raw.minimumMonthlyMarginCents as number
+      : d.minimumMonthlyMarginCents,
     renewalGraceHours: num(raw.renewalGraceHours, d.renewalGraceHours),
     retentionHours: num(raw.retentionHours, d.retentionHours),
     reminderHoursBeforeDelete: reminders,
@@ -298,6 +323,7 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
     if (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 10_000_000) throw new HostingPolicyError("monthlyPriceCents must be a whole number of cents");
     next.monthlyPriceCents = n as number;
   }
+  if (p.minimumMonthlyMarginCents !== undefined) next.minimumMonthlyMarginCents = intField(p.minimumMonthlyMarginCents, 0, 10_000_000, "minimumMonthlyMarginCents");
   if (p.renewalGraceHours !== undefined) next.renewalGraceHours = intField(p.renewalGraceHours, 0, 24 * 30, "renewalGraceHours");
   if (p.retentionHours !== undefined) next.retentionHours = intField(p.retentionHours, 0, 24 * 365, "retentionHours");
   if (p.reminderHoursBeforeDelete !== undefined) {

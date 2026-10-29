@@ -134,7 +134,13 @@ export class FakeProvider implements HostingProvider {
   private readonly now: () => number;
   private timeoutArmed: boolean;
   readonly regions: ProviderRegion[] = [{ id: "nrt", label: "Tokyo" }, { id: "itm", label: "Osaka" }];
-  readonly plans: ProviderPlan[] = [{ id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 }];
+  // Index 0 is the default plan (vc2-2c-2gb, Vultr's live $15 quote on
+  // 2026-10-29). The former default vc2-1c-2gb stays listed so instances
+  // reserved under it still find their own plan.
+  readonly plans: ProviderPlan[] = [
+    { id: "vc2-2c-2gb", vcpus: 2, ramMb: 2048, diskGb: 65, monthlyCostCents: 1500 },
+    { id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 },
+  ];
   /** Calls made, for a test to assert exactly-once creation across a crash
    *  simulation. */
   createCalls: CreateInstanceRequest[] = [];
@@ -196,6 +202,8 @@ export class FakeProvider implements HostingProvider {
 export type HttpLike = (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ status: number; ok: boolean; text: () => Promise<string> }>;
 
 const VULTR_API_BASE = "https://api.vultr.com/v2";
+const PLAN_PAGE_SIZE = 500;
+const MAX_PLAN_PAGES = 20;
 export const DEFAULT_VULTR_REQUEST_TIMEOUT_MS = 20_000;
 
 /** The real adapter. Constructed only when an operator has supplied a Vultr
@@ -253,10 +261,27 @@ export class VultrProvider implements HostingProvider {
     return rows.map((x: any) => ({ id: String(x.id), label: String(x.city ?? x.id) }));
   }
 
+  /** v0.4.100 — pages through the whole catalogue. Vultr returns 100 plans
+   *  per page by default (138 on 2026-10-29), so a single unpaged GET could
+   *  silently miss the configured plan. Every page must succeed; a cursor
+   *  that repeats or a catalogue past MAX_PLAN_PAGES is refused, never
+   *  truncated into a partial list. */
   async listPlans(): Promise<ProviderPlan[]> {
-    const r = await this.call("GET", "/plans");
-    if (r.status >= 300 || !Array.isArray(r.json?.plans)) throw new Error(`vultr listPlans: HTTP ${r.status} returned no plan list`);
-    return r.json.plans.map((x: any) => {
+    const rows: any[] = [];
+    const seen = new Set<string>();
+    let cursor = "";
+    for (let page = 1; ; page++) {
+      if (page > MAX_PLAN_PAGES) throw new Error(`vultr listPlans: more than ${MAX_PLAN_PAGES} pages`);
+      const r = await this.call("GET", `/plans?per_page=${PLAN_PAGE_SIZE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      if (r.status >= 300 || !Array.isArray(r.json?.plans)) throw new Error(`vultr listPlans: HTTP ${r.status} returned no plan list`);
+      rows.push(...r.json.plans);
+      const next = r.json?.meta?.links?.next;
+      if (next === undefined || next === null || next === "") break;
+      if (typeof next !== "string" || seen.has(next)) throw new Error("vultr listPlans: invalid or repeated page cursor");
+      seen.add(next);
+      cursor = next;
+    }
+    return rows.map((x: any) => {
       const rawCost = x.monthly_cost;
       const validType = typeof rawCost === "number" ||
         (typeof rawCost === "string" && /^\d+(?:\.\d+)?$/.test(rawCost.trim()));

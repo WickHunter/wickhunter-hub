@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { freshHub, test, summary } from "./helpers.mjs";
 import { exceptionEmail } from "../dist/src/hosting/emails.js";
 import { VultrProvider } from "../dist/src/hosting/provider.js";
+import { applyHostingPolicyPatch, defaultHostingPolicy, hostingPriceCoversCost, readHostingPolicy, HOSTING_POLICY_FILE, DEFAULT_PLAN_ID, DEFAULT_PLAN_LABEL } from "../dist/src/hosting/policy.js";
 import { fetchBoundedPublicHealth, HostingService } from "../dist/src/hosting/service.js";
 
 await test("public health transport refuses redirects and streamed bodies over 4096 bytes", async () => {
@@ -289,6 +290,69 @@ await test("public hosting options are CORS-readable and fail closed while the m
   } finally {
     await h.close();
   }
+});
+
+await test("price rule: retail must cover the verified provider cost plus the minimum margin", () => {
+  assert.equal(hostingPriceCoversCost(2000, 1500, 300), true, "$20 over the $15 2 vCPU plan");
+  assert.equal(hostingPriceCoversCost(2000, 1000, 300), true, "$20 over the former $10 plan");
+  assert.equal(hostingPriceCoversCost(2000, 1700, 300), true, "exactly cost + margin");
+  assert.equal(hostingPriceCoversCost(2000, 1701, 300), false, "one cent inside the margin");
+  assert.equal(hostingPriceCoversCost(2000, 2400, 300), false, "provider cost above retail (a loss)");
+  assert.equal(hostingPriceCoversCost(2000, 1500, 0), true);
+  for (const cost of [0, -1, null, undefined, NaN, 15.5, "1500"]) assert.equal(hostingPriceCoversCost(2000, cost, 300), false, `unverified cost ${String(cost)}`);
+  for (const margin of [-1, null, NaN, 1.5]) assert.equal(hostingPriceCoversCost(2000, 1500, margin), false, `bad margin ${String(margin)}`);
+  assert.equal(hostingPriceCoversCost(null, 1500, 300), false);
+});
+
+await test("default policy: vc2-2c-2gb, its label, $20 retail and a 300c margin; the data file still overrides", () => {
+  const d = defaultHostingPolicy();
+  assert.equal(DEFAULT_PLAN_ID, "vc2-2c-2gb");
+  assert.equal(d.planId, "vc2-2c-2gb");
+  assert.equal(d.planLabel, DEFAULT_PLAN_LABEL);
+  assert.equal(d.planLabel, "2 vCPU / 2 GB RAM / 65 GB SSD");
+  assert.equal(d.monthlyPriceCents, 2000);
+  assert.equal(d.minimumMonthlyMarginCents, 300);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wh-hosting-policy-"));
+  try {
+    // The deployed 0.4.99 file shape: old plan, no margin field.
+    fs.writeFileSync(path.join(dir, HOSTING_POLICY_FILE), JSON.stringify({ planId: "vc2-1c-2gb", planLabel: "1 vCPU / 2 GB / 55 GB", monthlyPriceCents: 2000 }));
+    const old = readHostingPolicy(dir);
+    assert.equal(old.planId, "vc2-1c-2gb", "an existing data file keeps its plan until edited");
+    assert.equal(old.minimumMonthlyMarginCents, 300);
+    for (const bad of [-1, 1.5, "300", null]) {
+      fs.writeFileSync(path.join(dir, HOSTING_POLICY_FILE), JSON.stringify({ minimumMonthlyMarginCents: bad }));
+      assert.equal(readHostingPolicy(dir).minimumMonthlyMarginCents, 300, `malformed margin ${JSON.stringify(bad)} never reads as a smaller one`);
+    }
+    fs.writeFileSync(path.join(dir, HOSTING_POLICY_FILE), JSON.stringify({ minimumMonthlyMarginCents: 0 }));
+    assert.equal(readHostingPolicy(dir).minimumMonthlyMarginCents, 0, "an explicit zero is kept");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  assert.equal(applyHostingPolicyPatch(d, { minimumMonthlyMarginCents: 450 }).minimumMonthlyMarginCents, 450);
+  for (const bad of [-1, 1.5, true, "x"]) assert.throws(() => applyHostingPolicyPatch(d, { minimumMonthlyMarginCents: bad }), /minimumMonthlyMarginCents/);
+});
+
+await test("Vultr plan lookup pages through the whole catalogue with per_page and the returned cursor", async () => {
+  const urls = [];
+  const page1 = { plans: [{ id: "vc2-1c-2gb", vcpu_count: 1, ram: 2048, disk: 55, monthly_cost: 10 }], meta: { total: 2, links: { next: "bmV4dA==", prev: "" } } };
+  const page2 = { plans: [{ id: "vc2-2c-2gb", vcpu_count: 2, ram: 2048, disk: 65, monthly_cost: 15 }], meta: { total: 2, links: { next: "", prev: "cHJldg==" } } };
+  const provider = new VultrProvider("test-key", async (url) => {
+    urls.push(url);
+    const body = url.includes("cursor=") ? page2 : page1;
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  });
+  const plans = await provider.listPlans();
+  assert.deepEqual(plans.map((p) => [p.id, p.monthlyCostCents]), [["vc2-1c-2gb", 1000], ["vc2-2c-2gb", 1500]], "the page-2 plan is found");
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /\/plans\?per_page=500$/);
+  assert.match(urls[1], /\/plans\?per_page=500&cursor=bmV4dA%3D%3D$/);
+
+  const looping = new VultrProvider("test-key", async () => ({ ok: true, status: 200, text: async () => JSON.stringify(page1) }));
+  await assert.rejects(() => looping.listPlans(), /repeated page cursor/, "a cursor that repeats is refused, never looped or truncated");
+
+  let n = 0;
+  const failing = new VultrProvider("test-key", async () => (++n === 1
+    ? { ok: true, status: 200, text: async () => JSON.stringify(page1) }
+    : { ok: false, status: 500, text: async () => "{}" }));
+  await assert.rejects(() => failing.listPlans(), /HTTP 500 returned no plan list/, "a failed later page fails the whole lookup");
 });
 
 summary("hosting-guardrails");
