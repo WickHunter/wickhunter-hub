@@ -144,6 +144,16 @@ export interface InvoiceFacts {
   subscriptionId: string;
   chargeId: string;
   paymentIntentId: string;
+  /** Every charge / PaymentIntent id this invoice's payload names: the
+   *  pre-basil top-level `charge` and `payment_intent`, plus (2025-03-31.basil
+   *  and later, including the live 2026-08-26.dahlia) each inline
+   *  `payments.data[].payment` — its `payment_intent` (id or expanded object,
+   *  with that object's `latest_charge`) and its `charge`. Basil removed the
+   *  top-level fields, and `payments` is includable only, so an ordinary
+   *  webhook payload carries none of these; a refund or dispute on such a
+   *  charge is resolved through Stripe's invoice payments instead
+   *  (BillingService.resolveUnknownCharge). Deduplicated, blanks removed. */
+  paymentIds: string[];
   billingReason: string;
   paid: boolean;
   /** The latest `period.end` across the invoice's lines — what the customer
@@ -197,6 +207,15 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
   const subscriptionId = asId(o.subscription) || asId(asObj(parent.subscription_details).subscription);
   const subDetailsMeta = strMap(asObj(o.subscription_details).metadata);
   const parentSubDetailsMeta = strMap(asObj(parent.subscription_details).metadata);
+  const paymentIds = new Set<string>([asId(o.charge), asId(o.payment_intent)]);
+  const payments = asObj(o.payments);
+  for (const row of Array.isArray(payments.data) ? payments.data : []) {
+    const payment = asObj(asObj(row).payment);
+    paymentIds.add(asId(payment.payment_intent));
+    paymentIds.add(asId(asObj(payment.payment_intent).latest_charge));
+    paymentIds.add(asId(payment.charge));
+  }
+  paymentIds.delete("");
   const firstLine = data.length > 0 ? asObj(data[0]) : {};
   const firstLineMeta = strMap(firstLine.metadata);
   const metadata = Object.keys(subDetailsMeta).length ? subDetailsMeta
@@ -210,6 +229,7 @@ export function invoiceFacts(o: Obj): InvoiceFacts {
     subscriptionId,
     chargeId: asId(o.charge),
     paymentIntentId: asId(o.payment_intent),
+    paymentIds: [...paymentIds],
     billingReason: asStr(o.billing_reason),
     paid: o.paid === true || asStr(o.status) === "paid",
     periodEndMs: periodEnd === null ? null : periodEnd * 1000,
