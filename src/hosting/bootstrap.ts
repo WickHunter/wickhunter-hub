@@ -32,6 +32,13 @@ export interface BootstrapInput {
   probeVenues: readonly ProbeVenue[];
 }
 
+/** The fleet's GC tuning for the customer app's unit. Keep these three in
+ *  step with templates/install.sh's verify_existing_unit, which tolerates
+ *  exactly this drop-in (path, bytes and resulting Environment) on a rerun. */
+export const GC_TUNING_DIR = "/etc/systemd/system/wickhunter.service.d";
+export const GC_TUNING_ENVIRONMENT = "NODE_OPTIONS=--max-semi-space-size=32";
+export const GC_TUNING_CONTENT = `[Service]\nEnvironment=${GC_TUNING_ENVIRONMENT}\n`;
+
 function shellSingleQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
@@ -161,7 +168,35 @@ systemctl_retry() {
   done
 }
 # END HOSTING SYSTEMCTL RETRY HELPER
+
+# BEGIN HOSTING GC TUNING
+# The fleet's V8 young-generation tuning, as its own systemd drop-in. Written
+# only AFTER the signed installer succeeded: the installer's rerun/recovery
+# path verifies the unit and tolerates exactly this one drop-in, but a drop-in
+# present before a fresh install would turn attempt 2/3 into a recovery run.
+# No stop-timeout setting here: the app updater writes its own runtime stop-budget
+# drop-in for each update and must keep owning that value.
+install -d -m 755 ${GC_TUNING_DIR}
+cat > ${GC_TUNING_DIR}/gc-tuning.conf.tmp <<'WH_GC_TUNING'
+${GC_TUNING_CONTENT}WH_GC_TUNING
+chmod 644 ${GC_TUNING_DIR}/gc-tuning.conf.tmp
+mv -f ${GC_TUNING_DIR}/gc-tuning.conf.tmp ${GC_TUNING_DIR}/gc-tuning.conf
+# END HOSTING GC TUNING
 systemctl_retry daemon-reload
+[ "$(systemctl show wickhunter --property=Environment)" = 'Environment=${GC_TUNING_ENVIRONMENT}' ] \\
+  || { echo "GC tuning drop-in was not applied to wickhunter.service" >&2; exit 1; }
+# Restart once so the running app picks the tuning up, then require a fresh
+# healthy app of the installed version before any readiness is reported.
+timeout 330s systemctl restart wickhunter || { echo "wickhunter did not restart with GC tuning" >&2; exit 1; }
+WH_APP_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' /opt/wickhunter/package.json)
+gc_healthy=0
+for _try in $(seq 1 60); do
+  body=$(curl -q -fsS --max-time 5 http://127.0.0.1:8090/api/health 2>/dev/null || true)
+  if node -e 'const [r,v]=process.argv.slice(1);try{const x=JSON.parse(r);process.exit(x.ok===true&&x.version===v?0:1)}catch{process.exit(1)}' "$body" "$WH_APP_VERSION"; then gc_healthy=1; break; fi
+  sleep 5
+done
+[ "$gc_healthy" -eq 1 ] || { echo "wickhunter did not become healthy after the GC tuning restart" >&2; exit 1; }
+unset body WH_APP_VERSION gc_healthy
 systemctl_retry enable --now wickhunter-hosting-readiness.timer >/dev/null
 systemctl_retry is-enabled wickhunter-hosting-readiness.timer >/dev/null
 systemctl_retry is-active wickhunter-hosting-readiness.timer >/dev/null

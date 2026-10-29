@@ -1,3 +1,9 @@
+## v0.4.100 — GC tuning on new hosted servers; installer reruns accept it
+
+- **New hosted servers get the fleet's GC tuning.** After the signed installer succeeds, the hosting bootstrap writes `/etc/systemd/system/wickhunter.service.d/gc-tuning.conf` (`[Service]` / `Environment=NODE_OPTIONS=--max-semi-space-size=32`, no stop-timeout setting — the app updater owns that), reloads systemd, verifies the unit's Environment, restarts the app once and requires a fresh healthy app of the installed version before it reports readiness. Existing hosted servers are not touched.
+- **Installer reruns tolerate exactly that drop-in.** The rerun/recovery check still refuses any other drop-in or unit environment; the only accepted extra is that path with those exact bytes (a V8 heap flag, never a preload) and that one Environment entry. Fleet boxes that already carry the drop-in were refused by a rerun before this release.
+- **Test provider lists Vultr's 2 vCPU / 2 GB plan** (`vc2-2c-2gb`, $15/month) next to the default. The default hosting plan is unchanged: switching it requires a pricing decision, because hosting checkout requires the retail price to equal twice the provider cost.
+
 ## v0.4.99 — Candle snapshots off the event loop; health counts the served window
 
 - **Snapshot builds no longer block the Hub.** The `/api/candles/snapshot` fold (up to ~2 minutes for a 30-day daily window over ~800 pairs, during which every other request waited and nginx's 75 s upstream timeout fired) now runs in a worker thread that holds no key material; the main thread signs the canonical bytes. The fold reads day-file buffers directly instead of materialising a Candle and Row for every held minute, with a test proving the served bytes equal the previous build's exactly. Concurrent requests for one venue/interval/depth share a single build, at most two folds run at once, and a failed or timed-out worker answers 503 (a complete answer already held for the same window is kept) — partial data is never served. The v1 wire contract (paths, auth, fields, signature, ETag, gzip, status codes) is unchanged.
@@ -2020,6 +2026,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.100 — New hosted servers get the fleet GC tuning drop-in (`NODE_OPTIONS=--max-semi-space-size=32`) after install, with a restart and fresh health proof; installer reruns tolerate exactly that drop-in; default hosting plan unchanged.
 - v0.4.99 — 1m snapshots now pass the app's verifier (settle lag capped at one bucket); snapshot folds run in a worker thread with single-flight and an unchanged-retry hold (identical v1 bytes); unanswerable repairs back off; Bitget paced at 5/s with refused-rate memory; candle health counts gaps inside the 30-day served window separately from older ones.
 - v0.4.98 — Recognize validated crypto `py_` charge IDs in referral purchase status while preserving every payment/refund guard.
 - v0.4.97 — Retry one transient Stripe GET failure without replaying writes or accepting incomplete referral evidence.

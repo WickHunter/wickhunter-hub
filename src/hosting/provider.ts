@@ -134,7 +134,12 @@ export class FakeProvider implements HostingProvider {
   private readonly now: () => number;
   private timeoutArmed: boolean;
   readonly regions: ProviderRegion[] = [{ id: "nrt", label: "Tokyo" }, { id: "itm", label: "Osaka" }];
-  readonly plans: ProviderPlan[] = [{ id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 }];
+  // vc2-2c-2gb mirrors Vultr's live 2 vCPU / 2 GB quote (2026-10-29), so a
+  // policy that selects it has fixture coverage; index 0 stays the default.
+  readonly plans: ProviderPlan[] = [
+    { id: "vc2-1c-2gb", vcpus: 1, ramMb: 2048, diskGb: 55, monthlyCostCents: 1000 },
+    { id: "vc2-2c-2gb", vcpus: 2, ramMb: 2048, diskGb: 65, monthlyCostCents: 1500 },
+  ];
   /** Calls made, for a test to assert exactly-once creation across a crash
    *  simulation. */
   createCalls: CreateInstanceRequest[] = [];

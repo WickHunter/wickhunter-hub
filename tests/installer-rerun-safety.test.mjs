@@ -277,4 +277,41 @@ await test('minimal135 and172 health cannot bypass absent, stale, foreign or cha
   const f=fixture('active',version);try{const deadline=kind==='generation'?12:2,code=f.code.replace('HEALTH_DEADLINE_SECONDS=45','HEALTH_DEADLINE_SECONDS='+deadline);const r=run(f,code,{READINESS:kind},true);assert.notEqual(r.status,0,version+':'+kind);assert.ok(r.stderr.includes('within '+deadline+'s'),r.stderr);assert.ok(!fs.existsSync(f.env.STARTED));}finally{f.cleanup();}
  }
 });
+await test('the exact hosted/fleet GC tuning drop-in is the only drop-in a rerun tolerates',()=>{
+ const gcEnv='NODE_OPTIONS=--max-semi-space-size=32',gcBytes='[Service]\nEnvironment='+gcEnv+'\n';
+ const cases=[
+  ['exact',{},true],
+  ['exact-no-trailing-newline',{bytes:gcBytes.slice(0,-1)},true],
+  ['preload-env',{env:'NODE_OPTIONS=--require=/private/preload'},false],
+  ['extra-env',{env:gcEnv+' LD_PRELOAD=/private/x.so'},false],
+  ['extra-directive',{bytes:gcBytes+'ExecStartPre=/private/hook\n'},false],
+  ['timeout-override',{bytes:gcBytes+'TimeoutStopSec=900s\n'},false],
+  ['other-name',{name:'other.conf'},false],
+  ['second-dropin',{extraDropin:true},false],
+  ['symlink',{symlink:true},false],
+  ['missing-file',{missing:true},false],
+ ];
+ for(const [kind,o,pass] of cases){
+  const f=fixture('inactive');try{
+   const dir=f.env.UNIT_FILE+'.d',name=o.name??'gc-tuning.conf',file=path.join(dir,name);
+   fs.mkdirSync(dir);
+   if(o.symlink){fs.writeFileSync(path.join(f.dir,'elsewhere.conf'),gcBytes);fs.symlinkSync(path.join(f.dir,'elsewhere.conf'),file);}
+   else if(!o.missing)fs.writeFileSync(file,o.bytes??gcBytes);
+   const dropin=o.extraDropin?file+' /run/systemd/system/wickhunter.service.d/foreign.conf':file;
+   const before=f.snapshot(),r=run(f,f.code,{DROPIN:dropin,UNIT_ENV:o.env??gcEnv},false,'ENTRY=server.js; verify_existing_unit');
+   assert.equal(r.status===0,pass,kind+': '+r.stderr);
+   assert.deepEqual(f.snapshot(),before,kind);assert.ok(!fs.existsSync(f.env.STARTED),kind);
+  }finally{f.cleanup();}
+ }
+});
+await test('a recovery run of a GC-tuned stopped install starts it exactly once without mutation',()=>{
+ const f=fixture('inactive','0.90.172');try{
+  const dir=f.env.UNIT_FILE+'.d',file=path.join(dir,'gc-tuning.conf');
+  fs.mkdirSync(dir);fs.writeFileSync(file,'[Service]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n');
+  const before=f.snapshot(),r=run(f,f.code,{DROPIN:file,UNIT_ENV:'NODE_OPTIONS=--max-semi-space-size=32'},true);
+  assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/existing signed release recovered/);assert.deepEqual(f.snapshot(),before);
+  assert.equal(fs.readFileSync(file,'utf8'),'[Service]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n');
+  const ops=fs.readFileSync(f.env.OPS,'utf8');assert.equal(ops.split('\n').filter(x=>x==='start wickhunter').length,1);assert.doesNotMatch(ops,/restart|stop|UNSAFE/);
+ }finally{f.cleanup();}
+});
 summary('installer-rerun-safety');

@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { test, summary } from "./helpers.mjs";
-import { buildBootstrapUserData } from "../dist/src/hosting/bootstrap.js";
+import { buildBootstrapUserData, GC_TUNING_CONTENT, GC_TUNING_DIR, GC_TUNING_ENVIRONMENT } from "../dist/src/hosting/bootstrap.js";
 import { DEFAULT_PROBE_VENUES } from "../dist/src/hosting/policy.js";
 
 const input = {
@@ -203,6 +203,41 @@ await test("a venue url containing a single quote cannot break out of the shell 
   // The dangerous substring must be neutralised by shell single-quote
   // escaping (`'\''`), never left as a bare unescaped quote.
   assert.doesNotMatch(script, /example\.com\/'; rm -rf/);
+});
+
+await test("the fleet GC tuning drop-in is written only after a successful install, with no stop-timeout override", () => {
+  const script = commandOf(buildBootstrapUserData(input));
+  const begin = script.indexOf("# BEGIN HOSTING GC TUNING");
+  const end = script.indexOf("# END HOSTING GC TUNING");
+  assert.ok(begin > 0 && end > begin, "the GC tuning block is reviewable in cloud-init");
+  const block = script.slice(begin, end);
+  const heredoc = /<<'WH_GC_TUNING'\n([\s\S]*?)WH_GC_TUNING\n/.exec(block);
+  assert.ok(heredoc, "drop-in content is a quoted heredoc");
+  assert.equal(heredoc[1], "[Service]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n");
+  assert.equal(GC_TUNING_CONTENT, heredoc[1]);
+  assert.match(block, /mv -f \/etc\/systemd\/system\/wickhunter\.service\.d\/gc-tuning\.conf\.tmp \/etc\/systemd\/system\/wickhunter\.service\.d\/gc-tuning\.conf/);
+  assert.doesNotMatch(script, /TimeoutStopSec/, "the app updater owns the stop budget");
+  assert.equal(script.match(/NODE_OPTIONS/g).length, 2, "NODE_OPTIONS is set only by the drop-in (and checked once)");
+  const installRun = script.indexOf('bash "$INSTALLER"');
+  const installedCheck = script.indexOf('[ "$installed" -eq 1 ]');
+  assert.ok(installRun > 0 && installedCheck > installRun && begin > installedCheck, "a retried install never sees the drop-in as an existing-unit recovery");
+  const reload = script.indexOf("systemctl_retry daemon-reload", end);
+  const envCheck = script.indexOf("systemctl show wickhunter --property=Environment", reload);
+  const restart = script.indexOf("timeout 330s systemctl restart wickhunter", envCheck);
+  const health = script.indexOf("http://127.0.0.1:8090/api/health", restart);
+  const healthGate = script.indexOf('[ "$gc_healthy" -eq 1 ]', health);
+  const readinessPost = script.indexOf('"$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness"');
+  const mainProbes = script.lastIndexOf("https://api.bybit.com/v5/market/time");
+  assert.ok(reload > end && envCheck > reload && restart > envCheck && health > restart && healthGate > health, "reload, verify, restart, then a fresh healthy app");
+  assert.ok(mainProbes > healthGate && readinessPost > healthGate, "readiness is never reported for a box that did not come back healthy");
+  assert.match(script, /'Environment=NODE_OPTIONS=--max-semi-space-size=32'/);
+});
+
+await test("the installer's rerun check tolerates exactly the drop-in this bootstrap writes", () => {
+  const installer = fs.readFileSync(new URL("../templates/install.sh", import.meta.url), "utf8");
+  assert.ok(installer.includes('const gc=unit+".d/gc-tuning.conf",gcEnv="' + GC_TUNING_ENVIRONMENT + '"'));
+  assert.ok(installer.includes("/^\\[Service\\]\\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\\n?$/"), "same bytes the bootstrap writes");
+  assert.equal(GC_TUNING_DIR + "/gc-tuning.conf", "/etc/systemd/system/wickhunter.service.d/gc-tuning.conf");
 });
 
 summary("hosting-bootstrap");

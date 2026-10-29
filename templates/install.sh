@@ -177,8 +177,14 @@ try {
  // systemctl prints structured Exec arrays once per command; empty arrays
  // can be omitted even with --all. Only these four hooks permit omission.
  const hooksEmpty=["ExecStartPre","ExecStartPost","ExecCondition","ExecStopPost"].every(k=>!Object.hasOwn(s,k)||s[k]==="");
+ // The only tolerated drop-in is the fleet/hosted GC tuning: this exact
+ // path, these exact bytes (a V8 heap flag, never a preload), and exactly
+ // that one Environment entry. Any other drop-in or environment still fails.
+ const gc=unit+".d/gc-tuning.conf",gcEnv="NODE_OPTIONS=--max-semi-space-size=32";
+ const gcOk=()=>{const fs=require("node:fs"),d=fs.lstatSync(unit+".d"),f=fs.lstatSync(gc);return d.isDirectory()&&!d.isSymbolicLink()&&f.isFile()&&!f.isSymbolicLink()&&/^\[Service\]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n?$/.test(fs.readFileSync(gc,"utf8"));};
+ const unitEnvOk=(s.DropInPaths===""&&s.Environment==="")||(s.DropInPaths===gc&&s.Environment===gcEnv&&gcOk());
  if(s.LoadState!=="loaded"||s.FragmentPath!==unit||s.WorkingDirectory!==app||s.NeedDaemonReload!=="no"||!["","root"].includes(s.User)
-   ||s.EnvironmentFiles!==env+" (ignore_errors=no)"||s.DropInPaths!==""||s.Environment!==""||!hooksEmpty||!m||m[1]!==node||![node+" "+entry,node+" "+app+"/"+entry].includes(m[2].trim()))throw Error();
+   ||s.EnvironmentFiles!==env+" (ignore_errors=no)"||!unitEnvOk||!hooksEmpty||!m||m[1]!==node||![node+" "+entry,node+" "+app+"/"+entry].includes(m[2].trim()))throw Error();
 } catch {console.error("installed unit does not match the verified server entry; no files changed");process.exit(1);}
 VERIFY_EXISTING_UNIT
 }
