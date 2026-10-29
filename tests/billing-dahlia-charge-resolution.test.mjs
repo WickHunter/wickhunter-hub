@@ -225,7 +225,7 @@ await test("fail closed: an unreadable or malformed Stripe answer is a 500 (not 
       ["Stripe 500", { "/v1/invoice_payments": new Response(JSON.stringify({ error: { code: "api_error" } }), { status: 500 }) }],
       ["no list", { "/v1/invoice_payments": {} }],
       ["row for another payment", { "/v1/invoice_payments": list([inpay(invoice.id, "pi_not_this_one")]) }],
-      ["invoice read fails", { "/v1/invoice_payments": list([inpay(invoice.id, pi)]) }],
+      ["invoice read fails", { "/v1/invoice_payments": list([inpay(invoice.id, pi)]), [`/v1/invoices/${invoice.id}`]: new Response(JSON.stringify({ error: { code: "api_error" } }), { status: 502 }) }],
     ]) {
       c.setRoutes(routes);
       const r = await c.post("charge.refunded", dahliaCharge({ id: ch, pi, customer: owner }));

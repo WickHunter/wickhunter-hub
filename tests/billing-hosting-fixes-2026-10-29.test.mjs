@@ -181,6 +181,32 @@ await test("an ineligible owner's running server follows its hosting subscriptio
   } finally { await c.h.close(); }
 });
 
+await test("end-only fail closed: an ineligible owner's 'cancels at period end' with no period end and no paid-through date schedules nothing (never an end at now) and logs once", async () => {
+  const c = await hub();
+  try {
+    const { instance } = await lapsedSoftwareWithServer(c);
+    const bs = c.h.hub.billing.store;
+    const host = bs.findRoleSubscriptionBySubscription("hosting", "sub_host_l");
+    bs.putRoleSubscription({ ...host, subscriptionStatus: "active (cancels at period end)", periodEndMs: null });
+    const row0 = instance();
+    assert.ok(c.h.hub.hosting.store.updateInstance(row0.id, row0.version, (d) => { d.paidThroughMs = null; }, c.now()));
+    for (let i = 0; i < 3; i++) { await c.tick(); c.advance(30_000); }
+    const row = instance();
+    assert.equal(row.stage, "ready", `pre-fix: cancel_scheduled with suspendAt = now (${row.suspendAtMs})`);
+    assert.equal(row.cancellationReason, null);
+    assert.equal(row.suspendAtMs, null);
+    assert.equal(row.deleteAtMs, null);
+    assert.equal(c.h.hub.hosting.store.outboxFor(row.id).filter(j => j.status === "pending" && (j.jobType === "suspend" || j.jobType === "delete")).length, 0);
+    assert.equal(c.logs.filter(l => l.includes("not scheduling the end of")).length, 1, "one journal line, not one per tick");
+    // A later signal with a real period end schedules the end from it.
+    const end = c.now() + 5 * DAY;
+    bs.putRoleSubscription({ ...bs.findRoleSubscriptionBySubscription("hosting", "sub_host_l"), periodEndMs: end });
+    await c.tick();
+    assert.equal(instance().stage, "cancel_scheduled");
+    assert.equal(instance().suspendAtMs, end);
+  } finally { await c.h.close(); }
+});
+
 await test("an ineligible owner whose hosting subscription Stripe already ended is scheduled for its nonpayment-shaped end, not left running", async () => {
   const c = await hub();
   try {

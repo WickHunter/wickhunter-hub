@@ -47,7 +47,7 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
-import { EarnStripeApi } from "../earn-stripe-api.js";
+import { EarnStripeApi, EarnStripeError } from "../earn-stripe-api.js";
 import { componentPriceId, softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
 
 import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
@@ -599,26 +599,103 @@ export class BillingService {
    *  charge's PaymentIntent (a dispute without one reads its charge first),
    *  then the invoice itself. A pre-basil `charge.invoice` is used directly.
    *
-   *  Returns null to continue the ordinary flow: the charge was already
-   *  known, no secret key is saved (today's behaviour), the ids are not
+   *  Returns null to continue the ordinary flow: the records already hold
+   *  the charge completely (`chargeHolding`; a role-index entry alone, or a
+   *  bundle charge held by its hosting record only, is not enough and is
+   *  re-resolved), no secret key is saved (today's behaviour), the ids are not
    *  readable Stripe ids, Stripe proves the payment funded no invoice, or the
    *  invoice belongs to no subscription this Hub records. Returns an
    *  `unclassified` result when the evidence is complete but ambiguous or
    *  conflicting (more than one page or invoice, a different customer or
-   *  mode, a role conflict); nothing is indexed then. Throws (500, Stripe
+   *  mode, a role conflict, a deterministic Stripe 4xx other than 408, 409
+   *  or 429); nothing is indexed then. Throws (500, Stripe
    *  retries, the event is not marked seen) when Stripe cannot be read or
    *  answers with something other than the requested objects. Never writes a
-   *  role or charge without the invoice that proves it. */
+   *  role or charge without the invoice that proves it, and writes the role
+   *  index only after the record(s) holding the charge are saved. */
   private async resolveUnknownCharge(ev: StripeEvent, cfg: BillingConfig): Promise<ApplyResult | null> {
     const refund = ev.type === "charge.refunded";
     const cf = refund ? chargeFacts(ev.object) : null;
     const df = refund ? null : disputeFacts(ev.object);
     const chargeId = cf ? cf.chargeId : df!.chargeId;
-    let paymentIntentId = cf ? cf.paymentIntentId : df!.paymentIntentId;
-    let invoiceId = cf?.invoiceId ?? "";
+    const paymentIntentId = cf ? cf.paymentIntentId : df!.paymentIntentId;
+    const invoiceId = cf?.invoiceId ?? "";
     const named = [chargeId, paymentIntentId, invoiceId].filter(Boolean);
     if (!named.length) return null;
-    if (this.roleFromIndex(named) || named.some(id => this.store.findByCharge(id) || this.store.findRoleSubscriptionByCharge("hosting", id))) return null;
+    const held = this.chargeHolding(named);
+    if (held.state === "held") return null;
+    if (held.state === "conflict") return { outcome: "unclassified", note: `${ev.type} on ${chargeId || paymentIntentId}: ${held.why} — recorded for reconciliation, applied to neither software nor hosting` };
+    // "unheld" (no record holds it — even when the role index already names
+    // it: a crash between the index write and the record write) and
+    // "partial" (a bundle with only one side holding it) re-run the
+    // resolution, whose writes are idempotent. A Lifetime bundle's VPS-only
+    // renewal is legitimately held by hosting alone: its re-run is best
+    // effort and any failure continues the ordinary flow exactly as before.
+    const lenient = held.state === "partial" && held.lenient;
+    try {
+      let r: ApplyResult | null;
+      try { r = await this.resolveChargeThroughInvoice(ev, cfg, chargeId, paymentIntentId, invoiceId); }
+      catch (err) {
+        // A deterministic refusal (404 resource_missing, 400, 401, 403 …)
+        // fails identically on every Stripe retry for ~3 days: park it with
+        // its status/code. 408, 409, 429, 5xx, transport errors and malformed
+        // answers still throw (500, not seen, Stripe retries).
+        if (!(err instanceof EarnStripeError) || err.status < 400 || err.status >= 500 || [408, 409, 429].includes(err.status)) throw err;
+        r = { outcome: "unclassified", note: `${ev.type} on ${chargeId || paymentIntentId}: Stripe answered ${err.status} ${err.code} while linking the charge to its invoice — recorded for reconciliation, applied to neither software nor hosting` };
+      }
+      if (r && lenient && r.outcome === "unclassified") { this.log(`[billing] ${ev.type} ${ev.id}: Lifetime bundle re-resolution parked (${r.note}); continuing with the recorded hosting charge`); return null; }
+      return r;
+    } catch (err) {
+      if (!lenient) throw err;
+      this.log(`[billing] ${ev.type} ${ev.id}: Lifetime bundle re-resolution failed (${(err as Error).message}); continuing with the recorded hosting charge`);
+      return null;
+    }
+  }
+
+  /** How completely the records already hold a refunded/disputed charge.
+   *  "held": every record that must hold it does, and (outside a bundle,
+   *  whose events never use the role index) the role index names it — the
+   *  ordinary flow can proceed. A record that holds it while the index is
+   *  missing (a crash after the record write, before the index write) is
+   *  repaired here from the record, as `migrateLegacySoftwareRoles` does.
+   *  "partial": a bundle subscription whose hosting record holds it but whose
+   *  software record does not (a crash or hosting-hook failure between the
+   *  two writes). "unheld": no record holds it. "conflict": the index names
+   *  a different role than the record holding it. */
+  private chargeHolding(named: readonly string[]): { state: "held" | "unheld" | "partial"; lenient?: boolean } | { state: "conflict"; why: string } {
+    let sw: CustomerRecord | null = null, host: RoleSubscriptionRecord | null = null;
+    for (const id of named) { sw ??= this.store.findByCharge(id); host ??= this.store.findRoleSubscriptionByCharge("hosting", id); }
+    if (!sw && !host) return { state: "unheld" };
+    if (host) {
+      const sub = host.subscriptionId ?? "";
+      const bound = sub ? this.store.getBundleSubscription(sub) : null;
+      const partner = sub ? this.store.findBySubscription(sub) ?? (bound ? this.store.getCustomer(bound.customerId) : null) : null;
+      if (bound || (partner && partner.key === host.customerKey)) {
+        if (partner && sw?.key !== partner.key) return { state: "partial", lenient: bound?.planKey === "lifetime" };
+        return { state: "held" };
+      }
+    }
+    const role: BillingRole = sw ? "software" : "hosting";
+    if (sw && host) return { state: "held" }; // two unrelated records: the existing flow decides, as before
+    if (sw?.subscriptionId) {
+      // A bundle's software record: bundle events never use the role index,
+      // so there is nothing to repair here and the existing flow decides.
+      const hostOfSub = this.store.findRoleSubscriptionBySubscription("hosting", sw.subscriptionId);
+      if (this.store.getBundleSubscription(sw.subscriptionId) || hostOfSub?.customerKey === sw.key) return { state: "held" };
+    }
+    const now = this.now();
+    for (const id of named) {
+      const known = this.store.roleFor(id);
+      if (known && known !== role) return { state: "conflict", why: `${id} is recorded under ${known} but held by a ${role} record` };
+    }
+    for (const id of named) {
+      if (role === "software" ? sw!.chargeIds.includes(id) : host!.chargeIds.includes(id)) this.store.noteRole(id, role, now);
+    }
+    return { state: "held" };
+  }
+
+  private async resolveChargeThroughInvoice(ev: StripeEvent, cfg: BillingConfig, chargeId: string, paymentIntentId: string, invoiceId: string): Promise<ApplyResult | null> {
+    const cf = ev.type === "charge.refunded" ? chargeFacts(ev.object) : null;
     const mode: BillingMode = ev.livemode ? "live" : "test";
     const secretKey = cfg.stripe[mode].secretKey;
     if (!secretKey) return null;
@@ -677,17 +754,27 @@ export class BillingService {
       // purchase on the initial mixed invoice; its hosting-only renewals
       // never index onto the software record (applyBundleEvent).
       const softwareLine = !bound || bound.planKey !== "lifetime" || f.priceIds.includes(bound.priceId);
-      if (host) { for (const id of ids) this.noteHostingCharge(host, id); this.saveHostingRecord(host); indexed.push("hosting"); }
-      if (sw && softwareLine) { for (const id of ids) this.noteCharge(sw, id); this.store.putCustomer(sw); indexed.push("software"); }
+      // Hosting first, software last: chargeHolding treats a bundle whose
+      // hosting record holds the charge but whose software record does not
+      // as a partial write (a crash or hosting-hook failure between the two)
+      // and re-runs this resolution, which only writes what is missing.
+      if (host) { if (ids.some(id => !host.chargeIds.includes(id))) { for (const id of ids) this.noteHostingCharge(host, id); this.saveHostingRecord(host); } indexed.push("hosting"); }
+      if (sw && softwareLine) { if (ids.some(id => !sw.chargeIds.includes(id))) { for (const id of ids) this.noteCharge(sw, id); this.store.putCustomer(sw); } indexed.push("software"); }
     } else {
       const fresh = classifyRole({ priceIds: f.priceIds, productIds: f.productIds, planRole: null }, cfg.roles[mode]);
       const role = fresh !== "unknown" ? fresh : this.roleFromIndex([invoiceId, f.subscriptionId]);
       if (!role) return park(`invoice ${invoiceId} could not be attributed to a product role`);
       const rec = role === "software" ? sw : host;
       if (!rec) return null;
-      for (const id of ids) if (!this.store.noteRole(id, role, now)) return park(`${id} is already recorded under a different role`);
+      // The record first, the role index last. The index alone must never
+      // know a charge no record holds: a crash between the two used to leave
+      // exactly that, and the retry then short-circuited to "dispute on
+      // unknown charge" (marked seen, licence live). The conflict check that
+      // noteRole performs is made first, without writing.
+      for (const id of ids) { const known = this.store.roleFor(id); if (known && known !== role) return park(`${id} is already recorded under a different role`); }
       if (role === "software") { for (const id of ids) this.noteCharge(sw!, id); this.store.putCustomer(sw!); }
       else { for (const id of ids) this.noteHostingCharge(host!, id); this.saveHostingRecord(host!); }
+      for (const id of ids) this.store.noteRole(id, role, now); // cannot refuse: checked above, no await between
       indexed.push(role);
     }
     if (indexed.length) this.log(`[billing] ${ev.type} ${ev.id}: ${ids.join("/")} resolved through invoice ${invoiceId} (subscription ${f.subscriptionId}); indexed for ${indexed.join(" and ")}`);

@@ -762,7 +762,21 @@ export class HostingService {
       return;
     }
     if (scheduledCancel && instance.cancellationReason !== "intentional_cancellation" && !TERMINAL_ISH.has(instance.stage)) {
-      this.scheduleEnd(instance, "intentional_cancellation", signal.periodEndMs ?? instance.paidThroughMs ?? nowMs, policy, nowMs);
+      const anchor = signal.periodEndMs ?? instance.paidThroughMs;
+      if (endOnly && anchor === null) {
+        // An intentional cancellation suspends AT its anchor, so the `nowMs`
+        // fallback would end an ineligible owner's server immediately on a
+        // fabricated date. Fail closed: schedule nothing and wait for a later
+        // signal that carries a real period end (logged once per instance
+        // lifecycle per process).
+        const quietKey = `${instance.id}:v${instance.lifecycleVersion}`;
+        if (!this.quietUnanchoredEnds.has(quietKey)) {
+          this.quietUnanchoredEnds.add(quietKey);
+          this.log(`[hosting] not scheduling the end of ${instance.id} for an owner without an eligible software licence: the cancellation names no period end and the server has no paid-through date; waiting for a later billing signal`);
+        }
+        return;
+      }
+      this.scheduleEnd(instance, "intentional_cancellation", anchor ?? nowMs, policy, nowMs);
       return;
     }
     if (nonpaying && !TERMINAL_ISH.has(instance.stage) && instance.cancellationReason !== "intentional_cancellation") {
@@ -1121,6 +1135,8 @@ export class HostingService {
    *  provisioning" verdict already logged by this process. Log-only, like
    *  the two sets above; a changed reason logs again. */
   private readonly quietIneligibleOwners = new Set<string>();
+  /** Instance lifecycles whose end-only cancellation had no anchor (logged once). */
+  private readonly quietUnanchoredEnds = new Set<string>();
 
   /** Owns its own periodic reconciliation (candles/liq's own `start`/`stop`
    *  shape — src/server.ts's `listen`/`close`), so every hub that
