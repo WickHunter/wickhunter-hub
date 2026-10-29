@@ -287,7 +287,7 @@ await test('the exact hosted/fleet GC tuning drop-in is the only drop-in a rerun
   ['extra-directive',{bytes:gcBytes+'ExecStartPre=/private/hook\n'},false],
   ['timeout-override',{bytes:gcBytes+'TimeoutStopSec=900s\n'},false],
   ['other-name',{name:'other.conf'},false],
-  ['second-dropin',{extraDropin:true},false],
+  ['update-stop-budget-alongside',{extraDropin:true},false], // the app updater's runtime drop-in mid-update: refused
   ['symlink',{symlink:true},false],
   ['missing-file',{missing:true},false],
  ];
@@ -297,7 +297,7 @@ await test('the exact hosted/fleet GC tuning drop-in is the only drop-in a rerun
    fs.mkdirSync(dir);
    if(o.symlink){fs.writeFileSync(path.join(f.dir,'elsewhere.conf'),gcBytes);fs.symlinkSync(path.join(f.dir,'elsewhere.conf'),file);}
    else if(!o.missing)fs.writeFileSync(file,o.bytes??gcBytes);
-   const dropin=o.extraDropin?file+' /run/systemd/system/wickhunter.service.d/foreign.conf':file;
+   const dropin=o.extraDropin?file+' /run/systemd/system/wickhunter.service.d/90-wh-update-0f0e0d0c-0b0a-4908-8706-050403020100.conf':file;
    const before=f.snapshot(),r=run(f,f.code,{DROPIN:dropin,UNIT_ENV:o.env??gcEnv},false,'ENTRY=server.js; verify_existing_unit');
    assert.equal(r.status===0,pass,kind+': '+r.stderr);
    assert.deepEqual(f.snapshot(),before,kind);assert.ok(!fs.existsSync(f.env.STARTED),kind);

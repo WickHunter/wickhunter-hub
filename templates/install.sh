@@ -179,7 +179,10 @@ try {
  const hooksEmpty=["ExecStartPre","ExecStartPost","ExecCondition","ExecStopPost"].every(k=>!Object.hasOwn(s,k)||s[k]==="");
  // The only tolerated drop-in is the fleet/hosted GC tuning: this exact
  // path, these exact bytes (a V8 heap flag, never a preload), and exactly
- // that one Environment entry. Any other drop-in or environment still fails.
+ // that one Environment entry. Any other drop-in or environment still fails,
+ // including the app updater's runtime stop budget
+ // (/run/systemd/system/wickhunter.service.d/90-wh-update-<uuid>.conf): a
+ // rerun during or after an interrupted update is refused, never guessed at.
  const gc=unit+".d/gc-tuning.conf",gcEnv="NODE_OPTIONS=--max-semi-space-size=32";
  const gcOk=()=>{const fs=require("node:fs"),d=fs.lstatSync(unit+".d"),f=fs.lstatSync(gc);return d.isDirectory()&&!d.isSymbolicLink()&&f.isFile()&&!f.isSymbolicLink()&&/^\[Service\]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n?$/.test(fs.readFileSync(gc,"utf8"));};
  const unitEnvOk=(s.DropInPaths===""&&s.Environment==="")||(s.DropInPaths===gc&&s.Environment===gcEnv&&gcOk());

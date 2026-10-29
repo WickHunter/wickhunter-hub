@@ -174,29 +174,51 @@ systemctl_retry() {
 # only AFTER the signed installer succeeded: the installer's rerun/recovery
 # path verifies the unit and tolerates exactly this one drop-in, but a drop-in
 # present before a fresh install would turn attempt 2/3 into a recovery run.
-# No stop-timeout setting here: the app updater writes its own runtime stop-budget
-# drop-in for each update and must keep owning that value.
+# No stop-timeout setting here. During an update the customer app
+# (scripts/update-stop-budget.mjs) adds a runtime drop-in
+# /run/systemd/system/wickhunter.service.d/90-wh-update-<uuid>.conf with
+# TimeoutStopSec=600s and refuses the update if systemd does not apply it;
+# gc-tuning.conf sorts after it, so a TimeoutStopSec here would override it.
 install -d -m 755 ${GC_TUNING_DIR}
 cat > ${GC_TUNING_DIR}/gc-tuning.conf.tmp <<'WH_GC_TUNING'
 ${GC_TUNING_CONTENT}WH_GC_TUNING
 chmod 644 ${GC_TUNING_DIR}/gc-tuning.conf.tmp
 mv -f ${GC_TUNING_DIR}/gc-tuning.conf.tmp ${GC_TUNING_DIR}/gc-tuning.conf
-# END HOSTING GC TUNING
-systemctl_retry daemon-reload
-[ "$(systemctl show wickhunter --property=Environment)" = 'Environment=${GC_TUNING_ENVIRONMENT}' ] \\
-  || { echo "GC tuning drop-in was not applied to wickhunter.service" >&2; exit 1; }
-# Restart once so the running app picks the tuning up, then require a fresh
-# healthy app of the installed version before any readiness is reported.
-timeout 330s systemctl restart wickhunter || { echo "wickhunter did not restart with GC tuning" >&2; exit 1; }
+gc_fail() { echo "GC tuning: $1" >&2; exit 1; }
+# A fresh retry window for these calls (the installer may have used the
+# first one); every systemctl call goes through the bounded retry helper.
+HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 300))
+systemctl_retry daemon-reload || gc_fail "systemd did not reload"
+gc_env=$(systemctl_retry show wickhunter --property=Environment) || gc_fail "the unit environment could not be read"
+[ "$gc_env" = 'Environment=${GC_TUNING_ENVIRONMENT}' ] || gc_fail "the drop-in was not applied to wickhunter.service"
+gc_before=$(systemctl_retry show wickhunter --property=InvocationID --value) || gc_fail "the running invocation could not be read"
+# Enqueue the restart without waiting on the stop job from the client (a
+# 30 s client attempt must not be retried into a second restart), then prove
+# a NEW invocation is active, its process carries the tuning, and the app of
+# the installed version is healthy. Bounded: stop budget 300 s + start.
+systemctl_retry --no-block restart wickhunter || gc_fail "the restart could not be queued"
 WH_APP_VERSION=$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version' /opt/wickhunter/package.json)
+gc_deadline=$((SECONDS + 480))
 gc_healthy=0
-for _try in $(seq 1 60); do
-  body=$(curl -q -fsS --max-time 5 http://127.0.0.1:8090/api/health 2>/dev/null || true)
-  if node -e 'const [r,v]=process.argv.slice(1);try{const x=JSON.parse(r);process.exit(x.ok===true&&x.version===v?0:1)}catch{process.exit(1)}' "$body" "$WH_APP_VERSION"; then gc_healthy=1; break; fi
+while [ "$SECONDS" -lt "$gc_deadline" ]; do
+  gc_state=$(timeout --foreground 10s systemctl show wickhunter --property=InvocationID,ActiveState,MainPID 2>/dev/null || true)
+  gc_inv=$(printf '%s\n' "$gc_state" | sed -n 's/^InvocationID=//p')
+  gc_active=$(printf '%s\n' "$gc_state" | sed -n 's/^ActiveState=//p')
+  gc_pid=$(printf '%s\n' "$gc_state" | sed -n 's/^MainPID=//p')
+  case "$gc_pid" in ''|*[!0-9]*) gc_pid=0 ;; esac
+  if [ -n "$gc_inv" ] && [ "$gc_inv" != "$gc_before" ] && [ "$gc_active" = active ] && [ "$gc_pid" -gt 0 ] \\
+    && tr '\\0' '\\n' < "/proc/$gc_pid/environ" 2>/dev/null | grep -qxF '${GC_TUNING_ENVIRONMENT}'; then
+    body=$(curl -q -fsS --max-time 5 http://127.0.0.1:8090/api/health 2>/dev/null || true)
+    if node -e 'const [r,v]=process.argv.slice(1);try{const x=JSON.parse(r);process.exit(x.ok===true&&x.version===v?0:1)}catch{process.exit(1)}' "$body" "$WH_APP_VERSION"; then gc_healthy=1; break; fi
+  fi
   sleep 5
 done
-[ "$gc_healthy" -eq 1 ] || { echo "wickhunter did not become healthy after the GC tuning restart" >&2; exit 1; }
-unset body WH_APP_VERSION gc_healthy
+[ "$gc_healthy" -eq 1 ] || gc_fail "wickhunter did not come back healthy with the tuning after its restart"
+unset body WH_APP_VERSION gc_healthy gc_deadline gc_state gc_inv gc_active gc_pid gc_before gc_env
+# END HOSTING GC TUNING
+# The GC restart may have used the whole retry window; the timer gets its own.
+HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 300))
+systemctl_retry daemon-reload
 systemctl_retry enable --now wickhunter-hosting-readiness.timer >/dev/null
 systemctl_retry is-enabled wickhunter-hosting-readiness.timer >/dev/null
 systemctl_retry is-active wickhunter-hosting-readiness.timer >/dev/null

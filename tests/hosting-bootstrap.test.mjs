@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { test, summary } from "./helpers.mjs";
 import { buildBootstrapUserData, GC_TUNING_CONTENT, GC_TUNING_DIR, GC_TUNING_ENVIRONMENT } from "../dist/src/hosting/bootstrap.js";
 import { DEFAULT_PROBE_VENUES } from "../dist/src/hosting/policy.js";
@@ -216,20 +216,27 @@ await test("the fleet GC tuning drop-in is written only after a successful insta
   assert.equal(heredoc[1], "[Service]\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\n");
   assert.equal(GC_TUNING_CONTENT, heredoc[1]);
   assert.match(block, /mv -f \/etc\/systemd\/system\/wickhunter\.service\.d\/gc-tuning\.conf\.tmp \/etc\/systemd\/system\/wickhunter\.service\.d\/gc-tuning\.conf/);
-  assert.doesNotMatch(script, /TimeoutStopSec/, "the app updater owns the stop budget");
-  assert.equal(script.match(/NODE_OPTIONS/g).length, 2, "NODE_OPTIONS is set only by the drop-in (and checked once)");
+  const code = script.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+  assert.doesNotMatch(code, /TimeoutStopSec/, "the app updater owns the stop budget (only a comment names it)");
+  assert.ok(script.match(/NODE_OPTIONS[^\s'"]*/g).every((m) => m === "NODE_OPTIONS=--max-semi-space-size=32"), "NODE_OPTIONS only ever appears as the exact tuning value");
   const installRun = script.indexOf('bash "$INSTALLER"');
   const installedCheck = script.indexOf('[ "$installed" -eq 1 ]');
   assert.ok(installRun > 0 && installedCheck > installRun && begin > installedCheck, "a retried install never sees the drop-in as an existing-unit recovery");
-  const reload = script.indexOf("systemctl_retry daemon-reload", end);
-  const envCheck = script.indexOf("systemctl show wickhunter --property=Environment", reload);
-  const restart = script.indexOf("timeout 330s systemctl restart wickhunter", envCheck);
+  const rearm = script.indexOf("HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 300))", begin);
+  const reload = script.indexOf("systemctl_retry daemon-reload", rearm);
+  const envCheck = script.indexOf("gc_env=$(systemctl_retry show wickhunter --property=Environment)", reload);
+  const restart = script.indexOf("systemctl_retry --no-block restart wickhunter", envCheck);
   const health = script.indexOf("http://127.0.0.1:8090/api/health", restart);
   const healthGate = script.indexOf('[ "$gc_healthy" -eq 1 ]', health);
+  const timerRearm = script.indexOf("HOSTING_SYSTEMCTL_DEADLINE=$((SECONDS + 300))", healthGate);
+  const timer = script.indexOf("systemctl_retry enable --now wickhunter-hosting-readiness.timer", timerRearm);
   const readinessPost = script.indexOf('"$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness"');
   const mainProbes = script.lastIndexOf("https://api.bybit.com/v5/market/time");
-  assert.ok(reload > end && envCheck > reload && restart > envCheck && health > restart && healthGate > health, "reload, verify, restart, then a fresh healthy app");
+  assert.ok(rearm > begin && reload > rearm && envCheck > reload && restart > envCheck && health > restart && healthGate > health, "re-armed retry window, reload, verify, queue restart, then a fresh healthy app");
+  assert.ok(timerRearm > healthGate && timer > timerRearm, "the readiness timer gets its own retry window after the GC restart");
   assert.ok(mainProbes > healthGate && readinessPost > healthGate, "readiness is never reported for a box that did not come back healthy");
+  assert.doesNotMatch(block, /\n\[ "\$\(systemctl show/, "no bare systemctl show under set -e");
+  assert.doesNotMatch(script, /timeout 330s systemctl restart/, "no unretried blocking restart");
   assert.match(script, /'Environment=NODE_OPTIONS=--max-semi-space-size=32'/);
 });
 
@@ -238,6 +245,69 @@ await test("the installer's rerun check tolerates exactly the drop-in this boots
   assert.ok(installer.includes('const gc=unit+".d/gc-tuning.conf",gcEnv="' + GC_TUNING_ENVIRONMENT + '"'));
   assert.ok(installer.includes("/^\\[Service\\]\\nEnvironment=NODE_OPTIONS=--max-semi-space-size=32\\n?$/"), "same bytes the bootstrap writes");
   assert.equal(GC_TUNING_DIR + "/gc-tuning.conf", "/etc/systemd/system/wickhunter.service.d/gc-tuning.conf");
+});
+
+await test("GC tuning block runs end to end: D-Bus drops are retried, a NEW tuned invocation must be healthy, and the timer keeps its own window", () => {
+  const script = commandOf(buildBootstrapUserData(input));
+  const from = script.indexOf("# BEGIN HOSTING SYSTEMCTL RETRY HELPER");
+  const to = script.indexOf("systemctl_retry is-active wickhunter-hosting-readiness.timer >/dev/null");
+  const block = script.slice(from, script.indexOf("\n", to) + 1);
+  const run = (mode) => {
+    const sb = fs.mkdtempSync(path.join(os.tmpdir(), "wh-gc-block-"));
+    try {
+      const bin = path.join(sb, "bin"), etc = path.join(sb, "etc"), proc = path.join(sb, "proc"), app = path.join(sb, "app");
+      for (const d of [bin, etc, proc, app]) fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ version: "0.91.22" }));
+      const exe = (n, body) => fs.writeFileSync(path.join(bin, n), `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`, { mode: 0o700 });
+      // Fake systemd: the first call of each kind fails once (a dropped D-Bus
+      // client); Environment comes from the real drop-in file; a queued
+      // restart becomes a new invocation whose /proc environ carries the
+      // drop-in's environment (or not, in "untuned" mode).
+      exe("systemctl", `
+printf '%s\\n' "$*" >> "$SB/ops"
+key=$(printf '%s' "$1" | tr -c 'a-z' '_'); f="$SB/fail.$key"
+if [ ! -f "$f" ]; then touch "$f"; exit 1; fi
+case "$*" in
+  "show wickhunter --property=Environment") e=$(sed -n 's/^Environment=//p' "$SB/etc/wickhunter.service.d/gc-tuning.conf" 2>/dev/null || true); echo "Environment=$e" ;;
+  "show wickhunter --property=InvocationID --value") cat "$SB/inv" 2>/dev/null || echo old-invocation ;;
+  "--no-block restart wickhunter") echo new-invocation > "$SB/inv"; mkdir -p "$SB/proc/4242"; if [ "$MODE" = untuned ]; then printf 'PATH=/usr/bin\\0' > "$SB/proc/4242/environ"; else printf 'PATH=/usr/bin\\0NODE_OPTIONS=--max-semi-space-size=32\\0' > "$SB/proc/4242/environ"; fi ;;
+  "show wickhunter --property=InvocationID,ActiveState,MainPID") printf 'InvocationID=%s\\nActiveState=active\\nMainPID=4242\\n' "$(cat "$SB/inv" 2>/dev/null || echo old-invocation)" ;;
+esac
+exit 0`);
+      exe("timeout", `[ "$1" != --foreground ] || shift\nshift\nexec "$@"`);
+      exe("curl", `n=0; [ ! -f "$SB/curls" ] || n=$(cat "$SB/curls"); n=$((n+1)); echo $n > "$SB/curls"\n[ "$n" -gt "\${SLOW_POLLS:-0}" ] || exit 7\nprintf '{"ok":true,"version":"0.91.22"}'`);
+      const body = block
+        .replaceAll("/etc/systemd/system", etc)
+        .replaceAll("/opt/wickhunter/package.json", path.join(app, "package.json"))
+        .replaceAll('"/proc/$gc_pid/environ"', `"${proc}/$gc_pid/environ"`);
+      // sleep advances bash's own clock, so a long health wait really
+      // consumes the shared systemctl retry window.
+      const r = spawnSync("bash", ["-c", `set -euo pipefail\nsleep(){ SECONDS=$((SECONDS+$1)); }\n${body}\necho GC-BLOCK-DONE`], {
+        env: { PATH: `${bin}:/usr/bin:/bin`, SB: sb, MODE: mode, SLOW_POLLS: mode === "slow" ? "70" : "0" }, encoding: "utf8", timeout: 60000,
+      });
+      return { ...r, ops: fs.existsSync(path.join(sb, "ops")) ? fs.readFileSync(path.join(sb, "ops"), "utf8").trim().split("\n") : [], dropin: fs.existsSync(path.join(etc, "wickhunter.service.d/gc-tuning.conf")) ? fs.readFileSync(path.join(etc, "wickhunter.service.d/gc-tuning.conf"), "utf8") : null };
+    } finally { fs.rmSync(sb, { recursive: true, force: true }); }
+  };
+  const ok = run("normal");
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /GC-BLOCK-DONE/);
+  assert.equal(ok.dropin, GC_TUNING_CONTENT);
+  assert.equal(ok.ops.filter((o) => o === "--no-block restart wickhunter").length, 2, "one dropped client attempt, then exactly one queued restart");
+  assert.ok(ok.ops.includes("enable --now wickhunter-hosting-readiness.timer"));
+
+  // Health takes 70 polls (~350 s of bash clock): past the first 300 s retry
+  // window, the readiness timer must still get its own attempts.
+  const slow = run("slow");
+  assert.equal(slow.status, 0, slow.stderr);
+  assert.match(slow.stdout, /GC-BLOCK-DONE/);
+  assert.ok(slow.ops.filter((o) => o === "enable --now wickhunter-hosting-readiness.timer").length >= 1);
+
+  // A restarted process without the tuning is never accepted as healthy.
+  const untuned = run("untuned");
+  assert.notEqual(untuned.status, 0);
+  assert.match(untuned.stderr, /did not come back healthy with the tuning/);
+  assert.doesNotMatch(untuned.stdout, /GC-BLOCK-DONE/);
+  assert.ok(!untuned.ops.includes("enable --now wickhunter-hosting-readiness.timer"));
 });
 
 summary("hosting-bootstrap");
