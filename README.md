@@ -1,8 +1,10 @@
-## v0.4.100 — GC tuning on new hosted servers; installer reruns accept it
+## v0.4.100 — 2 vCPU hosted servers at the same $20; GC tuning on new hosted servers
 
+- **New hosted servers default to 2 vCPU.** The default hosting plan is Vultr `vc2-2c-2gb` (2 vCPU / 2 GB RAM / 65 GB SSD, $15/month on the live catalogue, available in Tokyo `nrt` and Osaka `itm`), replacing `vc2-1c-2gb` (1 vCPU, $10). Retail stays $20/month and the bundle prices are unchanged. Instances already reserved or running keep the plan they were reserved with. A Hub whose `hosting-policy.v1.json` names a plan keeps it until the operator edits that file.
+- **Price rule: cover cost plus a margin.** The "retail must equal exactly twice the provider cost" rule is replaced (operator decision 2026-10-29). Checkout, the hosted bundle, the split checkout and the provisioning job now require retail ≥ verified provider monthly cost + `minimumMonthlyMarginCents` (default 300, editable on the admin Hosting card). A plan priced above retail is still refused; an unverified, zero or negative cost is refused rather than treated as zero. A reserved row whose captured cost no longer leaves that margin fails provisioning by name before any server is created.
+- **Vultr plan lookup pages.** The catalogue (138 plans) is read with `per_page=500` and the returned cursor, so a plan on a later page cannot be missed. Every page must succeed; a repeated cursor or more than 20 pages is refused rather than truncated.
 - **New hosted servers get the fleet's GC tuning.** After the signed installer succeeds, the hosting bootstrap writes `/etc/systemd/system/wickhunter.service.d/gc-tuning.conf` (`[Service]` / `Environment=NODE_OPTIONS=--max-semi-space-size=32`, no stop-timeout setting — the app updater owns that), reloads systemd, verifies the unit's Environment, restarts the app once and requires a fresh healthy app of the installed version before it reports readiness. Existing hosted servers are not touched.
 - **Installer reruns tolerate exactly that drop-in.** The rerun/recovery check still refuses any other drop-in or unit environment; the only accepted extra is that path with those exact bytes (a V8 heap flag, never a preload) and that one Environment entry. Fleet boxes that already carry the drop-in were refused by a rerun before this release.
-- **Test provider lists Vultr's 2 vCPU / 2 GB plan** (`vc2-2c-2gb`, $15/month) next to the default. The default hosting plan is unchanged: switching it requires a pricing decision, because hosting checkout requires the retail price to equal twice the provider cost.
 
 ## v0.4.99 — Candle snapshots off the event loop; health counts the served window
 
@@ -2026,7 +2028,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
-- v0.4.100 — New hosted servers get the fleet GC tuning drop-in (`NODE_OPTIONS=--max-semi-space-size=32`) after install, with a restart and fresh health proof; installer reruns tolerate exactly that drop-in; default hosting plan unchanged.
+- v0.4.100 — New hosted servers default to Vultr `vc2-2c-2gb` (2 vCPU / 2 GB / 65 GB) at the unchanged $20 retail; retail must cover provider cost + `minimumMonthlyMarginCents` (default 300) instead of exactly 2×; Vultr plan lookup pages; the fleet GC tuning drop-in (`NODE_OPTIONS=--max-semi-space-size=32`) is written after install with a restart and fresh health proof; installer reruns tolerate exactly that drop-in.
 - v0.4.99 — 1m snapshots now pass the app's verifier (settle lag capped at one bucket); snapshot folds run in a worker thread with single-flight and an unchanged-retry hold (identical v1 bytes); unanswerable repairs back off; Bitget paced at 5/s with refused-rate memory; candle health counts gaps inside the 30-day served window separately from older ones.
 - v0.4.98 — Recognize validated crypto `py_` charge IDs in referral purchase status while preserving every payment/refund guard.
 - v0.4.97 — Retry one transient Stripe GET failure without replaying writes or accepting incomplete referral evidence.

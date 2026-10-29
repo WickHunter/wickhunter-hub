@@ -265,14 +265,14 @@ await test("holding twice never moves the hold's own instant — the clock a rel
 await test("cost ceiling: exactly at the ceiling passes, one cent over refuses — checked with no provider call", async () => {
   const ctx = await newHub();
   const existing = await provisionedInstance(ctx, "cus_cost1", "cost1@example.com");
-  assert.equal(existing.providerPlanMonthlyCostCents, 1000, "FakeProvider's vc2-1c-2gb quote");
+  assert.equal(existing.providerPlanMonthlyCostCents, 1500, "FakeProvider's default vc2-2c-2gb quote");
 
   await softwareOnly(ctx, "cus_cost2", "cost2@example.com");
 
-  // ceiling = the existing instance's 1000c + this plan's own 1000c quote
+  // ceiling = the existing instance's 1500c + this plan's own 1500c quote
   // (reused from the existing instance, since planId is shared — V1 offers
-  // one plan) = 2000 exactly -> passes.
-  await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 2000 } }) });
+  // one plan) = 3000 exactly -> passes.
+  await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 3000 } }) });
   const atCeiling = await ctx.h.hub.hosting.checkoutUrl("cus_cost2", "cost2@example.com");
   assert.equal(atCeiling.ok, true, "projected total exactly equals the ceiling — passes");
   assert.equal(atCeiling.value.url, "https://checkout.stripe.com/c/pay_test");
@@ -293,7 +293,7 @@ await test("cost ceiling: exactly at the ceiling passes, one cent over refuses �
   // attempted — the one existing call is cus_cost1's own provisioning).
   await softwareOnly(ctx, "cus_cost3", "cost3@example.com");
   const callsBefore = ctx.provider.createCalls.length;
-  await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 1999 } }) });
+  await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 2999 } }) });
   const overCeiling = await ctx.h.hub.hosting.checkoutUrl("cus_cost3", "cost3@example.com");
   assert.equal(overCeiling.ok, false);
   assert.equal(overCeiling.code, "PROVISIONING_DISABLED");
@@ -357,7 +357,7 @@ await test("admin GET /admin/api/hosting/policy reports projected vs ceiling", a
   await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { maximumProjectedMonthlyProviderCostCents: 5000 } }) });
   const r = await ctx.admin("/admin/api/hosting/policy");
   assert.equal(r.status, 200);
-  assert.deepEqual(r.body.projectedMonthlyProviderCostCents, { known: true, cents: 1000 });
+  assert.deepEqual(r.body.projectedMonthlyProviderCostCents, { known: true, cents: 1500 });
   assert.equal(r.body.policy.maximumProjectedMonthlyProviderCostCents, 5000);
   await ctx.h.close();
 });
@@ -404,6 +404,91 @@ await test("selected zero-cost plan refuses checkout before reservation or Strip
     assert.match(result.error, /positive provider cost/);
     assert.equal(instancesFor(ctx, "cus_free").length, 0);
     assert.equal(ctx.hostingCalls.length, 0);
+  } finally { await ctx.h.close(); }
+});
+
+// ── v0.4.100: retail covers provider cost + minimum margin (no 2x rule) ─
+
+await test("default plan is vc2-2c-2gb: $20 retail over its $15 quote checks out and reserves that plan", async () => {
+  const ctx = await newHub();
+  try {
+    assert.equal(ctx.h.hub.hosting.policy().planId, "vc2-2c-2gb");
+    assert.equal(ctx.h.hub.hosting.policy().minimumMonthlyMarginCents, 300);
+    await softwareOnly(ctx, "cus_m1", "m1@example.com");
+    const r = await ctx.h.hub.hosting.checkoutUrl("cus_m1", "m1@example.com", ctx.getClock());
+    assert.equal(r.ok, true, r.error);
+    const [row] = instancesFor(ctx, "cus_m1");
+    assert.equal(row.planId, "vc2-2c-2gb");
+    assert.equal(row.providerPlanMonthlyCostCents, 1500);
+  } finally { await ctx.h.close(); }
+});
+
+await test("$20 retail over the former $10 plan still checks out when an operator selects it", async () => {
+  const ctx = await newHub();
+  try {
+    await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy: { planId: "vc2-1c-2gb", planLabel: "1 vCPU / 2 GB RAM / 55 GB SSD" } }) });
+    await softwareOnly(ctx, "cus_m2", "m2@example.com");
+    const r = await ctx.h.hub.hosting.checkoutUrl("cus_m2", "m2@example.com", ctx.getClock());
+    assert.equal(r.ok, true, r.error);
+    assert.equal(instancesFor(ctx, "cus_m2")[0].providerPlanMonthlyCostCents, 1000);
+  } finally { await ctx.h.close(); }
+});
+
+await test("retail below provider cost + margin is refused before any reservation or Stripe call", async () => {
+  for (const [label, policy, provider] of [
+    ["margin raised past the gap", { minimumMonthlyMarginCents: 501 }, null],
+    ["provider cost above retail", {}, 2100],
+    ["provider cost inside the margin", {}, 1701],
+  ]) {
+    const fake = new FakeProvider();
+    if (provider !== null) fake.plans[0].monthlyCostCents = provider;
+    const ctx = await newHub({ provider: fake });
+    try {
+      if (Object.keys(policy).length) await ctx.admin("/admin/api/hosting/policy", { method: "POST", body: JSON.stringify({ policy }) });
+      await softwareOnly(ctx, "cus_lo", "lo@example.com");
+      const before = ctx.hostingCalls.length;
+      const r = await ctx.h.hub.hosting.checkoutUrl("cus_lo", "lo@example.com", ctx.getClock());
+      assert.equal(r.ok, false, label);
+      assert.equal(r.code, "PROVISIONING_DISABLED", label);
+      assert.match(r.error, /does not cover the verified provider cost plus the minimum margin/, label);
+      assert.equal(instancesFor(ctx, "cus_lo").length, 0, label);
+      assert.equal(ctx.hostingCalls.length, before, label + ": no Stripe call");
+    } finally { await ctx.h.close(); }
+  }
+  // Exactly cost + margin (1700 + 300 = 2000) passes.
+  const edge = new FakeProvider(); edge.plans[0].monthlyCostCents = 1700;
+  const ctx = await newHub({ provider: edge });
+  try {
+    await softwareOnly(ctx, "cus_edge", "edge@example.com");
+    assert.equal((await ctx.h.hub.hosting.checkoutUrl("cus_edge", "edge@example.com", ctx.getClock())).ok, true);
+  } finally { await ctx.h.close(); }
+});
+
+await test("an in-flight row reserved under the former vc2-1c-2gb plan still provisions on that plan", async () => {
+  const ctx = await newHub();
+  try {
+    const [row] = await boughtHosting(ctx, "cus_old", "old@example.com");
+    // As a pre-0.4.100 checkout left it: old plan, its $10 quote captured.
+    ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.planId = "vc2-1c-2gb"; d.providerPlanMonthlyCostCents = 1000; }, ctx.getClock());
+    await ctx.h.hub.hosting.tick(ctx.getClock());
+    const fresh = ctx.h.hub.hosting.store.getInstance(row.id);
+    assert.notEqual(fresh.stage, "failed", fresh.failureReason ?? "");
+    assert.equal(ctx.provider.createCalls.length, 1);
+    assert.equal(ctx.provider.createCalls[0].planId, "vc2-1c-2gb", "existing reservations keep their own plan");
+    assert.equal(fresh.planId, "vc2-1c-2gb");
+    assert.equal(fresh.providerPlanMonthlyCostCents, 1000);
+  } finally { await ctx.h.close(); }
+});
+
+await test("a reserved row whose captured cost no longer leaves the margin fails provisioning by name, creating nothing", async () => {
+  const ctx = await newHub();
+  try {
+    const [row] = await boughtHosting(ctx, "cus_loss", "loss@example.com");
+    ctx.h.hub.hosting.store.updateInstance(row.id, row.version, (d) => { d.providerPlanMonthlyCostCents = 1800; }, ctx.getClock());
+    await ctx.h.hub.hosting.tick(ctx.getClock());
+    const fresh = ctx.h.hub.hosting.store.getInstance(row.id);
+    assert.equal(ctx.provider.createCalls.length, 0);
+    assert.match(JSON.stringify(fresh), /no longer covers the verified provider cost plus the minimum margin/);
   } finally { await ctx.h.close(); }
 });
 

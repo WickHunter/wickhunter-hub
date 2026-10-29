@@ -39,7 +39,7 @@ import type { StripeObject } from "../earn-stripe-api.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
 import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold } from "./store.js";
-import { readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
+import { hostingPriceCoversCost, readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
 import { deadlines, type HostingDeadlines, type HostingEndReason } from "./deadlines.js";
 import { readinessVerdict, type ProbeResult, type ReadinessVerdict } from "./readiness.js";
 import { bootstrapPasswordFromTokenHash, hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
@@ -297,7 +297,7 @@ export class HostingService {
     } catch {
       return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" };
     }
-    if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
+    if (!hostingPriceCoversCost(policy.monthlyPriceCents, quote, policy.minimumMonthlyMarginCents)) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price does not cover the verified provider cost plus the minimum margin" };
     const ceilingRefusal = this.costCeilingRefusalWithQuote(quote, policy);
     if (ceilingRefusal) return { ok: false, code: "PROVISIONING_DISABLED", error: ceilingRefusal };
     const priceId = cfg.stripe[mode].priceIds[planKey] || cfg.roles[mode].hosting.priceIds[0]!;
@@ -355,7 +355,7 @@ export class HostingService {
     if (pending.length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
     const provider = this.provider()!;
     const quote = (await provider.listPlans()).find(p => p.id === policy.planId)?.monthlyCostCents;
-    if (!Number.isSafeInteger(quote) || !quote || quote <= 0 || quote * 2 !== policy.monthlyPriceCents) throw Error('VPS provider cost differs from the approved price');
+    if (!Number.isSafeInteger(quote) || !quote || quote <= 0 || !hostingPriceCoversCost(policy.monthlyPriceCents, quote, policy.minimumMonthlyMarginCents)) throw Error('VPS provider cost is not covered by the approved price');
     if (this.billing.config().mode !== cfg.mode || JSON.stringify(this.policy()) !== JSON.stringify(policy)) throw Error("Hosting policy changed during price verification");
     if (this.store.instances().filter(r => r.ownerId.startsWith("bundle:") && r.stage === "ordered" && r.checkoutExpiresAtMs && r.checkoutExpiresAtMs > now).length >= MAX_PENDING_SPLIT_CHECKOUTS) throw new HostingCheckoutCapacityError();
     const refusal = this.costCeilingRefusalWithQuote(quote, policy);
@@ -422,7 +422,7 @@ export class HostingService {
       quote = match.monthlyCostCents;
     } catch { return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "the provider price could not be verified" }; }
     if (!Number.isSafeInteger(quote) || quote <= 0) return { ok: false, code: "PROVISIONING_DISABLED", error: "the selected provider plan returned an invalid monthly cost" };
-    if (policy.monthlyPriceCents !== quote * 2) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price must equal twice the verified provider cost" };
+    if (!hostingPriceCoversCost(policy.monthlyPriceCents, quote, policy.minimumMonthlyMarginCents)) return { ok: false, code: "PROVISIONING_DISABLED", error: "managed hosting price does not cover the verified provider cost plus the minimum margin" };
     const ceiling = this.costCeilingRefusalWithQuote(quote, policy);
     if (ceiling) return { ok: false, code: "PROVISIONING_DISABLED", error: ceiling };
     const verified = await this.verifyStripeRecurringPrice(cfg.stripe[cfg.mode].secretKey, priceId, plan.amountCents, plan.currency, interval);
@@ -1191,8 +1191,8 @@ export class HostingService {
     // CAS or the stale version would make that mutation a silent no-op.
     row = this.store.getInstance(row.id) ?? row;
     if (row.providerPlanMonthlyCostCents === null || !Number.isSafeInteger(row.providerPlanMonthlyCostCents) || row.providerPlanMonthlyCostCents <= 0) throw new Error("provider price could not be verified — provisioning remains blocked");
-    if (policy.monthlyPriceCents !== row.providerPlanMonthlyCostCents * 2) {
-      this.failProvisioning(row, "advertised hosting price no longer equals twice the verified provider cost", nowMs);
+    if (!hostingPriceCoversCost(policy.monthlyPriceCents, row.providerPlanMonthlyCostCents, policy.minimumMonthlyMarginCents)) {
+      this.failProvisioning(row, "advertised hosting price no longer covers the verified provider cost plus the minimum margin", nowMs);
       return;
     }
     const projected = this.projectedMonthlyProviderCostCents();
