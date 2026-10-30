@@ -17,7 +17,7 @@ import {
   CandleService, runSnapshotWorker, SNAPSHOT_FAILURE_TTL_MS, SNAPSHOT_WORKER_CONCURRENCY, HEALTH_GAP_WINDOW_DAYS,
 } from "../dist/src/candles/service.js";
 import {
-  DEFAULT_COLLECTOR_OPTIONS, RATE_REFUSED_MEMORY_MS, REPAIR_BACKOFF_BASE_MS,
+  DEFAULT_COLLECTOR_OPTIONS, RATE_REFUSED_MEMORY_MS, REPAIR_BACKOFF_BASE_MS, VENUE_EMPTY_RECHECK_MS,
 } from "../dist/src/candles/collector.js";
 
 const { privateKey } = generateKeyPairSync("ed25519");
@@ -297,17 +297,69 @@ function stub(opts) {
   return { state, fetchLike };
 }
 
-await test("a repair the venue cannot answer backs off instead of being re-requested every tick, and a younger hole is repaired behind it", async () => {
+await test("v0.4.102: a hole the venue confirms empty is marked as such — not re-requested, not counted gapped, never filled — and a younger hole is repaired behind it", async () => {
   const dataDir = tmpDir("repair");
   const s = new CandleStore(path.join(dataDir, "candles"));
   const end = newestClosedOpenMs(BG_NOW) - MINUTE_MS;
-  const old1 = end - 5 * DAY_MS; // the venue has nothing for this minute
+  const old1 = end - 5 * DAY_MS; // the venue has nothing for this minute (its neighbours exist)
   const young = end - 2 * DAY_MS; // this one it does have
   const rows = [];
   for (let t = end - 6 * DAY_MS; t <= end; t += MINUTE_MS) if (t !== old1 && t !== young) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
   s.write("bitget", "HOLEUSDT", rows);
   let clock = BG_NOW;
   const venue = stub({ symbols: ["HOLEUSDT"], now: clock, missing: { HOLEUSDT: new Set([old1]) }, since: end - 6 * DAY_MS });
+  const make = () => new CandleService(
+    { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 6 }, tickMs: 60_000 },
+    { sign, fetchLike: venue.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
+  );
+  let svc = make();
+  const repairsAt = (start) => venue.state.requests.filter((u) => u.includes(`startTime=${start}&`) || u.endsWith(`startTime=${start}`)).length;
+  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
+  let col = svc.collector("bitget");
+  assert.equal(repairsAt(old1), 1, "the old hole was asked for once");
+  assert.equal(s.readWindow("bitget", "HOLEUSDT", young, young).rows.length, 1, "the younger hole behind it was repaired");
+  assert.equal(s.readWindow("bitget", "HOLEUSDT", old1, old1).rows.length, 0, "nothing is fabricated for the empty minute");
+  assert.equal(col.cachedCoverage("HOLEUSDT").interiorMissing, 1, "the store still truthfully lacks it");
+  assert.deepEqual(col.venueEmptyRanges("HOLEUSDT").map(([a, b]) => [a, b]), [[old1, old1]]);
+  assert.equal(col.repairBackoff("HOLEUSDT"), null, "a proof, not a back-off");
+  const { windowStart, windowEnd } = snapshotWindow(clock, 1440, 6);
+  assert.equal(col.snapshotSkipIsTransient("HOLEUSDT", "gap", windowStart, clock, windowEnd), false,
+    "a gap no pending work can close is structural for the snapshot cache");
+  let status = svc.status(clock).find((v) => v.venue === "bitget");
+  assert.equal(status.liveMissingMinutes, 0, "not a repairable hole");
+  assert.equal(status.oldMissingMinutes, 0);
+  assert.equal(status.venueEmptyMinutes, 1, "reported apart");
+  assert.equal(status.counts.gapped, 0);
+  assert.equal(status.gapWindowDays, HEALTH_GAP_WINDOW_DAYS);
+  // Durable: a restart does not re-ask the venue.
+  svc.stop(); svc = make(); col = svc.collector("bitget");
+  clock += REPAIR_BACKOFF_BASE_MS + 60_000;
+  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
+  assert.equal(repairsAt(old1), 1, "not re-requested after a restart or past the old back-off");
+  // A day later it is checked once more — and if the venue now has it, filled.
+  venue.state.missing.HOLEUSDT.clear();
+  clock += VENUE_EMPTY_RECHECK_MS;
+  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
+  assert.equal(repairsAt(old1), 2, "re-checked after VENUE_EMPTY_RECHECK_MS");
+  assert.equal(s.readWindow("bitget", "HOLEUSDT", old1, old1).rows.length, 1, "the venue's late candle is stored");
+  assert.deepEqual(col.venueEmptyRanges("HOLEUSDT"), [], "the range is gone with the contradiction");
+  status = svc.status(clock).find((v) => v.venue === "bitget");
+  assert.equal(status.venueEmptyMinutes, 0);
+  svc.stop();
+});
+
+await test("a repair page with NOTHING after the hole is not proof of emptiness: it backs off instead of being re-requested every tick", async () => {
+  const dataDir = tmpDir("repair-outage");
+  const s = new CandleStore(path.join(dataDir, "candles"));
+  const end = newestClosedOpenMs(BG_NOW) - MINUTE_MS;
+  const old1 = end - 5 * DAY_MS;
+  const rows = [];
+  for (let t = end - 6 * DAY_MS; t <= end; t += MINUTE_MS) if (t !== old1) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
+  s.write("bitget", "OUTUSDT", rows);
+  let clock = BG_NOW;
+  // The venue answers the hole's whole page with no rows at all.
+  const outage = new Set(Array.from({ length: 400 }, (_, i) => old1 + i * MINUTE_MS));
+  const venue = stub({ symbols: ["OUTUSDT"], now: clock, missing: { OUTUSDT: outage }, since: end - 6 * DAY_MS });
   const svc = new CandleService(
     { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 6 }, tickMs: 60_000 },
     { sign, fetchLike: venue.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
@@ -315,24 +367,17 @@ await test("a repair the venue cannot answer backs off instead of being re-reque
   const repairsAt = (start) => venue.state.requests.filter((u) => u.includes(`startTime=${start}&`) || u.endsWith(`startTime=${start}`)).length;
   for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
   const col = svc.collector("bitget");
-  assert.ok(repairsAt(old1) >= 1, "the old hole was tried");
-  assert.ok(repairsAt(old1) <= 2, `and not re-requested every tick (${repairsAt(old1)} requests in 12 ticks)`);
-  assert.equal(s.readWindow("bitget", "HOLEUSDT", young, young).rows.length, 1, "the younger hole behind it was repaired");
-  assert.equal(col.cachedCoverage("HOLEUSDT").interiorMissing, 1, "only the unanswerable minute is still missing");
-  const { windowStart, windowEnd } = snapshotWindow(clock, 1440, 6);
-  assert.equal(col.snapshotSkipIsTransient("HOLEUSDT", "gap", windowStart, clock, windowEnd), false,
-    "a gap no pending work can close is structural for the snapshot cache");
-  // After the back-off it is tried again — a few times a day, not never.
+  assert.ok(repairsAt(old1) >= 1 && repairsAt(old1) <= 2, `tried, then backed off (${repairsAt(old1)} requests in 12 ticks)`);
+  assert.deepEqual(col.venueEmptyRanges("OUTUSDT"), [], "an empty page proves nothing");
+  assert.equal(col.repairBackoff("OUTUSDT")?.failures, 1);
   clock += REPAIR_BACKOFF_BASE_MS + 60_000;
   const before = repairsAt(old1);
   for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
   assert.ok(repairsAt(old1) > before, "retried once the back-off expired");
-  // The health split: the hole is five days old, inside the 30-day window.
   const status = svc.status(clock).find((v) => v.venue === "bitget");
   assert.equal(status.liveMissingMinutes, 1);
-  assert.equal(status.oldMissingMinutes, 0);
   assert.equal(status.counts.gapped, 1);
-  assert.equal(status.gapWindowDays, HEALTH_GAP_WINDOW_DAYS);
+  svc.stop();
 });
 
 await test("a hole older than the served window is reported as OLD and no longer makes the symbol gapped", async () => {
@@ -344,7 +389,9 @@ await test("a hole older than the served window is reported as OLD and no longer
   for (let t = end - 45 * DAY_MS; t <= end; t += MINUTE_MS) if (t < oldHole || t > oldHole + 2 * MINUTE_MS) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
   s.write("bitget", "OLDUSDT", rows);
   let clock = BG_NOW;
-  const venue = stub({ symbols: ["OLDUSDT"], now: clock, missing: { OLDUSDT: new Set([oldHole, oldHole + MINUTE_MS, oldHole + 2 * MINUTE_MS]) }, since: end - 45 * DAY_MS });
+  // v0.4.102 — outage-shaped (no row after the hole in its page either), so it
+  // stays a real hole rather than a venue-confirmed empty range.
+  const venue = stub({ symbols: ["OLDUSDT"], now: clock, missing: { OLDUSDT: new Set(Array.from({ length: 400 }, (_, i) => oldHole + i * MINUTE_MS)) }, since: end - 45 * DAY_MS });
   const svc = new CandleService(
     { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 63 }, tickMs: 60_000 },
     { sign, fetchLike: venue.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
@@ -469,7 +516,9 @@ await test("the repair back-off resets: a filling repair zeroes its escalation, 
   for (let t = end - 5 * DAY_MS; t <= end; t += MINUTE_MS) if (t !== hole) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
   s.write("bitget", "RSTUSDT", rows);
   let clock = BG_NOW;
-  const missing = new Set([hole]);
+  // v0.4.102 — an outage-shaped hole (the page has no row after it either), so
+  // this exercises the back-off rather than a venue-empty proof.
+  const missing = new Set(Array.from({ length: 400 }, (_, i) => hole + i * MINUTE_MS));
   const venue = stub({ symbols: ["RSTUSDT"], now: clock, missing: { RSTUSDT: missing }, since: end - 5 * DAY_MS });
   const svc = new CandleService(
     { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 5 }, tickMs: 60_000 },
@@ -495,7 +544,7 @@ await test("the repair back-off resets: a filling repair zeroes its escalation, 
   const r2 = rows.filter((x) => x.openMs !== old && x.openMs !== young);
   const d2 = tmpDir("repairreset2");
   new CandleStore(path.join(d2, "candles")).write("bitget", "TWOUSDT", r2);
-  const v2 = stub({ symbols: ["TWOUSDT"], now: clock, missing: { TWOUSDT: new Set([old]) }, since: end - 5 * DAY_MS });
+  const v2 = stub({ symbols: ["TWOUSDT"], now: clock, missing: { TWOUSDT: new Set(Array.from({ length: 400 }, (_, i) => old + i * MINUTE_MS)) }, since: end - 5 * DAY_MS });
   const svc2 = new CandleService(
     { dataDir: d2, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 5 }, tickMs: 60_000 },
     { sign, fetchLike: v2.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },

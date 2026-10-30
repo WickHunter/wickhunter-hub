@@ -53,6 +53,10 @@ export interface SymbolStatus {
    *  split is not known yet every missing minute is reported live. */
   liveMissingMinutes: number | null;
   oldMissingMinutes: number | null;
+  /** v0.4.102 — held-range minutes the venue itself confirmed it has no candle
+   *  for (collector.ts `venueEmpty`). NOT included in the missing counts above:
+   *  nothing can repair them. Still a gap on the seed wire. */
+  venueEmptyMinutes: number;
   newlyListed: boolean;
   delisted: boolean;
   tradable: boolean;
@@ -93,6 +97,9 @@ export interface VenueStatus {
    *  (retained history only). `live + old === total`. */
   liveMissingMinutes: number;
   oldMissingMinutes: number;
+  /** v0.4.102 — venue-confirmed empty minutes inside held ranges, excluded
+   *  from the missing totals (see SymbolStatus). */
+  venueEmptyMinutes: number;
   gapWindowDays: number;
   /** Symbols with the most missing minutes — a venue quietly accumulating gaps
    *  is the failure that poisons seeds without ever throwing an error. */
@@ -346,6 +353,9 @@ export class CandleService {
       this.streams.set(v, runner);
       runner.start();
     }
+    // v0.4.102 — exact coverage for the whole roster within minutes of boot,
+    // not only through each tick's bounded slice (collector.ts).
+    for (const c of this.collectors.values()) void c.primeCoverageInBackground();
     this.timer = setInterval(() => void this.tickAll(), this.cfg.tickMs);
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
@@ -764,7 +774,7 @@ export class CandleService {
           delisted: 0, newLast24h: 0, newLast24hBackfilling: 0, oldGapped: 0,
         },
         oldestClosedMs: null, newestClosedMs: null, totalMissingMinutes: 0,
-        liveMissingMinutes: 0, oldMissingMinutes: 0, gapWindowDays: HEALTH_GAP_WINDOW_DAYS,
+        liveMissingMinutes: 0, oldMissingMinutes: 0, venueEmptyMinutes: 0, gapWindowDays: HEALTH_GAP_WINDOW_DAYS,
         worstGaps: [], newlyListed: [],
       };
     }
@@ -780,6 +790,7 @@ export class CandleService {
     let totalMissingMinutes = 0;
     let liveMissingMinutes = 0;
     let oldMissingMinutes = 0;
+    let venueEmptyMinutes = 0;
 
     for (const s of per) {
       counts[s.bucket]++;
@@ -795,6 +806,7 @@ export class CandleService {
       totalMissingMinutes += s.missingMinutes ?? 0;
       liveMissingMinutes += s.liveMissingMinutes ?? 0;
       oldMissingMinutes += s.oldMissingMinutes ?? 0;
+      venueEmptyMinutes += s.venueEmptyMinutes;
       if ((s.oldMissingMinutes ?? 0) > 0 && (s.liveMissingMinutes ?? 0) === 0) counts.oldGapped++;
       if (s.firstClosedMs !== null && (oldestClosedMs === null || s.firstClosedMs < oldestClosedMs)) {
         oldestClosedMs = s.firstClosedMs;
@@ -829,7 +841,7 @@ export class CandleService {
     return {
       venue, configured: true, health: collector.health(now), klineEndpoint,
       counts, oldestClosedMs, newestClosedMs, totalMissingMinutes,
-      liveMissingMinutes, oldMissingMinutes, gapWindowDays: HEALTH_GAP_WINDOW_DAYS, worstGaps, newlyListed,
+      liveMissingMinutes, oldMissingMinutes, venueEmptyMinutes, gapWindowDays: HEALTH_GAP_WINDOW_DAYS, worstGaps, newlyListed,
     };
   }
 
@@ -838,11 +850,20 @@ export class CandleService {
     return collector.symbols().map((t) => {
       const cov = collector.cachedCoverage(t.symbol);
       const heldMinutes = cov?.count ?? null;
-      const missingMinutes = cov?.interiorMissing ?? null;
+      // v0.4.102 — minutes the venue confirmed it has no candle for are not
+      // repairable holes; they are reported apart (venueEmptyMinutes).
+      const windowFrom = now - HEALTH_GAP_WINDOW_DAYS * DAY_MS;
+      const emptyAll = cov && cov.firstClosedMs !== null && cov.lastClosedMs !== null
+        ? collector.venueEmptyMinutes(t.symbol, cov.firstClosedMs, cov.lastClosedMs) : 0;
+      const emptyLive = cov && cov.firstClosedMs !== null && cov.lastClosedMs !== null
+        ? collector.venueEmptyMinutes(t.symbol, Math.max(cov.firstClosedMs, Math.floor(windowFrom / DAY_MS) * DAY_MS), cov.lastClosedMs) : 0;
+      const missingMinutes = cov ? Math.max(0, cov.interiorMissing - emptyAll) : null;
       // Unknown split: every hole counts as live, the direction that warns.
-      const split = cov ? collector.missingSplit(t.symbol, now - HEALTH_GAP_WINDOW_DAYS * DAY_MS) : null;
-      const liveMissingMinutes = missingMinutes === null ? null : split ? split.live : missingMinutes;
-      const oldMissingMinutes = missingMinutes === null ? null : split ? split.old : 0;
+      const split = cov ? collector.missingSplit(t.symbol, windowFrom) : null;
+      const liveMissingMinutes = missingMinutes === null ? null
+        : split ? Math.min(missingMinutes, Math.max(0, split.live - emptyLive)) : missingMinutes;
+      const oldMissingMinutes = missingMinutes === null || liveMissingMinutes === null ? null
+        : split ? Math.max(0, missingMinutes - liveMissingMinutes) : 0;
       // ── ONE BUCKET PER SYMBOL, IN PRIORITY ORDER ────────────────────────
       // The buckets are reported as plain counts and never rolled into a
       // health score: an operator needs to know WHICH of these is wrong, and a
@@ -877,6 +898,7 @@ export class CandleService {
         missingMinutes,
         liveMissingMinutes,
         oldMissingMinutes,
+        venueEmptyMinutes: emptyAll,
         newlyListed: now - t.firstSeenAt < NEW_SYMBOL_WINDOW_MS,
         delisted: t.delisted,
         tradable: t.tradable,
