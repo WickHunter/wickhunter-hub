@@ -19,6 +19,7 @@
 //   M7 migration keeps the timeframe cache → "stored data" red.
 //   M8 migration ignores a rollback → "rollback" red.
 //   M9 listSymbols tracks USD contracts → "linear" red.
+//   M10 the marker dir is created on a Hub without Bitunix → "fresh" red.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -302,13 +303,22 @@ await test("stored data: a rollback to <=0.4.101 after the migration is detected
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 
-await test("stored data: a fresh install only writes the marker", () => {
+await test("stored data: a fresh Bitunix-collecting install only writes the marker; a Hub without Bitunix creates nothing", () => {
   const d = tmpDir("bitunix-fresh");
   try {
     const r = migrateBitunixVolumeContract(d);
     assert.equal(r.migrated, false);
     assert.ok(exists(d, `candles/bitunix/${BITUNIX_VOLUME_MARKER}`));
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
+  const e = tmpDir("bitunix-none");
+  try {
+    migrateBitunixVolumeContract(e, () => {}, false);
+    assert.deepEqual(fs.readdirSync(e), [], "no candles dir appears in a Hub that does not collect");
+  } finally { fs.rmSync(e, { recursive: true, force: true }); }
+  const f = legacyDataDir();
+  try {
+    assert.equal(migrateBitunixVolumeContract(f, () => {}, false).migrated, true, "stale data is still discarded when Bitunix collection was turned off");
+  } finally { fs.rmSync(f, { recursive: true, force: true }); }
 });
 
 await test("the Bitunix collector's REST frontier names the volume contract it vouches for", async () => {

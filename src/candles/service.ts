@@ -282,7 +282,7 @@ export class CandleService {
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
     // v0.4.102 — before any collector, cache or stream reads Bitunix rows:
     // discard the pre-contract mixed-unit store once (bitunix-migration.ts).
-    migrateBitunixVolumeContract(cfg.dataDir, (m) => (deps.log ?? console.log)(`[candles] ${m}`));
+    migrateBitunixVolumeContract(cfg.dataDir, (m) => (deps.log ?? console.log)(`[candles] ${m}`), cfg.venues.includes("bitunix"));
     this.store = new CandleStore(path.join(cfg.dataDir, "candles"));
     this.timeframeHistory = new TimeframeHistory(
       path.join(cfg.dataDir, "candle-timeframes-v2"), this.store, cfg.options.retentionDays,

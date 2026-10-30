@@ -36,10 +36,14 @@ export interface BitunixMigrationResult {
   removedFrontiers: number;
 }
 
-export function migrateBitunixVolumeContract(dataDir: string, log: (m: string) => void = () => {}): BitunixMigrationResult {
+/** `collecting`: this Hub runs a Bitunix collector, so the marker is written
+ *  even on a fresh data dir (everything it collects from now on is base
+ *  volume). Without one, nothing is created unless pre-contract data exists. */
+export function migrateBitunixVolumeContract(dataDir: string, log: (m: string) => void = () => {}, collecting = true): BitunixMigrationResult {
   const venueDir = path.join(dataDir, "candles", "bitunix");
   const marker = path.join(venueDir, BITUNIX_VOLUME_MARKER);
   const result: BitunixMigrationResult = { migrated: false, removedSymbols: 0, removedTimeframeSymbols: 0, removedFrontiers: 0 };
+  if (!collecting && !fs.existsSync(venueDir) && !fs.existsSync(path.join(dataDir, "candle-timeframes-v2", "bitunix"))) return result;
   let current: string | null = null;
   try { current = fs.readFileSync(marker, "utf8").trim(); } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
