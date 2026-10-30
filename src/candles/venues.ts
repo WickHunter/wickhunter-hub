@@ -65,7 +65,7 @@
 // third flip is a visible refusal rather than another silent unit change.
 import type { Candle } from "./store.js";
 import { MINUTE_MS, newestClosedOpenMs } from "./store.js";
-import { BITUNIX_LINEAR_QUOTES, bitunixBaseVolume } from "./bitunix-volume.js";
+import { BITUNIX_LINEAR_QUOTES, UnprovableVolumeError, bitunixBaseVolume } from "./bitunix-volume.js";
 
 export const VENUE_IDS = ["bybit", "bitunix", "bitget", "binance", "aster", "weex"] as const;
 export type VenueId = (typeof VENUE_IDS)[number];
@@ -213,7 +213,7 @@ function bitunixRow(r: Record<string, unknown>): Candle | null {
   if (!c) return null;
   const volume = bitunixBaseVolume(r.baseVol, r.quoteVol, c.low, c.high);
   if (volume === null) {
-    throw new Error(`bitunix kline volume is unreadable or contradictory at ${String(r.time)} (baseVol ${String(r.baseVol)}, quoteVol ${String(r.quoteVol)})`);
+    throw new UnprovableVolumeError(`bitunix kline volume is unreadable or contradictory at ${String(r.time)} (baseVol ${String(r.baseVol)}, quoteVol ${String(r.quoteVol)})`);
   }
   return { ...c, volume };
 }

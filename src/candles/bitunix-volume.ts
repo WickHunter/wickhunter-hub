@@ -60,3 +60,19 @@ export const BITUNIX_LINEAR_QUOTES: ReadonlySet<string> = new Set(["USDT", "USDC
 /** The on-disk marker that says every Bitunix row under this data dir was
  *  written under the base-volume contract. See service.ts. */
 export const BITUNIX_VOLUME_CONTRACT = "bitunix-base-volume-v1";
+
+/** v0.4.102 — a venue page refused because a row's volume units could not be
+ *  proven. Typed, so the collector backs off that SYMBOL (and counts it in
+ *  health) instead of treating it as a transient request failure that the
+ *  next symbol's success silently resets. */
+export class UnprovableVolumeError extends Error {
+  readonly unprovableVolume = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "UnprovableVolumeError";
+  }
+}
+
+export function isUnprovableVolume(err: unknown): err is UnprovableVolumeError {
+  return !!err && typeof err === "object" && (err as UnprovableVolumeError).unprovableVolume === true;
+}

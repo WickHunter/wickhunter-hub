@@ -17,7 +17,7 @@ import {
   CandleService, runSnapshotWorker, SNAPSHOT_FAILURE_TTL_MS, SNAPSHOT_WORKER_CONCURRENCY, HEALTH_GAP_WINDOW_DAYS,
 } from "../dist/src/candles/service.js";
 import {
-  DEFAULT_COLLECTOR_OPTIONS, RATE_REFUSED_MEMORY_MS, REPAIR_BACKOFF_BASE_MS, VENUE_EMPTY_RECHECK_MS,
+  DEFAULT_COLLECTOR_OPTIONS, RATE_REFUSED_MEMORY_MS, REPAIR_BACKOFF_BASE_MS, VENUE_EMPTY_RECHECK_MS, VENUE_EMPTY_CONFIRM_GAP_MS,
 } from "../dist/src/candles/collector.js";
 
 const { privateKey } = generateKeyPairSync("ed25519");
@@ -297,7 +297,7 @@ function stub(opts) {
   return { state, fetchLike };
 }
 
-await test("v0.4.102: a hole the venue confirms empty is marked as such — not re-requested, not counted gapped, never filled — and a younger hole is repaired behind it", async () => {
+await test("v0.4.102: a hole the venue confirms empty TWICE, an hour apart, is marked as such — not re-requested, not counted gapped, never filled — and a younger hole is repaired behind it", async () => {
   const dataDir = tmpDir("repair");
   const s = new CandleStore(path.join(dataDir, "candles"));
   const end = newestClosedOpenMs(BG_NOW) - MINUTE_MS;
@@ -314,37 +314,77 @@ await test("v0.4.102: a hole the venue confirms empty is marked as such — not 
   );
   let svc = make();
   const repairsAt = (start) => venue.state.requests.filter((u) => u.includes(`startTime=${start}&`) || u.endsWith(`startTime=${start}`)).length;
-  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
+  const ticks = async (n) => { for (let i = 0; i < n; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; } };
+  const bitget = () => svc.status(clock).find((v) => v.venue === "bitget");
+  await ticks(12);
   let col = svc.collector("bitget");
   assert.equal(repairsAt(old1), 1, "the old hole was asked for once");
   assert.equal(s.readWindow("bitget", "HOLEUSDT", young, young).rows.length, 1, "the younger hole behind it was repaired");
+  assert.deepEqual(col.venueEmptyRanges("HOLEUSDT").map((r) => [r[0], r[1], r[4]]), [[old1, old1, 1]], "a first proof is only a candidate");
+  assert.equal(bitget().counts.gapped, 1, "one page does not exclude the hole from gapped");
+  assert.equal(bitget().venueEmptyMinutes, 0);
+  // Within the hour: not asked again. After it: asked again, and confirmed.
+  clock += VENUE_EMPTY_CONFIRM_GAP_MS;
+  await ticks(12);
+  assert.equal(repairsAt(old1), 2, "the candidate is re-checked once after VENUE_EMPTY_CONFIRM_GAP_MS");
+  assert.deepEqual(col.venueEmptyRanges("HOLEUSDT").map((r) => [r[0], r[1], r[4]]), [[old1, old1, 2]]);
   assert.equal(s.readWindow("bitget", "HOLEUSDT", old1, old1).rows.length, 0, "nothing is fabricated for the empty minute");
   assert.equal(col.cachedCoverage("HOLEUSDT").interiorMissing, 1, "the store still truthfully lacks it");
-  assert.deepEqual(col.venueEmptyRanges("HOLEUSDT").map(([a, b]) => [a, b]), [[old1, old1]]);
   assert.equal(col.repairBackoff("HOLEUSDT"), null, "a proof, not a back-off");
   const { windowStart, windowEnd } = snapshotWindow(clock, 1440, 6);
   assert.equal(col.snapshotSkipIsTransient("HOLEUSDT", "gap", windowStart, clock, windowEnd), false,
     "a gap no pending work can close is structural for the snapshot cache");
-  let status = svc.status(clock).find((v) => v.venue === "bitget");
+  let status = bitget();
   assert.equal(status.liveMissingMinutes, 0, "not a repairable hole");
   assert.equal(status.oldMissingMinutes, 0);
-  assert.equal(status.venueEmptyMinutes, 1, "reported apart");
+  assert.equal(status.venueEmptyMinutes, 1, "reported apart (served by /admin/api/candles)");
   assert.equal(status.counts.gapped, 0);
   assert.equal(status.gapWindowDays, HEALTH_GAP_WINDOW_DAYS);
   // Durable: a restart does not re-ask the venue.
   svc.stop(); svc = make(); col = svc.collector("bitget");
   clock += REPAIR_BACKOFF_BASE_MS + 60_000;
-  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
-  assert.equal(repairsAt(old1), 1, "not re-requested after a restart or past the old back-off");
+  await ticks(12);
+  assert.equal(repairsAt(old1), 2, "not re-requested after a restart or past the old back-off");
   // A day later it is checked once more — and if the venue now has it, filled.
   venue.state.missing.HOLEUSDT.clear();
   clock += VENUE_EMPTY_RECHECK_MS;
-  for (let i = 0; i < 12; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; }
-  assert.equal(repairsAt(old1), 2, "re-checked after VENUE_EMPTY_RECHECK_MS");
+  await ticks(12);
+  assert.equal(repairsAt(old1), 3, "re-checked after VENUE_EMPTY_RECHECK_MS");
   assert.equal(s.readWindow("bitget", "HOLEUSDT", old1, old1).rows.length, 1, "the venue's late candle is stored");
   assert.deepEqual(col.venueEmptyRanges("HOLEUSDT"), [], "the range is gone with the contradiction");
-  status = svc.status(clock).find((v) => v.venue === "bitget");
+  status = bitget();
   assert.equal(status.venueEmptyMinutes, 0);
+  svc.stop();
+});
+
+await test("v0.4.102: venue-empty ranges belong to one listing: a delisted-and-relisted symbol starts with none", async () => {
+  const dataDir = tmpDir("repair-relist");
+  const s = new CandleStore(path.join(dataDir, "candles"));
+  const end = newestClosedOpenMs(BG_NOW) - MINUTE_MS;
+  const old1 = end - 5 * DAY_MS;
+  const rows = [];
+  for (let t = end - 6 * DAY_MS; t <= end; t += MINUTE_MS) if (t !== old1) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
+  s.write("bitget", "RELUSDT", rows);
+  let clock = BG_NOW;
+  const listed = ["RELUSDT"];
+  const venue = stub({ symbols: listed, now: clock, missing: { RELUSDT: new Set([old1]) }, since: end - 6 * DAY_MS });
+  const svc = new CandleService(
+    { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS, retentionDays: 6 }, tickMs: 60_000 },
+    { sign, fetchLike: venue.fetchLike, now: () => clock, sleep: async () => {}, log: () => {} },
+  );
+  const ticks = async (n) => { for (let i = 0; i < n; i++) { venue.state.now = clock; await svc.tickAll(clock); clock += 60_000; } };
+  await ticks(6);
+  clock += VENUE_EMPTY_CONFIRM_GAP_MS;
+  await ticks(6);
+  const col = svc.collector("bitget");
+  assert.equal(col.venueEmptyRanges("RELUSDT")[0]?.[4], 2, "confirmed for this listing");
+  listed.length = 0;
+  await col.refreshSymbols(venue.fetchLike, clock);
+  assert.deepEqual(col.venueEmptyRanges("RELUSDT"), [], "a delisted symbol has no exemptions");
+  clock += 60_000;
+  listed.push("RELUSDT");
+  await col.refreshSymbols(venue.fetchLike, clock);
+  assert.deepEqual(col.venueEmptyRanges("RELUSDT"), [], "the relisted instrument does not inherit them");
   svc.stop();
 });
 

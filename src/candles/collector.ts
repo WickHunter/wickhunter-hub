@@ -37,7 +37,7 @@ import {
   type FetchLike, type VenueId,
 } from "./venues.js";
 import type { TimeframeHistory, TimeframeWork } from "./timeframe.js";
-import { BITUNIX_VOLUME_CONTRACT } from "./bitunix-volume.js";
+import { BITUNIX_VOLUME_CONTRACT, isUnprovableVolume } from "./bitunix-volume.js";
 
 export interface CollectorOptions {
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
@@ -224,9 +224,17 @@ interface SymbolsFile {
   symbols: Record<string, TrackedSymbol>;
 }
 
+/** [fromMs, toMs, firstConfirmedAtMs, lastConfirmedAtMs, confirmations]. */
+type VenueEmptyRange = [number, number, number, number, number];
+interface VenueEmptyEntry {
+  /** The listing identity the ranges were proven for (generationAt or
+   *  firstSeenAt): a relisted symbol cannot inherit its predecessor's. */
+  gen: string;
+  ranges: VenueEmptyRange[];
+}
 interface VenueEmptyFile {
   v: number;
-  ranges: Record<string, Array<[number, number, number]>>;
+  symbols: Record<string, VenueEmptyEntry>;
 }
 
 /** Per symbol: the newest ranges are kept. Bounded so a pathological venue
@@ -235,6 +243,11 @@ interface VenueEmptyFile {
 const VENUE_EMPTY_MAX_RANGES = 256;
 /** How long a venue-confirmed empty range is exempt from repair. */
 export const VENUE_EMPTY_RECHECK_MS = 24 * 3_600_000;
+/** A first proof is only a candidate: it must be repeated at least this long
+ *  after the first before the range is excluded from gapped/repair, and the
+ *  candidate is re-asked after the same interval. One page is one answer; a
+ *  venue having a bad minute is not the venue having no candle. */
+export const VENUE_EMPTY_CONFIRM_GAP_MS = 3_600_000;
 
 interface RestFrontierFile {
   restConfirmed: Record<string, number>;
@@ -284,6 +297,14 @@ export interface VenueHealth {
   rateLimitHits: number;
   /** While this is in the future the collector is deliberately not asking. */
   cooldownUntil: number | null;
+  /** v0.4.102 — pages refused because a row's volume units could not be
+   *  proven (Bitunix: bitunix-volume.ts). Lifetime refusals, symbols whose
+   *  work is currently backed off, and the newest refusal. */
+  unprovableVolume: {
+    refusals: number;
+    backedOffSymbols: number;
+    last: { symbol: string; message: string; at: number } | null;
+  };
 }
 
 export class VenueCollector {
@@ -340,6 +361,12 @@ export class VenueCollector {
   /** See REPAIR_BACKOFF_BASE_MS: per symbol, holes ending before `afterMs`
    *  are not chased again until `until`. */
   private repairSkip = new Map<string, { afterMs: number; until: number; failures: number }>();
+  /** v0.4.102 — per symbol: a page for it was refused for unprovable volume
+   *  units; ALL its REST work waits until `until` (15 min doubling to 6 h,
+   *  the repair back-off's schedule). Cleared by its next accepted page. */
+  private volumeSkip = new Map<string, { until: number; failures: number }>();
+  private volumeRefusals = 0;
+  private lastVolumeRefusal: { symbol: string; message: string; at: number } | null = null;
   /** v0.4.99 — candles held per UTC day inside [first, last], per symbol, kept
    *  exactly beside `coverageCache` (deep scan, then each write's per-day
    *  `newlyFilledByDay`). Absent = unknown: health then counts every hole as
@@ -357,8 +384,10 @@ export class VenueCollector {
    *  range (the venue published it after all) removes the range, and repair
    *  re-asks for a range once it is `VENUE_EMPTY_RECHECK_MS` old, so a venue
    *  that back-fills its own history is still picked up (one page per range
-   *  per day). Tuple: [fromMs, toMs, confirmedAtMs]. */
-  private venueEmpty = new Map<string, Array<[number, number, number]>>();
+   *  per day). A range counts only after TWO such proofs at least
+   *  `VENUE_EMPTY_CONFIRM_GAP_MS` apart; ranges are keyed by the listing
+   *  identity, so a delisted-and-relisted symbol starts with none. */
+  private venueEmpty = new Map<string, VenueEmptyEntry>();
   private readonly venueEmptyFile: string;
   /** A recent page that did not contain an existing tail's first missing
    *  minute. The next pass uses bounded history instead of retrying the same
@@ -420,14 +449,14 @@ export class VenueCollector {
     for (const sym of this.tracked.keys()) {
       if (!this.restFrontier.has(sym)) this.restartCandidates.add(sym);
     }
-    const emptyFile = readJson<VenueEmptyFile>(this.venueEmptyFile, { v: 1, ranges: {} });
-    if (emptyFile.v === 1) for (const [sym, ranges] of Object.entries(emptyFile.ranges ?? {})) {
-      if (!Array.isArray(ranges)) continue;
-      const ok = ranges.filter((r): r is [number, number, number] => Array.isArray(r) && r.length === 3
-        && Number.isSafeInteger(r[0]) && Number.isSafeInteger(r[1]) && Number.isSafeInteger(r[2])
-        && r[0] > 0 && r[0] % MINUTE_MS === 0 && r[1] % MINUTE_MS === 0 && r[1] >= r[0] && r[2] >= 0);
-      if (ok.length) this.venueEmpty.set(sym, ok.map((r) => [r[0], r[1], r[2]] as [number, number, number])
-        .sort((a, b) => a[0] - b[0]).slice(-VENUE_EMPTY_MAX_RANGES));
+    const emptyFile = readJson<VenueEmptyFile>(this.venueEmptyFile, { v: 1, symbols: {} });
+    if (emptyFile.v === 1) for (const [sym, entry] of Object.entries(emptyFile.symbols ?? {})) {
+      if (!entry || typeof entry.gen !== "string" || !Array.isArray(entry.ranges)) continue;
+      const ok = entry.ranges.filter((r): r is VenueEmptyRange => Array.isArray(r) && r.length === 5
+        && r.every((n) => Number.isSafeInteger(n) && n >= 0)
+        && r[0] > 0 && r[0] % MINUTE_MS === 0 && r[1] % MINUTE_MS === 0 && r[1] >= r[0] && r[3] >= r[2] && r[4] >= 1);
+      if (ok.length) this.venueEmpty.set(sym, { gen: entry.gen, ranges: ok.map((r) => [...r] as VenueEmptyRange)
+        .sort((a, b) => a[0] - b[0]).slice(-VENUE_EMPTY_MAX_RANGES) });
     }
     this.timeframes?.noteInstrumentRoster(this.venue, [...this.tracked.values()].map((rec) => ({
       symbol: rec.symbol, generation: `${this.venue}:usdt-perpetual:${rec.generationAt ?? rec.firstSeenAt}`,
@@ -638,16 +667,25 @@ export class VenueCollector {
     }
   }
 
-  /** v0.4.102 — prime every tracked symbol's exact coverage in the
-   *  background after boot, yielding after each symbol. Ticks never await it
-   *  (they keep their own bounded slice), and an unprimed symbol gets no REST
-   *  work at all from `workQueue`, so a roster that primes only through the
-   *  per-tick slice (32 per 60 s) took ~25 min even on an idle loop. Started
-   *  by `CandleService.start()`; shares `prepareCoverage`'s single pass. */
-  primeCoverageInBackground(): Promise<void> {
-    return this.prepareCoverage().catch((err) => {
-      this.log(`${this.venue}: background coverage prime stopped — ${(err as Error)?.message ?? "unknown"}`);
-    });
+  /** v0.4.102 — one TURN of the post-boot roster prime: deep-scan unprimed
+   *  symbols synchronously until `budgetMs` of scan time is spent (at least
+   *  one symbol), then return so the caller yields. `CandleService` drives
+   *  this for ONE venue at a time (a turn never touches two collectors) with
+   *  a timer yield between turns, so the event loop stays responsive and the
+   *  page cache sees one venue's day files at a time, not six at once. An
+   *  unprimed symbol gets no REST work from `workQueue`, and the per-tick
+   *  slice alone (32 per 60 s) took ~25 min per venue on an idle loop. */
+  primeTurn(budgetMs: number, clock: () => number): { scanned: number; spentMs: number; done: boolean } {
+    let scanned = 0, spentMs = 0;
+    for (const symbol of this.tracked.keys()) {
+      if (this.coverageCache.has(symbol)) continue;
+      if (scanned > 0 && spentMs >= budgetMs) return { scanned, spentMs, done: false };
+      const t0 = clock();
+      this.coverage(symbol);
+      spentMs += Math.max(0, clock() - t0);
+      scanned++;
+    }
+    return { scanned, spentMs, done: true };
   }
 
   /** An admin refresh may advance one exact row, at most once per 15 seconds.
@@ -1069,6 +1107,15 @@ export class VenueCollector {
    * claim. Routine reconciliation, old repairs, minute depth and demanded
    * timeframe depth share the remaining WEEX weight envelope fairly. */
   private scheduledWork(now: number): ScheduledWork[] {
+    // v0.4.102 — a symbol backed off for unprovable volume gets no work of
+    // any kind until its back-off expires.
+    if (this.volumeSkip.size) {
+      return this.scheduledWorkUnfiltered(now).filter((item) => !((this.volumeSkip.get(item.symbol)?.until ?? 0) > now));
+    }
+    return this.scheduledWorkUnfiltered(now);
+  }
+
+  private scheduledWorkUnfiltered(now: number): ScheduledWork[] {
     const minute = this.workQueue(now);
     if (!this.timeframes) return minute;
     const urgent = minute.filter((item) => item.kind !== "backfill");
@@ -1321,6 +1368,7 @@ export class VenueCollector {
           const page = await fetchNativeTimeframeKlines(
             fetchLike, this.venue, item.symbol, item.interval, item.startMs, item.endMs,
           );
+          this.volumeSkip.delete(item.symbol);
           written += this.timeframes!.record(item, page, now);
           this.lastSuccessAt = now;
           this.consecutiveFailures = 0;
@@ -1335,6 +1383,7 @@ export class VenueCollector {
         const page = item.recent && adapter.fetchRecentKlines
           ? await adapter.fetchRecentKlines(fetchLike, item.symbol, item.startMs, item.endMs)
           : await adapter.fetchKlines(fetchLike, item.symbol, item.startMs, item.endMs);
+        this.volumeSkip.delete(item.symbol);
         // Use the store's captured settlement cutoff for every downstream
         // decision, including contiguity, corrections, coverage and provenance.
         // A yielding scan or slow request can observe newer WS/REST rows, but
@@ -1471,6 +1520,20 @@ export class VenueCollector {
           break;
         }
         this.lastError = { message: `${item.symbol}: ${(err as Error).message}`, at: now };
+        if (isUnprovableVolume(err)) {
+          // The venue answered; its answer cannot be stored. Not a transient
+          // request failure (the next symbol's success would reset that
+          // count and hide this one for ever): back the symbol off, count it.
+          const failures = (this.volumeSkip.get(item.symbol)?.failures ?? 0) + 1;
+          const wait = Math.min(REPAIR_BACKOFF_MAX_MS, REPAIR_BACKOFF_BASE_MS * 2 ** Math.min(20, failures - 1));
+          this.volumeSkip.set(item.symbol, { until: now + wait, failures });
+          this.volumeRefusals++;
+          this.lastVolumeRefusal = { symbol: item.symbol, message: (err as Error).message, at: now };
+          if (failures === 1 || failures % 8 === 0) {
+            this.log(`${this.venue}: ${item.symbol} page refused — ${(err as Error).message}; symbol backed off ${Math.round(wait / 60_000)} min (refusal ${failures})`);
+          }
+          continue;
+        }
         this.consecutiveFailures++;
       }
     }
@@ -1488,11 +1551,11 @@ export class VenueCollector {
     const horizon = now - this.opts.retentionDays * DAY_MS;
     let removed = 0;
     let emptyChanged = false;
-    for (const [symbol, ranges] of this.venueEmpty) {
-      const kept = ranges.filter(([, b]) => b >= dayStartOf(horizon));
-      if (kept.length === ranges.length) continue;
+    for (const [symbol, entry] of this.venueEmpty) {
+      const kept = entry.ranges.filter(([, b]) => b >= dayStartOf(horizon));
+      if (kept.length === entry.ranges.length) continue;
       emptyChanged = true;
-      if (kept.length) this.venueEmpty.set(symbol, kept); else this.venueEmpty.delete(symbol);
+      if (kept.length) entry.ranges = kept; else this.venueEmpty.delete(symbol);
     }
     if (emptyChanged) this.persistVenueEmpty();
     for (const symbol of this.store.symbols(this.venue)) {
@@ -1519,38 +1582,62 @@ export class VenueCollector {
     return removed;
   }
 
-  /** Venue-confirmed empty minutes for `symbol` inside [fromMs, toMs]. */
+  /** The listing identity venue-empty ranges are keyed by, or null for a
+   *  symbol that is not a live listing (no exemptions for it). */
+  private listingIdentity(symbol: string): string | null {
+    const rec = this.tracked.get(symbol);
+    if (!rec || rec.delisted) return null;
+    return String(rec.generationAt ?? rec.firstSeenAt);
+  }
+
+  /** This listing's ranges; a stale listing's are discarded. */
+  private emptyRanges(symbol: string): VenueEmptyRange[] {
+    const entry = this.venueEmpty.get(symbol);
+    if (!entry) return [];
+    const gen = this.listingIdentity(symbol);
+    if (gen === null) return [];
+    if (entry.gen !== gen) { this.venueEmpty.delete(symbol); this.persistVenueEmpty(); return []; }
+    return entry.ranges;
+  }
+
+  /** Venue-confirmed empty minutes for `symbol` inside [fromMs, toMs]: only
+   *  ranges proven twice, `VENUE_EMPTY_CONFIRM_GAP_MS` apart. */
   venueEmptyMinutes(symbol: string, fromMs: number, toMs: number): number {
-    const ranges = this.venueEmpty.get(symbol);
-    if (!ranges || toMs < fromMs) return 0;
+    if (toMs < fromMs) return 0;
     let n = 0;
-    for (const [a, b] of ranges) {
+    for (const [a, b, , , confirmations] of this.emptyRanges(symbol)) {
+      if (confirmations < 2) continue;
       const lo = Math.max(a, fromMs), hi = Math.min(b, toMs);
       if (hi >= lo) n += (hi - lo) / MINUTE_MS + 1;
     }
     return n;
   }
 
-  /** Diagnostics/tests: the confirmed-empty ranges for one symbol. */
-  venueEmptyRanges(symbol: string): Array<[number, number, number]> {
-    return (this.venueEmpty.get(symbol) ?? []).map(([a, b, at]) => [a, b, at]);
+  /** Diagnostics/tests: [from, to, firstAt, lastAt, confirmations] per range. */
+  venueEmptyRanges(symbol: string): VenueEmptyRange[] {
+    return this.emptyRanges(symbol).map((r) => [...r] as VenueEmptyRange);
   }
 
   private persistVenueEmpty(): void {
-    writeJsonAtomic(this.venueEmptyFile, { v: 1, ranges: Object.fromEntries(this.venueEmpty) } satisfies VenueEmptyFile);
+    writeJsonAtomic(this.venueEmptyFile, { v: 1, symbols: Object.fromEntries(this.venueEmpty) } satisfies VenueEmptyFile);
   }
 
-  /** Is `gap` wholly inside a confirmed-empty range that is not yet due for
-   *  its re-check? Only repair scheduling asks; status counts every range. */
+  /** Is `gap` wholly inside a range that is not due to be asked again? A
+   *  confirmed range waits `VENUE_EMPTY_RECHECK_MS`; a single-proof candidate
+   *  only `VENUE_EMPTY_CONFIRM_GAP_MS`, then repair asks again. */
   private covered(symbol: string, gap: [number, number], now: number): boolean {
-    for (const [a, b, at] of this.venueEmpty.get(symbol) ?? []) {
-      if (a <= gap[0] && gap[1] <= b && now - at < VENUE_EMPTY_RECHECK_MS) return true;
+    for (const [a, b, , lastAt, confirmations] of this.emptyRanges(symbol)) {
+      if (a > gap[0] || gap[1] > b) continue;
+      const wait = confirmations >= 2 ? VENUE_EMPTY_RECHECK_MS : VENUE_EMPTY_CONFIRM_GAP_MS;
+      if (now - lastAt < wait) return true;
     }
     return false;
   }
 
   /** A repair page's verdict on the hole it was sent for. True when the page
-   *  proves the venue holds no candle anywhere in the hole (see `venueEmpty`). */
+   *  proves the venue holds no candle anywhere in the hole (see `venueEmpty`):
+   *  a first proof records a candidate, a repeat at least
+   *  `VENUE_EMPTY_CONFIRM_GAP_MS` after the first confirms it. */
   private confirmVenueEmpty(item: CandleWorkItem, rows: readonly Candle[], now: number): boolean {
     const hole = this.holeCache.get(item.symbol)?.gap;
     if (!hole || hole[0] !== item.startMs || hole[1] >= item.endMs) return false;
@@ -1560,37 +1647,41 @@ export class VenueCollector {
     // repair back-off owns them.
     const recentFloor = settledOpenMs(now) - Math.max(1, this.opts.tailFillMinutes) * MINUTE_MS;
     if (hole[1] >= recentFloor) return false;
+    const gen = this.listingIdentity(item.symbol);
+    if (gen === null) return false;
     let after = false;
     for (const r of rows) {
       if (r.openMs >= hole[0] && r.openMs <= hole[1]) return false;
       if (r.openMs > hole[1] && r.openMs <= item.endMs) after = true;
     }
     if (!after) return false;
-    const ranges = (this.venueEmpty.get(item.symbol) ?? []).filter(([a, b]) => b < hole[0] || a > hole[1]);
-    ranges.push([hole[0], hole[1], now]);
-    ranges.sort((a, b) => a[0] - b[0]);
-    // Merge touching ranges so the sidecar stays small; the merged range is
-    // as old as its oldest confirmation.
-    const merged: Array<[number, number, number]> = [];
-    for (const r of ranges) {
-      const last = merged[merged.length - 1];
-      if (last && r[0] <= last[1] + MINUTE_MS) { last[1] = Math.max(last[1], r[1]); last[2] = Math.min(last[2], r[2]); }
-      else merged.push([r[0], r[1], r[2]]);
+    const ranges = this.emptyRanges(item.symbol);
+    const same = ranges.find((r) => r[0] === hole[0] && r[1] === hole[1]);
+    let next: VenueEmptyRange[];
+    if (same) {
+      same[3] = now;
+      if (now - same[2] >= VENUE_EMPTY_CONFIRM_GAP_MS) same[4] = Math.min(same[4] + 1, 1_000_000);
+      next = ranges;
+    } else {
+      // A different span supersedes any range it overlaps: the hole changed.
+      next = ranges.filter(([a, b]) => b < hole[0] || a > hole[1]);
+      next.push([hole[0], hole[1], now, now, 1]);
+      next.sort((x, y) => x[0] - y[0]);
     }
-    this.venueEmpty.set(item.symbol, merged.slice(-VENUE_EMPTY_MAX_RANGES));
+    this.venueEmpty.set(item.symbol, { gen, ranges: next.slice(-VENUE_EMPTY_MAX_RANGES) });
     this.persistVenueEmpty();
     this.holeCache.delete(item.symbol);
     return true;
   }
 
-  /** A stored candle inside a confirmed-empty range: the venue published it
-   *  after all, so that range is no longer a fact. */
+  /** A stored candle inside a venue-empty range: the venue published it after
+   *  all, so that range is no longer a fact. */
   private dropVenueEmptyOverlap(symbol: string, candles: readonly Candle[]): void {
-    const ranges = this.venueEmpty.get(symbol);
-    if (!ranges || !candles.length) return;
-    const kept = ranges.filter(([a, b]) => !candles.some((c) => c.openMs >= a && c.openMs <= b));
-    if (kept.length === ranges.length) return;
-    if (kept.length) this.venueEmpty.set(symbol, kept); else this.venueEmpty.delete(symbol);
+    const entry = this.venueEmpty.get(symbol);
+    if (!entry || !candles.length) return;
+    const kept = entry.ranges.filter(([a, b]) => !candles.some((c) => c.openMs >= a && c.openMs <= b));
+    if (kept.length === entry.ranges.length) return;
+    if (kept.length) entry.ranges = kept; else this.venueEmpty.delete(symbol);
     this.persistVenueEmpty();
   }
 
@@ -1634,6 +1725,11 @@ export class VenueCollector {
       effectiveRps: this.effectiveRps,
       configuredRps: this.opts.requestsPerSecond,
       rateLimitHits: this.rateLimitHits,
+      unprovableVolume: {
+        refusals: this.volumeRefusals,
+        backedOffSymbols: [...this.volumeSkip.values()].filter((v) => v.until > now).length,
+        last: this.lastVolumeRefusal ? { ...this.lastVolumeRefusal } : null,
+      },
       cooldownUntil: this.cooldownUntil > now ? this.cooldownUntil : null,
     };
     // FAILING beats STALLED: if requests are actively erroring, that is the

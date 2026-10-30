@@ -1915,7 +1915,13 @@ async function cdRefresh() {
       + "<dt>" + (v.counts.warming ? "Known missing minutes" : "Missing minutes") + "</dt><dd>"
         + (typeof v.liveMissingMinutes === "number"
           ? v.liveMissingMinutes.toLocaleString() + " in the last " + v.gapWindowDays + " d · " + v.oldMissingMinutes.toLocaleString() + " older"
-          : v.totalMissingMinutes.toLocaleString()) + "</dd>"
+          : v.totalMissingMinutes.toLocaleString())
+        + (v.venueEmptyMinutes ? " · " + v.venueEmptyMinutes.toLocaleString() + " the venue confirms empty (not counted)" : "") + "</dd>"
+      + (h.unprovableVolume && h.unprovableVolume.refusals
+        ? "<dt>Unprovable volume</dt><dd>" + h.unprovableVolume.refusals.toLocaleString() + " pages refused · "
+          + h.unprovableVolume.backedOffSymbols.toLocaleString() + " symbols backed off"
+          + (h.unprovableVolume.last ? ' <span class="muted">(last ' + esc(h.unprovableVolume.last.symbol) + ")</span>" : "") + "</dd>"
+        : "")
       + "<dt>Requests</dt><dd>" + h.requestsMade.toLocaleString() + " · " + h.candlesWritten.toLocaleString() + " candles</dd>"
       // The rate is stated whenever the collector is not at full speed, because
       // "slow" and "broken" look identical from the bucket counts alone.

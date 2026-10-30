@@ -192,6 +192,18 @@ export interface CandleServiceConfig {
    *  Absent/empty = REST only, which is every install's behaviour until an
    *  operator sets `HUB_CANDLE_STREAM`. */
   streamVenues?: VenueId[];
+  /** v0.4.102 — the post-boot coverage prime (see `primeTurn`). Defaults:
+   *  start 10 s after `start()` (which runs after listen), 50 ms of scan per
+   *  turn, 25 ms timer yield between turns, venues one after another. */
+  coveragePrime?: {
+    delayMs?: number;
+    turnBudgetMs?: number;
+    yieldMs?: number;
+    /** Scan-time clock; default `performance.now`. */
+    clock?: () => number;
+    /** Tests: told about every turn. */
+    onTurn?: (turn: { venue: VenueId; scanned: number; spentMs: number; done: boolean }) => void;
+  };
 }
 
 export interface CandleServiceDeps {
@@ -355,7 +367,7 @@ export class CandleService {
     }
     // v0.4.102 — exact coverage for the whole roster within minutes of boot,
     // not only through each tick's bounded slice (collector.ts).
-    for (const c of this.collectors.values()) void c.primeCoverageInBackground();
+    this.startCoveragePrime();
     this.timer = setInterval(() => void this.tickAll(), this.cfg.tickMs);
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
@@ -374,7 +386,46 @@ export class CandleService {
     }
   }
 
+  private primeTimer: ReturnType<typeof setTimeout> | null = null;
+  private primeGeneration = 0;
+
+  /** Prime every collector's exact coverage, ONE venue at a time, in bounded
+   *  synchronous turns separated by timer yields. `stop()` ends it. */
+  private startCoveragePrime(): void {
+    const o = this.cfg.coveragePrime ?? {};
+    const generation = ++this.primeGeneration;
+    const budget = Math.max(1, o.turnBudgetMs ?? 50);
+    const yieldMs = Math.max(0, o.yieldMs ?? 25);
+    const clock = o.clock ?? (() => performance.now());
+    const venues = [...this.collectors.entries()];
+    let index = 0;
+    const turn = (): void => {
+      this.primeTimer = null;
+      if (generation !== this.primeGeneration) return;
+      const entry = venues[index];
+      if (!entry) return;
+      const [venue, collector] = entry;
+      let result: { scanned: number; spentMs: number; done: boolean };
+      try { result = collector.primeTurn(budget, clock); }
+      catch (err) {
+        (this.deps.log ?? console.log)(`[candles] ${venue}: coverage prime skipped — ${(err as Error)?.message ?? "unknown"}`);
+        result = { scanned: 0, spentMs: 0, done: true };
+      }
+      o.onTurn?.({ venue, ...result });
+      if (result.done) index++;
+      if (index < venues.length) {
+        this.primeTimer = setTimeout(turn, yieldMs);
+        this.primeTimer.unref?.();
+      }
+    };
+    this.primeTimer = setTimeout(turn, Math.max(0, o.delayMs ?? 10_000));
+    this.primeTimer.unref?.();
+  }
+
   stop(): void {
+    this.primeGeneration++;
+    if (this.primeTimer) clearTimeout(this.primeTimer);
+    this.primeTimer = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     if (this.startupTick) clearImmediate(this.startupTick);

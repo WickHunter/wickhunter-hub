@@ -20,6 +20,10 @@
 //   M8 migration ignores a rollback → "rollback" red.
 //   M9 listSymbols tracks USD contracts → "linear" red.
 //   M10 the marker dir is created on a Hub without Bitunix → "fresh" red.
+//   M11 the collector treats an unprovable page as an ordinary failure (no
+//       per-symbol back-off, no counter) → "unprovable volume" red.
+//   M12 an unprovable page is thrown as a plain Error → "unprovable volume" red.
+//   M13 the migration keeps venue-empty.v1.json → "stored data" red.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -251,6 +255,7 @@ function legacyDataDir() {
   put("candles/bitunix/ETHUSDT/2026-10-29.c1m");
   put("candles/bitunix/symbols.json", JSON.stringify({ symbols: { BTCUSDT: { symbol: "BTCUSDT" } } }));
   put("candles/bitunix/rest-frontier.json", JSON.stringify({ restConfirmed: { BTCUSDT: 60_000 } }));
+  put("candles/bitunix/venue-empty.v1.json", JSON.stringify({ v: 1, symbols: {} }));
   put("candles/bybit/BTCUSDT/2026-10-28.c1m");
   put("candles/bybit/rest-frontier.json", JSON.stringify({ restConfirmed: { BTCUSDT: 60_000 } }));
   put("candle-timeframes-v2/bitunix/BTCUSDT/60/2026-10-28.tf");
@@ -271,6 +276,7 @@ await test("stored data: pre-contract Bitunix rows are discarded once; other ven
     assert.equal(r.removedFrontiers, 1);
     assert.ok(!exists(d, "candles/bitunix/BTCUSDT") && !exists(d, "candles/bitunix/ETHUSDT"));
     assert.ok(!exists(d, "candles/bitunix/rest-frontier.json"), "no REST frontier vouches for discarded rows");
+    assert.ok(!exists(d, "candles/bitunix/venue-empty.v1.json"), "nor any venue-empty range");
     assert.ok(exists(d, "candles/bitunix/symbols.json"), "the roster carries no candle values");
     assert.ok(!exists(d, "candle-timeframes-v2/bitunix"));
     assert.ok(exists(d, "candles/bybit/BTCUSDT/2026-10-28.c1m") && exists(d, "candles/bybit/rest-frontier.json"));
@@ -340,6 +346,52 @@ await test("the Bitunix collector's REST frontier names the volume contract it v
     await c.tick(fetchLike, 3, now, { clock: () => clock, sleep: async (ms) => { clock += ms; } });
     const f = JSON.parse(fs.readFileSync(path.join(d, "bitunix", "rest-frontier.json"), "utf8"));
     assert.equal(f.volumeContract, BITUNIX_VOLUME_CONTRACT);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+await test("unprovable volume: the symbol is backed off (15 min doubling) and counted in health; other symbols keep working", async () => {
+  const { VenueCollector, DEFAULT_COLLECTOR_OPTIONS, REPAIR_BACKOFF_BASE_MS } = await import("../dist/src/candles/collector.js");
+  const { CandleStore } = await import("../dist/src/candles/store.js");
+  const d = tmpDir("bitunix-unprovable");
+  try {
+    let now = 1_793_328_600_000;
+    const store = new CandleStore(d);
+    const col = new VenueCollector("bitunix", store, d, DEFAULT_COLLECTOR_OPTIONS, now, () => {});
+    let badFixed = false;
+    const asked = { GOODUSDT: 0, BADUSDT: 0 };
+    const fetchLike = async (url) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith("/trading_pairs")) return { ok: true, status: 200, json: async () => ({ code: 0, data: [
+        { symbol: "GOODUSDT", quote: "USDT", symbolStatus: "OPEN" }, { symbol: "BADUSDT", quote: "USDT", symbolStatus: "OPEN" }] }) };
+      const sym = u.searchParams.get("symbol"); asked[sym]++;
+      const end = Math.floor(Number(u.searchParams.get("endTime")) / MIN) * MIN;
+      const swapped = sym === "BADUSDT" && !badFixed;
+      const data = [0, 1, 2].map((k) => ({ time: String(end - k * MIN), open: "10", high: "10", low: "10", close: "10",
+        baseVol: swapped ? "20" : "2", quoteVol: swapped ? "2" : "20" }));
+      return { ok: true, status: 200, json: async () => ({ code: 0, data }) };
+    };
+    const tick = async () => { let c = now; await col.tick(fetchLike, 10, now, { clock: () => c, sleep: async (ms) => { c += ms; } }); };
+    await tick();
+    let h = col.health(now);
+    assert.equal(h.unprovableVolume.refusals, 1);
+    assert.equal(h.unprovableVolume.backedOffSymbols, 1);
+    assert.equal(h.unprovableVolume.last.symbol, "BADUSDT");
+    assert.equal(h.consecutiveFailures, 0, "not a transient request failure");
+    const badAfterFirst = asked.BADUSDT, goodAfterFirst = asked.GOODUSDT;
+    now += 5 * MIN; await tick();
+    assert.equal(asked.BADUSDT, badAfterFirst, "no work for the backed-off symbol");
+    assert.ok(asked.GOODUSDT >= goodAfterFirst, "other symbols are unaffected");
+    now += REPAIR_BACKOFF_BASE_MS; await tick();
+    h = col.health(now);
+    assert.equal(asked.BADUSDT, badAfterFirst + 1, "asked again after the back-off");
+    assert.equal(h.unprovableVolume.refusals, 2, "and refused again, counted");
+    now += REPAIR_BACKOFF_BASE_MS + MIN; await tick();
+    assert.equal(asked.BADUSDT, badAfterFirst + 1, "the second back-off is longer (doubled)");
+    badFixed = true;
+    now += 2 * REPAIR_BACKOFF_BASE_MS; await tick();
+    h = col.health(now);
+    assert.equal(h.unprovableVolume.backedOffSymbols, 0, "an accepted page clears the back-off");
+    assert.ok(store.readWindow("bitunix", "BADUSDT", 0, now).rows.length > 0, "and its rows are stored");
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 

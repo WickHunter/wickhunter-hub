@@ -12,6 +12,8 @@
 // MUTATION EVIDENCE (isolated dist copy; all RED 2026-10-30):
 //   W1 slice bound back to wall time → "busy loop" red.
 //   W2 no background prime at start → "boot" red.
+//   W4 the prime runs every venue concurrently → "one venue per turn" red.
+//   W5 a turn ignores its scan budget → "one venue per turn" red.
 //   W3 prune drops coverage again → "prune" red.
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -38,6 +40,9 @@ function seededDir(days = 3) {
 }
 
 const fetchLike = async (url) => {
+  if (url.includes("/v5/market/instruments-info")) {
+    return { ok: true, status: 200, json: async () => ({ retCode: 0, result: { list: symbols.map((symbol) => ({ symbol, quoteCoin: "USDT", status: "Trading", contractType: "LinearPerpetual" })), nextPageCursor: "" } }) };
+  }
   if (url.includes("/mix/market/contracts")) {
     return { ok: true, status: 200, json: async () => ({ code: "00000", data: symbols.map((symbol) => ({ symbol, symbolStatus: "normal" })) }) };
   }
@@ -68,7 +73,7 @@ await test("boot: CandleService.start() primes the whole roster's exact coverage
     const pre = new VenueCollector("bitget", new CandleStore(path.join(dataDir, "candles")), path.join(dataDir, "candles"), DEFAULT_COLLECTOR_OPTIONS, NOW, () => {});
     await pre.refreshSymbols(fetchLike, NOW); // persists symbols.json, as a running Hub has
     const svc = new CandleService(
-      { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS }, tickMs: 3_600_000 },
+      { dataDir, venues: ["bitget"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS }, tickMs: 3_600_000, coveragePrime: { delayMs: 0 } },
       { sign: () => Buffer.alloc(64), fetchLike, now: () => NOW, sleep: async () => {}, log: () => {} },
     );
     const warming = () => svc.status(NOW).find((v) => v.venue === "bitget").counts.warming;
@@ -106,6 +111,49 @@ await test("prune: retention removing a day keeps exact coverage (no roster-wide
       const fresh = store.coverage("bitget", sym, true);
       assert.deepEqual(cached, fresh, `${sym}: carried-forward coverage equals a fresh deep scan`);
     }
+  } finally { fs.rmSync(dataDir, { recursive: true, force: true }); }
+});
+
+await test("one venue per turn: the boot prime serialises venues, bounds each turn's scan time and yields on a timer between turns", async () => {
+  const { dataDir, end } = seededDir(2);
+  try {
+    // A second venue with the same roster.
+    const store = new CandleStore(path.join(dataDir, "candles"));
+    for (const sym of symbols) {
+      const rows = [];
+      for (let t = end - 2 * DAY_MS; t <= end; t += MINUTE_MS) rows.push({ openMs: t, open: 1, high: 2, low: 0.5, close: 1.5, volume: 3 });
+      store.write("bybit", sym, rows);
+    }
+    for (const v of ["bitget", "bybit"]) {
+      const pre = new VenueCollector(v, store, path.join(dataDir, "candles"), DEFAULT_COLLECTOR_OPTIONS, NOW, () => {});
+      await pre.refreshSymbols(fetchLike, NOW);
+      assert.equal(pre.symbols().length, N, `${v} roster`);
+    }
+    // Every scan costs exactly 5 ms on the prime's clock (two reads); budget 25.
+    let fake = 0;
+    const turns = [];
+    const svc = new CandleService(
+      { dataDir, venues: ["bitget", "bybit"], keyId: "seed-1", options: { ...DEFAULT_COLLECTOR_OPTIONS }, tickMs: 3_600_000,
+        coveragePrime: { delayMs: 0, turnBudgetMs: 25, yieldMs: 1, clock: () => (fake += 5), onTurn: (t) => turns.push({ ...t, at: Date.now() }) } },
+      { sign: () => Buffer.alloc(64), fetchLike, now: () => NOW, sleep: async () => {}, log: () => {} },
+    );
+    // A concurrent timer proves the loop is free between turns.
+    let ticks = 0; const beat = setInterval(() => ticks++, 1);
+    svc.start();
+    try {
+      const deadline = Date.now() + 20_000;
+      const warming = () => svc.status(NOW).filter((v) => v.configured).reduce((n, v) => n + v.counts.warming, 0);
+      while (warming() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+      assert.equal(warming(), 0, "both venues primed");
+    } finally { svc.stop(); clearInterval(beat); }
+    assert.ok(turns.every((t) => t.scanned >= 1 && t.scanned <= 5 && t.spentMs <= 25 + 5), `each turn scans within its budget (${turns.map((t) => t.scanned).join(",")})`);
+    const order = turns.map((t) => t.venue);
+    const firstBybit = order.indexOf("bybit");
+    assert.ok(firstBybit > 0 && order.slice(0, firstBybit).every((v) => v === "bitget") && order.slice(firstBybit).every((v) => v === "bybit"),
+      "venues are primed one after another, never interleaved or concurrent");
+    assert.equal(turns.reduce((n, t) => n + t.scanned, 0), 2 * N, "every symbol scanned exactly once");
+    assert.ok(turns.length >= Math.ceil((2 * N) / 5), "many short turns, not one long one");
+    assert.ok(ticks > 0, "other timers ran while the prime was in progress");
   } finally { fs.rmSync(dataDir, { recursive: true, force: true }); }
 });
 

@@ -72,6 +72,9 @@ export function migrateBitunixVolumeContract(dataDir: string, log: (m: string) =
     }
   }
   fs.rmSync(path.join(venueDir, "rest-frontier.json"), { force: true });
+  // Venue-empty ranges (collector.ts) were proven against the discarded
+  // rows' coverage; they start again with the re-collected store.
+  fs.rmSync(path.join(venueDir, "venue-empty.v1.json"), { force: true });
 
   // Higher-timeframe cache: native Bitunix pages read `quoteVol` too, and
   // aggregates fold minute volumes.
