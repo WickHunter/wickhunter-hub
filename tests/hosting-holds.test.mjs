@@ -492,4 +492,18 @@ await test("a reserved row whose captured cost no longer leaves the margin fails
   } finally { await ctx.h.close(); }
 });
 
+await test("v0.4.102: an idempotent reconcileAll pass parses the hosting db a bounded number of times, not once per owner", async () => {
+  const ctx = await newHub();
+  const owners = Array.from({ length: 6 }, (_, i) => `cus_parse${i}`);
+  for (const o of owners) await boughtHosting(ctx, o, `${o}@example.com`);
+  const store = ctx.h.hub.hosting.store;
+  ctx.h.hub.hosting.reconcileAll(ctx.getClock());
+  const before = store.instances().map((r) => [r.id, r.version, r.stage]);
+  store.dbParses = 0;
+  ctx.h.hub.hosting.reconcileAll(ctx.getClock());
+  assert.ok(store.dbParses <= 2, `parses ${store.dbParses} for ${owners.length} owners`);
+  assert.deepEqual(store.instances().map((r) => [r.id, r.version, r.stage]), before, "an idempotent pass changes nothing");
+  await ctx.h.close();
+});
+
 summary("hosting-holds");

@@ -28,6 +28,7 @@
 // across process restarts (an operation that dies mid-await, e.g. a Vultr
 // call that never returns), not to arbitrate concurrent writers within one
 // process (the synchronous `mutate` already does that).
+import fs from "node:fs";
 import path from "node:path";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
@@ -244,7 +245,40 @@ export class HostingStore {
     this.dbFile = path.join(dataDir, HOSTING_DB_FILE);
   }
 
+  /** v0.4.102 — the parsed db for READ-ONLY queries, re-parsed only when the
+   *  file on disk changed. The 2026-10-30 profile of the live Hub had 7.8% of
+   *  its main thread in `reconcileAll` → `activeInstanceForOwner` re-reading
+   *  and parsing the whole hosting db once per owner per 30 s tick. The cache
+   *  key is the file's identity (inode, size, mtime/ctime in ns): every write
+   *  is tmp+rename, so any writer — this process or another — changes it, and
+   *  this process's own `mutate` drops it outright. Queries return CLONES, so a
+   *  caller mutating a returned row can never corrupt the cache. `mutate`
+   *  never uses it: every compare-and-set still reads the on-disk version. */
+  private readCache: { key: string; db: HostingDb } | null = null;
+  /** Diagnostics/tests: full parses of the db file. */
+  dbParses = 0;
+
+  private fileKey(): string | null {
+    try {
+      const st = fs.statSync(this.dbFile, { bigint: true });
+      return `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  private readShared(): HostingDb {
+    const key = this.fileKey();
+    if (key !== null && this.readCache?.key === key) return this.readCache.db;
+    const db = this.readDb();
+    // Re-stat after the read: a write racing the read leaves no cache entry.
+    this.readCache = key !== null && this.fileKey() === key ? { key, db } : null;
+    return db;
+  }
+
   private readDb(): HostingDb {
+    this.dbParses++;
     const raw = readJson<Partial<HostingDb>>(this.dbFile, emptyDb());
     return {
       v: 1,
@@ -262,6 +296,7 @@ export class HostingStore {
    *  handed; the whole db is written back atomically iff `fn` returns
    *  without throwing. */
   private mutate<T>(fn: (db: HostingDb) => T): T {
+    this.readCache = null;
     const db = this.readDb();
     const result = fn(db);
     writeJsonAtomic(this.dbFile, db);
@@ -275,11 +310,12 @@ export class HostingStore {
   // ── instances ─────────────────────────────────────────────────────────
 
   instances(): HostingInstanceRow[] {
-    return Object.values(this.readDb().instances);
+    return Object.values(this.readShared().instances).map((r) => structuredClone(r));
   }
 
   getInstance(id: string): HostingInstanceRow | null {
-    return this.readDb().instances[id] ?? null;
+    const row = this.readShared().instances[id];
+    return row ? structuredClone(row) : null;
   }
 
   /** The "one active hosting instance per owner" reservation (H6). Active =
@@ -287,15 +323,15 @@ export class HostingStore {
    *  brand-new purchase (spec §17: "a returning customer receives a new
    *  instance only through an explicit new purchase"). */
   activeInstanceForOwner(ownerId: string, environment: HostingEnvironment): HostingInstanceRow | null {
-    for (const row of Object.values(this.readDb().instances)) {
-      if (row.ownerId === ownerId && row.environment === environment && row.stage !== "deleted") return row;
+    for (const row of Object.values(this.readShared().instances)) {
+      if (row.ownerId === ownerId && row.environment === environment && row.stage !== "deleted") return structuredClone(row);
     }
     return null;
   }
 
   findByProviderInstanceId(providerInstanceId: string): HostingInstanceRow | null {
     if (!providerInstanceId) return null;
-    for (const row of Object.values(this.readDb().instances)) if (row.providerInstanceId === providerInstanceId) return row;
+    for (const row of Object.values(this.readShared().instances)) if (row.providerInstanceId === providerInstanceId) return structuredClone(row);
     return null;
   }
 
@@ -456,7 +492,7 @@ export class HostingStore {
   // ── provider resources ──────────────────────────────────────────────────
 
   resourcesFor(hostingInstanceId: string): HostingResourceRow[] {
-    return Object.values(this.readDb().resources).filter((r) => r.hostingInstanceId === hostingInstanceId);
+    return Object.values(this.readShared().resources).filter((r) => r.hostingInstanceId === hostingInstanceId).map((r) => structuredClone(r));
   }
 
   recordResource(row: Omit<HostingResourceRow, "id">): HostingResourceRow {
@@ -512,6 +548,11 @@ export class HostingStore {
    *  exists — the outbox's own idempotency, independent of the billing
    *  inbox's. */
   enqueue(job: Omit<HostingOutboxRow, "id" | "status" | "attemptCount" | "leaseUntilMs" | "providerMessageId" | "lastErrorCode" | "createdAtMs" | "updatedAtMs">, nowMs: number): boolean {
+    // v0.4.102 — the common case on every reconcile tick is a duplicate.
+    // Answer it from the current on-disk version (readShared re-validates the
+    // file identity) without rewriting the whole db; the transaction below
+    // still re-checks before inserting.
+    for (const row of Object.values(this.readShared().outbox)) if (row.dedupeKey === job.dedupeKey) return false;
     return this.mutate((db) => {
       for (const row of Object.values(db.outbox)) if (row.dedupeKey === job.dedupeKey) return false;
       const id = this.newId("job");
@@ -521,14 +562,15 @@ export class HostingStore {
   }
 
   duePending(nowMs: number, limit = 100): HostingOutboxRow[] {
-    return Object.values(this.readDb().outbox)
+    return Object.values(this.readShared().outbox)
       .filter((r) => r.status === "pending" && r.availableAtMs <= nowMs && (r.leaseUntilMs === null || r.leaseUntilMs < nowMs))
       .sort((a, b) => a.availableAtMs - b.availableAtMs)
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((r) => structuredClone(r));
   }
 
   outboxFor(hostingInstanceId: string): HostingOutboxRow[] {
-    return Object.values(this.readDb().outbox).filter((r) => r.hostingInstanceId === hostingInstanceId);
+    return Object.values(this.readShared().outbox).filter((r) => r.hostingInstanceId === hostingInstanceId).map((r) => structuredClone(r));
   }
 
   claimOutboxJob(id: string, ttlMs: number, nowMs: number): HostingOutboxRow | null {

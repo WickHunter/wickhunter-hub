@@ -79,6 +79,26 @@ export class VenueStreamRunner {
   private readonly now: () => number;
   private settleTimer: ReturnType<typeof setInterval> | null = null;
   private readonly deferred = new Map<string, Map<number, Candle>>();
+  /** v0.4.102 — the `notAfterMs` the deferred queue was last fully scanned at.
+   *  A row is deferred only while its openMs is NEWER than the cutoff of the
+   *  moment it closed, so nothing becomes due until the cutoff advances (once
+   *  a minute). Scanning every deferred symbol on every frame was 17% of the
+   *  live Hub's main thread (2026-10-30 profile); now a frame scans only when
+   *  the cutoff moved. The 1 s timer flush still scans unconditionally. */
+  private settledScanMs = -Infinity;
+  /** Diagnostics/tests: full scans of the deferred queue. */
+  deferredScans = 0;
+  /** v0.4.102 — each connection's symbol list as a Set, built once per list
+   *  (a resync makes new connections with new lists). Building it per frame
+   *  was the largest self-time in a synthetic ingest profile: a 300–500
+   *  symbol Set allocated for every one-symbol push. */
+  private readonly assignedSets = new WeakMap<readonly string[], ReadonlySet<string>>();
+
+  private assignedOf(symbols: readonly string[]): ReadonlySet<string> {
+    let set = this.assignedSets.get(symbols);
+    if (!set) { set = new Set(symbols); this.assignedSets.set(symbols, set); }
+    return set;
+  }
 
   constructor(private readonly deps: StreamRunnerDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -140,8 +160,8 @@ export class VenueStreamRunner {
     // never defer a forming observation or advance the REST frontier here.
     const notAfterMs = settledOpenMs(this.now());
     const closedBySymbol = new Map<string, Map<number, Candle>>();
-    this.takeSettledDeferred(notAfterMs, closedBySymbol);
-    const assigned = new Set(c.symbols);
+    if (notAfterMs > this.settledScanMs) this.takeSettledDeferred(notAfterMs, closedBySymbol);
+    const assigned = this.assignedOf(c.symbols);
     for (const t of ticks) {
       if (!assigned.has(t.symbol)) continue;
       const done = c.extra.buf.push(t);
@@ -185,6 +205,8 @@ export class VenueStreamRunner {
     notAfterMs: number,
     ready: Map<string, Map<number, Candle>>,
   ): void {
+    this.deferredScans++;
+    if (notAfterMs > this.settledScanMs) this.settledScanMs = notAfterMs;
     for (const [symbol, byOpen] of this.deferred) {
       for (const [openMs, candle] of byOpen) {
         if (openMs > notAfterMs) continue;
@@ -201,7 +223,7 @@ export class VenueStreamRunner {
       if (!candles.length) continue;
       try {
         this.deps.write(symbol, candles, notAfterMs);
-        const owner = this.pool.connections.find((c) => c.symbols.includes(symbol));
+        const owner = this.pool.connections.find((c) => this.assignedOf(c.symbols).has(symbol));
         if (owner) owner.extra.closedCandles += candles.length;
       } catch (e) {
         this.deps.log?.(`${this.deps.adapter.id}: could not store ${symbol} — ${(e as Error)?.message ?? "unknown"}`);

@@ -617,4 +617,71 @@ await test("WEEX streams with an enabled collector unless explicitly disabled, a
   assert.deepEqual(effective, ["bitget", "weex"], "a stream venue that is not collecting is dropped");
 });
 
+// ── v0.4.102 — the deferred queue is scanned when the cutoff moves, not per frame
+await test("deferred settlement: identical rows/order, but frames inside one cutoff minute do not rescan the queue", async () => {
+  const symbols = Array.from({ length: 50 }, (_, i) => `S${i}USDT`);
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  let clock = T0 + MIN + 30_000;
+  const r = new VenueStreamRunner({
+    adapter: { ...STREAM_ADAPTERS.bybit, maxTopicsPerConnection: 1000 },
+    symbols: () => symbols, socket: factory, now: () => clock, settleFlushMs: 3_600_000,
+    write: (symbol, candles) => wrote.push([symbol, candles.map((c) => c.openMs)]),
+  });
+  try {
+    r.start(); made[0].h.onOpen();
+    for (const sym of symbols) made[0].h.onMessage(nativeClosingFrames("bybit", T0, sym)[0]);
+    assert.equal(wrote.length, 0, "every close is inside the clock-skew grace");
+    assert.equal(r.status().holding, 50);
+    const scansAfterCloses = r.deferredScans;
+    const forming = (sym, i) => JSON.stringify({ topic: `kline.1.${sym}`, data: [{ start: T0 + MIN, open: "1", high: "2", low: "0.5", close: String(1 + i / 1e4), volume: "3", confirm: false }] });
+    for (let i = 0; i < 2_000; i++) made[0].h.onMessage(forming(symbols[i % 50], i));
+    assert.equal(r.deferredScans, scansAfterCloses, "2,000 frames at one cutoff: zero further scans (was one per frame)");
+    assert.ok(scansAfterCloses <= 1, `closes at one cutoff scan at most once (scans ${scansAfterCloses})`);
+    clock += MIN; // the cutoff advances: the very next frame settles everything
+    made[0].h.onMessage(forming(symbols[0], 0));
+    assert.equal(r.deferredScans, scansAfterCloses + 1);
+    assert.deepEqual(wrote, symbols.map((sym) => [sym, [T0]]), "same rows, one write per symbol, roster order");
+    assert.equal(r.status().holding, 50, "only the 50 forming bars remain; the deferred queue is empty");
+  } finally { r.stop(); }
+});
+
+await test("store writes are already coalesced: many frames per minute still write each symbol's file once per closed minute", async () => {
+  const symbols = Array.from({ length: 20 }, (_, i) => `S${i}USDT`);
+  const { factory, made } = fakeSockets();
+  const wrote = [];
+  let clock = T0;
+  const r = new VenueStreamRunner({
+    adapter: { ...STREAM_ADAPTERS.bitunix, maxTopicsPerConnection: 1000 },
+    symbols: () => symbols, socket: factory, now: () => clock, settleFlushMs: 3_600_000,
+    write: (symbol, candles) => wrote.push({ symbol, rows: candles.map((c) => c.openMs) }),
+  });
+  const k = (sym, ts, o, h, l, c, b) => JSON.stringify({ ch: "market_kline_1min", symbol: sym, ts, data: { o: String(o), h: String(h), l: String(l), c: String(c), b: String(b), q: String(b * c) } });
+  try {
+    r.start(); made[0].h.onOpen();
+    for (let m = 0; m < 5; m++) {
+      for (let sec = 0; sec < 60; sec++) {
+        clock = T0 + m * MIN + sec * 1000 + 500;
+        for (const sym of symbols) {
+          const base = T0 + m * MIN;
+          if (sec === 0) {
+            if (m > 0) made[0].h.onMessage(k(sym, base + 120, m === 1 ? 10 : 11, 20, 5, 11, 60)); // finalisation of m-1
+            made[0].h.onMessage(k(sym, base + 120, m === 0 ? 10 : 11, m === 0 ? 10 : 11, m === 0 ? 10 : 11, m === 0 ? 10 : 11, 0));
+          } else {
+            // Every bar opens at the prior close (11, or 10 for the first seed).
+            made[0].h.onMessage(k(sym, base + sec * 1000, m === 0 ? 10 : 11, 20, 5, 11, sec));
+          }
+        }
+      }
+    }
+    // Minutes 0..3 closed; the grace admits 0..2 by the last clock reading.
+    const perSymbolMinute = new Map();
+    for (const w of wrote) for (const t of w.rows) perSymbolMinute.set(`${w.symbol}:${t}`, (perSymbolMinute.get(`${w.symbol}:${t}`) ?? 0) + 1);
+    assert.equal(wrote.length, 20 * 3, `minutes 0..2 written for every symbol (${wrote.length})`);
+    assert.ok([...perSymbolMinute.values()].every((n) => n === 1), "each symbol-minute reaches the store exactly once");
+    assert.ok(wrote.every((w) => w.rows.length === 1), "one row per write: one write per symbol per closed minute");
+    assert.equal(wrote.length, perSymbolMinute.size, `writes ${wrote.length} == symbol-minutes ${perSymbolMinute.size}, frames ${20 * 60 * 5}`);
+  } finally { r.stop(); }
+});
+
 summary("stream-runner");
