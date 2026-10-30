@@ -63,10 +63,14 @@ function nativeClosingFrames(venue, openMs, symbol = "BTCUSDT") {
   if (venue === "bitget") return [openMs, openMs + MIN].map(t => JSON.stringify({
     action: "update", arg: { instId: symbol }, data: [[String(t), "1", "2", "0.5", "1.5", "3"]],
   }));
-  if (venue === "bitunix") return [openMs, openMs + MIN].map(t => JSON.stringify({
-    ch: "market_kline_1min", symbol, ts: t + 30_000,
-    data: { o: "1", h: "2", l: "0.5", c: "1.5", b: "3" },
-  }));
+  // v0.4.102 — the measured Bitunix boundary: seed, trades, a post-boundary
+  // finalisation of the bar, then the successor's flat seed at the same ts.
+  if (venue === "bitunix") return [
+    [openMs + 100, "1", "1", "1", "1", "0", "0"],
+    [openMs + 30_000, "1", "2", "0.5", "1.5", "3", "4.5"],
+    [openMs + MIN + 100, "1", "2", "0.5", "1.5", "3", "4.5"],
+    [openMs + MIN + 100, "1.5", "1.5", "1.5", "1.5", "0", "0"],
+  ].map(([ts, o, h, l, c, b, q]) => JSON.stringify({ ch: "market_kline_1min", symbol, ts, data: { o, h, l, c, b, q } }));
   if (venue === "bybit") return [JSON.stringify({
     topic: `kline.1.${symbol}`,
     data: [{ start: openMs, open: "1", high: "2", low: "0.5", close: "1.5", volume: "3", confirm: true }],

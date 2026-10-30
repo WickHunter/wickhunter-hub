@@ -49,18 +49,23 @@
 //
 // ── VOLUME: A TRAP WORTH THE PARAGRAPH ──────────────────────────────────────
 // `volume` on the wire is BASE volume (contracts/coins), consistently, on every
-// venue. Bitget's array carries base at index 5 and quote at index 6. Bitunix
-// returns an OBJECT WHOSE TWO VOLUME FIELDS ARE NAMED THE WRONG WAY ROUND:
-// measured on BTCUSDT, `quoteVol` was 16.0341 and `baseVol` 1026789.19294 at a
-// price near 64,045 — 16.0341 x 64,045 = 1,026,792, so the field LABELLED
-// `quoteVol` is the base volume and the one labelled `baseVol` is the quote
-// turnover. Reading the field by its name would inflate volume by roughly the
-// price of the coin — about 64,000x on BTC — and every seeded band derived from
-// it would be wrong. Bitunix's adapter therefore reads `quoteVol` for volume,
-// and that is not a typo. Aster's row is Binance-shaped: index 5 is base volume
-// and index 7 is the quote turnover, both honestly named in its docs.
+// venue. Bitget's array carries base at index 5 and quote at index 6. Aster's
+// row is Binance-shaped: index 5 is base volume and index 7 is the quote
+// turnover, both honestly named in its docs.
+//
+// Bitunix is the venue that moved under us. HISTORY: on 2026-08 BTCUSDT
+// measured `quoteVol` 16.0341 and `baseVol` 1026789.19294 at ~64,045, i.e. the
+// fields were labelled the wrong way round, and through 0.4.101 this adapter
+// read `quoteVol` for volume on purpose. Probed again 2026-10-30, the venue now
+// labels them correctly (`baseVol` 28.2534, `quoteVol` 2,185,328.73 at
+// ~77,364), so the Hub had been storing USDT turnover from REST while its
+// websocket stored coin volume — mixed units in one window. Since 0.4.102 the
+// Bitunix readers take `baseVol` ONLY when `quoteVol` agrees with it
+// (`bitunixBaseVolume`, bitunix-volume.ts) and refuse the page otherwise, so a
+// third flip is a visible refusal rather than another silent unit change.
 import type { Candle } from "./store.js";
 import { MINUTE_MS, newestClosedOpenMs } from "./store.js";
+import { BITUNIX_LINEAR_QUOTES, bitunixBaseVolume } from "./bitunix-volume.js";
 
 export const VENUE_IDS = ["bybit", "bitunix", "bitget", "binance", "aster", "weex"] as const;
 export type VenueId = (typeof VENUE_IDS)[number];
@@ -200,6 +205,19 @@ function candle(t: unknown, o: unknown, h: unknown, l: unknown, c: unknown, v: u
   return cand;
 }
 
+/** One Bitunix kline object as a Candle with BASE volume, or null when the
+ *  row is structurally malformed (like `candle`). A row whose volume units
+ *  cannot be proven throws: the whole page is refused, never half-stored. */
+function bitunixRow(r: Record<string, unknown>): Candle | null {
+  const c = candle(r.time, r.open, r.high, r.low, r.close, 0);
+  if (!c) return null;
+  const volume = bitunixBaseVolume(r.baseVol, r.quoteVol, c.low, c.high);
+  if (volume === null) {
+    throw new Error(`bitunix kline volume is unreadable or contradictory at ${String(r.time)} (baseVol ${String(r.baseVol)}, quoteVol ${String(r.quoteVol)})`);
+  }
+  return { ...c, volume };
+}
+
 /** `Retry-After` is seconds or an HTTP date. Anything unparseable returns
  *  undefined so the collector uses its own backoff rather than a bogus number. */
 function retryAfterMs(res: { headers?: { get(name: string): string | null } }): number | undefined {
@@ -305,8 +323,16 @@ const bitunix: VenueAdapter = {
     const body = (await getJson(fetchLike, "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs")) as { data?: unknown[] };
     const out: VenueSymbol[] = [];
     for (const raw of asArray(body.data)) {
-      const r = raw as { symbol?: unknown; symbolStatus?: unknown };
+      const r = raw as { symbol?: unknown; symbolStatus?: unknown; quote?: unknown };
       if (typeof r.symbol !== "string") continue;
+      // v0.4.102 — linear (USDT/USDC-margined) contracts only. Coin-margined
+      // `…USD` contracts publish USD contracts in `baseVol` and coin in
+      // `quoteVol`, so no row of theirs passes the base-volume proof; tracking
+      // them would be permanent refusals and permanent gaps. A row without a
+      // `quote` field is judged by its symbol suffix.
+      const quote = typeof r.quote === "string" ? r.quote
+        : /USDT$/.test(r.symbol) ? "USDT" : /USDC$/.test(r.symbol) ? "USDC" : "";
+      if (!BITUNIX_LINEAR_QUOTES.has(quote)) continue;
       // OPEN = trading. PREVIEW = announced, not yet trading — listed by the
       // venue but with no candles behind it, so it is tracked and shown, never
       // polled as though it had history.
@@ -325,9 +351,10 @@ const bitunix: VenueAdapter = {
     const candles: Candle[] = [];
     for (const raw of list) {
       const r = raw as Record<string, unknown>;
-      // `quoteVol` IS the base volume on this venue — see the header note. Do
-      // not "fix" this to `baseVol`; that field is the USDT turnover.
-      const c = candle(r.time, r.open, r.high, r.low, r.close, r.quoteVol);
+      // v0.4.102 — `baseVol` is the coin volume, proven against `quoteVol`
+      // row by row (see the header note). An unprovable row refuses the PAGE:
+      // dropping it would leave a hole the repair path re-asks for forever.
+      const c = bitunixRow(r);
       if (c) candles.push(c);
     }
     return { candles: sortOldestFirst(candles), empty: list.length === 0 };
@@ -871,8 +898,7 @@ export async function fetchNativeTimeframeKlines(
     }
     const list = asArray(body.data);
     const candles = list.map((raw) => {
-      const r = raw as Record<string, unknown>;
-      return candle(r.time, r.open, r.high, r.low, r.close, r.quoteVol);
+      return bitunixRow(raw as Record<string, unknown>);
     }).filter((c): c is Candle => c !== null);
     return { candles: sortOldestFirst(candles), empty: list.length === 0 };
   }

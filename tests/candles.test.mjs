@@ -65,27 +65,26 @@ await test("BITGET: volume is BASE volume (index 5), not the quote turnover at i
 await test("BITUNIX: rows arrive NEWEST-FIRST and are normalised to oldest-first", async () => {
   const page = {
     code: 0, msg: "Success", data: [
-      { open: "64034.3", high: "64045.1", low: "64030.9", close: "64045.1", quoteVol: "16.0341", baseVol: "1026789.19294", time: String(NEWEST_CLOSED) },
-      { open: "63978.5", high: "64023", low: "63978.4", close: "64022.9", quoteVol: "7.5528", baseVol: "483424.02372", time: "1786410600000" },
-      { open: "63955.2", high: "63978.5", low: "63950", close: "63978.5", quoteVol: "4.29", baseVol: "274370.23937", time: "1786410540000" },
+      { open: "64034.3", high: "64045.1", low: "64030.9", close: "64045.1", baseVol: "16.0341", quoteVol: "1026789.19294", time: String(NEWEST_CLOSED) },
+      { open: "63978.5", high: "64023", low: "63978.4", close: "64022.9", baseVol: "7.5528", quoteVol: "483424.02372", time: "1786410600000" },
+      { open: "63955.2", high: "63978.5", low: "63950", close: "63978.5", baseVol: "4.29", quoteVol: "274370.23937", time: "1786410540000" },
     ],
   };
   const { candles } = await ADAPTERS.bitunix.fetchKlines(stubFetch(page), "BTCUSDT", 0, 0);
   assert.deepEqual(candles.map((c) => c.openMs), [1786410540000, 1786410600000, NEWEST_CLOSED], "oldest first");
 });
 
-await test("BITUNIX: volume comes from `quoteVol`, which on this venue holds the BASE volume", async () => {
-  // The venue's two volume fields are named the wrong way round. Measured on
-  // BTCUSDT: quoteVol 16.0341 x price ~64045 = 1,026,792 = the value it calls
-  // baseVol. Reading `baseVol` would inflate volume by roughly the coin price.
-  const page = {
-    code: 0, data: [
-      { open: "64034.3", high: "64045.1", low: "64030.9", close: "64045.1", quoteVol: "16.0341", baseVol: "1026789.19294", time: String(NEWEST_CLOSED) },
-    ],
-  };
-  const { candles } = await ADAPTERS.bitunix.fetchKlines(stubFetch(page), "BTCUSDT", 0, 0);
-  assert.equal(candles[0].volume, 16.0341, "base volume from the field LABELLED quoteVol");
-  assert.notEqual(candles[0].volume, 1026789.19294, "not the quote turnover from the field labelled baseVol");
+await test("BITUNIX (v0.4.102): volume is `baseVol`, proven by `quoteVol`; the old swapped orientation is refused", async () => {
+  // Probed live 2026-10-30: BTCUSDT baseVol 28.2534, quoteVol 2,185,328.73403
+  // at ~77,364 — baseVol is the coin volume. Through 0.4.101 this test pinned
+  // the 2026-08 orientation (fields swapped) and the Hub stored quote turnover.
+  const page = (baseVol, quoteVol) => ({ code: 0, data: [
+    { open: "77364.9", high: "77371.2", low: "77308.9", close: "77344.3", baseVol, quoteVol, time: String(NEWEST_CLOSED) },
+  ] });
+  const { candles } = await ADAPTERS.bitunix.fetchKlines(stubFetch(page("28.2534", "2185328.73403")), "BTCUSDT", 0, 0);
+  assert.equal(candles[0].volume, 28.2534, "base volume from baseVol");
+  await assert.rejects(ADAPTERS.bitunix.fetchKlines(stubFetch(page("2185328.73403", "28.2534")), "BTCUSDT", 0, 0),
+    /unreadable or contradictory/, "a swapped page is refused, never stored as either unit");
 });
 
 await test("BYBIT: the forming bar leads its NEWEST-FIRST list and is dropped (replay)", async () => {

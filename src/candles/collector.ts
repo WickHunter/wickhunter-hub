@@ -37,6 +37,7 @@ import {
   type FetchLike, type VenueId,
 } from "./venues.js";
 import type { TimeframeHistory, TimeframeWork } from "./timeframe.js";
+import { BITUNIX_VOLUME_CONTRACT } from "./bitunix-volume.js";
 
 export interface CollectorOptions {
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
@@ -418,6 +419,10 @@ export class VenueCollector {
       this.restartCandidates.delete(symbol);
       writeJsonAtomic(this.restFrontierFile, {
         restConfirmed: Object.fromEntries(this.restFrontier),
+        // v0.4.102 — names the unit contract the frontier vouches for. A
+        // rollback to <=0.4.101 rewrites this file without it, which is how
+        // bitunix-migration.ts notices rows written by the old reader.
+        ...(this.venue === "bitunix" ? { volumeContract: BITUNIX_VOLUME_CONTRACT } : {}),
       });
     }
   }

@@ -30,7 +30,7 @@
 // everything exceeds the topic cap and is refused.
 
 import { settledOpenMs, type Candle } from "./store.js";
-import { ClosureBuffer, type StreamAdapter, type StreamTick } from "./stream.js";
+import { ClosureBuffer, type StreamAdapter, type StreamTick, type TickCloser } from "./stream.js";
 import {
   SocketPool, nodeSocketFactory,
   type PoolConn, type SocketFactory, type StreamSocket, type StreamSocketHandlers,
@@ -63,7 +63,7 @@ export interface StreamRunnerDeps {
 }
 
 interface ConnExtra {
-  buf: ClosureBuffer;
+  buf: TickCloser;
   closedCandles: number;
 }
 
@@ -85,7 +85,7 @@ export class VenueStreamRunner {
     this.pool = new SocketPool<ConnExtra>({
       adapter: deps.adapter,
       symbols: deps.symbols,
-      makeExtra: () => ({ buf: new ClosureBuffer(), closedCandles: 0 }),
+      makeExtra: () => ({ buf: deps.adapter.closer?.() ?? new ClosureBuffer(), closedCandles: 0 }),
       onMessage: (c, data) => this.ingest(c, data),
       onDiscard: (c) => c.extra.buf.clear(),
       onBeforeResync: (wanted) => {

@@ -73,6 +73,12 @@
 // The store's own `settledOpenMs` filter still runs on write, so a stream that
 // somehow published early is caught by the same gate REST output passes.
 //
+// v0.4.102 — BITUNIX IS THE EXCEPTION. Its first later-minute frame is the
+// closing bar's own post-boundary FINALISATION, not the next bar, so the
+// generic rule published a stale pre-boundary snapshot every minute. Bitunix
+// closes with `BitunixClosureBuffer` (bitunix-fold.ts): finalisation proven by
+// the successor's zero-volume seed, otherwise the minute is left for REST.
+//
 // ── WHAT THIS MODULE DELIBERATELY DOES NOT DO ──────────────────────────────
 // It never backfills, never decides retention, and never touches the tracked
 // symbol set. A stream that dropped frames for an hour must leave no trace
@@ -82,6 +88,8 @@
 
 import { MINUTE_MS, floorMinute, type Candle } from "./store.js";
 import type { VenueId } from "./venues.js";
+import { bitunixBaseVolume } from "./bitunix-volume.js";
+import { BitunixClosureBuffer } from "./bitunix-fold.js";
 
 /** One parsed candle observation off the wire. `closed` is TRUE only when the
  *  venue itself said so; everything else is settled by the ordering rule. */
@@ -90,6 +98,19 @@ export interface StreamTick {
   openMs: number;
   candle: Candle;
   closed: boolean;
+  /** v0.4.102 — the push's own wire timestamp, for venues whose closure rule
+   *  needs it (Bitunix: bitunix-fold.ts). Absent on the others. */
+  ts?: number;
+}
+
+/** Turns forming observations into CLOSED candles. `ClosureBuffer` is the
+ *  generic ordering rule; a venue with a measured boundary pattern supplies
+ *  its own (`StreamAdapter.closer`). */
+export interface TickCloser {
+  push(tick: StreamTick): StreamTick | null;
+  size(): number;
+  forget(symbol: string): void;
+  clear(): void;
 }
 
 export interface StreamAdapter {
@@ -110,6 +131,8 @@ export interface StreamAdapter {
   /** Some venues want a periodic ping to keep the socket open. */
   readonly pingIntervalMs?: number;
   readonly pingFrame?: string;
+  /** A venue-specific closure rule, one per connection. Default: `ClosureBuffer`. */
+  closer?(): TickCloser;
 }
 
 const num = (v: unknown): number => {
@@ -200,6 +223,8 @@ const bitunix: StreamAdapter = {
   subscribeFrames(symbols) {
     return [{ op: "subscribe", args: symbols.map((s) => ({ symbol: s, ch: "market_kline_1min" })) }];
   },
+  // v0.4.102 — the measured boundary pattern, not the generic ordering rule.
+  closer: () => new BitunixClosureBuffer(),
   parse(frame) {
     let m: { ch?: string; symbol?: string; ts?: number; data?: Record<string, unknown> };
     try { m = JSON.parse(frame); } catch { return []; }
@@ -207,18 +232,25 @@ const bitunix: StreamAdapter = {
     const symbol = String(m.symbol ?? "");
     if (!symbol) return [];
     // NO openMs on the wire — derived from the venue's own message clock.
-    const openMs = openMsFromTs(num(m.ts));
+    const ts = num(m.ts);
+    const openMs = openMsFromTs(ts);
     const d = m.data;
+    // v0.4.102 — `b` is coin volume, accepted only when `q` (the quote
+    // turnover) agrees with it (bitunix-volume.ts). An unprovable frame is
+    // ignored: the bar it belonged to then cannot be proven by the fold and
+    // REST decides that minute. Never a zero, never a derived quantity.
+    const volume = bitunixBaseVolume(d.b, d.q, num(d.l), num(d.h));
+    if (volume === null) return [];
     const t: StreamTick = {
       symbol,
       openMs,
       candle: {
-        openMs, open: num(d.o), high: num(d.h), low: num(d.l), close: num(d.c),
-        volume: num(d.b), // `b` is base volume; `q` is quote
+        openMs, open: num(d.o), high: num(d.h), low: num(d.l), close: num(d.c), volume,
       },
-      closed: false, // Bitunix never says
+      closed: false, // Bitunix never says — bitunix-fold.ts decides
+      ts,
     };
-    return usable(t) ? [t] : [];
+    return usable(t) && ts > 0 && [t.candle.open, t.candle.close].every((n) => n > 0) ? [t] : [];
   },
 };
 
@@ -455,7 +487,7 @@ export const STREAM_ADAPTERS: Partial<Record<VenueId, StreamAdapter>> = { bybit,
  *  on reconnect, and re-opening a minute already published would let a partial
  *  bar overwrite a complete one. The REST collector repairs anything lost here,
  *  which is the whole reason this may be lossy and still be safe. */
-export class ClosureBuffer {
+export class ClosureBuffer implements TickCloser {
   private readonly pending = new Map<string, StreamTick>();
 
   /** Feed one tick; get back any candle that just became closed. */

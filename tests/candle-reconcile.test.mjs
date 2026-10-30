@@ -501,7 +501,7 @@ function settlementFixture(venue, { graceOnDisk = false, advanceDuringScan = tru
     const end = Number(u.searchParams.get("endTime"));
     const rows = state.rows.filter(c => c.openMs >= start && c.openMs <= end);
     return response(venue === "bitunix"
-      ? { code: 0, data: rows.map(c => ({ time: c.openMs, open: c.open, high: c.high, low: c.low, close: c.close, quoteVol: c.volume })) }
+      ? { code: 0, data: rows.map(c => ({ time: c.openMs, open: c.open, high: c.high, low: c.low, close: c.close, baseVol: c.volume, quoteVol: c.volume * c.close })) }
       : rows.map(c => [c.openMs, c.open, c.high, c.low, c.close, c.volume]));
   };
   return {

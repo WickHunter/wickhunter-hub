@@ -3,6 +3,7 @@
 // answers the two questions the rest of the hub asks: "build me a signed seed
 // for this venue+symbol" and "what is each exchange's status right now".
 import path from "node:path";
+import { migrateBitunixVolumeContract } from "./bitunix-migration.js";
 import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { CandleStore, DAY_MS, MINUTE_MS, newestClosedOpenMs } from "./store.js";
@@ -272,6 +273,9 @@ export class CandleService {
   private lastPruneAt = 0;
 
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
+    // v0.4.102 — before any collector, cache or stream reads Bitunix rows:
+    // discard the pre-contract mixed-unit store once (bitunix-migration.ts).
+    migrateBitunixVolumeContract(cfg.dataDir, (m) => (deps.log ?? console.log)(`[candles] ${m}`));
     this.store = new CandleStore(path.join(cfg.dataDir, "candles"));
     this.timeframeHistory = new TimeframeHistory(
       path.join(cfg.dataDir, "candle-timeframes-v2"), this.store, cfg.options.retentionDays,
