@@ -1861,6 +1861,9 @@ async function cdRefresh() {
     : "no collectors configured — set HUB_CANDLE_VENUES to turn seeding on";
 
   cdRenderKey(data);
+  if (data.timeframeHorizon && data.timeframeHorizon.error) {
+    document.getElementById("cdMeta").textContent += " · " + data.timeframeHorizon.error + " (running with no horizon)";
+  }
 
   const wrap = document.getElementById("venues");
   wrap.innerHTML = "";
@@ -1931,6 +1934,22 @@ async function cdRefresh() {
         + "</dd>"
       + "</dl>";
 
+    // v0.4.103 — the standing long horizon (HUB_TIMEFRAME_HORIZON) for this
+    // venue: per interval, pairs complete / still backfilling / stopped at a
+    // twice-proven venue-empty listing floor, and the estimated time left.
+    const hz = data.timeframeHorizon && (data.timeframeHorizon.venues || []).find(x => x.venue === v.venue);
+    if (hz) {
+      html += '<div class="worst"><span class="muted">Timeframe horizon (' + hz.days + ' d):</span> '
+        + hz.intervals.map((i) => esc(String(i.interval)) + "m"
+          + (i.fetchInterval !== i.interval ? ' <span class="muted">(from ' + i.fetchInterval + "m)</span>" : "")
+          + " " + i.complete + "/" + i.symbols + " complete"
+          + (i.backfilling ? " · " + i.backfilling + " backfilling" : "")
+          + (i.floored ? " · " + i.floored + " since listing (venue-empty floor)" : "")
+          + (i.symbols - i.primed ? " · " + (i.symbols - i.primed) + " scanning" : "")
+          + (i.remainingPages ? " · " + i.remainingPages.toLocaleString() + " pages left" : "")).join("; ")
+        + (hz.etaMs ? ' <span class="muted">· est. ' + dur(Math.ceil(hz.etaMs / 60000)) + " to complete</span>" : "")
+        + "</div>";
+    }
     // A venue quietly accumulating gaps is the failure that poisons seeds
     // without ever throwing, so the worst offenders are named on the card.
     if (v.worstGaps.length) {

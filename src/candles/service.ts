@@ -398,11 +398,13 @@ export class CandleService {
     // v0.4.102 — exact coverage for the whole roster within minutes of boot,
     // not only through each tick's bounded slice (collector.ts).
     this.startCoveragePrime();
-    this.warmHorizon(this.deps.now?.() ?? Date.now());
     this.timer = setInterval(() => void this.tickAll(), this.cfg.tickMs);
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
     this.timer.unref();
+    // v0.4.103 — standing horizon cursors for the persisted roster, primed in
+    // bounded turns from boot (not only from the first tick).
+    this.warmHorizon(this.deps.now?.() ?? Date.now());
     // WEEX joined existing enabled Hub rosters in this release. Do not make
     // that new collector wait one full scheduler period before it discovers
     // symbols and starts its bounded queue. Existing non-WEEX service seams
@@ -568,6 +570,9 @@ export class CandleService {
       // WEEX discovery updates its tracked roster. Subscribe newly eligible
       // pairs in this same pass; retain other venues' existing stream cadence.
       this.streams.get("weex")?.resync();
+      // v0.4.103 — a listing discovered by this pass gets its standing cursor
+      // now, not one tick later.
+      this.warmHorizon(now);
       if (now - this.lastPruneAt >= DAY_MS) {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);

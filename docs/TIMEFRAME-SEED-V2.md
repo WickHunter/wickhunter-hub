@@ -200,3 +200,56 @@ or six native pages at 21–25 total weight. Exact tails and recent repairs may
 reduce that throughput because freshness remains first. Retries, empty listings
 and client verification can increase cold time further; these are recovery
 measurements, not startup SLAs.
+
+## v0.4.103 addendum — the standing long horizon
+
+`HUB_TIMEFRAME_HORIZON=venue[,venue…]:interval[,interval…]:days[;…]` (for
+example `bybit,binance,aster,bitget,bitunix,weex:60,120,240,1440:365`) makes the
+Hub hold `days` (+1 day) of the named intervals for every tracked, tradable
+pair of each named venue, whether or not anyone has asked. Unset or blank is
+exactly 0.4.102; a malformed value is refused as a whole (logged, shown on the
+admin card) and the Hub runs with no horizon. A target without a native
+venue interval is built from the largest native interval that divides it
+(Bitget and WEEX 120m from native 60m, exact OHLC; never across a gap).
+
+The wire contract does not change. The envelope, canonical key order, `keyId`,
+signature, licence gate, ETag and gzip are as above, and every window of at
+most 60 days of its interval keeps the synchronous 0.4.102 path:
+`tests/fixtures/timeframe-v2-golden.json` pins ten such responses byte for byte
+(generated from the 0.4.102 dist) with the horizon unset and set. A longer
+window of a horizon interval is built by a read-only worker (`assembleTimeframe`
+and the same provenance rule, `timeframeRowSafe`) and only signed on the main
+thread; it is byte-identical to what the synchronous path would have produced
+for the same rows. A pool of two workers with a 32-job queue answers further
+requests `503 timeframe history build is busy; retry shortly` with
+`retry-after: 1`.
+
+Long responses carry UNSIGNED hint headers (never body fields — the app pins the
+envelope's key set): `x-wh-horizon-from-ms` (the oldest bucket this Hub keeps
+for the series) and, when the Hub has met a venue-empty boundary,
+`x-wh-venue-floor-ms` (the oldest row the venue returned), `-checked-from-ms`
+(start of the page that proved nothing older exists), `-proofs` (≥ 2 means two
+reads at least an hour apart agreed), `-first-proof-ms` and `-last-proof-ms`.
+They tell an app where to look; they are not proof of a listing boundary. The
+signed body still reports the leading gap, and readiness "since listing" needs
+the app's own venue evidence.
+
+Storage: horizon intervals are kept in one file per UTC month
+(`YYYY-MM.ctf3`, the same 56-byte record), so a year is ~13 files per series
+instead of ~366. A 0.4.102 day file is read where its month has no month file
+yet and is folded into the month file the first time that month is written
+(then removed); without a horizon, day layout reads month files as a fallback.
+Retention is per interval: horizon intervals keep `days + 2` days (whole months
+leave), every other series keeps minute retention + 1 day.
+
+Work: one standing cursor per (pair, native fetch interval) is primed by a
+single disk scan (in ≤ 25 ms turns after boot) and then kept from the rows
+actually written, so a collector pass costs no disk reads. Pages go newest
+missing range first, paged backwards; per-venue page sizes are chosen so the
+venue can never truncate an answer (Bybit/Binance/Aster 1000, Bitget 200 and at
+most 90 days, Bitunix 200 incl. one predecessor row, WEEX 990 newest rows at
+weight 1 or 100-row `historyKlines` at weight 5). A page that returns no row
+before a held/returned newer row proves the range empty; two such proofs at
+least an hour apart floor a young listing's leading gap (or exclude an
+interior venue hole) until a daily re-read, keyed by the listing identity and
+kept in `horizon-proofs.v1.json`.

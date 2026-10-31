@@ -784,7 +784,9 @@ export class TimeframeHistory {
    *  row can be served without being refetched through `1Dutc`. Marker-guarded. */
   private migrateBitgetDaily(rootDir: string): void {
     const marker = path.join(rootDir, "bitget-1dutc.v1.done");
-    if (fs.existsSync(marker)) return;
+    // A Hub that has never held timeframe data has nothing to migrate and
+    // gets no directory created on its behalf.
+    if (!fs.existsSync(rootDir) || fs.existsSync(marker)) return;
     let changed = false;
     for (const key of [...this.frontiers.keys()]) {
       const [venue, , interval] = key.split("\u0000");
@@ -792,8 +794,7 @@ export class TimeframeHistory {
     }
     if (changed) writeJsonAtomic(this.frontierFile, { v: 2, frontiers: Object.fromEntries(this.frontiers) } satisfies FrontierFile);
     try {
-      fs.mkdirSync(rootDir, { recursive: true });
-      fs.writeFileSync(marker, `${new Date().toISOString()}\n`);
+      fs.writeFileSync(marker, "bitget native daily = 1Dutc\n");
     } catch { /* re-run next start: the step is idempotent */ }
   }
 
