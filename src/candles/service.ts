@@ -16,8 +16,11 @@ import { STREAM_ADAPTERS } from "./stream.js";
 import { VenueStreamRunner, type SocketFactory } from "./stream-runner.js";
 import { buildSeed, type SeedOutcome, type SeedRequest } from "./seed.js";
 import {
-  TimeframeHistory, isTimeframeInterval, type TimeframeInterval, type TimeframeOutcome,
+  TimeframeHistory, isTimeframeInterval,
+  type HorizonVenueStatus, type TimeframeBoundary, type TimeframeHorizon, type TimeframeInterval,
+  type TimeframeLongJob, type TimeframeLongReply, type TimeframeOutcome, type TimeframeSigned,
 } from "./timeframe.js";
+import { TimeframePoolBusyError, TimeframeSeedPool } from "./timeframe-seed-pool.js";
 import {
   isSnapshotDepth, isSnapshotInterval, newestCompleteBucketOpenMs, signedSnapshotBody,
   snapshotBucketMs, snapshotExpiresAtMs, snapshotWindow, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH,
@@ -192,6 +195,9 @@ export interface CandleServiceConfig {
    *  Absent/empty = REST only, which is every install's behaviour until an
    *  operator sets `HUB_CANDLE_STREAM`. */
   streamVenues?: VenueId[];
+  /** v0.4.103 — standing long-horizon timeframe intervals per venue
+   *  (`HUB_TIMEFRAME_HORIZON`). Absent/empty = the 0.4.102 behaviour. */
+  timeframeHorizon?: TimeframeHorizon;
   /** v0.4.102 — the post-boot coverage prime (see `primeTurn`). Defaults:
    *  start 10 s after `start()` (which runs after listen), 50 ms of scan per
    *  turn, 25 ms timer yield between turns, venues one after another. */
@@ -230,6 +236,23 @@ export interface CandleServiceDeps {
   /** v0.4.99 — where a snapshot fold runs. Defaults to a fresh worker thread
    *  (`runSnapshotWorker`); a suite injects a failing or slow one. */
   snapshotFold?: (job: SnapshotWorkerJob) => Promise<SnapshotWorkerReply>;
+  /** v0.4.103 — where a long timeframe window is built. Defaults to the
+   *  bounded worker pool; a suite injects an inline, slow or failing one. */
+  timeframeBuild?: (job: TimeframeLongJob) => Promise<TimeframeLongReply>;
+}
+
+/** v0.4.103 — a served timeframe seed: the synchronous path keeps its payload
+ *  object (serialised by the route exactly as 0.4.102 did); the long path
+ *  arrives as signed bytes plus unsigned venue-boundary facts. */
+export type TimeframeServed =
+  | { ok: true; payload: TimeframeSigned; body?: undefined }
+  | { ok: true; body: Buffer; boundary: TimeframeBoundary | null; payload?: undefined }
+  | { ok: false; code: 400 | 404 | 500 | 503; error: string; retryAfter?: number };
+
+export interface TimeframeHorizonHealth {
+  configured: boolean;
+  venues: Array<HorizonVenueStatus & { pending: number; etaMs: number | null; weightPerSecond: number | null }>;
+  pool: ReturnType<TimeframeSeedPool["status"]> | null;
 }
 
 const realFetch: FetchLike = async (url: string) => {
@@ -290,14 +313,21 @@ export class CandleService {
    *  again leaves nothing behind but a gap the collector already repairs. */
   private readonly streams = new Map<VenueId, VenueStreamRunner>();
   private lastPruneAt = 0;
+  /** v0.4.103 — long timeframe windows; created on first use. */
+  private timeframePool: TimeframeSeedPool | null = null;
+  private horizonPrimeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
     // v0.4.102 — before any collector, cache or stream reads Bitunix rows:
     // discard the pre-contract mixed-unit store once (bitunix-migration.ts).
     migrateBitunixVolumeContract(cfg.dataDir, (m) => (deps.log ?? console.log)(`[candles] ${m}`), cfg.venues.includes("bitunix"));
     this.store = new CandleStore(path.join(cfg.dataDir, "candles"));
+    // Only collected venues can hold a horizon: nothing would ever fill it.
+    const horizon: TimeframeHorizon = {};
+    for (const v of cfg.venues) if (cfg.timeframeHorizon?.[v]) horizon[v] = cfg.timeframeHorizon[v];
     this.timeframeHistory = new TimeframeHistory(
       path.join(cfg.dataDir, "candle-timeframes-v2"), this.store, cfg.options.retentionDays,
+      Object.keys(horizon).length ? { horizon, clock: deps.now } : { clock: deps.now },
     );
     this.fetchLike = deps.fetchLike ?? realFetch;
     for (const v of cfg.venues) {
@@ -368,6 +398,7 @@ export class CandleService {
     // v0.4.102 — exact coverage for the whole roster within minutes of boot,
     // not only through each tick's bounded slice (collector.ts).
     this.startCoveragePrime();
+    this.warmHorizon(this.deps.now?.() ?? Date.now());
     this.timer = setInterval(() => void this.tickAll(), this.cfg.tickMs);
     // Never hold the process open on the collector's account; the HTTP server
     // is what keeps the hub alive.
@@ -422,7 +453,45 @@ export class CandleService {
     this.primeTimer.unref?.();
   }
 
+  /** v0.4.103 — register the standing horizon for every collected venue's
+   *  tradable roster and start the bounded cursor prime if any is unprimed. */
+  private warmHorizon(now: number): void {
+    for (const venue of this.timeframeHistory.horizonVenues()) {
+      const collector = this.collectors.get(venue);
+      if (!collector) continue;
+      this.timeframeHistory.warm(venue, collector.symbols().filter((t) => !t.delisted && t.tradable).map((t) => t.symbol), now);
+    }
+    if (this.timer && !this.horizonPrimeTimer && this.timeframeHistory.horizonPending() > 0) this.startHorizonPrime();
+  }
+
+  /** One cursor scan per standing series, in turns of at most ~25 ms of
+   *  synchronous disk read separated by timer yields (as the coverage prime). */
+  private startHorizonPrime(): void {
+    const o = this.cfg.coveragePrime ?? {};
+    const budget = Math.max(1, Math.min(25, o.turnBudgetMs ?? 25));
+    const yieldMs = Math.max(0, o.yieldMs ?? 25);
+    const clock = o.clock ?? (() => performance.now());
+    const turn = (): void => {
+      this.horizonPrimeTimer = null;
+      if (!this.timer) return;
+      let done = true;
+      try { done = this.timeframeHistory.primeHorizon((this.deps.now ?? Date.now)(), budget, clock).done; }
+      catch (err) { (this.deps.log ?? console.log)(`[candles] horizon prime stopped — ${(err as Error)?.message ?? "unknown"}`); }
+      if (!done) {
+        this.horizonPrimeTimer = setTimeout(turn, yieldMs);
+        this.horizonPrimeTimer.unref?.();
+      }
+    };
+    this.horizonPrimeTimer = setTimeout(turn, yieldMs);
+    this.horizonPrimeTimer.unref?.();
+  }
+
   stop(): void {
+    if (this.horizonPrimeTimer) clearTimeout(this.horizonPrimeTimer);
+    this.horizonPrimeTimer = null;
+    this.timeframePool?.close();
+    this.timeframePool = null;
+    try { this.timeframeHistory.flush(); } catch { /* the next start refetches unproven slots */ }
     this.primeGeneration++;
     if (this.primeTimer) clearTimeout(this.primeTimer);
     this.primeTimer = null;
@@ -483,6 +552,7 @@ export class CandleService {
       // independent rate limits, and now that each pass paces itself across most
       // of the tick period, running them in series would mean the last venue
       // never got a turn at all.
+      this.warmHorizon(now);
       await Promise.all([...this.collectors.values()].map(async (c) => {
         try {
           const plan = c.workBudgetFor(this.cfg.tickMs);
@@ -503,6 +573,8 @@ export class CandleService {
         for (const c of this.collectors.values()) c.prune(now);
         this.timeframeHistory.prune(now);
       }
+      // v0.4.103 — the frontier/proof sidecars are written once per pass.
+      this.timeframeHistory.flush();
     } finally { /* the public wrapper releases the shared in-flight promise */ }
   }
 
@@ -805,6 +877,59 @@ export class CandleService {
       (this.deps.now ?? Date.now)(), minuteRestFrontier,
       this.cfg.keyId, this.deps.sign,
     );
+  }
+
+  /** v0.4.103 — true when this request takes the off-thread long path. */
+  isLongTimeframeRequest(req: SeedRequest & { interval: number }): boolean {
+    return this.timeframeHistory.isLongRequest(req.venue, req.interval, req.fromMs, req.toMs, (this.deps.now ?? Date.now)());
+  }
+
+  /** v0.4.103 — the timeframe route's entry point. Windows up to 60 days (and
+   *  every interval not on a configured horizon) take `timeframeSeed` exactly
+   *  as 0.4.102 did; a long horizon window is built by the read-only worker
+   *  pool and only signed here. */
+  async timeframeSeedAsync(req: SeedRequest & { interval: number }): Promise<TimeframeServed> {
+    if (!isTimeframeInterval(req.interval) || !this.isLongTimeframeRequest(req)) return this.timeframeSeed(req);
+    const collector = this.collectors.get(req.venue);
+    if (collector && !collector.isTracked(req.symbol) && this.store.coverage(req.venue, req.symbol).lastClosedMs === null) {
+      return { ok: false, code: 404, error: `symbol ${req.symbol} is not listed on ${req.venue}` };
+    }
+    const minuteRestFrontier = collector ? collector.restConfirmedMs(req.symbol) : Infinity;
+    const prepared = this.timeframeHistory.prepareLongRequest(
+      req.venue, req.symbol, req.interval as TimeframeInterval, req.fromMs, req.toMs,
+      (this.deps.now ?? Date.now)(), minuteRestFrontier, this.cfg.keyId,
+    );
+    if (!prepared.ok) return prepared;
+    let reply: TimeframeLongReply;
+    try {
+      reply = await (this.deps.timeframeBuild ?? ((job) => (this.timeframePool ??= new TimeframeSeedPool()).run(job)))(prepared.job);
+    } catch (err) {
+      if (err instanceof TimeframePoolBusyError) return { ok: false, code: 503, error: err.message, retryAfter: 1 };
+      (this.deps.log ?? console.log)(`[candles] ${req.venue} ${req.symbol} ${req.interval}m long seed failed — ${(err as Error)?.message ?? "unknown"}`);
+      return { ok: false, code: 503, error: "timeframe history build failed; retry shortly", retryAfter: 5 };
+    }
+    return this.timeframeHistory.finishLongRequest(prepared, reply, this.deps.sign);
+  }
+
+  /** v0.4.103 — per-venue horizon progress for /admin/api/candles. */
+  horizonHealth(now = Date.now()): TimeframeHorizonHealth {
+    const venues = this.timeframeHistory.horizonStatus(now).map((v) => {
+      const collector = this.collectors.get(v.venue);
+      const weightPerSecond = collector ? collector.workBudgetFor(60_000).weightPerSecond : null;
+      // Targets sharing one native fetch series (Bitget/WEEX 120m from 60m)
+      // share its cursor: count each fetch series once.
+      const byFetch = new Map<number, number>();
+      for (const i of v.intervals) byFetch.set(i.fetchInterval, i.remainingWeight);
+      const weight = [...byFetch.values()].reduce((n, w) => n + w, 0);
+      const pendingByFetch = new Map<number, number>();
+      for (const i of v.intervals) pendingByFetch.set(i.fetchInterval, i.symbols - i.primed);
+      const pending = [...pendingByFetch.values()].reduce((n, p) => n + p, 0);
+      // The standing backfill shares its venue lane with the 1m backfill
+      // (alternating turns) after tails and repairs: about half the budget.
+      const etaMs = weightPerSecond && weightPerSecond > 0 ? Math.round(weight / (weightPerSecond * 0.5) * 1000) : null;
+      return { ...v, pending, etaMs, weightPerSecond };
+    });
+    return { configured: venues.length > 0, venues, pool: this.timeframePool?.status() ?? null };
   }
 
   /** Per-exchange status for the admin panel. Every venue in VENUE_IDS gets a

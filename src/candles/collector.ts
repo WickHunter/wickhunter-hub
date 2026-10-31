@@ -1143,9 +1143,25 @@ export class VenueCollector {
         if (legacyReconcile[i]) legacy.push(legacyReconcile[i]!);
         if (backfill[i]) legacy.push(backfill[i]!);
       }
+      // v0.4.103 — a horizon page on WEEX's ranged history route costs weight
+      // 5 like a 1m history page, so it joins the LEGACY share, last: the
+      // year of 1h/4h backfill is the lowest-priority work on this lane.
+      const cheapHigher = higher.filter((item) => (item.weight ?? WEEX_RECENT_KLINE_WEIGHT) <= WEEX_RECENT_KLINE_WEIGHT);
+      const costlyHigher = higher.filter((item) => (item.weight ?? WEEX_RECENT_KLINE_WEIGHT) > WEEX_RECENT_KLINE_WEIGHT);
+      if (costlyHigher.length) {
+        // Interleave after the existing legacy streams so they keep their turns.
+        const merged: ScheduledWork[] = [];
+        const rounds = Math.max(legacy.length, costlyHigher.length);
+        for (let i = 0, li2 = 0; i < rounds; i++) {
+          for (let n = 0; n < 3 && li2 < legacy.length; n++) merged.push(legacy[li2++]!);
+          if (costlyHigher[i]) merged.push(costlyHigher[i]!);
+          if (i === rounds - 1) while (li2 < legacy.length) merged.push(legacy[li2++]!);
+        }
+        legacy.splice(0, legacy.length, ...merged);
+      }
       const cheap: ScheduledWork[] = [];
-      const firstCheap = this.higherReconcileFirst ? higher : routine;
-      const secondCheap = this.higherReconcileFirst ? routine : higher;
+      const firstCheap = this.higherReconcileFirst ? cheapHigher : routine;
+      const secondCheap = this.higherReconcileFirst ? routine : cheapHigher;
       for (let i = 0; i < Math.max(firstCheap.length, secondCheap.length); i++) {
         if (firstCheap[i]) cheap.push(firstCheap[i]!);
         if (secondCheap[i]) cheap.push(secondCheap[i]!);
@@ -1167,7 +1183,7 @@ export class VenueCollector {
           cheapBlock();
         }
       }
-      if (higher.length && routine.length) this.higherReconcileFirst = !this.higherReconcileFirst;
+      if (cheapHigher.length && routine.length) this.higherReconcileFirst = !this.higherReconcileFirst;
       if (cheap.length && legacy.length) this.higherHistoryFirst = !this.higherHistoryFirst;
       return [...critical, ...history];
     } else {
@@ -1334,7 +1350,8 @@ export class VenueCollector {
 
     for (const item of queue) {
       const requestWeight = this.venue === "weex"
-        ? (item.kind === "timeframe" || item.recent ? WEEX_RECENT_KLINE_WEIGHT : WEEX_HISTORY_KLINE_WEIGHT)
+        ? (item.kind === "timeframe" ? (item.weight ?? WEEX_RECENT_KLINE_WEIGHT)
+          : item.recent ? WEEX_RECENT_KLINE_WEIGHT : WEEX_HISTORY_KLINE_WEIGHT)
         : 1;
       if (requests >= (deps.maxRequests ?? budget)) break;
       // A weight-5 history page may not fit near the end of a pass while a
@@ -1366,7 +1383,7 @@ export class VenueCollector {
         if (item.kind === "timeframe") {
           this.timeframes!.attempted(item, now);
           const page = await fetchNativeTimeframeKlines(
-            fetchLike, this.venue, item.symbol, item.interval, item.startMs, item.endMs,
+            fetchLike, this.venue, item.symbol, item.interval, item.startMs, item.endMs, item.route ?? "recent",
           );
           this.volumeSkip.delete(item.symbol);
           written += this.timeframes!.record(item, page, now);

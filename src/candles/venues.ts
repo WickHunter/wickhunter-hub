@@ -837,12 +837,60 @@ export function nativeTimeframePageLimit(venue: VenueId): number {
   return 1000;
 }
 
+/** v0.4.103 — how a native higher-timeframe page is fetched. `recent` is the
+ *  venue's ordinary kline route; `history` exists only for WEEX, whose
+ *  ordinary route answers the newest 1000 rows whatever range is asked. */
+export type NativeTimeframeRoute = "recent" | "history";
+
+/** Bitget history-candles refuses a span longer than this (probed 2026-10-31:
+ *  1Dutc over 90 days answered, 91 days answered code 40017). */
+export const BITGET_HISTORY_MAX_SPAN_MS = 90 * 24 * 3_600_000;
+/** WEEX newest-page rows a native timeframe page may rely on, leaving a
+ *  margin for clock skew between work emission and the venue's own window. */
+export const WEEX_RECENT_TIMEFRAME_ROWS = WEEX_RECENT_PAGE_LIMIT - 10;
+
+/** v0.4.103 — rows one native timeframe page may ask for, so that the venue
+ *  can never truncate the answer (a truncated page proves nothing about the
+ *  rows it left out). Probed 2026-10-31:
+ *   - Bybit /v5/market/kline: limit 1000.
+ *   - Binance/Aster /fapi/v1/klines: 1000 rows at weight 5 (1500 costs weight
+ *     10 — fewer rows per weight unit, and the collector's request pacing
+ *     assumes weight 5, so 1000 is kept).
+ *   - Bitget history-candles: limit 200 AND endTime-startTime <= 90 days.
+ *   - Bitunix kline: 200 rows ending at endTime (startTime is not honoured).
+ *   - WEEX klines (recent): the newest 1000 rows; historyKlines: 100 rows,
+ *     weight 5, intervals 1h/4h/1d (2h is refused, code -1142). */
+export function nativeTimeframePageRows(venue: VenueId, interval: number, route: NativeTimeframeRoute = "recent"): number {
+  if (venue === "bitget") return Math.max(1, Math.min(200, Math.floor(BITGET_HISTORY_MAX_SPAN_MS / (interval * MINUTE_MS))));
+  if (venue === "bitunix") return 200;
+  if (venue === "weex") return route === "history" ? WEEX_PAGE_LIMIT : WEEX_RECENT_TIMEFRAME_ROWS;
+  return 1000;
+}
+
+/** WEEX historyKlines interval tokens that were proved to answer. */
+const WEEX_HISTORY_TIMEFRAMES: readonly number[] = [60, 240, 1440];
+
+/** Request weight of one native timeframe page in the venue's own units
+ *  (only WEEX distinguishes; every other lane is paced per request). */
+export function nativeTimeframeWeight(venue: VenueId, route: NativeTimeframeRoute): number {
+  if (venue === "weex") return route === "history" ? WEEX_HISTORY_KLINE_WEIGHT : WEEX_RECENT_KLINE_WEIGHT;
+  return 1;
+}
+
+/** Can this venue fetch an arbitrary older range of this native interval? */
+export function nativeTimeframeHistoryRoute(venue: VenueId, interval: number): boolean {
+  return venue !== "weex" || WEEX_HISTORY_TIMEFRAMES.includes(interval);
+}
+
 function nativeToken(venue: VenueId, interval: number): string {
   if (!NATIVE_TIMEFRAMES[venue].includes(interval)) throw new Error(`${venue} has no proved native ${interval}m candle interval`);
   if (venue === "bybit") return interval === 1440 ? "D" : String(interval);
   if (venue === "bitget") return interval < 60 ? `${interval}m`
     : interval === 60 ? "1H" : interval === 240 ? "4H" : interval === 360 ? "6H"
-      : interval === 720 ? "12H" : "1D";
+      // v0.4.103 — `1Dutc`, not `1D`: Bitget's `1D` day opens at 16:00 UTC
+      // (UTC+8 midnight; probed 2026-10-31, open 1761840000000), which no
+      // UTC daily slot can hold. `1Dutc` opens at 00:00 UTC.
+      : interval === 720 ? "12H" : "1Dutc";
   if (venue === "bitunix" || venue === "aster" || venue === "binance" || venue === "weex") return interval < 60 ? `${interval}m`
     : interval === 1440 ? "1d" : `${interval / 60}h`;
   throw new Error(`${venue} native timeframe token is not configured`);
@@ -853,6 +901,7 @@ function nativeToken(venue: VenueId, interval: number): string {
  * accounting. Closure/alignment are enforced again by TimeframeHistory.record. */
 export async function fetchNativeTimeframeKlines(
   fetchLike: FetchLike, venue: VenueId, symbol: string, interval: number, startMs: number, endMs: number,
+  route: NativeTimeframeRoute = "recent",
 ): Promise<KlinePage> {
   const token = nativeToken(venue, interval);
   const span = interval * MINUTE_MS;
@@ -874,7 +923,12 @@ export async function fetchNativeTimeframeKlines(
   }
   if (venue === "bitget") {
     const body = (await getJson(fetchLike, `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(symbol)}`
-      + `&productType=usdt-futures&granularity=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`)) as {
+      // v0.4.103 — history-candles selects by CLOSE time (open + span) and
+      // answers ceil((endTime - startTime) / span) rows backwards from the
+      // newest close <= endTime (probed 2026-10-31). `endMs + span - 1`
+      // therefore dropped the newest requested bar and returned one bar
+      // before startMs; `endMs + span` asks for exactly [startMs, endMs].
+      + `&productType=usdt-futures&granularity=${token}&startTime=${startMs}&endTime=${endMs + span}&limit=${limit}`)) as {
         code?: unknown; msg?: unknown; data?: unknown[];
       };
     if (body.code !== undefined && String(body.code) !== "00000") {
@@ -921,6 +975,15 @@ export async function fetchNativeTimeframeKlines(
     return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
   }
   if (venue === "weex") {
+    if (route === "history") {
+      // v0.4.103 — the ranged route: 100 rows, weight 5, 1h/4h/1d only.
+      if (!WEEX_HISTORY_TIMEFRAMES.includes(interval)) throw new Error(`weex has no proved history route for ${interval}m candles`);
+      const rows = (endMs - startMs) / span + 1;
+      if (!Number.isSafeInteger(rows) || rows < 1 || rows > WEEX_PAGE_LIMIT) throw new Error(`weex history page must hold 1..${WEEX_PAGE_LIMIT} rows`);
+      const url = `${WEEX_BASE}/capi/v3/market/historyKlines?symbol=${encodeURIComponent(symbol)}`
+        + `&interval=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${WEEX_PAGE_LIMIT}&priceType=LAST`;
+      return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
+    }
     const url = `${WEEX_BASE}/capi/v3/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${token}&limit=${limit}`;
     return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
   }

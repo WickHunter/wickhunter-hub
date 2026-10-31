@@ -91,9 +91,9 @@ import type { HttpLike } from "./marketcap/cmc.js";
 import { LiqService, DEFAULT_LIQ_SERVICE_CONFIG, type LiqFetchLike } from "./liq/service.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
-import { isVenueId } from "./candles/venues.js";
+import { isVenueId, type VenueId } from "./candles/venues.js";
 import { isSnapshotDepth, isSnapshotInterval, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH } from "./candles/snapshot.js";
-import { isTimeframeInterval, TIMEFRAME_INTERVALS } from "./candles/timeframe.js";
+import { isTimeframeInterval, TIMEFRAME_INTERVALS, type TimeframeBoundary } from "./candles/timeframe.js";
 import {
   AsyncGzipQueue, GzipCapacityError,
   type AsyncGzipLimits, type GzipFunction, type GzipReservation,
@@ -268,6 +268,8 @@ export interface HubDeps {
   candleNow?: CandleServiceDeps["now"];
   /** Where a snapshot rebuild reports its cost; production prints it. */
   candleLog?: CandleServiceDeps["log"];
+  /** v0.4.103 — where a long timeframe window is built (default: worker pool). */
+  candleTimeframeBuild?: CandleServiceDeps["timeframeBuild"];
   /** Injectable async response compressor and limits for deterministic tests. */
   responseGzip?: GzipFunction;
   responseGzipLimits?: Partial<AsyncGzipLimits>;
@@ -614,15 +616,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       keyId: cfg.candleKeyId,
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,
+      timeframeHorizon: cfg.candleTimeframeHorizon,
     },
     {
       sign: signSeed,
+      timeframeBuild: deps.candleTimeframeBuild,
       fetchLike: deps.candleFetch,
       sleep: deps.candleSleep,
       now: deps.candleNow,
       log: deps.candleLog,
     },
   );
+  // v0.4.103 — a refused HUB_TIMEFRAME_HORIZON runs the Hub without one, loudly.
+  if (cfg.candleTimeframeHorizonError) console.error(`[candles] ${cfg.candleTimeframeHorizonError} — running with no timeframe horizon`);
+  for (const v of Object.keys(cfg.candleTimeframeHorizon ?? {})) {
+    if (!cfg.candleVenues.includes(v as VenueId)) console.warn(`[candles] HUB_TIMEFRAME_HORIZON names ${v}, which has no collector (HUB_CANDLE_VENUES); ignored`);
+  }
   // ── THE MARKET-CAP PRODUCER ───────────────────────────────────────────────
   // Built only when it is configured AND usable. A refusal is PRINTED and the
   // service stays null: the hub also does licensing and candle seeding, and a
@@ -2275,6 +2284,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     });
   }
 
+  /** v0.4.103 — UNSIGNED venue-boundary facts beside a long timeframe seed.
+   *  Never in the body: the v2 envelope's key set is pinned on both sides.
+   *  They are hints (the app proves a listing boundary against the venue
+   *  itself); a leading gap in the signed body is never proof on its own. */
+  function timeframeBoundaryHeaders(b: TimeframeBoundary | null): Record<string, string> {
+    if (!b) return {};
+    const out: Record<string, string> = { "x-wh-horizon-from-ms": String(b.horizonFromMs) };
+    if (b.floor) {
+      out["x-wh-venue-floor-ms"] = String(b.floor.atMs);
+      out["x-wh-venue-floor-checked-from-ms"] = String(b.floor.checkedFromMs);
+      out["x-wh-venue-floor-proofs"] = String(b.floor.confirmations);
+      out["x-wh-venue-floor-first-proof-ms"] = String(b.floor.firstAt);
+      out["x-wh-venue-floor-last-proof-ms"] = String(b.floor.lastAt);
+    }
+    return out;
+  }
+
   /** Gzipped snapshot bodies, keyed by the exact served buffer. */
   const snapshotGzip = new WeakMap<Buffer, Promise<Buffer>>();
 
@@ -2321,12 +2347,43 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         return sendJson(res, 400, { ok: false,
           error: `interval must be 1 or one of ${TIMEFRAME_INTERVALS.join(",")} minutes` });
       }
+      const tfReq = { venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo) };
+      // v0.4.103 — a window longer than 60 days of a horizon interval is built
+      // off the event loop and arrives already signed. Its compression slot is
+      // reserved AFTER the build, so a slow build never holds one.
+      if (candles.isLongTimeframeRequest(tfReq)) {
+        const served = await candles.timeframeSeedAsync(tfReq);
+        if (!served.ok) {
+          return sendJson(res, served.code, { ok: false, error: served.error },
+            served.retryAfter ? { "retry-after": String(served.retryAfter), "cache-control": "no-store" } : undefined);
+        }
+        const body = served.body ?? Buffer.from(JSON.stringify(served.payload), "utf8");
+        const boundary = served.body ? timeframeBoundaryHeaders(served.boundary) : {};
+        const etag = `"${createHash("sha256").update(body).update(JSON.stringify(boundary)).digest("base64url").slice(0, 32)}"`;
+        const inm = String(req.headers["if-none-match"] ?? "");
+        if (inm && inm.split(",").some((t) => t.trim() === etag)) {
+          res.writeHead(304, { etag, "cache-control": "public, max-age=60", ...boundary });
+          return void res.end();
+        }
+        const reservation = wantsGzip ? responseGzip.reserve() : null;
+        if (wantsGzip && !reservation) return compressionBusy(res);
+        try {
+          const bytes = reservation ? await compressedBytes(body, reservation, res) : body;
+          if (!bytes) return;
+          res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8", "content-length": bytes.length,
+            ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+            etag, "cache-control": "public, max-age=60", ...boundary,
+          });
+          return void res.end(bytes);
+        } finally {
+          reservation?.release();
+        }
+      }
       const reservation = wantsGzip ? responseGzip.reserve() : null;
       if (wantsGzip && !reservation) return compressionBusy(res);
       try {
-        const outcome = candles.timeframeSeed({
-          venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo),
-        });
+        const outcome = candles.timeframeSeed(tfReq);
         if (!outcome.ok) {
           return sendJson(res, outcome.code, { ok: false, error: outcome.error });
         }
@@ -2945,6 +3002,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         signer: cfg.candleSigner,
         requiresLicense: cfg.candleRequireLicense,
         retentionDays: cfg.candleOptions.retentionDays,
+        // v0.4.103 — standing long-horizon progress per venue × interval.
+        timeframeHorizon: { ...candles.horizonHealth(), error: cfg.candleTimeframeHorizonError ?? null },
         seedPublicKey,
         candleKeyId: CANDLE_KEY_ID,
         candlePublicKey,

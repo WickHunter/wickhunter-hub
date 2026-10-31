@@ -1,0 +1,46 @@
+{
+  "generatedFrom": "wickhunter-hub 0.4.102 (a135d24) dist",
+  "now": 1792498050000,
+  "scenarios": {
+    "bybit-60-60d": {
+      "sha256": "764816be3ccc07f192382ec752756f449aa202e76d0f0410fb3ac3ea861ade61",
+      "bytes": 99065
+    },
+    "bybit-60-7d": {
+      "sha256": "4be615cf77f545ee7a003306d88e0d2f0abb6a3296c167259bf23af9ae9e3487",
+      "bytes": 11970
+    },
+    "bybit-240-fold-30d": {
+      "sha256": "f8affe35860f541dd89cbacb6b599bc3ef4bddd9e35bacc4035ce0f7ac7a54b5",
+      "bytes": 12078
+    },
+    "binance-240-gapped": {
+      "sha256": "1fe511df389ef076e3b1a2e9403ad472a0fe029f9af06955ea71dc8ff780ec5a",
+      "bytes": 7910
+    },
+    "bitget-120-minutes": {
+      "sha256": "65e45cb051d9413284f35c7159af628bbb5a5d96360a758f08b3d5f776a9105f",
+      "bytes": 2035
+    },
+    "bitget-1440-minutes": {
+      "sha256": "0a6375c6386ca340ad5b05c18086d39c8e3dafc1bf94d3676c5acf2c5a82e16e",
+      "bytes": 580
+    },
+    "bitunix-60-carried": {
+      "sha256": "488fd0f9782addbee43518f818b7f8e2745da8612aa1e51a2b5c4308600d03e1",
+      "bytes": 3132
+    },
+    "weex-1440-45d": {
+      "sha256": "8a83e90c593173351be091398d91d6ed0e94375609a8d26da5e619e2dd75b86e",
+      "bytes": 3551
+    },
+    "weex-60-100h": {
+      "sha256": "1046dc402ddfded083a7ee97785fbe6fb1715e1ddc58264846cf303d2b170383",
+      "bytes": 7302
+    },
+    "aster-60-cold": {
+      "sha256": "9104fdabe02650a2029fa5643f0b0e1a7be6af7189ec3c5910e85e1e779debbc",
+      "bytes": 84
+    }
+  }
+}
