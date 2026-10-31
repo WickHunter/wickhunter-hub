@@ -9,6 +9,7 @@ import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
 import { test, summary, tmpDir, freshHub } from "./helpers.mjs";
 import { CandleStore, MINUTE_MS } from "../dist/src/candles/store.js";
 import { VenueCollector, DEFAULT_COLLECTOR_OPTIONS, VENUE_EMPTY_CONFIRM_GAP_MS, VENUE_EMPTY_RECHECK_MS } from "../dist/src/candles/collector.js";
+import { collectorOptionsFromEnv } from "../dist/src/candles/service.js";
 import {
   TimeframeHistory, TimeframeStore, parseTimeframeHorizon, buildTimeframeLong, signedTimeframeBody, canonicalTimeframeBytes,
   HORIZON_EMPTY_CONFIRM_GAP_MS, HORIZON_EMPTY_RECHECK_MS, HORIZON_RETRY_MS,
@@ -230,8 +231,16 @@ await test("standing demand: the roster is warm before anyone asks, pages newest
   assert.deepEqual(btc60.targets, [60]);
   // A short request with gaps adds no per-request demand beside the cursor
   // (which would re-read the window from disk every pass).
+  // Review S8: until the cursor's newest page has landed, the request keeps
+  // its 0.4.102 demand (nothing waits on the prime or the first page).
   h.request("bybit", "ETHUSDT", 60, last - 10 * DAY, last, NOW, null, "seed-1", sign);
-  assert.equal(h.demands.size, 0);
+  assert.equal(h.demands.size, 1);
+  h.demands.clear();
+  const ethTail = h.work("bybit", NOW, 1000).find((p) => p.symbol === "ETHUSDT" && p.interval === 60 && p.horizon);
+  h.attempted(ethTail, NOW);
+  h.record(ethTail, { candles: venueRows(ethTail.startMs, ethTail.endMs, HOUR), empty: false }, NOW);
+  h.request("bybit", "ETHUSDT", 60, last - 60 * DAY, last, NOW, null, "seed-1", sign);
+  assert.equal(h.demands.size, 0, "a landed cursor owns the series: no per-request rescanning demand");
   assert.ok(h.work("bybit", NOW, 1000).every((p) => p.horizon === true));
   // Far past the 6 h TTL that retires request-driven demand.
   const later = NOW + 7 * HOUR;
@@ -460,7 +469,7 @@ await test("a long window for a young listing is a signed partial with its leadi
   assert.equal(content.value.complete, false);
 });
 
-await test("the long path never reads 1m or writes aggregates beyond minute retention; aggregate-only targets fold from native 1h", () => {
+await test("the long path does no main-thread disk work: no 1m read, no store read or write before the worker; aggregate-only targets fold from native 1h", () => {
   const { h, minutes } = make("tf-long-fold", "bitget:60,120:365", { retentionDays: 30 });
   const step = 2 * HOUR;
   const last = Math.floor(NOW / step) * step - step;
@@ -474,10 +483,13 @@ await test("the long path never reads 1m or writes aggregates beyond minute rete
   const aggregateFrom = [];
   const realWrite = h.store.write.bind(h.store);
   h.store.write = (v, s, i, c, source, base, n) => { if (source === "aggregate" && c.length) aggregateFrom.push(Math.min(...c.map((x) => x.openMs))); return realWrite(v, s, i, c, source, base, n); };
+  let storeReads = 0;
+  const realRead = h.store.read.bind(h.store);
+  h.store.read = (...a) => { storeReads++; return realRead(...a); };
   const prepared = h.prepareLongRequest("bitget", "SOLUSDT", 120, from, last, NOW, mins.at(-1).openMs, "seed-1");
-  const floor = NOW - 30 * DAY - step;
-  assert.ok(minuteFrom.length > 0 && minuteFrom.every((a) => a >= floor), "1m reads only inside minute retention");
-  assert.ok(aggregateFrom.every((a) => a >= floor), "aggregate writes only inside minute retention");
+  h.store.read = realRead;
+  assert.deepEqual([minuteFrom.length, aggregateFrom.length, storeReads], [0, 0, 0],
+    "review S1: prepare is O(1) — no 1m fold, no store read or write on the main thread");
   assert.equal(prepared.job.foldBase, 60);
   const reply = buildTimeframeLong(prepared.job);
   const body = JSON.parse(h.finishLongRequest(prepared, reply, sign).body);
@@ -725,6 +737,155 @@ await test("non-WEEX: tails and repairs keep first claim; horizon pages share th
   assert.ok(kinds.includes("timeframe"));
   const firstTf = kinds.indexOf("timeframe");
   assert.ok(kinds.indexOf("tail") >= 0 && kinds.indexOf("tail") < firstTf, `tail first: ${kinds.join(",")}`);
+});
+
+
+// ── review fixes (S1–S11) ───────────────────────────────────────────────────
+await test("S1: a full pool answers busy before any main-thread work for the request", async () => {
+  const h = await freshHub({ candleVenues: ["bybit"], candleTimeframeHorizon: horizonOf("bybit:60:365") }, {
+    candleNow: () => NOW,
+    candleFetch: async () => ({ ok: true, status: 200, json: async () => ({ retCode: 0, result: { list: [] } }) }),
+  });
+  try {
+    const { token } = h.store.issue("tf-s1", 1);
+    const last = Math.floor(NOW / HOUR) * HOUR - HOUR;
+    h.candles.store.write("bybit", "BTCUSDT", [{ openMs: last, ...px(1) }], last);
+    const pool = new TimeframeSeedPool(1, 0, 60_000);
+    pool.slots[0].running = { id: -1, timer: setTimeout(() => {}, 0) }; // occupied, no queue room
+    h.candles.timeframePool = pool;
+    let prepared = 0;
+    const real = h.candles.timeframeHistory.prepareLongRequest.bind(h.candles.timeframeHistory);
+    h.candles.timeframeHistory.prepareLongRequest = (...a) => { prepared++; return real(...a); };
+    const res = await fetch(`${h.origin}/api/candles/seed?venue=bybit&symbol=BTCUSDT&interval=60&fromMs=${last - 8759 * HOUR}&toMs=${last}`,
+      { headers: { "x-license": token } });
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "1");
+    assert.equal(prepared, 0, "refused before prepareLongRequest");
+    assert.equal(pool.status().refusedBusy, 1);
+    pool.slots[0].running = null;
+  } finally { await h.close(); }
+});
+
+await test("S2: a prime turn stops between month reads, not only between cursors", () => {
+  const { h } = make("tf-s2", "bybit:60:365");
+  const last = newestClosed(60);
+  seed(h, "bybit", "YEARUSDT", 60, last - 366 * DAY, last);
+  h.warm("bybit", ["YEARUSDT"], NOW);
+  let fake = 0;
+  let reads = 0;
+  const realRead = h.store.read.bind(h.store);
+  h.store.read = (...a) => { reads++; fake += 3; return realRead(...a); }; // each month read "costs" 3 ms
+  const turn = h.primeHorizon(NOW, 10, () => fake);
+  assert.equal(turn.done, false, "one year-long cursor does not finish inside a 10 ms turn");
+  assert.equal(reads, 4, "the budget is checked after every month read (10 ms / 3 ms -> 4 reads)");
+  let turns = 1;
+  while (!h.primeHorizon(NOW, 10, () => fake).done) turns++;
+  assert.ok(turns >= 3, `${turns} turns`);
+  h.store.read = realRead;
+  const { h: whole } = make("tf-s2b", "bybit:60:365");
+  seed(whole, "bybit", "YEARUSDT", 60, last - 366 * DAY, last);
+  whole.warm("bybit", ["YEARUSDT"], NOW);
+  whole.primeHorizon(NOW, Infinity);
+  assert.deepEqual(h.work("bybit", NOW, 1000), whole.work("bybit", NOW, 1000), "stepwise scan = one-shot scan");
+});
+
+await test("S3/S11: prune walks one symbol directory per step and removes stale tmp files (fresh ones stay)", () => {
+  const { h, root } = make("tf-s3", "bybit:60:30");
+  const last = newestClosed(60);
+  for (const sym of ["AUSDT", "BUSDT", "CUSDT"]) {
+    seed(h, "bybit", sym, 3, newestClosed(3) - 40 * DAY, newestClosed(3) - 39 * DAY);
+  }
+  const dir = `${root}/tf/bybit/AUSDT/3`;
+  fs.writeFileSync(`${dir}/2026-10-01.ctf2.tmp.123`, "x");
+  fs.writeFileSync(`${dir}/2026-10-02.ctf2.tmp.456`, "x");
+  const old = new Date(Date.now() - 2 * HOUR);
+  fs.utimesSync(`${dir}/2026-10-01.ctf2.tmp.123`, old, old);
+  const steps = h.pruneSteps(NOW);
+  const first = steps.step(0);
+  assert.equal(first.done, false, "one symbol per zero-budget step");
+  let n = 1;
+  let r = first;
+  while (!r.done) { r = steps.step(0); n++; }
+  assert.equal(n, 3);
+  assert.ok(r.removed >= 3);
+  assert.equal(fs.existsSync(`${dir}/2026-10-01.ctf2.tmp.123`), false, "an hour-old tmp file is a crash leftover");
+  assert.equal(fs.existsSync(`${dir}/2026-10-02.ctf2.tmp.456`), true, "a fresh tmp file may be a write in progress");
+  void last;
+});
+
+await test("S4: unsetting the horizon never deletes the year: month files keep the remembered horizon", () => {
+  const { h, root, minutes } = make("tf-s4", "bybit:60:365");
+  const last = newestClosed(60);
+  seed(h, "bybit", "BTCUSDT", 60, last - 200 * DAY, last);
+  assert.ok(fs.existsSync(`${root}/tf/horizon-memory.v1.json`));
+  const unset = new TimeframeHistory(`${root}/tf`, minutes, 30);
+  unset.prune(NOW);
+  const held = unset.store.read("bybit", "BTCUSDT", 60, last - 200 * DAY, last);
+  assert.equal(held.length, 200 * 24 + 1, "day layout still reads the month files, and prune kept them");
+  // Day files of a non-horizon series still age out at minute retention.
+  const day = new TimeframeStore(`${root}/tf`);
+  day.write("bybit", "BTCUSDT", 3, rowsFrom(newestClosed(3) - 40 * DAY, 3 * MINUTE_MS, 10), "native", 3, NOW);
+  unset.prune(NOW);
+  assert.equal(day.read("bybit", "BTCUSDT", 3, 0, NOW).length, 0);
+  // The remembered horizon still applies its own clock.
+  unset.prune(NOW + 400 * DAY);
+  assert.equal(unset.store.read("bybit", "BTCUSDT", 60, 0, NOW + 400 * DAY).length, 0);
+});
+
+await test("S5: request-driven pages come before horizon pages; horizon takes at most 1 slot in 4 beside 1m backfill", async () => {
+  const { h, minutes, root } = make("tf-s5", "bybit:60:365");
+  const last = newestClosed(60);
+  // A Beta-style short request for a non-horizon interval registers demand.
+  seed(h, "bybit", "BTCUSDT", 15, last - DAY, last - 12 * HOUR);
+  h.request("bybit", "BTCUSDT", 15, last - DAY, last, NOW, null, "seed-1", sign);
+  const symbols = Array.from({ length: 12 }, (_, i) => `S${i}USDT`);
+  h.warm("bybit", symbols, NOW);
+  h.primeHorizon(NOW, Infinity);
+  const pages = h.work("bybit", NOW, 1000);
+  assert.equal(pages[0].horizon, undefined, "request-driven demand first");
+  assert.ok(pages.slice(1).every((p) => p.horizon));
+  const current = Math.floor((NOW - 2 * MINUTE_MS) / MINUTE_MS) * MINUTE_MS;
+  for (const s of symbols) minutes.write("bybit", s, [{ openMs: current, ...px(0) }], current);
+  const collector = new VenueCollector("bybit", minutes, `${root}/state`, DEFAULT_COLLECTOR_OPTIONS, NOW, () => {}, h);
+  await collector.refreshSymbols(async () => ({ ok: true, status: 200, json: async () => ({ retCode: 0, result: { list:
+    symbols.map((symbol) => ({ symbol, status: "Trading", quoteCoin: "USDT", contractType: "LinearPerpetual" })) } }) }), NOW);
+  await collector.prepareCoverage();
+  const queue = collector.scheduledWork(NOW);
+  const history = queue.filter((w) => w.kind === "backfill" || w.horizon);
+  const backfills = history.filter((w) => w.kind === "backfill").length;
+  assert.ok(backfills >= 10);
+  const window = history.slice(0, backfills);
+  const horizonShare = window.filter((w) => w.horizon).length / window.length;
+  assert.ok(horizonShare <= 0.25 + 1e-9, `horizon share while backfill waits: ${horizonShare}`);
+  assert.ok(history.filter((w) => w.horizon).length >= 12, "the rest of the horizon follows once backfill is exhausted");
+});
+
+await test("S6: WEEX history-route horizon pages take one legacy turn in 8 by default; the env can lower or raise it", async () => {
+  assert.equal(collectorOptionsFromEnv({ HUB_TIMEFRAME_WEEX_HISTORY_EVERY: "16" }).weexHorizonHistoryEvery, 16);
+  assert.equal(collectorOptionsFromEnv({ HUB_TIMEFRAME_WEEX_HISTORY_EVERY: "1" }).weexHorizonHistoryEvery, undefined);
+  assert.equal(collectorOptionsFromEnv({}).weexHorizonHistoryEvery, undefined);
+  const { h, minutes, root } = make("tf-s6", "weex:60:365");
+  const current = Math.floor((NOW - 2 * MINUTE_MS) / MINUTE_MS) * MINUTE_MS;
+  const symbols = Array.from({ length: 20 }, (_, i) => `W${i}USDT`);
+  for (const s of symbols) minutes.write("weex", s, [{ openMs: current, ...px(0) }], current);
+  const collector = new VenueCollector("weex", minutes, `${root}/state`, {
+    ...DEFAULT_COLLECTOR_OPTIONS, requestsPerSecond: ADAPTERS.weex.publicRequestsPerSecond,
+    minRequestsPerSecond: Math.min(DEFAULT_COLLECTOR_OPTIONS.minRequestsPerSecond, ADAPTERS.weex.publicRequestsPerSecond),
+    retentionDays: 30,
+  }, NOW, () => {}, h);
+  await collector.refreshSymbols(async (url) => ({ ok: true, status: 200,
+    json: async () => url.includes("apiTradingSymbols") ? symbols : { symbols: symbols.map((symbol) => ({
+      symbol, quoteAsset: "USDT", marginAsset: "USDT", contractType: "PERPETUAL", forwardContractFlag: true, status: "TRADING",
+    })) } }), NOW);
+  await collector.prepareCoverage();
+  h.warm("weex", symbols, NOW);
+  h.primeHorizon(NOW, Infinity);
+  for (const p of h.work("weex", NOW, 1000)) { h.attempted(p, NOW); h.record(p, { candles: venueRows(p.proofFromMs, p.endMs, HOUR), empty: false }, NOW); }
+  const expensive = collector.scheduledWork(NOW).filter((w) => (w.kind === "timeframe" && w.weight === 5) || w.kind === "backfill");
+  const legacy = expensive.filter((w) => w.kind === "backfill").length;
+  const window = expensive.slice(0, legacy);
+  const share = window.filter((w) => w.kind === "timeframe").length / window.length;
+  assert.ok(share > 0 && share <= 1 / 8 + 1e-9, `WEEX horizon share of legacy turns: ${share}`);
 });
 
 summary("timeframe horizon");

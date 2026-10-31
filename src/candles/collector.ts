@@ -40,6 +40,9 @@ import type { TimeframeHistory, TimeframeWork } from "./timeframe.js";
 import { BITUNIX_VOLUME_CONTRACT, isUnprovableVolume } from "./bitunix-volume.js";
 
 export interface CollectorOptions {
+  /** v0.4.103 — WEEX: one legacy history turn in this many may be a
+   *  history-route horizon page (DEFAULT_WEEX_HORIZON_HISTORY_EVERY). */
+  weexHorizonHistoryEvery?: number;
   /** How deep to keep history. The bot's warm window; anything older is pruned. */
   retentionDays: number;
   /** Requests per second across ALL symbols of this venue. A CEILING, not a
@@ -248,6 +251,14 @@ export const VENUE_EMPTY_RECHECK_MS = 24 * 3_600_000;
  *  candidate is re-asked after the same interval. One page is one answer; a
  *  venue having a bad minute is not the venue having no candle. */
 export const VENUE_EMPTY_CONFIRM_GAP_MS = 3_600_000;
+/** v0.4.103 — on non-WEEX venues a standing horizon page takes at most one
+ *  history slot in this many while other history work waits (1m backfill
+ *  keeps >= 75% of its 0.4.102 share). */
+export const HORIZON_HISTORY_EVERY = 4;
+/** v0.4.103 — on WEEX a history-route (weight 5) horizon page takes one
+ *  legacy turn in this many (default 8: WEEX 1m backfill slows <= 12.5%);
+ *  HUB_TIMEFRAME_WEEX_HISTORY_EVERY overrides (2..64). */
+export const DEFAULT_WEEX_HORIZON_HISTORY_EVERY = 8;
 
 interface RestFrontierFile {
   restConfirmed: Record<string, number>;
@@ -1152,8 +1163,9 @@ export class VenueCollector {
         // Interleave after the existing legacy streams so they keep their turns.
         const merged: ScheduledWork[] = [];
         const rounds = Math.max(legacy.length, costlyHigher.length);
+        const every = Math.max(2, Math.min(64, Math.floor(this.opts.weexHorizonHistoryEvery ?? DEFAULT_WEEX_HORIZON_HISTORY_EVERY)));
         for (let i = 0, li2 = 0; i < rounds; i++) {
-          for (let n = 0; n < 3 && li2 < legacy.length; n++) merged.push(legacy[li2++]!);
+          for (let n = 0; n < every - 1 && li2 < legacy.length; n++) merged.push(legacy[li2++]!);
           if (costlyHigher[i]) merged.push(costlyHigher[i]!);
           if (i === rounds - 1) while (li2 < legacy.length) merged.push(legacy[li2++]!);
         }
@@ -1187,14 +1199,29 @@ export class VenueCollector {
       if (cheap.length && legacy.length) this.higherHistoryFirst = !this.higherHistoryFirst;
       return [...critical, ...history];
     } else {
-      const first = this.higherHistoryFirst ? higher : backfill;
-      const second = this.higherHistoryFirst ? backfill : higher;
+      // Request-driven timeframe pages alternate with 1m backfill exactly as
+      // in 0.4.102. v0.4.103 (review S5) — standing horizon pages take at
+      // most one slot in HORIZON_HISTORY_EVERY of that lane while other
+      // history work is waiting, so the 1m backfill (Beta's minute seeds)
+      // keeps >= 75% of its pre-horizon share; with nothing else waiting the
+      // horizon uses the whole remainder.
+      const requested = higher.filter((item) => !item.horizon);
+      const standing = higher.filter((item) => item.horizon);
+      const first = this.higherHistoryFirst ? requested : backfill;
+      const second = this.higherHistoryFirst ? backfill : requested;
+      const base: ScheduledWork[] = [];
       for (let i = 0; i < Math.max(first.length, second.length); i++) {
-        if (first[i]) history.push(first[i]!);
-        if (second[i]) history.push(second[i]!);
+        if (first[i]) base.push(first[i]!);
+        if (second[i]) base.push(second[i]!);
       }
+      let si = 0;
+      for (let i = 0; i < base.length; i++) {
+        history.push(base[i]!);
+        if ((i + 1) % (HORIZON_HISTORY_EVERY - 1) === 0 && si < standing.length) history.push(standing[si++]!);
+      }
+      while (si < standing.length) history.push(standing[si++]!);
     }
-    if (higher.length && backfill.length) this.higherHistoryFirst = !this.higherHistoryFirst;
+    if (higher.some((item) => !item.horizon) && backfill.length) this.higherHistoryFirst = !this.higherHistoryFirst;
     return [...urgent, ...history];
   }
 

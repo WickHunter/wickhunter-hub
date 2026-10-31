@@ -316,6 +316,7 @@ export class CandleService {
   /** v0.4.103 — long timeframe windows; created on first use. */
   private timeframePool: TimeframeSeedPool | null = null;
   private horizonPrimeTimer: ReturnType<typeof setTimeout> | null = null;
+  private timeframePruneTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly cfg: CandleServiceConfig, private readonly deps: CandleServiceDeps) {
     // v0.4.102 — before any collector, cache or stream reads Bitunix rows:
@@ -466,11 +467,12 @@ export class CandleService {
     if (this.timer && !this.horizonPrimeTimer && this.timeframeHistory.horizonPending() > 0) this.startHorizonPrime();
   }
 
-  /** One cursor scan per standing series, in turns of at most ~25 ms of
-   *  synchronous disk read separated by timer yields (as the coverage prime). */
+  /** One cursor scan per standing series, in turns of ~10 ms of synchronous
+   *  disk read (checked between month reads) separated by timer yields. */
   private startHorizonPrime(): void {
     const o = this.cfg.coveragePrime ?? {};
-    const budget = Math.max(1, Math.min(25, o.turnBudgetMs ?? 25));
+    // Review S2: 10 ms turns, checked between month reads (≤ ~15 ms a turn).
+    const budget = Math.max(1, Math.min(10, o.turnBudgetMs ?? 10));
     const yieldMs = Math.max(0, o.yieldMs ?? 25);
     const clock = o.clock ?? (() => performance.now());
     const turn = (): void => {
@@ -488,7 +490,31 @@ export class CandleService {
     this.horizonPrimeTimer.unref?.();
   }
 
+  /** Walk the timeframe tree for retention in bounded turns (one symbol
+   *  directory at a time, ~10 ms per turn, 25 ms timer yields). Without a
+   *  running service (tests, tools) the walk completes inline. */
+  private startTimeframePrune(now: number): void {
+    if (this.timeframePruneTimer) return;
+    const steps = this.timeframeHistory.pruneSteps(now);
+    if (!this.timer) { steps.step(Infinity); return; }
+    const turn = (): void => {
+      this.timeframePruneTimer = null;
+      if (!this.timer) return;
+      let done = true;
+      try { done = steps.step(10).done; }
+      catch (err) { (this.deps.log ?? console.log)(`[candles] timeframe prune stopped — ${(err as Error)?.message ?? "unknown"}`); }
+      if (!done) {
+        this.timeframePruneTimer = setTimeout(turn, 25);
+        this.timeframePruneTimer.unref?.();
+      }
+    };
+    this.timeframePruneTimer = setTimeout(turn, 0);
+    this.timeframePruneTimer.unref?.();
+  }
+
   stop(): void {
+    if (this.timeframePruneTimer) clearTimeout(this.timeframePruneTimer);
+    this.timeframePruneTimer = null;
     if (this.horizonPrimeTimer) clearTimeout(this.horizonPrimeTimer);
     this.horizonPrimeTimer = null;
     this.timeframePool?.close();
@@ -576,7 +602,9 @@ export class CandleService {
       if (now - this.lastPruneAt >= DAY_MS) {
         this.lastPruneAt = now;
         for (const c of this.collectors.values()) c.prune(now);
-        this.timeframeHistory.prune(now);
+        // v0.4.103 (review S3) — the timeframe tree (~220k files with a full
+        // horizon) is walked in ~10 ms turns on a timer, not in this pass.
+        this.startTimeframePrune(now);
       }
       // v0.4.103 — the frontier/proof sidecars are written once per pass.
       this.timeframeHistory.flush();
@@ -899,6 +927,14 @@ export class CandleService {
     if (collector && !collector.isTracked(req.symbol) && this.store.coverage(req.venue, req.symbol).lastClosedMs === null) {
       return { ok: false, code: 404, error: `symbol ${req.symbol} is not listed on ${req.venue}` };
     }
+    // Refuse busy before doing any work for this request (review S1).
+    if (!this.deps.timeframeBuild) {
+      this.timeframePool ??= new TimeframeSeedPool();
+      if (!this.timeframePool.hasCapacity()) {
+        this.timeframePool.refusedBusy++;
+        return { ok: false, code: 503, error: new TimeframePoolBusyError().message, retryAfter: 1 };
+      }
+    }
     const minuteRestFrontier = collector ? collector.restConfirmedMs(req.symbol) : Infinity;
     const prepared = this.timeframeHistory.prepareLongRequest(
       req.venue, req.symbol, req.interval as TimeframeInterval, req.fromMs, req.toMs,
@@ -1122,5 +1158,8 @@ export function collectorOptionsFromEnv(env: NodeJS.ProcessEnv): CollectorOption
     failingAfter: numOr(env.HUB_CANDLE_FAILING_AFTER, DEFAULT_COLLECTOR_OPTIONS.failingAfter),
     reconcileWsGapMinutes: numOr(env.HUB_CANDLE_RECONCILE_GAP_MIN, DEFAULT_COLLECTOR_OPTIONS.reconcileWsGapMinutes),
     perVenueRequestsPerSecond,
+    ...(/^\d{1,2}$/.test(env.HUB_TIMEFRAME_WEEX_HISTORY_EVERY ?? "")
+      && Number(env.HUB_TIMEFRAME_WEEX_HISTORY_EVERY) >= 2 && Number(env.HUB_TIMEFRAME_WEEX_HISTORY_EVERY) <= 64
+      ? { weexHorizonHistoryEvery: Number(env.HUB_TIMEFRAME_WEEX_HISTORY_EVERY) } : {}),
   };
 }

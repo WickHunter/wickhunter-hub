@@ -44,6 +44,11 @@ export class TimeframeSeedPool {
     };
   }
 
+  /** Would run() accept a job now? Checked BEFORE any main-thread work. */
+  hasCapacity(): boolean {
+    return !this.closed && (this.slots.some((s) => !s.running) || this.queue.length < this.maxQueue);
+  }
+
   run(job: TimeframeLongJob): Promise<TimeframeLongReply> {
     if (this.closed) return Promise.reject(new Error("timeframe seed pool is closed"));
     const idle = this.slots.some((s) => !s.running);

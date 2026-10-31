@@ -314,42 +314,81 @@ export class TimeframeStore {
   }
 
   /** Remove files wholly older than the cutoff. `olderThan` is one instant for
-   *  every series (0.4.102) or a per-(venue, interval) resolver (v0.4.103
-   *  horizon retention). A month file goes only when its whole month is older. */
-  prune(olderThan: number | ((venue: string, interval: number) => number)): number {
-    const cutoffFor = typeof olderThan === "number" ? () => olderThan : olderThan;
+   *  every series (0.4.102) or a per-(venue, interval, file kind) resolver
+   *  (v0.4.103 horizon retention). A month file goes only when its whole month
+   *  is older. Runs to completion; the service uses `pruneSteps` instead. */
+  prune(olderThan: number | PruneCutoff): number {
+    const steps = this.pruneSteps(olderThan);
     let removed = 0;
+    for (;;) { const r = steps.step(Infinity); removed = r.removed; if (r.done) return removed; }
+  }
+
+  /** v0.4.103 (review S3) — the same walk, one symbol directory at a time, so
+   *  a caller can spend at most a time budget per turn. Also removes
+   *  `*.tmp.<pid>` files a crash left between write and rename once they are
+   *  an hour old (review S11). */
+  pruneSteps(olderThan: number | PruneCutoff, wallNow: () => number = Date.now): {
+    step(budgetMs: number, clock?: () => number): { removed: number; done: boolean };
+  } {
+    const cutoffFor: PruneCutoff = typeof olderThan === "number" ? () => olderThan : olderThan;
     const entries = (dir: string): fs.Dirent[] => {
       try { return fs.readdirSync(dir, { withFileTypes: true }); }
       catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return []; throw err; }
     };
-    for (const v of entries(this.rootDir)) {
-      if (!v.isDirectory()) continue;
-      for (const sym of entries(path.join(this.rootDir, v.name))) {
-        if (!sym.isDirectory()) continue;
-        for (const iv of entries(path.join(this.rootDir, v.name, sym.name))) {
-          if (!iv.isDirectory()) continue;
-          const dir = path.join(this.rootDir, v.name, sym.name, iv.name);
-          const cutoff = dayStartOf(cutoffFor(v.name, Number(iv.name)));
-          if (!Number.isFinite(cutoff)) continue;
-          for (const entry of entries(dir)) {
-            if (!entry.isFile()) continue;
-            if (entry.name.endsWith(FILE_EXT)) {
-              const key = entry.name.slice(0, -FILE_EXT.length);
-              const day = /^\d{4}-\d{2}-\d{2}$/.test(key) ? Date.parse(`${key}T00:00:00.000Z`) : NaN;
-              if (Number.isFinite(day) && day < cutoff) { fs.unlinkSync(path.join(dir, entry.name)); removed++; }
-            } else if (entry.name.endsWith(MONTH_EXT)) {
-              const key = entry.name.slice(0, -MONTH_EXT.length);
-              const month = /^\d{4}-\d{2}$/.test(key) ? Date.parse(`${key}-01T00:00:00.000Z`) : NaN;
-              if (Number.isFinite(month) && nextMonthStart(month) <= cutoff) { fs.unlinkSync(path.join(dir, entry.name)); removed++; }
-            }
+    const pending: Array<[string, string]> = [];
+    let venues: fs.Dirent[] | null = null;
+    let removed = 0;
+    const pruneSymbol = (venue: string, symbol: string): void => {
+      for (const iv of entries(path.join(this.rootDir, venue, symbol))) {
+        if (!iv.isDirectory()) continue;
+        const dir = path.join(this.rootDir, venue, symbol, iv.name);
+        const interval = Number(iv.name);
+        const dayCutoff = dayStartOf(cutoffFor(venue, interval, "day"));
+        const monthCutoff = dayStartOf(cutoffFor(venue, interval, "month"));
+        for (const entry of entries(dir)) {
+          if (!entry.isFile()) continue;
+          const file = path.join(dir, entry.name);
+          if (entry.name.endsWith(FILE_EXT)) {
+            const key = entry.name.slice(0, -FILE_EXT.length);
+            const day = /^\d{4}-\d{2}-\d{2}$/.test(key) ? Date.parse(`${key}T00:00:00.000Z`) : NaN;
+            if (Number.isFinite(day) && Number.isFinite(dayCutoff) && day < dayCutoff) { fs.unlinkSync(file); removed++; }
+          } else if (entry.name.endsWith(MONTH_EXT)) {
+            const key = entry.name.slice(0, -MONTH_EXT.length);
+            const month = /^\d{4}-\d{2}$/.test(key) ? Date.parse(`${key}-01T00:00:00.000Z`) : NaN;
+            if (Number.isFinite(month) && Number.isFinite(monthCutoff) && nextMonthStart(month) <= monthCutoff) { fs.unlinkSync(file); removed++; }
+          } else if (/\.tmp\.\d+$/.test(entry.name)) {
+            try {
+              if (wallNow() - fs.statSync(file).mtimeMs > TIMEFRAME_STALE_TMP_MS) { fs.unlinkSync(file); removed++; }
+            } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
           }
         }
       }
-    }
-    return removed;
+    };
+    return {
+      step: (budgetMs: number, clock: () => number = () => performance.now()) => {
+        const started = clock();
+        if (venues === null) {
+          venues = entries(this.rootDir).filter((v) => v.isDirectory());
+          for (const v of venues) {
+            for (const sym of entries(path.join(this.rootDir, v.name))) if (sym.isDirectory()) pending.push([v.name, sym.name]);
+          }
+        }
+        while (pending.length) {
+          const [venue, symbol] = pending.shift()!;
+          pruneSymbol(venue, symbol);
+          if (clock() - started >= budgetMs) break;
+        }
+        return { removed, done: pending.length === 0 };
+      },
+    };
   }
 }
+
+/** Cutoff (epoch ms; older files go) per series and file kind. */
+export type PruneCutoff = (venue: string, interval: number, kind: TimeframeLayout) => number;
+/** A crash between a tmp write and its rename leaves `*.tmp.<pid>`; one hour
+ *  is far beyond any write in progress. */
+export const TIMEFRAME_STALE_TMP_MS = 3_600_000;
 
 export interface TimeframeUnsigned {
   v: 2;
@@ -555,6 +594,12 @@ interface ProofFile { v: 1; entries: Record<string, HorizonProofs> }
 interface HorizonCursor {
   key: string; venue: VenueId; symbol: string; interval: TimeframeInterval; targets: TimeframeInterval[];
   ready: boolean; fromMs: number; coveredTo: number;
+  /** Next month the boot scan still has to read (null = not started). The
+   *  scan reads one month per step so a prime turn stays inside its budget. */
+  scanAt: number | null;
+  /** v0.4.103 — the cursor has fetched (or found held) its newest bucket.
+   *  Until then a request-driven demand is not suppressed beside it. */
+  landed: boolean;
   /** Sorted, disjoint missing native ranges in [fromMs, coveredTo]. Kept from
    *  rows actually written, so work() never re-reads disk for this series. */
   gaps: Gap[];
@@ -732,6 +777,8 @@ export class TimeframeHistory {
   private readonly proofs = new Map<string, HorizonProofs>();
   private readonly horizonRotation = new Map<VenueId, number>();
   private readonly clock: () => number;
+  /** "venue:interval" -> days of every series ever held on a horizon here. */
+  private readonly horizonMemory = new Map<string, number>();
   private frontiersDirty = false;
   private proofsDirty = false;
   private lastSidecarWriteAt = -Infinity;
@@ -782,6 +829,27 @@ export class TimeframeHistory {
       this.proofs.set(key, { gen: entry.gen, floor, empty });
     }
     this.migrateBitgetDaily(rootDir);
+    this.rememberHorizon(rootDir);
+  }
+
+  private rememberHorizon(rootDir: string): void {
+    const file = path.join(rootDir, "horizon-memory.v1.json");
+    const held = readJson<{ v: 1; series: Record<string, number> }>(file, { v: 1, series: {} });
+    if (held.v === 1) for (const [key, days] of Object.entries(held.series ?? {})) {
+      if (/^[a-z]+:\d+$/.test(key) && Number.isSafeInteger(days) && days > 0 && days <= TIMEFRAME_HORIZON_MAX_DAYS) this.horizonMemory.set(key, days);
+    }
+    let changed = false;
+    for (const [venue, retained] of this.horizonRetained) {
+      for (const interval of retained) {
+        const key = `${venue}:${interval}`;
+        const days = this.horizon[venue]!.days;
+        if (this.horizonMemory.get(key) !== days) { this.horizonMemory.set(key, days); changed = true; }
+      }
+    }
+    if (changed) {
+      fs.mkdirSync(rootDir, { recursive: true });
+      writeJsonAtomic(file, { v: 1, series: Object.fromEntries(this.horizonMemory) });
+    }
   }
 
   /** v0.4.103 — Bitget's native daily moved from `1D` (16:00 UTC opens) to
@@ -1098,8 +1166,10 @@ export class TimeframeHistory {
     const built = assembleTimeframe(venue, symbol, interval, fromMs, toMs, requiredFromMs, requiredClosedToMs,
       requiredRows, held, keyId);
     // A standing horizon cursor already owns this series' venue work; a
-    // per-request demand beside it would rescan the window every tick.
-    const standing = this.standingCursor(venue, symbol, interval) !== undefined;
+    // per-request demand beside it would rescan the window every tick. Until
+    // the cursor's first newest page has landed (cold boot, unprimed), the
+    // request keeps its 0.4.102 demand so nothing waits on the prime.
+    const standing = this.standingCursor(venue, symbol, interval)?.landed === true;
     if (!built.payload) {
       if (!standing) this.demand(venue, symbol, interval, requiredFromMs, requiredClosedToMs, now);
       return { ok: false, code: 503, error: `no closed ${interval}m candles cached yet for ${venue} ${symbol}` };
@@ -1128,20 +1198,19 @@ export class TimeframeHistory {
     return { frontiers, minuteFloor: this.minuteFloors.get(this.instrumentIdentity(venue, symbol)) ?? null, minuteRestFrontier };
   }
 
-  /** Main-thread half of a long request: validation, interest, aggregate
-   *  materialization limited to the minute-retention suffix (the only part a
-   *  1m fold can complete), and the worker's read-only job. */
+  /** Main-thread half of a long request: validation and the worker's
+   *  read-only job — O(1) work, no disk access. (Review S1: the 0.4.103 draft
+   *  folded the minute-retention suffix from 1m here, 150–220 ms per cold
+   *  series before the pool could refuse busy.) The long path serves only what
+   *  is stored: natives come from the standing cursor, aggregate-only targets
+   *  fold from native rows in the worker, and aggregates already folded for
+   *  short windows are read as stored. A series not fetched yet is a signed
+   *  partial with exact gaps, never a main-thread 1m fold. */
   prepareLongRequest(venue: VenueId, symbol: string, interval: TimeframeInterval, fromMs: number, toMs: number,
     now: number, minuteRestFrontier: number | null, keyId: string): TimeframeLongPrepared {
     const w = this.window(interval, fromMs, toMs, now);
     if (!w.ok) return w;
     const { requiredFromMs, requiredClosedToMs, requiredRows } = w;
-    const step = interval * MINUTE_MS;
-    this.noteInterest(venue, symbol, interval, now);
-    const suffixFrom = Math.max(requiredFromMs, Math.ceil((now - this.retentionDays * DAY_MS) / step) * step);
-    if (suffixFrom <= requiredClosedToMs) {
-      this.ensureMaterialized(venue, symbol, interval, suffixFrom, requiredClosedToMs, minuteRestFrontier, now);
-    }
     const fetch = horizonFetchInterval(venue, interval);
     const foldBase = fetch !== null && fetch !== interval ? fetch : null;
     const layouts: Record<string, TimeframeLayout> = { [String(interval)]: this.store.layout(venue, interval) };
@@ -1225,7 +1294,7 @@ export class TimeframeHistory {
         keep.add(key);
         if (this.cursors.has(key)) continue;
         this.cursors.set(key, { key, venue, symbol, interval: fetch, targets: [...targets], ready: false,
-          fromMs: 0, coveredTo: 0, gaps: [], retryAt: 0 });
+          fromMs: 0, coveredTo: 0, gaps: [], retryAt: 0, scanAt: null, landed: false });
       }
     }
     const prefix = `${venue}\u0000`;
@@ -1248,19 +1317,38 @@ export class TimeframeHistory {
   }
 
   /** One disk scan per cursor, ever (until its identity changes): the held
-   *  safe native slots across the horizon become its gap list. */
-  private initCursor(c: HorizonCursor, now: number): void {
+   *  safe native slots across the horizon become its gap list. The scan is
+   *  read one UTC month per step (a year of 1h is ~13 steps of ~2–3 ms), so a
+   *  bounded prime turn can stop between months. */
+  private initStep(c: HorizonCursor, now: number): void {
     const step = c.interval * MINUTE_MS;
-    const from = this.horizonFrom(c, now);
-    const newest = this.newestClosed(c.interval, now);
-    c.fromMs = from;
-    c.coveredTo = Math.max(newest, from - step);
-    c.ready = true;
-    if (newest < from) { c.gaps = []; return; }
-    const held = this.store.read(c.venue, c.symbol, c.interval, from, newest)
+    if (c.scanAt === null) {
+      const from = this.horizonFrom(c, now);
+      const newest = this.newestClosed(c.interval, now);
+      c.fromMs = from;
+      c.coveredTo = Math.max(newest, from - step);
+      c.gaps = newest < from ? [] : [[from, newest]];
+      c.scanAt = from;
+    }
+    if (c.scanAt > c.coveredTo) { this.finishScan(c); return; }
+    const chunkTo = Math.min(c.coveredTo, Math.floor((nextMonthStart(c.scanAt) - 1) / step) * step);
+    const held = this.store.read(c.venue, c.symbol, c.interval, c.scanAt, chunkTo)
       .filter((row) => row.source === "native" && this.safe(c.venue, c.symbol, c.interval, row, null))
       .map((row) => row.openMs);
-    c.gaps = subtractOpens([[from, newest]], held, step);
+    c.gaps = subtractOpens(c.gaps, held, step);
+    c.scanAt = chunkTo + step;
+    if (c.scanAt > c.coveredTo) this.finishScan(c);
+  }
+
+  private finishScan(c: HorizonCursor): void {
+    c.ready = true;
+    const last = c.gaps.at(-1);
+    if (!last || last[1] !== c.coveredTo) c.landed = true;
+  }
+
+  /** Whole scan at once (tests, and the inline fallback below). */
+  private initCursor(c: HorizonCursor, now: number): void {
+    while (!c.ready) this.initStep(c, now);
   }
 
   /** Cursors still waiting for their one scan. */
@@ -1270,15 +1358,19 @@ export class TimeframeHistory {
     return n;
   }
 
-  /** Initialise unprimed cursors for at most `budgetMs` of synchronous time. */
+  /** Initialise unprimed cursors for at most `budgetMs` of synchronous time,
+   *  checked between month reads (a turn overruns by at most one month). */
   primeHorizon(now: number, budgetMs: number, clock: () => number = () => performance.now()): { primed: number; remaining: number; done: boolean } {
     const started = clock();
     let primed = 0;
-    for (const c of this.cursors.values()) {
-      if (c.ready) continue;
-      if (primed > 0 && clock() - started >= budgetMs) break;
-      this.initCursor(c, now);
-      primed++;
+    let steps = 0;
+    outer: for (const c of this.cursors.values()) {
+      while (!c.ready) {
+        if (steps > 0 && clock() - started >= budgetMs) break outer;
+        this.initStep(c, now);
+        steps++;
+      }
+      if (steps > 0 && c.ready) primed++;
     }
     const remaining = this.horizonPending();
     return { primed, remaining, done: remaining === 0 };
@@ -1379,9 +1471,8 @@ export class TimeframeHistory {
     // Fallback for a pass that arrives before the boot prime has run.
     const started = performance.now();
     for (const c of list) {
-      if (c.ready) continue;
+      while (!c.ready && performance.now() - started < HORIZON_INLINE_INIT_BUDGET_MS) this.initStep(c, now);
       if (performance.now() - started >= HORIZON_INLINE_INIT_BUDGET_MS) break;
-      this.initCursor(c, now);
     }
     const offset = (this.horizonRotation.get(venue) ?? 0) % list.length;
     for (let n = 0; n < list.length && tail.length + older.length < HORIZON_MAX_ITEMS_PER_CALL; n++) {
@@ -1438,10 +1529,11 @@ export class TimeframeHistory {
     }
     this.flush(false);
     if (!this.horizonFetches.has(venue)) return out;
-    // Horizon tails keep served history current; request-driven demand comes
-    // next; standing backfill takes what budget is left.
+    // Request-driven demand first (Beta's short windows, review S5), then
+    // horizon tails, then standing backfill. The collector caps the horizon's
+    // share of the history lane.
     const { tail, older } = this.horizonWork(venue, now);
-    return [...tail, ...out, ...older];
+    return [...out, ...tail, ...older];
   }
 
   attempted(work: TimeframeWork, now: number): void {
@@ -1522,6 +1614,7 @@ export class TimeframeHistory {
     }
     if (c && c.ready) {
       c.gaps = subtractOpens(c.gaps, servable, step);
+      if (servable.includes(c.coveredTo) || !inGaps(c.gaps, c.coveredTo)) c.landed = true;
       let proved = false;
       const proofFrom = work.proofFromMs ?? work.startMs;
       const pe = work.endMs;
@@ -1593,17 +1686,28 @@ export class TimeframeHistory {
   }
 
   /** Per-interval retention: horizon intervals keep `days` (+ padding), every
-   *  other series keeps the minute retention + 1 day, as in 0.4.102. */
-  retentionCutoff(venue: string, interval: number, now: number): number {
-    const days = isVenueId(venue) && this.horizonRetained.get(venue)?.has(interval) ? this.horizon[venue]!.days : null;
+   *  other series keeps the minute retention + 1 day, as in 0.4.102. Month
+   *  files of a series that WAS on a horizon (remembered in
+   *  horizon-memory.v1.json) keep that horizon's days even when the variable
+   *  no longer names it, so unsetting or narrowing HUB_TIMEFRAME_HORIZON never
+   *  deletes a year of backfill at the next prune (review S4); they age out
+   *  on that horizon's own clock. */
+  retentionCutoff(venue: string, interval: number, now: number, kind: TimeframeLayout = "day"): number {
+    const days = isVenueId(venue) && this.horizonRetained.get(venue)?.has(interval) ? this.horizon[venue]!.days
+      : kind === "month" ? this.horizonMemory.get(`${venue}:${interval}`) ?? null : null;
     return days !== null ? now - (days + HORIZON_PAD_DAYS + 1) * DAY_MS : now - this.retentionDays * DAY_MS - DAY_MS;
   }
 
   prune(now: number): number {
     // Preserve a complete UTC boundary bar beyond the configured 30-day minute horizon.
     this.trimState(now);
-    if (!this.horizonRetained.size) return this.store.prune(now - this.retentionDays * DAY_MS - DAY_MS);
-    return this.store.prune((venue, interval) => this.retentionCutoff(venue, interval, now));
+    return this.store.prune((venue, interval, kind) => this.retentionCutoff(venue, interval, now, kind));
+  }
+
+  /** The same prune in caller-paced steps (the service spends ~10 ms a turn). */
+  pruneSteps(now: number): ReturnType<TimeframeStore["pruneSteps"]> {
+    this.trimState(now);
+    return this.store.pruneSteps((venue, interval, kind) => this.retentionCutoff(venue, interval, now, kind));
   }
 
   /** Is (venue, interval) held on the standing horizon? */
