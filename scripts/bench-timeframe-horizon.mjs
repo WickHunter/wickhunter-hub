@@ -89,7 +89,7 @@ try {
   }
   const reqMs = req.map((r) => r.ms).sort((a, b) => a - b)[5];
   console.log(JSON.stringify({
-    dist: distDir, horizonCapable, symbols: N, seedMs: Math.round(seedMs), registerOrPrimeMs: Math.round(regMs),
+    dist: distDir, horizonCapable, symbols: N, seedMs: Math.round(seedMs), registerOrPrimeMs: Math.round(regMs), registerOrPrimeMsPerPair: +(regMs / N).toFixed(2),
     workTickMs: { median: +tickMs.toFixed(2), all: ticks.map((t) => +t.ms.toFixed(2)), items: ticks[0].items },
     workTickMsPerDemand: +(tickMs / (N - mature.size)).toFixed(4),
     longRequestMainThreadMs: { median: +reqMs.toFixed(2), bytes: req[0].bytes },
