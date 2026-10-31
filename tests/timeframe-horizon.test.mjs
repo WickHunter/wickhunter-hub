@@ -356,6 +356,24 @@ await test("a listing inside the page: rows from x are written and x becomes the
   assert.equal(h.request("binance", "MIDUSDT", 240, x, last, NOW, null, "seed-1", sign).payload.complete, true);
 });
 
+await test("Bitunix: pages carry one predecessor row and a raw (carried-open) first venue row still bounds the floor", () => {
+  const { h } = make("tf-floor-bitunix", "bitunix:60:30");
+  const last = newestClosed(60);
+  const held = last - 3 * DAY;
+  seed(h, "bitunix", "BXUSDT", 60, held, last);
+  h.warm("bitunix", ["BXUSDT"], NOW);
+  h.primeHorizon(NOW, 50);
+  const page = h.work("bitunix", NOW, 1000).find((p) => p.endMs < held);
+  assert.equal(page.proofFromMs - page.startMs, HOUR, "one predecessor slot");
+  assert.equal((page.endMs - page.proofFromMs) / HOUR + 1, 199);
+  const x = held - 5 * HOUR;
+  const rows = venueRows(x, held - HOUR, HOUR);
+  rows[0] = { ...rows[0], open: rows[0].high + 1 }; // listing bar: open outside its own range (carried)
+  h.attempted(page, NOW);
+  h.record(page, { candles: rows, empty: false }, NOW);
+  assert.equal(h.boundary("bitunix", "BXUSDT", 60, NOW).floor.atMs, x, "the venue's first row, not the first servable one");
+});
+
 await test("an interior venue hole is proven twice and then left alone; a later venue row retires the proof", () => {
   const { h } = make("tf-interior", "bybit:60:30");
   const last = newestClosed(60);
@@ -390,7 +408,7 @@ await test("a 365-day (8,760-row) window built by the read-only worker is byte-i
   assert.equal(h.isLongRequest("binance", 60, from, last, NOW), false, "not on the horizon: synchronous as 0.4.102");
   const prepared = h.prepareLongRequest("bybit", "BTCUSDT", 60, from, last, NOW, null, "seed-1");
   assert.ok(prepared.ok);
-  assert.deepEqual(Object.keys(prepared.job).sort(), ["foldBase", "fromMs", "interval", "keyId", "layouts", "requiredClosedToMs",
+  assert.deepEqual(Object.keys(prepared.job).sort(), ["foldBase", "fromMs", "generation", "interval", "keyId", "layouts", "requiredClosedToMs",
     "requiredFromMs", "requiredRows", "rootDir", "safety", "symbol", "toMs", "venue"], "the job carries values, never key material");
   const reply = buildTimeframeLong(structuredClone(prepared.job));
   const long = h.finishLongRequest(prepared, reply, sign);
@@ -404,6 +422,13 @@ await test("a 365-day (8,760-row) window built by the read-only worker is byte-i
   assert.equal(content.value.rows.length, 8760);
   assert.equal(content.value.complete, true);
   assert.throws(() => signedTimeframeBody(new Uint8Array([1, 2]), "x"), /do not end an object/);
+  // A relisting fenced while the worker read is not signed under the new listing.
+  h.noteInstrumentRoster("bybit", [{ symbol: "BTCUSDT", generation: "bybit:usdt-perpetual:1" }]);
+  const racing = h.prepareLongRequest("bybit", "BTCUSDT", 60, from, last, NOW, null, "seed-1");
+  const racingReply = buildTimeframeLong(racing.job);
+  h.noteInstrumentRoster("bybit", [{ symbol: "BTCUSDT", generation: "bybit:usdt-perpetual:2" }]);
+  const refused = h.finishLongRequest(racing, racingReply, sign);
+  assert.deepEqual([refused.ok, refused.code], [false, 503]);
   void canonicalTimeframeBytes;
 });
 

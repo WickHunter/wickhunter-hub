@@ -543,7 +543,12 @@ export function parseTimeframeHorizon(raw: string | undefined): { ok: true; valu
 /** [from, to, firstProofAt, lastProofAt, confirmations] — as collector.ts. */
 type EmptyRange = [number, number, number, number, number];
 /** The oldest row the venue has: nothing in [checkedFromMs, atMs) twice. */
-export interface HorizonFloor { atMs: number; checkedFromMs: number; firstAt: number; lastAt: number; confirmations: number }
+export interface HorizonFloor {
+  atMs: number; checkedFromMs: number; firstAt: number; lastAt: number; confirmations: number;
+  /** The venue's first row is a raw Bitunix boundary row the read path cannot
+   *  serve (no predecessor exists): its slot is part of the boundary too. */
+  rawFirst?: true;
+}
 interface HorizonProofs { gen: string; floor: HorizonFloor | null; empty: EmptyRange[] }
 interface ProofFile { v: 1; entries: Record<string, HorizonProofs> }
 
@@ -576,6 +581,8 @@ export interface TimeframeLongJob {
   keyId: string; safety: TimeframeSafety;
   /** Fold missing target rows from this native base (aggregate-only targets). */
   foldBase: TimeframeInterval | null;
+  /** Listing generation the safety values belong to (checked again on finish). */
+  generation: string;
 }
 export type TimeframeLongReply =
   | { ok: true; canonical: Uint8Array; rows: number; complete: boolean }
@@ -1146,6 +1153,7 @@ export class TimeframeHistory {
         rootDir: this.store.rootDir, layouts, venue, symbol, interval, fromMs, toMs,
         requiredFromMs, requiredClosedToMs, requiredRows, keyId,
         safety: this.safetyFor(venue, symbol, minuteRestFrontier), foldBase,
+        generation: this.identities.get(this.instrumentIdentity(venue, symbol)) ?? "",
       },
     };
   }
@@ -1154,6 +1162,12 @@ export class TimeframeHistory {
   finishLongRequest(prepared: Extract<TimeframeLongPrepared, { ok: true }>, reply: TimeframeLongReply,
     sign: (bytes: Buffer) => Buffer): TimeframeLongOutcome {
     if (!reply.ok) return reply;
+    // A relisting fenced while the worker read (files removed, frontiers
+    // dropped) must not be signed under the new listing.
+    const job = prepared.job;
+    if ((this.identities.get(this.instrumentIdentity(job.venue, job.symbol)) ?? "") !== job.generation) {
+      return { ok: false, code: 503, error: `${job.venue} ${job.symbol} was relisted during the build; retry shortly` };
+    }
     const canonical = Buffer.from(reply.canonical.buffer, reply.canonical.byteOffset, reply.canonical.byteLength);
     const sig = sign(canonical).toString("base64");
     return { ok: true, body: signedTimeframeBody(reply.canonical, sig), boundary: prepared.boundary };
@@ -1312,7 +1326,7 @@ export class TimeframeHistory {
     if (proofs && proofs.gen === gen) {
       const f = proofs.floor;
       if (f && now - f.lastAt < (f.confirmations >= 2 ? HORIZON_EMPTY_RECHECK_MS : HORIZON_EMPTY_CONFIRM_GAP_MS)) {
-        waiting.push([0, f.atMs - step]);
+        waiting.push([0, f.rawFirst ? f.atMs : f.atMs - step]);
       }
       for (const r of proofs.empty) {
         if (now - r[3] < (r[4] >= 2 ? HORIZON_EMPTY_RECHECK_MS : HORIZON_EMPTY_CONFIRM_GAP_MS)) waiting.push([r[0], r[1]]);
@@ -1514,7 +1528,9 @@ export class TimeframeHistory {
       // Proof needs the page to have been wholly answerable (constructed so),
       // a closed range, and a held/returned row right after it.
       if (pe + step <= c.coveredTo && pe <= newestClosed && proofFrom >= c.fromMs && !inGaps(c.gaps, pe + step)) {
-        const inRange = servable.filter((at) => at >= proofFrom && at <= pe);
+        // Emptiness is judged on every bounded venue row (a Bitunix raw
+        // boundary row is still a venue row, even though it is not served).
+        const inRange = candles.map((row) => row.openMs).filter((at) => at >= proofFrom && at <= pe);
         let provenTo: number | null = null;
         let boundaryAt = 0;
         if (!inRange.length) { provenTo = pe; boundaryAt = pe + step; }
@@ -1523,8 +1539,8 @@ export class TimeframeHistory {
           if (x > proofFrom && inRange.length === (pe - x) / step + 1) { provenTo = x - step; boundaryAt = x; }
         }
         if (provenTo !== null) {
-          proved = true;
           const proofs = this.proofsFor(c);
+          const rawFirst = !servable.includes(boundaryAt) && candles.some((row) => row.openMs === boundaryAt);
           const first = c.gaps[0];
           const leading = first !== undefined && first[0] <= c.fromMs && first[1] >= provenTo;
           if (leading) {
@@ -1532,16 +1548,21 @@ export class TimeframeHistory {
             if (f && f.atMs === boundaryAt) {
               f.lastAt = now;
               f.checkedFromMs = Math.min(f.checkedFromMs, proofFrom);
-              if (now - f.firstAt >= HORIZON_EMPTY_CONFIRM_GAP_MS) f.confirmations = Math.min(f.confirmations + 1, 1_000_000);
+              if (now - f.firstAt >= HORIZON_EMPTY_CONFIRM_GAP_MS && f.confirmations < 2) { f.confirmations = 2; proved = true; }
+              else if (now - f.firstAt >= HORIZON_EMPTY_CONFIRM_GAP_MS) f.confirmations = Math.min(f.confirmations + 1, 1_000_000);
+              if (rawFirst) f.rawFirst = true; else delete f.rawFirst;
             } else {
-              proofs.floor = { atMs: boundaryAt, checkedFromMs: proofFrom, firstAt: now, lastAt: now, confirmations: 1 };
+              proofs.floor = { atMs: boundaryAt, checkedFromMs: proofFrom, firstAt: now, lastAt: now, confirmations: 1,
+                ...(rawFirst ? { rawFirst: true as const } : {}) };
+              proved = true;
             }
           } else {
             const same = proofs.empty.find((r) => r[0] === proofFrom && r[1] === provenTo);
             if (same) {
               same[3] = now;
-              if (now - same[2] >= HORIZON_EMPTY_CONFIRM_GAP_MS) same[4] = Math.min(same[4] + 1, 1_000_000);
+              if (now - same[2] >= HORIZON_EMPTY_CONFIRM_GAP_MS) { if (same[4] < 2) proved = true; same[4] = Math.min(same[4] + 1, 1_000_000); }
             } else {
+              proved = true;
               proofs.empty = proofs.empty.filter(([a, b]) => b < proofFrom || a > provenTo!);
               proofs.empty.push([proofFrom, provenTo, now, now, 1]);
               proofs.empty.sort((x, y) => x[0] - y[0]);
@@ -1558,8 +1579,9 @@ export class TimeframeHistory {
         const kept = proofs.empty.filter(([a, b]) => !servable.some((at) => at >= a && at <= b));
         if (kept.length !== proofs.empty.length) { proofs.empty = kept; this.proofsDirty = true; }
       }
-      // Progress (or a fresh proof) earns the next page this pass; the grace
-      // tail retries next pass; anything else waits HORIZON_RETRY_MS.
+      // Progress (or a new proof or confirmation — not a mere re-read of a
+      // known boundary) earns the next page this pass; the grace tail retries
+      // next pass; anything else waits HORIZON_RETRY_MS.
       if (servable.length || proved || work.endMs > newestClosed) c.retryAt = 0;
     }
     for (const target of work.targets ?? []) {
