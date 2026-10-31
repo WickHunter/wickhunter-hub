@@ -147,7 +147,9 @@ await test("migration on write: a month's 0.4.102 day files fold into its month 
     ...before.filter((c) => c.openMs > extra.openMs)]);
   // A leftover day file after a crash (month already folded) is ignored by
   // reads and re-folding it fills empty slots only.
-  fs.writeFileSync(`${dir}/2026-09-02.ctf2`, fs.readFileSync(`${dir}/2026-09.ctf3`).subarray(6 * 56, 12 * 56));
+  const stale = Buffer.from(fs.readFileSync(`${dir}/2026-09.ctf3`).subarray(6 * 56, 12 * 56));
+  for (let slot = 0; slot < 6; slot++) stale.writeDoubleLE(1.5 + slot, slot * 56 + 40); // different volume, still valid
+  fs.writeFileSync(`${dir}/2026-09-02.ctf2`, stale);
   assert.deepEqual(month.read("binance", "ETHUSDT", 240, from, from + 60 * DAY), after);
   month.write("binance", "ETHUSDT", 240, [extra], "native", 240, NOW);
   assert.deepEqual(month.read("binance", "ETHUSDT", 240, from, from + 60 * DAY), after);
@@ -226,6 +228,11 @@ await test("standing demand: the roster is warm before anyone asks, pages newest
   assert.equal(btc60.startMs, last - 2 * DAY + HOUR);
   assert.equal(btc60.horizon, true);
   assert.deepEqual(btc60.targets, [60]);
+  // A short request with gaps adds no per-request demand beside the cursor
+  // (which would re-read the window from disk every pass).
+  h.request("bybit", "ETHUSDT", 60, last - 10 * DAY, last, NOW, null, "seed-1", sign);
+  assert.equal(h.demands.size, 0);
+  assert.ok(h.work("bybit", NOW, 1000).every((p) => p.horizon === true));
   // Far past the 6 h TTL that retires request-driven demand.
   const later = NOW + 7 * HOUR;
   h.warm("bybit", ["BTCUSDT", "ETHUSDT"], later);
@@ -354,6 +361,12 @@ await test("a listing inside the page: rows from x are written and x becomes the
   assert.equal(b.floor.atMs, x);
   assert.equal(b.floor.checkedFromMs, page.startMs);
   assert.equal(h.request("binance", "MIDUSDT", 240, x, last, NOW, null, "seed-1", sign).payload.complete, true);
+  // The venue later publishing an older row retires the floor.
+  const later = NOW + 2 * HOUR;
+  const older = { key: page.key, venue: "binance", symbol: "MIDUSDT", targetInterval: 240, interval: 240,
+    startMs: x - 3 * step, endMs: x - step, horizon: true, route: "recent", weight: 1, proofFromMs: x - 3 * step, targets: [240] };
+  h.record(older, { candles: venueRows(x - 3 * step, x - step, step), empty: false }, later);
+  assert.equal(h.boundary("binance", "MIDUSDT", 240, later).floor, null);
 });
 
 await test("Bitunix: pages carry one predecessor row and a raw (carried-open) first venue row still bounds the floor", () => {
