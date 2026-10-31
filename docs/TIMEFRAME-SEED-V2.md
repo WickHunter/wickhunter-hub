@@ -220,7 +220,9 @@ most 60 days of its interval keeps the synchronous 0.4.102 path:
 window of a horizon interval is built by a read-only worker (`assembleTimeframe`
 and the same provenance rule, `timeframeRowSafe`) and only signed on the main
 thread; it is byte-identical to what the synchronous path would have produced
-for the same rows. A pool of two workers with a 32-job queue answers further
+for the same rows. The pool's capacity is checked before any work; the main-thread
+half is O(1) (no 1m fold on the long path). A pool of two workers with a
+32-job queue answers further
 requests `503 timeframe history build is busy; retry shortly` with
 `retry-after: 1`.
 
@@ -240,10 +242,12 @@ instead of ~366. A 0.4.102 day file is read where its month has no month file
 yet and is folded into the month file the first time that month is written
 (then removed); without a horizon, day layout reads month files as a fallback.
 Retention is per interval: horizon intervals keep `days + 2` days (whole months
-leave), every other series keeps minute retention + 1 day.
+leave), every other series keeps minute retention + 1 day. Series once held on
+a horizon are remembered (`horizon-memory.v1.json`): unsetting the variable
+never deletes their month files early.
 
 Work: one standing cursor per (pair, native fetch interval) is primed by a
-single disk scan (in ≤ 25 ms turns after boot) and then kept from the rows
+single disk scan (one UTC month per step, ~10 ms turns after boot) and then kept from the rows
 actually written, so a collector pass costs no disk reads. Pages go newest
 missing range first, paged backwards; per-venue page sizes are chosen so the
 venue can never truncate an answer (Bybit/Binance/Aster 1000, Bitget 200 and at
