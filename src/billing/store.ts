@@ -76,6 +76,8 @@ export interface CustomerRecord {
   updatedAtMs: number;
   welcomeSentAtMs: number | null;
   welcomeError: string | null;
+  /** Which welcome was last sent; absent on older records. */
+  welcomeKind?: "hosted" | "self-hosted";
   disputed: boolean;
   refunded: boolean;
   lastEventType: string | null;

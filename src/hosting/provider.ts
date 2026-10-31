@@ -46,6 +46,14 @@ export function bootstrapPasswordFromTokenHash(tokenHash: string): string {
   return createHash("sha256").update(`${tokenHash}:password:v1`).digest("hex").slice(0, 24);
 }
 
+/** A replacement temporary dashboard password. The management agent on the
+ *  VPS holds the raw management token, hashes it, and derives the same value
+ *  from the Hub-issued nonce; the password itself never crosses the network
+ *  to the server and is never stored by the Hub. */
+export function credentialResetPassword(managementTokenHash: string, nonce: string): string {
+  return createHash("sha256").update(`${managementTokenHash}:reset:${nonce}`).digest("hex").slice(0, 24);
+}
+
 export interface ProviderPlan {
   id: string;
   vcpus: number;

@@ -1,5 +1,5 @@
 // src/hosting/emails.ts
-// The nine hosting transactional templates (handoff §9). Reuses
+// The hosting transactional templates (handoff §9). Reuses
 // src/billing/email.ts's transport (`sendEmail`/`EmailConfig`/`EmailFetch`)
 // and its `escapeHtml` — one email pipeline for the whole Hub, never a
 // second one for hosting. Every template escapes every interpolated field
@@ -16,7 +16,7 @@
 // (src/hosting/service.ts) is responsible for computing an accurate label
 // from the current clock and the stored deadline; these functions format
 // whatever they are handed.
-import { escapeHtml, type EmailMessage } from "../billing/email.js";
+import { emailButton, emailCode, emailFacts, emailHeading, emailLayout, emailParagraph, emailSteps, escapeHtml, SUPPORT_EMAIL, type EmailMessage } from "../billing/email.js";
 
 export function fmtDate(ms: number, tz = "UTC"): string {
   try {
@@ -46,40 +46,100 @@ export interface InstanceEmailFacts {
   backupScopeSentence: string;
 }
 
-const SUPPORT_LINE = "Questions? admin@wickhunterunleashed.com";
+const SUPPORT_LINE = `Questions? Reply to this email or write to ${SUPPORT_EMAIL}.`;
 
-function wrap(subject: string, bodyText: string, bodyHtml: string): EmailMessage {
+/** Paragraph HTML (already escaped, "\n\n"-separated) in the shared branded
+ *  layout, so every hosting email reads like the welcome email and reflows
+ *  to one column on a phone. */
+function layoutHtml(bodyHtml: string, preheader?: string): string {
+  const rows = bodyHtml.split("\n\n").map((p) => p.trim()).filter(Boolean)
+    .map((p) => p.startsWith("<tr>") ? p : emailParagraph(p))
+    .join("\n");
+  return emailLayout({ preheader, rows: rows + "\n" + emailParagraph(escapeHtml(SUPPORT_LINE).replace(escapeHtml(SUPPORT_EMAIL), `<a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>`), { muted: true, size: 13, pad: 0 }) });
+}
+
+function wrap(subject: string, bodyText: string, bodyHtml: string, preheader?: string): EmailMessage {
   return {
     to: "",
     subject,
     text: `${bodyText}\n\n${SUPPORT_LINE}`,
-    html: `<p>${bodyHtml.split("\n\n").map((p) => p.trim()).filter(Boolean).join("</p><p>")}</p><p>${escapeHtml(SUPPORT_LINE)}</p>`,
+    html: layoutHtml(bodyHtml, preheader),
   };
 }
 function withTo(msg: EmailMessage, to: string): EmailMessage {
   return { ...msg, to };
 }
+/** Escaped plain text with its bare https links made clickable. */
+function linkify(escaped: string): string {
+  return escaped.replace(/https:\/\/[^\s<]+[^\s<.,;:)]/g, (url) => `<a href="${url}">${url}</a>`);
+}
 
 export function installationReadyEmail(to: string, firstName: string, f: InstanceEmailFacts): EmailMessage {
-  const name = escapeHtml(firstName || "there");
+  const first = firstName || "there";
   const renewal = f.renewalAt !== null ? fmtDate(f.renewalAt) : "not yet scheduled";
+  const steps: ReadonlyArray<readonly [string, string]> = [
+    ["Open your dashboard", `Go to ${f.appUrl} and sign in as ${f.appUsername} with the temporary password above.`],
+    ["Choose your own password", "The dashboard asks for a new password before anything else. Everything happens in your browser."],
+    ["Connect your exchange", "Add an API key with trade permission only — withdrawals off."],
+    ["Review and start your bots", "Your bots stay paused until you review their settings and start them."],
+  ];
   const text = [
-    `Hi ${firstName || "there"},`,
-    `Your VPS is ready with Unleashed installed. Open ${f.appUrl} to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
-    `Server: ${f.instanceReference}\nLocation: ${f.region}\nCPU / RAM / storage: ${f.cpu} / ${f.ram} / ${f.storage}\nOperating system: ${f.os}\nIP address: ${f.ip}\nApplication username: ${f.appUsername}\nSSH username / port: ${f.sshUsername} / ${f.sshPort}`,
-    `View access details: ${f.accessUrl}`,
-    `Temporary Unleashed password: ${f.temporaryPassword}\nThe application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${f.billingSummary} Next renewal: ${renewal}. ${f.backupScopeSentence}`,
+    `Hi ${first},`,
+    `Your Unleashed server is ready. Sign in at the address below to finish setup. Your bots stay paused until you connect your exchange, review your settings, and start them.`,
+    `SIGN IN\nDashboard: ${f.appUrl}\nUsername: ${f.appUsername}\nTemporary password: ${f.temporaryPassword}`,
+    `Keep this password private. You will choose your own password when you first sign in. If you lose this email before then, request a new temporary password from your account page: ${f.accessUrl}`,
+    `NEXT STEPS\n${steps.map(([t, d], i) => `${i + 1}. ${t} — ${d}`).join("\n")}`,
+    `Moving from another installation? Follow the migration steps before starting hosted bots so both installations never manage the same positions.`,
+    `YOUR SERVER\nServer: ${f.instanceReference}\nLocation: ${f.region}\nCPU / RAM / storage: ${f.cpu} / ${f.ram} / ${f.storage}\nOperating system: ${f.os}\nIP address: ${f.ip}\nSSH (optional, administrators only): ${f.sshUsername} on port ${f.sshPort}, with separate credentials`,
+    `This server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${f.billingSummary} Next renewal: ${renewal}. ${f.backupScopeSentence}`,
   ].join("\n\n");
   const html = [
-    `Hi ${name},`,
-    `Your VPS is ready with Unleashed installed. Open <a href="${escapeHtml(f.appUrl)}">${escapeHtml(f.appUrl)}</a> to finish setup. Your bots are paused until you connect your exchange, review your settings, and start them.`,
-    `Server: ${escapeHtml(f.instanceReference)}<br>Location: ${escapeHtml(f.region)}<br>CPU / RAM / storage: ${escapeHtml(f.cpu)} / ${escapeHtml(f.ram)} / ${escapeHtml(f.storage)}<br>Operating system: ${escapeHtml(f.os)}<br>IP address: ${escapeHtml(f.ip)}<br>Application username: ${escapeHtml(f.appUsername)}<br>SSH username / port: ${escapeHtml(f.sshUsername)} / ${f.sshPort}`,
-    `<a href="${escapeHtml(f.accessUrl)}">View access details</a>`,
-    `Temporary Unleashed password: <code>${escapeHtml(f.temporaryPassword)}</code><br>The application will require you to choose a new password before you can access your dashboard or configure bots; everything happens in the browser. Server administrator access uses separate credentials. If moving from another installation, use the migration steps before starting hosted bots so both installations do not manage the same workload.`,
-    `This hosted server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${escapeHtml(f.billingSummary)} Next renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`,
+    emailParagraph(`Hi ${escapeHtml(first)},`, { size: 16, pad: 8 }),
+    emailParagraph("Your Unleashed server is ready. Sign in at the address below to finish setup. Your bots stay paused until you connect your exchange, review your settings, and start them.", { muted: true, pad: 20 }),
+    emailFacts("Sign in", [["Dashboard", `<a href="${escapeHtml(f.appUrl)}">${escapeHtml(f.appUrl)}</a>`], ["Username", escapeHtml(f.appUsername)]]),
+    emailParagraph("Temporary password", { size: 12, pad: 6, muted: true }),
+    emailCode(f.temporaryPassword),
+    emailButton(f.appUrl, "Open your dashboard"),
+    emailParagraph(`Keep this password private. You will choose your own password when you first sign in. Lost this email before then? <a href="${escapeHtml(f.accessUrl)}">Request a new temporary password</a> from your account page.`, { muted: true, size: 13, pad: 4 }),
+    emailHeading("Next steps"),
+    emailSteps(steps),
+    emailParagraph("Moving from another installation? Follow the migration steps before starting hosted bots so both installations never manage the same positions.", { muted: true, size: 13 }),
+    emailHeading("Your server"),
+    emailFacts("Details", [["Server", escapeHtml(f.instanceReference)], ["Location", escapeHtml(f.region)], ["CPU / RAM / storage", `${escapeHtml(f.cpu)} / ${escapeHtml(f.ram)} / ${escapeHtml(f.storage)}`], ["Operating system", escapeHtml(f.os)], ["IP address", escapeHtml(f.ip)], ["SSH (optional)", `${escapeHtml(f.sshUsername)} · port ${f.sshPort} · separate credentials`]]),
+    emailParagraph(`This server supports up to ${f.maximumConnectedAccounts} connected exchange accounts. ${escapeHtml(f.billingSummary)} Next renewal: ${escapeHtml(renewal)}. ${escapeHtml(f.backupScopeSentence)}`, { muted: true, size: 13 }),
   ].join("\n\n");
-  return withTo(wrap("Your Unleashed VPS is ready", text, html), to);
+  return withTo(wrap("Your Unleashed VPS is ready", text, html, "Your dashboard address and temporary password are inside."), to);
+}
+
+export interface CredentialResetEmailFacts {
+  instanceReference: string;
+  appUrl: string;
+  appUsername: string;
+  accountUrl: string;
+  temporaryPassword: string;
+  requestedBy: "customer" | "operator";
+}
+
+/** The replacement temporary password, sent only after the server itself
+ *  confirmed it now accepts it. */
+export function credentialResetEmail(to: string, f: CredentialResetEmailFacts): EmailMessage {
+  const who = f.requestedBy === "operator" ? "Our support team reset" : "As you requested, we reset";
+  const text = [
+    `${who} the dashboard password on your Unleashed server (${f.instanceReference}). Your previous password no longer works.`,
+    `SIGN IN\nDashboard: ${f.appUrl}\nUsername: ${f.appUsername}\nTemporary password: ${f.temporaryPassword}`,
+    `You will be asked to choose a new password when you sign in. Your bots, exchange connections and settings were not changed; the dashboard restarted briefly to apply the new password.`,
+    `If you did not ask for this, sign in and choose a new password now, then contact support. Manage your server: ${f.accountUrl}`,
+  ].join("\n\n");
+  const html = [
+    emailParagraph(`${escapeHtml(who)} the dashboard password on your Unleashed server (${escapeHtml(f.instanceReference)}). Your previous password no longer works.`, { pad: 20 }),
+    emailFacts("Sign in", [["Dashboard", `<a href="${escapeHtml(f.appUrl)}">${escapeHtml(f.appUrl)}</a>`], ["Username", escapeHtml(f.appUsername)]]),
+    emailParagraph("Temporary password", { size: 12, pad: 6, muted: true }),
+    emailCode(f.temporaryPassword),
+    emailButton(f.appUrl, "Open your dashboard"),
+    emailParagraph("You will be asked to choose a new password when you sign in. Your bots, exchange connections and settings were not changed; the dashboard restarted briefly to apply the new password.", { muted: true, size: 13 }),
+    emailParagraph(`If you did not ask for this, sign in and choose a new password now, then contact support. <a href="${escapeHtml(f.accountUrl)}">Manage your server</a>.`, { muted: true, size: 13 }),
+  ].join("\n\n");
+  return withTo(wrap("Your new temporary Unleashed password", text, html, "Sign in and choose a new password."), to);
 }
 
 export function cancellationScheduledEmail(to: string, instanceReference: string, suspendAt: number, deleteAt: number, manageUrl: string, bundled = false): EmailMessage {
@@ -141,8 +201,7 @@ function reminderEmail(to: string, instanceReference: string, deleteAt: number, 
         `Complete the required payment before deletion begins if you want to keep this server. After deletion, its data cannot be recovered under this hosting plan. ${backupScopeSentence}`.trim(),
         `Renew VPS hosting: ${manageUrl}`,
       ].join("\n\n");
-  const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");
-  return withTo({ to, subject, text: `${text}\n\n${SUPPORT_LINE}`, html: `<p>${html}</p><p>${escapeHtml(SUPPORT_LINE)}</p>` }, to);
+  return withTo({ to, subject, text: `${text}\n\n${SUPPORT_LINE}`, html: layoutHtml(text.split("\n\n").map((p) => linkify(escapeHtml(p))).join("\n\n")) }, to);
 }
 export function threeDayReminderEmail(to: string, instanceReference: string, deleteAt: number, manageUrl: string, backupScopeSentence: string): EmailMessage {
   return reminderEmail(to, instanceReference, deleteAt, 72, manageUrl, backupScopeSentence);
@@ -194,13 +253,11 @@ export function exceptionEmail(to: string, kind: "setup_failure" | "late_payment
       `A request to stop renewal for this server has been sent. We will confirm both the renewal status and the status of your initial hosting payment separately; contact support if you do not receive that confirmation.`,
       `View hosting: ${hostingUrl}`,
     ].join("\n\n");
-    const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");
-    return withTo({ to, subject: "We could not finish setting up your Unleashed VPS", text: `${text}\n\n${SUPPORT_LINE}`, html: `<p>${html}</p><p>${escapeHtml(SUPPORT_LINE)}</p>` }, to);
+    return withTo({ to, subject: "We could not finish setting up your Unleashed VPS", text: `${text}\n\n${SUPPORT_LINE}`, html: layoutHtml(text.split("\n\n").map((p) => linkify(escapeHtml(p))).join("\n\n")) }, to);
   }
   const text = [
     `We received a hosting payment for ${instanceReference} after that server was already permanently deleted. ${detail}`,
     `View hosting: ${hostingUrl}`,
   ].join("\n\n");
-  const html = text.split("\n\n").map((p) => escapeHtml(p)).join("</p><p>");
-  return withTo({ to, subject: "About your recent Unleashed VPS hosting payment", text: `${text}\n\n${SUPPORT_LINE}`, html: `<p>${html}</p><p>${escapeHtml(SUPPORT_LINE)}</p>` }, to);
+  return withTo({ to, subject: "About your recent Unleashed VPS hosting payment", text: `${text}\n\n${SUPPORT_LINE}`, html: layoutHtml(text.split("\n\n").map((p) => linkify(escapeHtml(p))).join("\n\n")) }, to);
 }

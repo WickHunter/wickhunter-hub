@@ -3319,6 +3319,17 @@ async function hostingInstanceAction(id, action, confirmMsg) {
     if (e.message !== "unauthorized") alert(e.message);
   }
 }
+async function hostingResetPasswordAction(id) {
+  if (!confirm("Reset the app password on " + id + "? The customer's dashboard restarts briefly and the new temporary password is emailed to the owner.")) return;
+  const by = prompt("Your name/initials (kept in the reset audit log):", "") || "support";
+  try {
+    const r = await api("/admin/api/hosting/instances/" + encodeURIComponent(id) + "/reset-password", { method: "POST", body: JSON.stringify({ by: by }) });
+    alert(r.note || "queued");
+    hostingRefresh();
+  } catch (e) {
+    if (e.message !== "unauthorized") alert(e.message);
+  }
+}
 async function hostingHoldAction(id) {
   const by = prompt("Your name/initials (kept on the hold record):", "") || "support";
   const reason = prompt('Reason for the hold. The customer sees only "on hold by support" — this text is for the admin panel/audit log.', "") || "";
@@ -3379,7 +3390,7 @@ async function hostingRefresh() {
   rows.innerHTML = "";
   for (const inst of instances) {
     const badge = '<span class="custbadge ' + (HOSTING_STAGE_BADGE[inst.stage] || "muted") + '">' + esc(inst.stage) + "</span>";
-    const note = [inst.failureReason, inst.cancellationReason].filter(Boolean).map(esc).join(" · ");
+    const note = [inst.failureReason, inst.supportReference ? "ref " + inst.supportReference : "", inst.cancellationReason].filter(Boolean).map(esc).join(" · ");
     const hold = inst.deletionHold;
     const holdCell = hold ? '<span class="custbadge revoked" title="' + esc(hold.reason) + '">held by ' + esc(hold.by) + " · " + esc(fmt(hold.atMs)) + "</span>" : "—";
     const tr = document.createElement("tr");
@@ -3403,6 +3414,12 @@ async function hostingRefresh() {
     suspendBtn.onclick = () => hostingInstanceAction(inst.id, "force-suspend", "Force-suspend " + inst.id + "? This powers the VPS off through the provider.");
     const deleteBtn = document.createElement("button"); deleteBtn.type = "button"; deleteBtn.textContent = "Force delete";
     deleteBtn.onclick = () => hostingInstanceAction(inst.id, "force-delete", "PERMANENTLY delete " + inst.id + " and its server data? This cannot be undone.");
+    if (["ready", "active", "past_due", "cancel_scheduled"].includes(inst.stage)) {
+      const resetBtn = document.createElement("button"); resetBtn.type = "button"; resetBtn.textContent = "Reset app password";
+      resetBtn.title = "Queue a new temporary dashboard password. The server applies it (its app restarts briefly) and the owner is emailed; the password is never shown here.";
+      resetBtn.onclick = () => hostingResetPasswordAction(inst.id);
+      actions.appendChild(resetBtn); actions.appendChild(document.createTextNode(" "));
+    }
     actions.appendChild(retryBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(suspendBtn); actions.appendChild(document.createTextNode(" ")); actions.appendChild(deleteBtn);
     if (inst.stage === "cancel_scheduled") {
       const resumeBtn = document.createElement("button"); resumeBtn.type = "button"; resumeBtn.textContent = "Resume renewal";

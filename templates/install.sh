@@ -512,6 +512,30 @@ fetch_bounded() {
   if [ "$fetch_bytes" -gt "$fetch_max" ]; then return 65; fi
   [ "${fetch_status[0]:-1}" -eq 0 ] && [ "${fetch_status[1]:-1}" -eq 0 ]
 }
+# On a refused request, ask once more without --fail for the Hub's own
+# one-line reason (an expired or revoked licence, no published release).
+# Only short plain text or a JSON {"error": ...} is shown — never HTML, never
+# more than one line — and nothing is ever executed from it.
+hub_reason() { # hub_reason <url>
+  local reason_file="$work/hub-reason.txt"
+  set +e
+  if [ "${CHANNEL_AWARE:-0}" = "1" ]; then
+    curl -q --silent --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 \
+      --config "$work/channel-headers.curl" --header 'Accept-Encoding: identity' "$1" | head -c 4096 > "$reason_file"
+  else
+    curl -q --silent --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 \
+      --header 'Accept-Encoding: identity' "$1" | head -c 4096 > "$reason_file"
+  fi
+  set -e
+  node - "$reason_file" <<'HUB_REASON' 2>/dev/null || true
+const fs = require("node:fs");
+let text = fs.readFileSync(process.argv[2], "utf8").trim();
+try { const body = JSON.parse(text); text = typeof body.error === "string" ? body.error : ""; } catch {}
+text = (text.split("\n")[0] || "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+if (text && !text.startsWith("<") && text.length <= 400) process.stdout.write(text.replace(/^Wick Hunter:\s*/, ""));
+HUB_REASON
+}
+
 if [ -n "$PINNED_MANIFEST_B64U" ]; then
   node - "$PINNED_MANIFEST_B64U" "$work/latest.json" <<'DECODE_PINNED_MANIFEST' || die "embedded pinned release manifest is malformed"
 const fs = require("node:fs");
@@ -531,7 +555,9 @@ else
     if [ "$fetch_code" -eq 65 ]; then
       die "release manifest response exceeded 1 MiB — proxy or network corruption"
     fi
-    die "could not reach the hub (or your key is expired/revoked) — contact the operator"
+    hub_says=$(hub_reason "$latest_url")
+    [ -z "$hub_says" ] || die "the Wick Hunter Hub refused this install: $hub_says"
+    die "could not reach the hub — check this server's internet connection and run the command again; if it keeps failing, contact support"
   fi
 fi
 

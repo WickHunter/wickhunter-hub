@@ -374,7 +374,7 @@ export class LaunchBilling {
         ...(!softwareSubscription ? { non_renewing: 'true', license_days: String(plan.key === 'yearly' ? 365 : plan.licenseDays) } : {}) };
       const params: StripeObject = { mode: subscription ? 'subscription' : 'payment',
         client_reference_id: id,
-        success_url: `${this.origin}/customer?checkout=complete`, cancel_url: 'https://www.wickhunterunleashed.com/unleashed/#pricing',
+        success_url: `${this.origin}/customer?checkout=complete&session_id={CHECKOUT_SESSION_ID}`, cancel_url: 'https://www.wickhunterunleashed.com/unleashed/#pricing',
         'payment_method_types[0]': crypto ? 'crypto' : 'card', 'line_items[0][quantity]': 1,
         'consent_collection[terms_of_service]': 'required' };
       const cutoff = firstPayment ?? LAUNCH_REDEEM_UNTIL_MS;

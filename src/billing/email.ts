@@ -341,6 +341,238 @@ ${noticeHtml}
   return { to, subject, text, html };
 }
 
+// ── shared layout ───────────────────────────────────────────────────────────
+// The branded, table-based, single-column shell the welcome email uses, for
+// every other customer email too: 600px on desktop, full-width with 20px
+// gutters under 620px, light theme only (see the token note above).
+
+/** The support address every customer email names (the operator's own
+ *  mailbox; replies to the configured Reply-To reach the same place). */
+export const SUPPORT_EMAIL = "admin@wickhunterunleashed.com";
+
+export interface EmailLayoutInput {
+  /** Inbox preview text; hidden in the body. */
+  preheader?: string;
+  /** Marketing-site origin for the logo image and footer link; optional. */
+  origin?: string;
+  /** Rows (`<tr>…</tr>`) for the white card. */
+  rows: string;
+  /** Extra footer paragraph HTML (already escaped). */
+  footerHtml?: string;
+}
+
+export function emailParagraph(html: string, opts: { muted?: boolean; size?: number; pad?: number } = {}): string {
+  return `<tr><td style="font-family:${FONT};font-size:${opts.size ?? 14}px;color:${opts.muted ? MUTED : INK};line-height:1.6;padding:0 0 ${opts.pad ?? 16}px">${html}</td></tr>`;
+}
+export function emailButton(href: string, label: string, quiet = false): string {
+  const style = quiet
+    ? `color:${ACCENT};background-color:${CARD};border:1px solid ${BORDER};padding:10px 18px`
+    : `color:#ffffff;background-color:${ACCENT};padding:13px 22px`;
+  return `<tr><td style="padding:0 0 14px"><a href="${escapeHtml(href)}" style="display:inline-block;font-family:${FONT};font-size:14px;font-weight:600;text-decoration:none;border-radius:10px;${style}">${escapeHtml(label)}</a></td></tr>`;
+}
+export function emailHeading(text: string): string {
+  return `<tr><td style="font-family:${FONT};font-size:13px;font-weight:700;color:${INK};padding:20px 0 12px;border-top:1px solid ${BORDER_SOFT}">${escapeHtml(text)}</td></tr>`;
+}
+/** A grey inset box of label/value rows (values already escaped). */
+export function emailFacts(title: string, facts: ReadonlyArray<readonly [string, string]>): string {
+  const rows = facts.map(([label, value], i) => `
+    <tr>
+      <td style="padding:${i === 0 ? "0" : "8px"} 0 0;font-family:${FONT};font-size:13px;color:${DIM};white-space:nowrap;vertical-align:top">${escapeHtml(label)}</td>
+      <td style="padding:${i === 0 ? "0" : "8px"} 0 0 16px;font-family:${FONT};font-size:13px;color:${INK};font-weight:600;text-align:right;width:100%;word-break:break-word">${value}</td>
+    </tr>`).join("");
+  return `<tr><td style="padding:0 0 20px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${INSET};border:1px solid ${BORDER_SOFT};border-radius:10px">
+        <tr><td style="padding:16px 18px">
+          <div style="font-family:${FONT};font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:${DIM};padding-bottom:10px">${escapeHtml(title)}</div>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${rows}</table>
+        </td></tr>
+      </table>
+    </td></tr>`;
+}
+/** Numbered steps (title, description) — the welcome email's step list. */
+export function emailSteps(steps: ReadonlyArray<readonly [string, string]>): string {
+  const rows = steps.map(([title, desc], i) => `
+    <tr>
+      <td width="30" style="width:30px;padding:${i === 0 ? "0" : "16px"} 0 0;vertical-align:top">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td width="24" height="24" align="center" style="width:24px;height:24px;background-color:${ACCENT_DIM};border-radius:12px;font-family:${FONT};font-size:12px;font-weight:700;color:${ACCENT};text-align:center;line-height:24px">${i + 1}</td></tr></table>
+      </td>
+      <td style="padding:${i === 0 ? "0" : "16px"} 0 0 12px;vertical-align:top">
+        <div style="font-family:${FONT};font-size:14px;font-weight:700;color:${INK}">${escapeHtml(title)}</div>
+        <div style="font-family:${FONT};font-size:13px;color:${MUTED};line-height:1.5;margin-top:2px">${escapeHtml(desc)}</div>
+      </td>
+    </tr>`).join("");
+  return `<tr><td style="padding:0 0 8px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${rows}</table></td></tr>`;
+}
+export function emailNotice(html: string, tone: "warn" | "info" = "info"): string {
+  const bg = tone === "warn" ? WARN_DIM : ACCENT_DIM;
+  const border = tone === "warn" ? "rgba(168,114,15,.35)" : "rgba(88,79,230,.30)";
+  const color = tone === "warn" ? WARN : INK;
+  return `<tr><td style="padding:0 0 20px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${bg};border:1px solid ${border};border-radius:10px">
+        <tr><td style="padding:12px 14px;font-family:${FONT};font-size:13px;color:${color};line-height:1.5">${html}</td></tr>
+      </table>
+    </td></tr>`;
+}
+export function emailCode(text: string): string {
+  return `<tr><td style="padding:0 0 16px"><div style="font-family:${MONO};font-size:15px;font-weight:600;color:${INK};background-color:${INSET};border:1px solid ${BORDER_SOFT};border-radius:8px;padding:12px 14px;word-break:break-all">${escapeHtml(text)}</div></td></tr>`;
+}
+
+export function emailLayout(input: EmailLayoutInput): string {
+  const origin = (input.origin ?? "").replace(/\/+$/, "");
+  const logoCell = origin
+    ? `<td width="44" style="width:44px;padding-right:12px;vertical-align:middle"><img src="${escapeHtml(origin)}/assets/icon-192.png" width="44" height="44" alt="Wick Hunter" style="display:block;border:0;border-radius:10px"></td>`
+    : "";
+  const footerOrigin = origin
+    ? ` &middot; <a href="${escapeHtml(origin)}" style="color:${DIM};text-decoration:underline">${escapeHtml(origin.replace(/^https?:\/\//, ""))}</a>`
+    : "";
+  const preheader = input.preheader
+    ? `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;font-size:1px;line-height:1px;color:${BG}">${escapeHtml(input.preheader)}</div>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>Wick Hunter Unleashed</title>
+<style>
+  @media only screen and (max-width:620px) {
+    .wh-container { width:100% !important; }
+    .wh-px { padding-left:20px !important; padding-right:20px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:${BG}">
+${preheader}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${BG};margin:0;padding:0;width:100%">
+<tr><td align="center" style="padding:32px 16px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" class="wh-container" style="width:600px;max-width:600px">
+<tr><td class="wh-px" style="padding:0 4px 20px">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>${logoCell}<td style="vertical-align:middle">
+    <div style="font-family:${FONT};font-size:18px;font-weight:700;color:${INK};line-height:1.2">Wick<span style="color:${ACCENT}">Hunter</span></div>
+    <div style="font-family:${FONT};font-size:9px;font-weight:600;letter-spacing:2.6px;text-transform:uppercase;color:${DIM};margin-top:3px">UNLEASHED</div>
+  </td></tr></table>
+</td></tr>
+<tr><td class="wh-px" style="background-color:${CARD};border:1px solid ${BORDER};border-radius:14px;padding:32px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+${input.rows}
+  </table>
+</td></tr>
+<tr><td class="wh-px" style="padding:22px 4px 0">
+  ${input.footerHtml ? `<p style="margin:0 0 6px;font-family:${FONT};font-size:12px;color:${DIM};line-height:1.6">${input.footerHtml}</p>` : ""}
+  <p style="margin:0;font-family:${FONT};font-size:12px;color:${DIM}">Wick Hunter Software LLC${footerOrigin}</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
+}
+
+// ── hosted-server welcome ──────────────────────────────────────────────────
+
+export interface HostedWelcomeEmailInput {
+  name: string;
+  expiresAtMs: number;
+  subscription: boolean;
+  lifetime?: boolean;
+  firstPaymentAtMs?: number | null;
+  siteOrigin: string;
+  /** The Hub's own origin: the account page lives here. */
+  hubOrigin: string;
+  livemode: boolean;
+  starterPack?: boolean;
+  /** Known only when the server finished before this email was sent. */
+  dashboardUrl?: string | null;
+}
+
+const HOSTED_STEPS: ReadonlyArray<readonly [string, string]> = [
+  ["We build your server", "We create your private server, install Unleashed on it and check that it can reach the supported exchanges. There is nothing for you to install and no SSH to use."],
+  ["Watch for your access email", "When the server is ready we send a second email, \"Your Unleashed VPS is ready\", with your dashboard address and a temporary password. If it is not in your inbox, check spam or promotions."],
+  ["Sign in and choose your password", "Open the dashboard address, sign in as admin with the temporary password, and choose your own password. Lost the temporary password? Request a new one from your account page."],
+  ["Connect your exchange", "Add an API key with trade permission only — withdrawals off. Supported: Bybit, Bitunix, Bitget, Binance, Aster and WEEX."],
+  ["Start small", "Your bots stay paused until you start them. Let the guided setup create your first bot and begin with the smallest sizes."],
+];
+
+/** The welcome for a buyer whose Unleashed runs on a server we host. It
+ *  never contains an install command or a licence key: the server is
+ *  installed for them, and its credentials arrive in the separate
+ *  "ready" email once the server exists. */
+export function hostedWelcomeEmail(to: string, input: HostedWelcomeEmailInput): EmailMessage {
+  const first = input.name.trim().split(/\s+/)[0] || "there";
+  const until = input.lifetime ? "Lifetime access" : dateOf(input.expiresAtMs);
+  const firstCharge = input.firstPaymentAtMs ? `Your first subscription charge is scheduled for ${new Intl.DateTimeFormat("en-US", { dateStyle: "long", timeZone: "America/New_York" }).format(input.firstPaymentAtMs)} (Eastern Time).` : "";
+  const planValue = `Unleashed with managed server${input.livemode ? "" : " (test)"}`;
+  const renewalValue = input.lifetime ? "Software: one payment. Server: renews monthly" : input.subscription ? "Renews automatically until you cancel" : "One-time purchase";
+  const hub = input.hubOrigin.replace(/\/+$/, "");
+  const accountUrl = `${hub}/customer#hosting`;
+  const helpUrl = `${hub}/support`;
+  const site = input.siteOrigin.replace(/\/+$/, "");
+  const billingUrl = `${site || hub}/billing`;
+  const subject = `${input.livemode ? "" : "[TEST] "}Welcome to Wick Hunter Unleashed — your server is being set up`;
+  const statusLine = input.dashboardUrl
+    ? `Your server is ready. Your dashboard address is ${input.dashboardUrl} — the sign-in details are in the "Your Unleashed VPS is ready" email.`
+    : "We are setting up your private server now. We will email you as soon as it is ready; you can also follow its progress on your account page.";
+
+  const text = [
+    "Wick Hunter — Unleashed",
+    "",
+    `Hi ${first},`,
+    "",
+    `Thanks for choosing Wick Hunter Unleashed with a managed server. ${statusLine}`,
+    firstCharge || null,
+    "",
+    "WHAT YOU BOUGHT",
+    `  Plan: ${planValue}`,
+    `  Valid until: ${until}`,
+    `  Renewal: ${renewalValue}`,
+    `  Email: ${to}`,
+    "",
+    input.livemode ? null : "This is a TEST-MODE purchase. No real payment was taken.",
+    input.livemode ? null : "",
+    "FOLLOW YOUR SERVER",
+    `  ${accountUrl}`,
+    "  Sign in with this email address; we send a one-time sign-in link, so there is no password to remember for your account.",
+    "",
+    "WHAT HAPPENS NEXT",
+    ...HOSTED_STEPS.map(([title, desc], i) => `${i + 1}. ${title} — ${desc}`),
+    input.starterPack ? "" : null,
+    input.starterPack ? "Your Liquidation Bot + Hedge Bot starter pack is on your account page. Preview each import in your dashboard before enabling it." : null,
+    "",
+    "BILLING AND HELP",
+    `Manage billing: ${billingUrl}`,
+    `Help and guides: ${helpUrl}`,
+    `Questions? Reply to this email or write to ${SUPPORT_EMAIL}.`,
+    "",
+    "— Wick Hunter Software LLC",
+    site || null,
+  ].filter((line): line is string => line !== null).join("\n").replace(/\n{3,}/g, "\n\n");
+
+  const rows = [
+    emailParagraph(`Hi ${escapeHtml(first)},`, { size: 16, pad: 8 }),
+    emailParagraph(`Thanks for choosing Wick Hunter Unleashed with a managed server. ${escapeHtml(statusLine)}${firstCharge ? `<br><br>${escapeHtml(firstCharge)}` : ""}`, { muted: true, pad: 22 }),
+    emailFacts("What you bought", [["Plan", escapeHtml(planValue)], ["Valid until", escapeHtml(until)], ["Renewal", escapeHtml(renewalValue)], ["Email", escapeHtml(to)]]),
+    input.livemode ? "" : emailNotice("This is a <strong>test-mode</strong> purchase. No real payment was taken.", "warn"),
+    input.dashboardUrl ? emailButton(input.dashboardUrl, "Open your dashboard") : "",
+    emailButton(accountUrl, "Follow your server", !!input.dashboardUrl),
+    emailParagraph("Sign in with this email address — we send a one-time link, so there is no extra password to remember for your account.", { muted: true, size: 12.5, pad: 24 }),
+    emailHeading("What happens next"),
+    emailSteps(HOSTED_STEPS),
+    input.starterPack ? emailParagraph("<strong>Your Liquidation Bot + Hedge Bot starter pack</strong> is on your account page. Preview each import in your dashboard before enabling it.", { size: 13, pad: 8 }) : "",
+    emailHeading("Billing and help"),
+    emailButton(billingUrl, "Manage billing", true),
+    emailParagraph(`Step-by-step help: <a href="${escapeHtml(helpUrl)}" style="color:${ACCENT}">${escapeHtml(helpUrl.replace(/^https?:\/\//, ""))}</a><br>Questions? Reply to this email or write to <a href="mailto:${SUPPORT_EMAIL}" style="color:${ACCENT}">${SUPPORT_EMAIL}</a>.`, { muted: true, size: 13, pad: 0 }),
+  ].join("\n");
+  const html = emailLayout({
+    preheader: input.dashboardUrl ? "Your server is ready — sign-in details are in a separate email." : "Your private server is being set up. Here is what happens next.",
+    origin: site,
+    rows,
+    footerHtml: `If a button does not work, copy this link:<br><span style="word-break:break-all;font-family:${MONO}">${escapeHtml(accountUrl)}</span>`,
+  });
+  return { to, subject, text, html };
+}
+
 export function testEmail(to: string, hubOrigin: string): EmailMessage {
   return {
     to,
@@ -350,11 +582,15 @@ export function testEmail(to: string, hubOrigin: string): EmailMessage {
   };
 }
 
-/** Only the explicit, verified support reissue calls this. The licence key is
- * absent; the revocable opaque command expires after 24 hours. */
+/** The one-line install command every customer surface hands out. The
+ *  installer is downloaded to a temporary file first, so a refusal never
+ *  pipes an empty script into bash: on an HTTP error the Hub's own one-line
+ *  reason (for example "this licence has lapsed — renew it …") is printed,
+ *  and a proxy's HTML error page is replaced by one plain sentence. The
+ *  licence key is never in the command. */
 export function safeInstallCommand(installUrl: string): string {
   const quotedUrl = "'" + installUrl.replace(/'/g, "'\\''") + "'";
-  return `(wh_installer_tmp=$(mktemp) || exit; trap 'rm -f "$wh_installer_tmp"' EXIT; if curl -q --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 ${quotedUrl} -o "$wh_installer_tmp"; then sudo bash "$wh_installer_tmp"; else wh_install_status=$?; cat "$wh_installer_tmp" >&2; exit "$wh_install_status"; fi)`;
+  return `(wh_installer_tmp=$(mktemp) || exit; trap 'rm -f "$wh_installer_tmp"' EXIT; if curl -q --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 ${quotedUrl} -o "$wh_installer_tmp"; then sudo bash "$wh_installer_tmp"; else wh_install_status=$?; if [ -s "$wh_installer_tmp" ] && ! grep -qiE '<(!doctype|html)' "$wh_installer_tmp"; then head -c 1000 "$wh_installer_tmp" >&2; echo >&2; else echo 'The install did not start: the Wick Hunter Hub could not be reached. Try again in a few minutes, or contact support.' >&2; fi; exit "$wh_install_status"; fi)`;
 }
 
 export function reissuedInstallEmail(to: string, input: { name: string; installUrl: string; expiresAtMs: number; issue?: "bybit-us-ip" | "reinstall" | "device-recovery"; replacementLicenseToken?: string; dashboardUrl?: string }): EmailMessage {

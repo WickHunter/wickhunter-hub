@@ -64,6 +64,15 @@
   form{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   #loading{color:var(--dim);font-size:13px}
   [hidden]{display:none!important}
+  .welcome{border-color:var(--accent-line);background:linear-gradient(180deg,var(--accent-dim),var(--raised) 70%)}
+  .welcome h1{margin:6px 0 6px}
+  .steps{list-style:none;padding:0;margin:14px 0 4px}
+  .steps li{display:flex;gap:12px;align-items:flex-start;margin:0 0 12px;color:var(--muted);font-size:14px}
+  .steps .dot{flex:none;width:24px;height:24px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:var(--overlay);border:1px solid var(--line);color:var(--dim)}
+  .steps li.done .dot{background:var(--long-dim);border-color:rgba(47,208,138,.4);color:var(--long)}
+  .steps li.now .dot{background:var(--accent-dim);border-color:var(--accent-line);color:var(--accent)}
+  .steps li.done b,.steps li.now b{color:var(--ink)}
+  .steps b{display:block;font-weight:650;color:var(--muted)}
   @media (max-width:520px){.cmd{padding-right:14px;padding-bottom:52px}.copy{top:auto;bottom:9px;right:9px}.kv{grid-template-columns:1fr}}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -82,10 +91,31 @@
     <div><div class="n">Wick<b>Hunter</b></div><div class="t">Unleashed</div></div>
   </div>
 
+  <!-- ── after checkout: what was bought and what happens next ──────── -->
+  <section class="card welcome" id="checkoutWelcome" hidden aria-live="polite">
+    <span class="eyebrow v-eyebrow">Payment received</span>
+    <h1 class="v-title">Thank you for your purchase</h1>
+    <p class="sub v-lead" style="margin-bottom:10px"></p>
+    <div class="kv v-bought" hidden>
+      <span class="k">You bought</span><span class="v-product"></span>
+      <span class="k">Plan</span><span class="v-plan"></span>
+      <span class="k">Receipt email</span><span class="v-email"></span>
+    </div>
+    <ol class="steps v-steps"></ol>
+    <div class="row" style="margin-top:6px">
+      <a class="btn v-primary" hidden></a>
+      <a class="btn quiet" href="support" target="_blank" rel="noopener">Help &amp; guides</a>
+      <a class="btn quiet v-video" href="https://www.youtube.com/watch?v=uaG8oZXLl_I" target="_blank" rel="noopener" hidden>Watch the setup video</a>
+      <a class="btn quiet v-support" href="support" target="_blank" rel="noopener">Contact support</a>
+    </div>
+    <p class="fine v-foot"></p>
+  </section>
+
   <div id="loading">Loading your account&hellip;</div>
 
   <!-- ── signed out ──────────────────────────────────────────────────── -->
   <div id="signedOut" hidden>
+    <a id="signin"></a>
     <h1>Sign in to your account</h1>
     <p class="sub">Works for any email you have bought Wick Hunter Unleashed with — even with your server off or your licence lapsed.</p>
     <div class="card">
@@ -175,6 +205,12 @@
     <p class="err v-suspend-note" hidden style="margin:10px 0 0"></p>
     <p class="err v-delete-note" hidden style="margin:6px 0 0"></p>
     <p class="err v-fail-note" hidden style="margin:10px 0 0"></p>
+    <p class="fine v-fail-ref" hidden style="margin:4px 0 0">Support reference: <b class="v-ref"></b> · <a class="v-ref-link" href="support" target="_blank" rel="noopener">Contact support</a></p>
+    <div class="v-reset" hidden style="margin-top:14px">
+      <button class="btn quiet v-reset-btn" type="button">Email me a new temporary password</button>
+      <p class="fine v-reset-status" role="status" hidden></p>
+      <p class="err v-reset-err" role="alert" hidden></p>
+    </div>
     <p class="fine v-bundle-note" hidden style="margin:10px 0 0"></p>
     <div class="row" style="margin-top:14px">
       <a class="btn v-open" href="#" target="_blank" rel="noopener" hidden>Open server</a>
@@ -470,7 +506,13 @@
       var fNote = node.querySelector(".v-fail-note");
       fNote.hidden = false;
       fNote.textContent = inst.failureReason;
+      if (inst.supportReference) {
+        node.querySelector(".v-ref").textContent = inst.supportReference;
+        node.querySelector(".v-ref-link").href = "support#message=" + encodeURIComponent("Question about my hosted server " + inst.id + " (reference " + inst.supportReference + ").");
+        node.querySelector(".v-fail-ref").hidden = false;
+      }
     }
+    renderPasswordReset(node, inst);
 
     var openBtn = node.querySelector(".v-open");
     if (inst.appUrl && (inst.stage === "ready" || inst.stage === "active")) { openBtn.href = inst.appUrl; openBtn.hidden = false; }
@@ -512,7 +554,51 @@
     host.appendChild(node);
   }
 
+  var RESET_STAGES = ["ready", "active", "past_due", "cancel_scheduled"];
+  function resetStatusText(cr) {
+    if (!cr || !cr.status) return "";
+    if (cr.status === "pending") return "A new temporary password is on its way. Your server applies it within about ten minutes (your dashboard restarts briefly), then we email it to you.";
+    if (cr.status === "emailing") return "Your server applied the new password. The email with it is on its way.";
+    if (cr.status === "emailed") return "We emailed you a new temporary password on " + fmtDateTime(cr.atMs) + ". Check spam or promotions if you do not see it.";
+    if (cr.status === "failed") return "Your server could not apply a new password, so your previous password still works. Contact support" + (cr.reference ? " and quote " + cr.reference : "") + ".";
+    if (cr.status === "expired") return "Your server did not pick up the last request. Contact support" + (cr.reference ? " and quote " + cr.reference : "") + ".";
+    return "";
+  }
+  function renderPasswordReset(node, inst) {
+    var box = node.querySelector(".v-reset");
+    var cr = inst.credentialReset;
+    if (!cr || RESET_STAGES.indexOf(inst.stage) < 0) return;
+    box.hidden = false;
+    var btn = node.querySelector(".v-reset-btn");
+    var status = node.querySelector(".v-reset-status");
+    var err = node.querySelector(".v-reset-err");
+    var text = resetStatusText(cr);
+    if (text) { status.textContent = text; status.hidden = false; }
+    var busy = cr.status === "pending" || cr.status === "emailing";
+    if (!cr.available) {
+      btn.disabled = true;
+      if (cr.unavailableReason) { err.textContent = cr.unavailableReason; err.hidden = false; }
+      return;
+    }
+    btn.disabled = busy;
+    btn.addEventListener("click", async function () {
+      if (!window.confirm("Set a new temporary password on your server? Your dashboard restarts briefly to apply it (bots continue from their saved state), your current dashboard password stops working, and the new one is emailed to " + (currentEmail || "your account email") + ".")) return;
+      btn.disabled = true; err.hidden = true;
+      var r;
+      try { r = await boundedApi("/api/hosting/" + encodeURIComponent(inst.id) + "/reset-password", { method: "POST", body: "{}" }); }
+      catch (e) { r = { ok: false, body: { error: "Could not reach the Hub. Try again in a moment." } }; }
+      if (!r.ok || !r.body || !r.body.ok) {
+        err.textContent = (r.body && r.body.error) || "Could not request a new password. Try again or contact support.";
+        err.hidden = false; btn.disabled = false; return;
+      }
+      status.textContent = r.body.message || resetStatusText({ status: "pending" });
+      status.hidden = false;
+    });
+  }
+
+  var currentEmail = "";
   function showSignedIn(state) {
+    currentEmail = state.email || "";
     loadingEl.hidden = true;
     signedOutEl.hidden = true;
     signedInEl.hidden = false;
@@ -550,12 +636,118 @@
     });
   });
 
+  // ── post-checkout landing ────────────────────────────────────────────
+  var params = new URLSearchParams(window.location.search);
+  var checkoutKind = params.get("checkout") === "complete" ? "purchase"
+    : (params.get("hosting") === "checkout-success" || params.get("hosting") === "bundle-success") ? "hosting" : null;
+  var checkoutSession = /^cs_(test|live)_[A-Za-z0-9]{8,200}$/.test(params.get("session_id") || "") ? params.get("session_id") : null;
+  var checkoutSummary = null, signedInState = null, summaryPolls = 0;
+
+  var SERVER_STEPS = [
+    ["Payment confirmed", "Your order is in."],
+    ["Creating your server", "We create a private server for you."],
+    ["Installing Unleashed", "We install Unleashed and check it can reach the exchanges."],
+    ["Ready — sign in", "We email your dashboard address and a temporary password."],
+  ];
+  var SELF_HOSTED_STEPS = [
+    ["Open your welcome email", "It links to your private install page. Keep that link to yourself."],
+    ["Get a server", "A fresh Ubuntu 22.04 or newer VPS with 1 GB RAM and root access (Vultr, Hetzner, DigitalOcean)."],
+    ["Run the one-line command", "Paste the command from your install page into an SSH session as root. It takes about three minutes and prints your dashboard address."],
+    ["Connect your exchange", "Add an API key with trade permission only — withdrawals off — and start small."],
+  ];
+  function serverStepIndex(stage) {
+    if (stage === "ready" || stage === "active" || stage === "past_due" || stage === "cancel_scheduled") return 4;
+    if (stage === "bootstrapping") return 2;
+    if (stage === "provisioning") return 1;
+    return 1;
+  }
+  function renderSteps(list, steps, current) {
+    list.innerHTML = "";
+    steps.forEach(function (step, i) {
+      var li = document.createElement("li");
+      if (current !== null) li.className = i < current ? "done" : i === current ? "now" : "";
+      var dot = document.createElement("span"); dot.className = "dot"; dot.textContent = current !== null && i < current ? "✓" : String(i + 1);
+      var body = document.createElement("span");
+      var title = document.createElement("b"); title.textContent = step[0];
+      body.appendChild(title); body.appendChild(document.createTextNode(step[1]));
+      li.appendChild(dot); li.appendChild(body); list.appendChild(li);
+    });
+  }
+  function hostedInstanceOf(state) {
+    return state && state.hosting && state.hosting.hasInstance ? state.hosting.instance : null;
+  }
+  function renderCheckoutWelcome() {
+    var card = document.getElementById("checkoutWelcome");
+    if (!checkoutKind) return;
+    card.hidden = false;
+    var inst = hostedInstanceOf(signedInState);
+    var summary = checkoutSummary && checkoutSummary.status === "confirmed" ? checkoutSummary : null;
+    var hosted = checkoutKind === "hosting" || !!inst || (summary && summary.product === "hosted");
+    var known = hosted || !!summary || !!(signedInState && signedInState.software && signedInState.software.length);
+    var stage = inst ? inst.stage : summary && summary.server ? summary.server.stage : null;
+    var lead = card.querySelector(".v-lead"), foot = card.querySelector(".v-foot");
+    var primary = card.querySelector(".v-primary");
+    primary.hidden = true;
+    card.querySelector(".v-video").hidden = hosted || !known;
+    card.querySelector(".v-support").href = "support#message=" + encodeURIComponent("I just completed a purchase" + (checkoutSession ? " (checkout " + checkoutSession.slice(-10) + ")" : "") + " and need help getting started.");
+    var bought = card.querySelector(".v-bought");
+    if (summary || signedInState) {
+      bought.hidden = false;
+      card.querySelector(".v-product").textContent = hosted ? "Wick Hunter Unleashed + managed server" : "Wick Hunter Unleashed (runs on your own server)";
+      var sw = signedInState && signedInState.software && signedInState.software[0];
+      card.querySelector(".v-plan").textContent = (summary && summary.planName) || (sw && sw.plan) || "—";
+      card.querySelector(".v-email").textContent = signedInState ? signedInState.email : summary.emailHint || "—";
+    } else bought.hidden = true;
+    var list = card.querySelector(".v-steps");
+    if (hosted) {
+      var current = stage ? serverStepIndex(stage) : 1;
+      card.querySelector(".v-title").textContent = current >= 4 ? "Your server is ready" : "Thank you — we are setting up your server";
+      lead.textContent = current >= 4
+        ? "Your dashboard address and temporary password are in the email “Your Unleashed VPS is ready”. Sign in and choose your own password to finish setup."
+        : "There is nothing to install. We are building your private server now and will email you the moment it is ready. You can leave this page; your account always shows the latest status.";
+      renderSteps(list, SERVER_STEPS, current);
+      if (current >= 4 && inst && inst.appUrl) { primary.href = inst.appUrl; primary.textContent = "Open your dashboard"; primary.target = "_blank"; primary.rel = "noopener"; primary.hidden = false; }
+      else if (!signedInState) { primary.href = "#signin"; primary.textContent = "Sign in to follow progress"; primary.hidden = false; }
+      foot.textContent = "Lost the temporary password? Once your server is ready you can email yourself a new one from the Hosting card on this page.";
+    } else if (known) {
+      card.querySelector(".v-title").textContent = "Thank you — here is how to install";
+      lead.textContent = "Your licence is active. We emailed " + ((signedInState && signedInState.email) || (summary && summary.emailHint) || "you") + " a welcome message with your private install page.";
+      renderSteps(list, SELF_HOSTED_STEPS, null);
+      if (signedInState) foot.textContent = "Lost the welcome email? Use Regenerate install command on your licence card below to get a fresh command.";
+      else { primary.href = "#signin"; primary.textContent = "Sign in to your account"; primary.hidden = false; foot.textContent = "Sign in below with the email you used at checkout to see your licence and install options any time."; }
+    } else {
+      card.querySelector(".v-title").textContent = "Thank you — your payment went through";
+      lead.textContent = "We are confirming your order. This usually takes a few seconds; a welcome email with your next steps is on its way to the address you used at checkout.";
+      list.innerHTML = "";
+      if (!signedInState) { primary.href = "#signin"; primary.textContent = "Sign in to your account"; primary.hidden = false; }
+      foot.textContent = "Bought a managed server? We build it for you and email the sign-in details. Running it yourself? The welcome email links to your private install page.";
+    }
+  }
+  async function pollCheckoutSummary() {
+    if (!checkoutSession) return;
+    try {
+      var r = await boundedApi("/api/checkout/summary?session_id=" + encodeURIComponent(checkoutSession));
+      if (r.ok && r.body && r.body.ok) checkoutSummary = r.body;
+    } catch (e) { /* keep the generic copy */ }
+    renderCheckoutWelcome();
+    var hostedPending = checkoutSummary && checkoutSummary.product === "hosted" && !(checkoutSummary.server && checkoutSummary.server.ready);
+    if ((!checkoutSummary || checkoutSummary.status !== "confirmed" || hostedPending) && ++summaryPolls < 60) {
+      setTimeout(pollCheckoutSummary, checkoutSummary && checkoutSummary.status === "confirmed" ? 30000 : 4000);
+    }
+  }
+
   async function boot() {
     var r = await api("/api/customer/state");
     document.getElementById("earnLink").hidden = !r.body?.earnAvailable;
-    if (r.status === 200 && r.body && r.body.ok) showSignedIn(r.body);
+    if (r.status === 200 && r.body && r.body.ok) { signedInState = r.body; showSignedIn(r.body); }
     else showSignedOut();
+    renderCheckoutWelcome();
+    // Right after a hosted checkout, keep the progress tracker current until
+    // the server is ready (bounded; the page is otherwise static).
+    var inst = hostedInstanceOf(signedInState);
+    if (checkoutKind && inst && ["ordered", "provisioning", "bootstrapping"].indexOf(inst.stage) >= 0 && ++statePolls < 40) setTimeout(boot, 30000);
   }
+  var statePolls = 0;
 
   document.getElementById("signinForm").addEventListener("submit", async function (ev) {
     ev.preventDefault();
@@ -587,6 +779,7 @@
   });
 
   boot();
+  pollCheckoutSummary();
 })();
 </script>
 </body>

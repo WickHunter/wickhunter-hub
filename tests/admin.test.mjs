@@ -133,7 +133,7 @@ await test("editing expiry re-mints the token and hands back a new install comma
   // The list agrees, and the re-minted token verifies with the NEW expiry.
   const list = await jsonReq(`${h.origin}/admin/api/licenses`, { headers: AUTH });
   assert.equal(list.body.licenses.find((l) => l.id === id).exp, exp);
-  const token = r.body.installCommand.match(/key=([^"]+)"/)[1];
+  const token = r.body.installCommand.match(/key=([^'"]+)'/)[1];
   const v = h.store.verify(token);
   assert.equal(v.ok, true, "the re-minted token does not verify");
   assert.equal(v.payload.exp, exp);

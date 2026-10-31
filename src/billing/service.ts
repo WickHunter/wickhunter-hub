@@ -44,7 +44,7 @@ import {
   type StripeModeConfig,
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
-import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
+import { escapeHtml, hostedWelcomeEmail, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { EarnStripeApi, EarnStripeError } from "../earn-stripe-api.js";
@@ -113,6 +113,9 @@ export interface BillingServiceDeps {
   checkRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
   retireRecoveryActivation?: (licenseId: string, activationId: string, revision: number, reason: string) => void;
   recoveryHostingActive?: (customer: CustomerRecord) => boolean;
+  /** The customer's managed server, when one exists: decides which welcome
+   *  email they get (hosted buyers never need the SSH install page). */
+  hostedServerFor?: (customer: CustomerRecord) => { appUrl: string | null; ready: boolean } | null;
   recoveryCheckpoint?: (phase: string) => void;
   installBindingState?: (licenseId: string) => InstallBindingState;
   onVerifiedEvent?: (event: StripeEvent) => Promise<void>;
@@ -1922,11 +1925,53 @@ export class BillingService {
       this.store.putCustomer(rec);
       return "; welcome NOT sent (email not configured)";
     }
+    const exp = this.licenseExp(rec) ?? now;
+    const hosted = this.hostedPurchase(rec, cfg);
+    // A hosted buyer's server is installed for them: they get the hosted
+    // welcome (no install link, no SSH steps) and their existing install
+    // page tokens are left exactly as they were.
+    const msg = hosted ? hostedWelcomeEmail(rec.email, {
+      name: rec.name,
+      expiresAtMs: exp,
+      subscription: !!rec.subscriptionId,
+      lifetime: rec.lifetimeAccess === true,
+      firstPaymentAtMs: rec.firstActualPaymentAtMs ? null : rec.firstPaymentAtMs,
+      siteOrigin: cfg.siteOrigin,
+      hubOrigin: this.origin,
+      livemode: rec.livemode,
+      starterPack: starterPackEligible(rec),
+      dashboardUrl: hosted.ready ? hosted.appUrl : null,
+    }) : this.selfHostedWelcome(rec, cfg, exp, now);
+    const result = await sendEmail(cfg.email, msg, this.fetchLike);
+    if (result.ok) {
+      rec.welcomeSentAtMs = this.now();
+      rec.welcomeError = null;
+      rec.welcomeKind = hosted ? "hosted" : "self-hosted";
+      this.store.putCustomer(rec);
+      return `; ${hosted ? "hosted " : ""}welcome emailed to ${rec.email}`;
+    }
+    rec.welcomeError = result.error;
+    this.store.putCustomer(rec);
+    this.log(`[billing] welcome email to ${rec.email} failed: ${result.error}`);
+    return `; welcome email FAILED (${result.error})`;
+  }
+
+  /** Is this a managed-server purchase? A hosted-bundle plan, a bundle
+   *  subscription ledger entry, or a managed server already bound to the
+   *  customer all say yes; the server object is returned for its address. */
+  hostedPurchase(rec: CustomerRecord, cfg: BillingConfig = this.config()): { appUrl: string | null; ready: boolean } | null {
+    const server = this.recoveryDeps.hostedServerFor?.(rec) ?? null;
+    if (server) return server;
+    if (planByKey(cfg, rec.planKey)?.checkout === "hosted-bundle") return { appUrl: null, ready: false };
+    if (rec.subscriptionId && this.store.getBundleSubscription(rec.subscriptionId)) return { appUrl: null, ready: false };
+    return null;
+  }
+
+  private selfHostedWelcome(rec: CustomerRecord, cfg: BillingConfig, exp: number, now: number) {
     // A fresh page link every time we send; older links stop working.
     this.store.revokeTokens(rec.key, "page", now);
     const pageToken = this.store.mint("page", rec.licenseId, rec.key, now);
-    const exp = this.licenseExp(rec) ?? now;
-    const msg = welcomeEmail(rec.email, {
+    return welcomeEmail(rec.email, {
       name: rec.name,
       pageUrl: `${this.origin}/welcome/${pageToken}`,
       expiresAtMs: exp,
@@ -1937,17 +1982,6 @@ export class BillingService {
       livemode: rec.livemode,
       starterPack: starterPackEligible(rec),
     });
-    const result = await sendEmail(cfg.email, msg, this.fetchLike);
-    if (result.ok) {
-      rec.welcomeSentAtMs = this.now();
-      rec.welcomeError = null;
-      this.store.putCustomer(rec);
-      return `; welcome emailed to ${rec.email}`;
-    }
-    rec.welcomeError = result.error;
-    this.store.putCustomer(rec);
-    this.log(`[billing] welcome email to ${rec.email} failed: ${result.error}`);
-    return `; welcome email FAILED (${result.error})`;
   }
 
   async resendWelcome(customerKey: string): Promise<{ ok: true; sentTo: string } | { ok: false; status: number; error: string }> {
@@ -2200,7 +2234,7 @@ export class BillingService {
         ? (rec.subscriptionStatus?.startsWith("canceled") ? "Subscription cancelled — no further charges" : "Extends automatically when your subscription renews")
         : rec.lifetimeAccess ? "No recurring charge · technical licence renewal is automatic" : "One-time purchase",
       email: rec.email || "—",
-      installCommand: canInstall ? `curl -q -fsSL "${this.origin}/install/${installToken}" | sudo bash` : "",
+      installCommand: canInstall ? safeInstallCommand(`${this.origin}/install/${installToken}`) : "",
       noticeTitle: notice?.title ?? "",
       noticeText: notice?.text ?? "",
       noticeClass: notice?.cls ?? "",

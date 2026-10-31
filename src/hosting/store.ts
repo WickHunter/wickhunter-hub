@@ -73,6 +73,23 @@ export interface HostingDeletionHold {
   reason: string;
 }
 
+export interface HostingCredentialReset {
+  id: string;
+  nonce: string;
+  requestedAtMs: number;
+  requestedBy: "customer" | "operator";
+  actor: string;
+  expiresAtMs: number;
+  appliedAtMs: number | null;
+}
+
+export interface HostingCredentialResetEvent {
+  id: string;
+  atMs: number;
+  event: "requested" | "applied" | "failed" | "expired" | "emailed";
+  by: string;
+}
+
 export interface HostingInstanceRow {
   id: string;
   /** Billing customer key — the SAME key space as
@@ -117,6 +134,18 @@ export interface HostingInstanceRow {
    * configuration. The counter rejects replayed boot reports. */
   managementTokenHash: string | null;
   managementCounter: number;
+  /** A pending temporary-password reset for the hosted app (see
+   *  `HostingService.requestCredentialReset`). `nonce` is the only stored
+   *  input: the password is derived from it and `managementTokenHash`, the
+   *  same way the first password is derived from `bootstrapTokenHash`, and
+   *  the record is cleared as soon as the email carrying it is sent. Absent
+   *  on rows created before resets existed. */
+  credentialReset?: HostingCredentialReset | null;
+  /** Bounded audit trail of reset requests and outcomes (no secrets). */
+  credentialResetLog?: HostingCredentialResetEvent[];
+  /** Last authenticated poll from a management agent that can apply a
+   *  reset. Agents installed before resets existed never set this. */
+  credentialAgentSeenAtMs?: number | null;
   /** Exact signed-manifest identity pinned when this generation's cloud-init
    *  is built. Policy changes cannot move an in-flight instance to a newer
    *  customer artifact. */

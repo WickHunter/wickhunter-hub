@@ -249,6 +249,90 @@ unset WH_BOOTSTRAP_TOKEN
 `;
 }
 
+/** The management agent's temporary-password reset step. It asks the Hub
+ *  (with the management token, in a POST body) whether a reset is pending;
+ *  the Hub answers with a reset id and a nonce only. The new password is
+ *  derived here from the token's hash and the nonce, so it never crosses the
+ *  network and never appears in a process argument. It is applied through
+ *  the app's own first-boot contract — the same one the installer uses: with
+ *  no credential record and LIQHUNTER_BOOTSTRAP_PASSWORD in the service's
+ *  environment file, the app seeds a forced-change bootstrap credential. The
+ *  previous record is restored if the app does not prove the new one.
+ *  Every step checks its own status: callers run it as `credential_reset ||
+ *  true`, where errexit does not apply. */
+export const CREDENTIAL_RESET_BLOCK = `# BEGIN HOSTING CREDENTIAL RESET
+CRED_APP_DIR=/opt/wickhunter
+CRED_ENV_FILE=/etc/wickhunter/env
+CRED_STATE_DIR=/etc/wickhunter-hosting
+cred_post() { # cred_post <path suffix>; JSON body on stdin
+  curl -q -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 \\
+    -H 'content-type: application/json' --data-binary @- \\
+    "$HUB/api/hosting/instances/$INSTANCE/credential-reset$1"
+}
+cred_env_strip() {
+  local tmp
+  tmp=$(mktemp "$CRED_ENV_FILE.XXXXXX") || return 1
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  grep -v '^LIQHUNTER_BOOTSTRAP_PASSWORD=' "$CRED_ENV_FILE" > "$tmp"
+  [ "$?" -le 1 ] || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CRED_ENV_FILE"
+}
+cred_healthy() {
+  local _try body
+  for _try in $(seq 1 60); do
+    body=$(curl -q -fsS --max-time 5 http://127.0.0.1:8090/api/health 2>/dev/null || true)
+    if node -e 'const [r,v]=process.argv.slice(1);try{const x=JSON.parse(r);process.exit(x.ok===true&&x.version===v?0:1)}catch{process.exit(1)}' "$body" "$APP_VERSION"; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+cred_restart() { # queue a restart, then prove a NEW invocation is up and healthy
+  local before now _try
+  before=$(timeout --foreground 30s systemctl show wickhunter --property=InvocationID --value 2>/dev/null || true)
+  timeout --foreground 30s systemctl --no-block restart wickhunter || return 1
+  for _try in $(seq 1 96); do
+    now=$(timeout --foreground 10s systemctl show wickhunter --property=InvocationID --value 2>/dev/null || true)
+    if [ -n "$now" ] && [ "$now" != "$before" ] && timeout --foreground 10s systemctl is-active --quiet wickhunter; then
+      cred_healthy
+      return
+    fi
+    sleep 5
+  done
+  return 1
+}
+cred_confirm() { # cred_confirm <reset id> applied|failed
+  printf '{"managementToken":"%s","generation":%s,"resetId":"%s","outcome":"%s"}' "$TOKEN" "$GENERATION" "$1" "$2" | cred_post /confirm >/dev/null 2>&1
+}
+credential_reset() {
+  local reply pending reset_id nonce token_hash cred_pw backup record outcome=failed
+  reply=$(printf '{"managementToken":"%s","generation":%s}' "$TOKEN" "$GENERATION" | cred_post "" 2>/dev/null) || return 0
+  pending=$(printf '%s' "$reply" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const r=JSON.parse(s).reset;if(r&&/^cred_[A-Za-z0-9_-]{8,64}$/.test(r.id)&&/^[A-Za-z0-9_-]{16,64}$/.test(r.nonce))process.stdout.write(r.id+" "+r.nonce)}catch{}})') || return 0
+  [ -n "$pending" ] || return 0
+  reset_id=\${pending%% *}
+  nonce=\${pending#* }
+  record="$CRED_APP_DIR/data/app-credential.json"
+  backup="$CRED_STATE_DIR/app-credential.$reset_id.json"
+  if [ ! -s "$record" ] || ! cp -p "$record" "$backup"; then cred_confirm "$reset_id" failed; return 1; fi
+  chmod 600 "$backup"
+  token_hash=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
+  cred_pw=$(printf '%s' "$token_hash:reset:$nonce" | sha256sum | cut -c1-24)
+  unset token_hash
+  if cred_env_strip && printf 'LIQHUNTER_BOOTSTRAP_PASSWORD=%s\\n' "$cred_pw" >> "$CRED_ENV_FILE" && rm -f "$record" \\
+    && cred_restart \\
+    && node -e 'const fs=require("fs");const [f,b]=process.argv.slice(1);const x=JSON.parse(fs.readFileSync(f,"utf8")),old=JSON.parse(fs.readFileSync(b,"utf8"));process.exit(x.createdFrom==="bootstrap"&&x.mustChange===true&&typeof x.hash==="string"&&x.hash&&x.hash!==old.hash?0:1)' "$record" "$backup"; then
+    outcome=applied
+  fi
+  unset cred_pw
+  # The plaintext copy never outlives the seeding restart, whatever happened.
+  cred_env_strip || sed -i '/^LIQHUNTER_BOOTSTRAP_PASSWORD=/d' "$CRED_ENV_FILE"
+  if [ "$outcome" != applied ]; then cp -p "$backup" "$record"; fi
+  cred_restart
+  rm -f "$backup"
+  cred_confirm "$reset_id" "$outcome"
+  [ "$outcome" = applied ]
+}
+# END HOSTING CREDENTIAL RESET`;
+
 function managementAgentScript(input: BootstrapInput, probeLines: string): string {
   return `#!/usr/bin/env bash
 set -euo pipefail
@@ -273,6 +357,9 @@ for _try in $(seq 1 60); do
   sleep 5
 done
 [ "$healthy" -eq 1 ] || exit 1
+
+${CREDENTIAL_RESET_BLOCK}
+credential_reset || true
 
 RESULTS=""
 probe() {

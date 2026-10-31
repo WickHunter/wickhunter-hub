@@ -38,11 +38,12 @@ import { launchGrant } from "../billing/launch.js";
 import type { StripeObject } from "../earn-stripe-api.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
-import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold } from "./store.js";
+import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold, type HostingCredentialResetEvent } from "./store.js";
 import { hostingPriceCoversCost, readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
 import { deadlines, type HostingDeadlines, type HostingEndReason } from "./deadlines.js";
 import { readinessVerdict, type ProbeResult, type ReadinessVerdict } from "./readiness.js";
-import { bootstrapPasswordFromTokenHash, hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
+import { customerFailureMessage, supportReference } from "./customer-messages.js";
+import { bootstrapPasswordFromTokenHash, credentialResetPassword, hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
 import { buildBootstrapUserData } from "./bootstrap.js";
 import * as tmpl from "./emails.js";
 
@@ -133,7 +134,12 @@ export type HostingActionError =
   /** Renewal cannot be resumed: the Hub's mirror of Stripe says the
    *  subscription is not being billed, or a charge on it was refunded or
    *  disputed (see `reverseScheduledCancellation`). */
-  | "SUBSCRIPTION_NOT_ACTIVE";
+  | "SUBSCRIPTION_NOT_ACTIVE"
+  /** A temporary-password reset was refused: too many recent requests. */
+  | "RATE_LIMITED"
+  /** A temporary-password reset cannot be applied to this server (stage, or
+   *  a management agent that predates resets). */
+  | "RESET_UNAVAILABLE";
 
 export type HostingActionResult<T> = { ok: true; value: T } | { ok: false; code: HostingActionError; error: string };
 
@@ -315,7 +321,7 @@ export class HostingService {
     const body = new URLSearchParams({
       mode: "subscription", customer: ownerId, client_reference_id: ownerId,
       "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
-      success_url: `${this.origin}/customer?hosting=checkout-success#hosting`,
+      success_url: `${this.origin}/customer?hosting=checkout-success&session_id={CHECKOUT_SESSION_ID}#hosting`,
       cancel_url: `${this.origin}/customer?hosting=checkout-cancelled#hosting`,
       "metadata[plan]": planKey, "metadata[role]": "hosting", "metadata[owner]": ownerId,
       "subscription_data[metadata][plan]": planKey, "subscription_data[metadata][role]": "hosting",
@@ -1177,7 +1183,11 @@ export class HostingService {
 
   private async runJob(job: HostingOutboxRow, nowMs: number): Promise<void> {
     const row = this.store.getInstance(job.hostingInstanceId);
-    if (!row || row.lifecycleVersion !== job.lifecycleVersion || row.generation !== job.generation) return; // superseded — nothing to do, "sent" (obsolete-in-effect)
+    // A reset password email is tied to the reset it carries, not to the
+    // billing lifecycle: a renewal landing between the server applying the
+    // reset and this send must not strand the customer without it.
+    const lifecycleBound = !(job.jobType === "email" && job.payload.template === "credential_reset");
+    if (!row || (lifecycleBound && row.lifecycleVersion !== job.lifecycleVersion) || row.generation !== job.generation) return; // superseded — nothing to do, "sent" (obsolete-in-effect)
     switch (job.jobType) {
       case "provision": return this.drainProvision(row, nowMs);
       case "readiness_recheck": return this.drainReadinessRecheck(row, job, nowMs);
@@ -1201,7 +1211,7 @@ export class HostingService {
           this.log(`[hosting] ${row.id}: "${template}" deletion reminder suppressed — on an admin deletion hold (by ${row.deletionHold.by})`);
           return;
         }
-        return this.drainEmail(row, template, nowMs);
+        return this.drainEmail(row, template, nowMs, job.payload);
       }
       default: return;
     }
@@ -1468,7 +1478,7 @@ export class HostingService {
     this.store.enqueue({ hostingInstanceId: row.id, lifecycleVersion: row.lifecycleVersion, generation: row.generation, jobType: "email", dedupeKey: `email:setup_failure:${row.id}:g${row.generation}`, availableAtMs: nowMs, payload: { template: "setup_failure" } }, nowMs);
     const sub = this.billing.store.getRoleSubscription(row.ownerId, "hosting");
     if (sub?.subscriptionId) this.enqueueStripeCancellation(row, sub.subscriptionId, "setup-failure", nowMs);
-    this.log(`[hosting] ${row.id}: provisioning permanently failed — ${reason}. Recommended policy: refund the initial hosting payment (idempotent, operator-verified — see report).`);
+    this.log(`[hosting] ${row.id}: provisioning permanently failed — ${reason} (support reference ${customerFailureMessage(row.id, reason).reference}). Recommended policy: refund the initial hosting payment (idempotent, operator-verified — see report).`);
   }
 
   // ── suspend / delete ─────────────────────────────────────────────────────
@@ -1576,16 +1586,128 @@ export class HostingService {
     this.log(`[hosting] ${row.id}: LATE PAYMENT after deletion — operator payment resolution is required; tell the customer to buy a fresh VPS only after it is confirmed. Never mark this instance ready.`);
   }
 
+  // ── temporary dashboard password reset ──────────────────────────────────
+  // The first temporary password is derived from the bootstrap proof and that
+  // proof is erased once the ready email is sent, so it can never be resent.
+  // A reset instead issues a fresh nonce. The VPS's management agent polls
+  // with its management token, derives the new password from that token's
+  // hash and the nonce, seeds it into the app as a forced-change bootstrap
+  // credential, and confirms. Only then does the Hub derive the same value
+  // (from the stored token hash) for the email, and forget the nonce.
+
+  /** Can a customer start a reset right now? Null when yes. */
+  credentialResetIssue(row: HostingInstanceRow, nowMs = this.now()): string | null {
+    if (!CREDENTIAL_RESET_STAGES.has(row.stage) || !row.managementTokenHash) return "Password reset is available once your server is running.";
+    if (row.credentialAgentSeenAtMs == null || nowMs - row.credentialAgentSeenAtMs > CREDENTIAL_AGENT_FRESH_MS) {
+      return "This server cannot reset its password automatically. Contact support and we will reset it for you.";
+    }
+    return null;
+  }
+
+  async requestCredentialReset(instanceId: string, origin: { kind: "customer" | "operator"; by: string }, nowMs = this.now()): Promise<HostingActionResult<{ resetId: string; alreadyPending: boolean; expiresAtMs: number }>> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
+    const pending = row.credentialReset && row.credentialReset.expiresAtMs > nowMs ? row.credentialReset : null;
+    if (pending) return { ok: true, value: { resetId: pending.id, alreadyPending: true, expiresAtMs: pending.expiresAtMs } };
+    if (origin.kind === "customer") {
+      const issue = this.credentialResetIssue(row, nowMs);
+      if (issue) return { ok: false, code: "RESET_UNAVAILABLE", error: issue };
+      const recent = (row.credentialResetLog ?? []).filter((e) => e.event === "requested" && e.by.startsWith("customer") && nowMs - e.atMs < DAY_MS).length;
+      if (recent >= CUSTOMER_RESETS_PER_DAY) return { ok: false, code: "RATE_LIMITED", error: `You can request a new password ${CUSTOMER_RESETS_PER_DAY} times a day. Try again tomorrow or contact support.` };
+    } else if (!CREDENTIAL_RESET_STAGES.has(row.stage) || !row.managementTokenHash) {
+      return { ok: false, code: "RESET_UNAVAILABLE", error: `cannot reset the app password while the instance is ${row.stage}` };
+    }
+    const reset = {
+      id: this.store.newId("cred"), nonce: this.randomBytes(24).toString("base64url"),
+      requestedAtMs: nowMs, requestedBy: origin.kind, actor: origin.by.slice(0, 80), expiresAtMs: nowMs + CREDENTIAL_RESET_TTL_MS, appliedAtMs: null,
+    };
+    const actor = `${origin.kind}${origin.by ? `:${origin.by.slice(0, 80)}` : ""}`;
+    const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      d.credentialReset = reset;
+      d.credentialResetLog = appendResetLog(d.credentialResetLog, { id: reset.id, atMs: nowMs, event: "requested", by: actor });
+    }, nowMs);
+    if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+    this.log(`[hosting] ${row.id}: temporary app password reset ${reset.id} requested by ${actor}${row.credentialAgentSeenAtMs == null ? " (no reset-capable agent has polled yet — it applies only once one does)" : ""}`);
+    return { ok: true, value: { resetId: reset.id, alreadyPending: false, expiresAtMs: reset.expiresAtMs } };
+  }
+
+  private authenticatedManagementAgent(instanceId: string, presentedToken: string, generation: number): HostingInstanceRow | null {
+    const row = this.store.getInstance(instanceId);
+    if (!row || row.generation !== generation || !row.managementTokenHash || TERMINAL_ISH.has(row.stage)) return null;
+    return hashBootstrapToken(presentedToken) === row.managementTokenHash ? row : null;
+  }
+
+  /** The agent's poll. Returns only the nonce — never a password. */
+  pollCredentialReset(instanceId: string, presentedToken: string, generation: number, nowMs = this.now()): HostingActionResult<{ reset: { id: string; nonce: string } | null }> {
+    const row = this.authenticatedManagementAgent(instanceId, presentedToken, generation);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "invalid management proof" };
+    const pending = row.credentialReset ?? null;
+    const expired = pending !== null && pending.appliedAtMs === null && pending.expiresAtMs <= nowMs;
+    const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      d.credentialAgentSeenAtMs = nowMs;
+      if (expired) {
+        d.credentialReset = null;
+        d.credentialResetLog = appendResetLog(d.credentialResetLog, { id: pending!.id, atMs: nowMs, event: "expired", by: "agent" });
+      }
+    }, nowMs);
+    if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+    if (expired) this.log(`[hosting] ${row.id}: temporary app password reset ${pending!.id} expired before the server picked it up`);
+    const live = fresh.credentialReset;
+    return { ok: true, value: { reset: live && live.appliedAtMs === null ? { id: live.id, nonce: live.nonce } : null } };
+  }
+
+  confirmCredentialReset(instanceId: string, presentedToken: string, generation: number, resetId: string, outcome: "applied" | "failed", nowMs = this.now()): HostingActionResult<{ emailQueued: boolean }> {
+    const row = this.authenticatedManagementAgent(instanceId, presentedToken, generation);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "invalid management proof" };
+    const pending = row.credentialReset;
+    if (!pending || pending.id !== resetId) return { ok: false, code: "NOT_FOUND", error: "no such pending reset" };
+    if (pending.appliedAtMs !== null) return { ok: true, value: { emailQueued: true } };
+    const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      d.credentialAgentSeenAtMs = nowMs;
+      if (outcome === "applied") d.credentialReset = { ...pending, appliedAtMs: nowMs };
+      else d.credentialReset = null;
+      d.credentialResetLog = appendResetLog(d.credentialResetLog, { id: pending.id, atMs: nowMs, event: outcome, by: "agent" });
+    }, nowMs);
+    if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
+    if (outcome === "failed") {
+      this.log(`[hosting] ${row.id}: the server could not apply temporary app password reset ${pending.id}; its previous password was restored`);
+      return { ok: true, value: { emailQueued: false } };
+    }
+    this.store.enqueue({ hostingInstanceId: fresh.id, lifecycleVersion: fresh.lifecycleVersion, generation: fresh.generation, jobType: "email", dedupeKey: `email:credential_reset:${fresh.id}:${pending.id}`, availableAtMs: nowMs, payload: { template: "credential_reset", resetId: pending.id } }, nowMs);
+    this.log(`[hosting] ${row.id}: temporary app password reset ${pending.id} applied on the server; emailing the owner`);
+    return { ok: true, value: { emailQueued: true } };
+  }
+
+  /** Customer-facing reset state for the account page. */
+  private credentialResetView(row: HostingInstanceRow, nowMs: number): HostingCredentialResetView {
+    const last = (row.credentialResetLog ?? []).at(-1) ?? null;
+    const pending = row.credentialReset && (row.credentialReset.appliedAtMs !== null || row.credentialReset.expiresAtMs > nowMs) ? row.credentialReset : null;
+    const status: HostingCredentialResetView["status"] = pending ? (pending.appliedAtMs !== null ? "emailing" : "pending")
+      : last?.event === "emailed" ? "emailed" : last?.event === "failed" ? "failed" : last?.event === "expired" ? "expired" : null;
+    const issue = this.credentialResetIssue(row, nowMs);
+    return { available: issue === null || pending !== null, unavailableReason: pending ? null : issue, status, atMs: pending?.requestedAtMs ?? last?.atMs ?? null, reference: status === "failed" || status === "expired" ? supportReference(row.id, `credential-reset:${last!.id}`) : null };
+  }
+
   // ── emails ────────────────────────────────────────────────────────────────
 
-  private async drainEmail(row: HostingInstanceRow, template: string, nowMs: number): Promise<void> {
+  private async drainEmail(row: HostingInstanceRow, template: string, nowMs: number, payload: Record<string, unknown> = {}): Promise<void> {
     const cfg = this.billing.config().email;
     const email = this.emailFor(row.ownerId);
     if (!email) { this.log(`[hosting] ${row.id}: no email on file for ${row.ownerId} — cannot send "${template}"`); return; }
-    const msg = this.buildEmail(row, template, cfg, nowMs);
+    const msg = this.buildEmail(row, template, cfg, nowMs, payload);
     if (!msg) return;
     const r = await sendEmail(cfg, { ...msg, to: email }, this.fetchLike);
     if (!r.ok) throw new Error(`send failed: ${r.error}`);
+    if (template === "credential_reset") {
+      const current = this.store.getInstance(row.id);
+      if (current?.credentialReset) {
+        const resetId = current.credentialReset.id;
+        this.store.updateInstance(current.id, current.version, (d) => {
+          d.credentialReset = null;
+          d.credentialResetLog = appendResetLog(d.credentialResetLog, { id: resetId, atMs: nowMs, event: "emailed", by: "hub" });
+        }, nowMs);
+      }
+    }
     if (template === "installation_ready") {
       const current = this.store.getInstance(row.id);
       if (current) this.store.updateInstance(current.id, current.version, (d) => {
@@ -1614,7 +1736,7 @@ export class HostingService {
     return plan?.checkout === "hosted-bundle" ? plan : null;
   }
 
-  private buildEmail(row: HostingInstanceRow, template: string, cfg: EmailConfig, nowMs: number) {
+  private buildEmail(row: HostingInstanceRow, template: string, cfg: EmailConfig, nowMs: number, payload: Record<string, unknown> = {}) {
     const policy = this.policy();
     const ref = row.id;
     const manageUrl = `${this.origin}/customer#hosting`;
@@ -1632,6 +1754,17 @@ export class HostingService {
           maximumConnectedAccounts: policy.maximumConnectedAccounts,
           billingSummary: bundlePlan?.lifetime ? `Your Lifetime software purchase remains yours. VPS hosting renews at ${bundlePrice} per month.` : bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
+      case "credential_reset": {
+        // Only the reset this job was queued for, and only once the server
+        // confirmed it: a superseded or unapplied reset sends nothing.
+        const reset = row.credentialReset;
+        if (!reset || reset.id !== payload.resetId || reset.appliedAtMs === null || !row.managementTokenHash) return null;
+        return tmpl.credentialResetEmail("", {
+          instanceReference: ref, appUrl: row.appUrl ?? "", appUsername: "admin", accountUrl: manageUrl,
+          temporaryPassword: credentialResetPassword(row.managementTokenHash, reset.nonce),
+          requestedBy: reset.requestedBy,
+        });
+      }
       case "cancellation_scheduled":
         return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan && !bundlePlan.lifetime);
       case "overdue":
@@ -1647,7 +1780,7 @@ export class HostingService {
       case "terminated":
         return tmpl.terminatedEmail("", ref, row.terminatedAtMs ?? nowMs, "Hosting billing has been stopped for this server.", manageUrl);
       case "setup_failure":
-        return tmpl.exceptionEmail("", "setup_failure", ref, row.failureReason ?? "Setup did not complete.", manageUrl);
+        return tmpl.exceptionEmail("", "setup_failure", ref, setupFailureDetail(row), manageUrl);
       case "late_payment":
         return tmpl.exceptionEmail("", "late_payment_after_deletion", ref, "This server was already permanently deleted and its data cannot be recovered. Support must confirm the hosting payment resolution before any refund is considered complete.", manageUrl);
       default:
@@ -1884,7 +2017,7 @@ export class HostingService {
     }
     return {
       available: true, hasInstance: true, note: null, plans: this.hostingPlanKeys(), monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, maximumConnectedAccounts: policy.maximumConnectedAccounts,
-      instance: instanceView(row, policy, nowMs, this.bundlePlanForOwner(row.ownerId)),
+      instance: { ...instanceView(row, policy, nowMs, this.bundlePlanForOwner(row.ownerId)), credentialReset: this.credentialResetView(row, nowMs) },
     };
   }
 }
@@ -1902,7 +2035,11 @@ export interface HostingInstanceView {
   suspendAtMs: number | null;
   deleteAtMs: number | null;
   cancellationReason: string | null;
+  /** Customer-safe sentence (src/hosting/customer-messages.ts) — never the
+   *  raw operator reason, which stays in the admin instance list and logs. */
   failureReason: string | null;
+  /** Support reference for `failureReason`; null when there is none. */
+  supportReference: string | null;
   /** True while an admin deletion hold is in effect on this instance. When
    *  true, `suspendAtMs`/`deleteAtMs` are masked to `null` (no dates) and
    *  `failureReason` carries the one customer-safe sentence — see
@@ -1915,6 +2052,17 @@ export interface HostingInstanceView {
   softwareLifetime: boolean;
   billingPriceLabel: string;
   billingInterval: "month" | "year";
+  credentialReset: HostingCredentialResetView;
+}
+export interface HostingCredentialResetView {
+  /** True when the customer may press "Email me a new temporary password". */
+  available: boolean;
+  unavailableReason: string | null;
+  /** pending: waiting for the server; emailing: applied, email queued;
+   *  emailed / failed / expired: the last finished request. */
+  status: "pending" | "emailing" | "emailed" | "failed" | "expired" | null;
+  atMs: number | null;
+  reference: string | null;
 }
 export interface HostingCustomerView {
   available: boolean;
@@ -1926,12 +2074,13 @@ export interface HostingCustomerView {
   instance: HostingInstanceView | null;
 }
 
-function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number, bundlePlan: import("../billing/config.js").Plan | null): HostingInstanceView {
+function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: number, bundlePlan: import("../billing/config.js").Plan | null): Omit<HostingInstanceView, "credentialReset"> {
   // On hold: no dates ("Scheduled for permanent deletion at …" would be a
   // lie — the pipeline is paused), and the one customer-safe sentence in
   // place of any real failureReason (an operational failure note is not
   // what is going on here, and stacking both would read as two problems).
   const onHold = row.deletionHold !== null;
+  const failure = !onHold && row.failureReason ? customerFailureMessage(row.id, row.failureReason) : null;
   return {
     id: row.id, stage: row.stage, operationalHealth: row.operationalHealth,
     region: row.region, regionLabel: policy.regions.find((r) => r.id === row.region)?.label ?? row.region,
@@ -1940,7 +2089,8 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     suspendAtMs: onHold ? null : row.suspendAtMs,
     deleteAtMs: onHold ? null : row.deleteAtMs,
     cancellationReason: row.cancellationReason,
-    failureReason: onHold ? "This server is on hold by support." : row.failureReason,
+    failureReason: onHold ? "This server is on hold by support." : failure?.message ?? null,
+    supportReference: failure?.reference ?? null,
     onHold,
     monthlyPriceLabel: `$${(policy.monthlyPriceCents / 100).toFixed(2)}`, managedBackupsIncluded: policy.managedBackupsIncluded,
     maximumConnectedAccounts: policy.maximumConnectedAccounts,
@@ -1949,6 +2099,26 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     billingPriceLabel: bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
     billingInterval: bundlePlan?.interval === "year" ? "year" : "month",
   };
+}
+
+/** The customer-facing sentence for a failed setup email: never the raw
+ *  operator reason (a cost ceiling or margin check is not the customer's
+ *  business), always a reference support can match to it. */
+function setupFailureDetail(row: HostingInstanceRow): string {
+  if (!row.failureReason) return "The server did not finish installing.";
+  return `Support reference: ${customerFailureMessage(row.id, row.failureReason).reference}.`;
+}
+
+/** Stages whose app is installed and whose management agent is running. */
+const CREDENTIAL_RESET_STAGES = new Set<HostingStage>(["ready", "active", "past_due", "cancel_scheduled"]);
+const CREDENTIAL_RESET_TTL_MS = 2 * 60 * 60 * 1000;
+/** The agent polls every five minutes; a day of silence means it is off,
+ *  or it predates resets and never polled at all. */
+const CREDENTIAL_AGENT_FRESH_MS = 24 * 60 * 60 * 1000;
+const CUSTOMER_RESETS_PER_DAY = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
+function appendResetLog(log: HostingCredentialResetEvent[] | undefined, event: HostingCredentialResetEvent): HostingCredentialResetEvent[] {
+  return [...(log ?? []), event].slice(-30);
 }
 
 const RECOVERABLE_STAGES = new Set<HostingStage>(["past_due", "cancel_scheduled", "suspended", "restoring"]);

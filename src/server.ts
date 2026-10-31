@@ -189,6 +189,8 @@ import {
   HostingPolicyError,
 } from "./hosting/policy.js";
 import { classifyProbeStatus, type ProbeResult } from "./hosting/readiness.js";
+import { customerFailureMessage, customerCheckoutMessage } from "./hosting/customer-messages.js";
+import { safeInstallCommand } from "./billing/email.js";
 
 /** The provider fetcher for the market-cap producer. A separate shape from the
  *  candles' `FetchLike` because this one carries an API-key HEADER — which is
@@ -426,6 +428,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   catch { console.warn('[notifications] Saved notification state needs repair; billing remains available.'); }
   const billing: BillingService = new BillingService(cfg.dataDir, store, cfg.publicOrigin, cfg.templatesDir, {
     recoveryCheckpoint: deps.billingRecoveryCheckpoint,
+    hostedServerFor: rec => {
+      if (!hostingRef) return null;
+      for (const k of [rec.key, rec.stripeCustomerId, `email:${normalizeCustomerEmail(rec.email)}`]) {
+        if (!k) continue;
+        const row = hostingRef.store.activeInstanceForOwner(k, rec.livemode ? "live" : "test");
+        // An unpaid add-on checkout reservation is not a hosted purchase.
+        if (row && (row.stage !== "ordered" || row.stripeSubscriptionId)) return { appUrl: row.appUrl, ready: ["ready", "active", "past_due", "cancel_scheduled"].includes(row.stage) };
+      }
+      return null;
+    },
     recoveryHostingActive: rec => !hostingRef || [rec.key,rec.stripeCustomerId,`email:${normalizeCustomerEmail(rec.email)}`].some(k=>hostingRef!.store.activeInstanceForOwner(k,"live") || hostingRef!.store.activeInstanceForOwner(k,"test")),
     deviceRecoverySnapshot: licenseId => {
       if(!licenseLeases)throw Error("Machine recovery is unavailable");
@@ -741,7 +753,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET") {
       if (p === "/install.sh" || p === "/api/latest" || p === "/billing"
         || p === "/api/hub/liq-percentiles"
-        || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state"
+        || p === "/customer" || p === "/customer/signin" || p === "/api/customer/state" || p === "/api/checkout/summary"
         || p === "/api/hosting") return true;
       if (p.startsWith("/download/") || p.startsWith("/welcome/") || p.startsWith("/install/")) return true;
       return false;
@@ -764,8 +776,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       // token routes above it).
       if (p === "/api/hosting/checkout") return true;
       if (p === "/api/hosting/bundle-checkout") return true;
-      if (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal"))) return true;
-      if (p.startsWith("/api/hosting/instances/") && (p.endsWith("/installer") || p.endsWith("/readiness"))) return true;
+      if (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal") || p.endsWith("/reset-password"))) return true;
+      if (p.startsWith("/api/hosting/instances/") && (p.endsWith("/installer") || p.endsWith("/readiness") || p.endsWith("/credential-reset") || p.endsWith("/credential-reset/confirm"))) return true;
       return false;
     }
     return false;
@@ -798,7 +810,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const customerCookieWrite = m === "POST" && (
       (p === "/api/customer/install-command" || p === "/api/customer/replacement-license-key" || p === "/api/customer/license-key") || p === "/api/customer/portal"
       || p === "/api/customer/signout" || p === "/api/hosting/checkout"
-      || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal")))
+      || (p.startsWith("/api/hosting/") && (p.endsWith("/cancel") || p.endsWith("/resume-renewal") || (p.endsWith("/reset-password") && !p.startsWith("/api/hosting/instances/"))))
     );
     if (customerCookieWrite) {
       const origin = req.headers.origin;
@@ -1099,6 +1111,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "GET" && p === "/earn") return earnCustomer(req, res, url);
     if (/^\/api\/(customer|hub)\/earn(?:\/(uid|activate|onboard|refresh|payout-preference))?$/.test(p)) return earnCustomer(req, res, url);
     if (m === "GET" && p === "/customer") return customerPage(res);
+    if (m === "GET" && p === "/api/checkout/summary") return checkoutSummary(url, res);
     if (m === "GET" && p === "/customer/signin") return customerSigninExchange(req, url, res);
     if (m === "POST" && p === "/api/customer/signin") return customerRequestSignin(req, res);
     if (m === "GET" && p === "/api/customer/state") return customerState(req, res);
@@ -1139,6 +1152,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     if (m === "POST" && p.startsWith("/api/hosting/") && p.endsWith("/resume-renewal")) return hostingResumeRenewal(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/installer")) return hostingInstaller(req, res, p);
     if (m === "POST" && p.startsWith("/api/hosting/instances/") && p.endsWith("/readiness")) return hostingReadinessCallback(req, res, p);
+    if (m === "POST" && p.startsWith("/api/hosting/instances/") && (p.endsWith("/credential-reset") || p.endsWith("/credential-reset/confirm"))) return hostingCredentialAgent(req, res, p);
+    if (m === "POST" && p.startsWith("/api/hosting/") && !p.startsWith("/api/hosting/instances/") && p.endsWith("/reset-password")) return hostingResetPassword(req, res, p);
     if (m === "GET" && (p === "/admin" || p === "/admin/")) return adminPage(res);
     if (p.startsWith("/admin/api/")) return adminApi(req, res, url);
     sendJson(res, 404, { ok: false, error: "not found" });
@@ -1549,21 +1564,26 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   /** Shared gate for install.sh / latest / download. Sends the 403 itself.
    *  The installer keeps its query-only contract; the updater's two read
    *  routes prefer x-license and retain query compatibility for old clients. */
+  const LICENSE_REFUSAL_TEXT: Record<"format" | "signature" | "payload" | "expired" | "revoked", string> = {
+    expired: "this licence has lapsed. Renew it from your account page, then run the install command again.",
+    revoked: "this licence has been revoked. Contact support if you think this is a mistake.",
+    format: "this licence key is not valid. Copy the install command again from your account page.",
+    signature: "this licence key is not valid. Copy the install command again from your account page.",
+    payload: "this licence key is not valid. Copy the install command again from your account page.",
+  };
   function requireKey(url: URL, res: ServerResponse, req?: IncomingMessage): LicensePayload | null {
     const v = store.verify(req ? licenseTokenOf(req, url) : (url.searchParams.get("key") ?? ""));
     if (v.ok) return v.payload;
     // Plain-text 403 (these endpoints feed curl, not a JSON client). The
     // reason is safe to disclose: the caller already holds the token.
     res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
-    res.end(`forbidden: license ${v.reason}\n`);
+    res.end(`Wick Hunter: ${LICENSE_REFUSAL_TEXT[v.reason]} (licence ${v.reason})\n`);
     return null;
   }
 
   async function installScript(url: URL, res: ServerResponse): Promise<void> {
     if (!requireKey(url, res)) return;
-    if (!readLatest()) {
-      return sendJson(res, 503, { ok: false, error: "no authenticated release is available" });
-    }
+    if (!readLatest()) return sendText(res, 503, "Wick Hunter: no release is published right now. Try again in a few minutes.\n");
     sendInstaller(res, url.searchParams.get("key")!);
   }
 
@@ -1669,10 +1689,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   function installByToken(p: string, res: ServerResponse): void {
-    if (!readLatest()) return sendText(res, 503, "no release is published on the Hub yet — try again later");
+    // Plain one-line reasons: the install command prints them verbatim.
+    if (!readLatest()) return sendText(res, 503, "Wick Hunter: no release is published right now. Try again in a few minutes.\n");
     const r = billing.installByToken(decodeURIComponent(p.slice("/install/".length)));
-    if (!r.ok) return sendText(res, r.status, `forbidden: ${r.text}`);
+    if (!r.ok) return sendText(res, r.status, `Wick Hunter: install stopped — ${r.text}.\n`);
     sendInstaller(res, r.licenseToken);
+  }
+
+  function maskEmail(email: string): string {
+    const [user = "", domain = ""] = email.split("@");
+    if (!user || !domain) return "";
+    const dot = domain.lastIndexOf(".");
+    const host = dot > 0 ? domain.slice(0, dot) : domain;
+    return `${user[0]}${"•".repeat(Math.min(6, Math.max(2, user.length - 1)))}@${host[0]}${"•".repeat(Math.min(6, Math.max(2, host.length - 1)))}${dot > 0 ? domain.slice(dot) : ""}`;
   }
 
   function notFoundPage(message: string): string {
@@ -1891,7 +1920,12 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     let ownerId = candidates[0] ?? `email:${identity.email}`;
     for (const key of candidates) if (hosting.store.activeInstanceForOwner(key, "live") || hosting.store.activeInstanceForOwner(key, "test")) { ownerId = key; break; }
     const r = await hosting.checkoutUrl(ownerId, identity.email);
-    if (!r.ok) return sendJson(res, r.code === "SOFTWARE_LICENSE_REQUIRED" ? 403 : r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    if (!r.ok) {
+      // The raw refusal can name provider cost, margin or Stripe setup; it is
+      // for the operator log. The customer gets a plain sentence.
+      if (r.code !== "SOFTWARE_LICENSE_REQUIRED" && r.code !== "HOSTING_ALREADY_EXISTS") console.warn(`[hosting] checkout refused for ${ownerId}: ${r.code}: ${r.error}`);
+      return sendJson(res, r.code === "SOFTWARE_LICENSE_REQUIRED" ? 403 : r.code === "HOSTING_ALREADY_EXISTS" ? 409 : 503, { ok: false, code: r.code, error: customerCheckoutMessage(r.code) }, { "cache-control": "no-store" });
+    }
     sendJson(res, 200, { ok: true, url: r.value.url }, { "cache-control": "no-store" });
   }
 
@@ -1926,6 +1960,71 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const r = await hosting.resumeRenewal(owner, instanceId);
     if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, stage: r.value.stage }, { "cache-control": "no-store" });
+  }
+
+  /** POST /api/hosting/:id/reset-password — the signed-in owner asks for a
+   *  new temporary dashboard password. The password is never in the response:
+   *  it is emailed to the account address once the server has applied it. */
+  async function hostingResetPassword(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const identity = authenticatedCustomer(req);
+    if (!identity) return sendJson(res, 401, { ok: false, error: "sign in required" }, { "cache-control": "no-store" });
+    const instanceId = p.slice("/api/hosting/".length, -"/reset-password".length);
+    const owner = hostingResolveOwner(identity, instanceId);
+    if (!owner) return sendJson(res, 404, { ok: false, error: "unknown hosting instance" }, { "cache-control": "no-store" });
+    const r = await hosting.requestCredentialReset(instanceId, { kind: "customer", by: identity.email });
+    if (!r.ok) return sendJson(res, r.code === "RATE_LIMITED" ? 429 : r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true, alreadyPending: r.value.alreadyPending, message: "Your server will apply a new temporary password within about ten minutes, then we email it to you. Your dashboard restarts briefly while it does." }, { "cache-control": "no-store" });
+  }
+
+  /** POST /api/hosting/instances/:id/credential-reset[/confirm] — the VPS's
+   *  management agent, authenticated by its management token. */
+  async function hostingCredentialAgent(req: IncomingMessage, res: ServerResponse, p: string): Promise<void> {
+    const confirm = p.endsWith("/confirm");
+    const instanceId = p.slice("/api/hosting/instances/".length, -(confirm ? "/credential-reset/confirm" : "/credential-reset").length);
+    const body = await readJsonBody(req);
+    if (body === null || typeof body.managementToken !== "string" || typeof body.generation !== "number") {
+      return sendJson(res, 400, { ok: false, error: "expected {managementToken, generation}" }, { "cache-control": "no-store" });
+    }
+    if (!confirm) {
+      const r = hosting.pollCredentialReset(instanceId, body.managementToken, body.generation);
+      if (!r.ok) return sendJson(res, 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, reset: r.value.reset }, { "cache-control": "no-store" });
+    }
+    if (typeof body.resetId !== "string" || (body.outcome !== "applied" && body.outcome !== "failed")) {
+      return sendJson(res, 400, { ok: false, error: "expected {resetId, outcome: applied|failed}" }, { "cache-control": "no-store" });
+    }
+    const r = hosting.confirmCredentialReset(instanceId, body.managementToken, body.generation, body.resetId, body.outcome);
+    if (!r.ok) return sendJson(res, 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    sendJson(res, 200, { ok: true }, { "cache-control": "no-store" });
+  }
+
+  /** GET /api/checkout/summary?session_id=cs_… — what Stripe's success
+   *  redirect lands on before the buyer has signed in. The Checkout Session id
+   *  is the only input (Stripe puts it in the success URL); the answer is
+   *  deliberately small: product kind, plan name, a masked email and the
+   *  managed server's stage. Unknown or not-yet-processed ids both answer
+   *  "processing", so the endpoint cannot be used to test which ids exist. */
+  function checkoutSummary(url: URL, res: ServerResponse): void {
+    const headers = { "cache-control": "no-store" };
+    const sessionId = url.searchParams.get("session_id") ?? "";
+    if (!/^cs_(test|live)_[A-Za-z0-9]{8,200}$/.test(sessionId)) return sendJson(res, 400, { ok: false, error: "invalid checkout reference" }, headers);
+    const marker = `cs:${sessionId}`;
+    let rec = Object.values(billing.store.customers()).find((c) => c.chargeIds.includes(marker)) ?? null;
+    const role = rec ? null : Object.values(billing.store.roleSubscriptions()).find((r) => r.role === "hosting" && r.chargeIds.includes(marker)) ?? null;
+    if (!rec && role) rec = billing.store.getCustomer(role.customerKey);
+    if (!rec) return sendJson(res, 200, { ok: true, status: "processing" }, headers);
+    const plan = rec.planKey ? billing.plan(rec.planKey) : null;
+    const hosted = !!role || billing.hostedPurchase(rec) !== null;
+    let server: { stage: string; ready: boolean } | null = null;
+    for (const k of [rec.key, rec.stripeCustomerId, `email:${normalizeCustomerEmail(rec.email)}`]) {
+      const row = k ? hosting.store.activeInstanceForOwner(k, rec.livemode ? "live" : "test") : null;
+      if (row) { server = { stage: row.stage, ready: ["ready", "active", "past_due", "cancel_scheduled"].includes(row.stage) }; break; }
+    }
+    sendJson(res, 200, {
+      ok: true, status: "confirmed", product: hosted ? "hosted" : "self-hosted",
+      planName: plan?.name ?? null, lifetime: rec.lifetimeAccess === true, livemode: rec.livemode,
+      emailHint: maskEmail(rec.email), welcomeSent: rec.welcomeSentAtMs !== null, server,
+    }, headers);
   }
 
   /** Which of the identity's candidate owner keys actually owns this
@@ -2728,7 +2827,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         ok: true,
         license: issued.payload,
         token: issued.token,
-        installCommand: `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${issued.token}" | sudo bash`,
+        installCommand: safeInstallCommand(`${cfg.publicOrigin}/install.sh?key=${issued.token}`),
       });
     }
     if (m === "GET" && p === "/admin/api/license-leases") {
@@ -3078,7 +3177,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (!token) return sendJson(res, 404, { ok: false, error: "unknown or revoked license id" });
       return sendJson(res, 200, {
         ok: true,
-        installCommand: `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash`,
+        installCommand: safeInstallCommand(`${cfg.publicOrigin}/install.sh?key=${token}`),
       });
     }
     // ── CHANGE AN ISSUED LICENSE'S EXPIRY ──────────────────────────────────
@@ -3115,7 +3214,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, {
         ok: true,
         exp: payload.exp,
-        installCommand: token ? `curl -q -fsS "${cfg.publicOrigin}/install.sh?key=${token}" | sudo bash` : null,
+        installCommand: token ? safeInstallCommand(`${cfg.publicOrigin}/install.sh?key=${token}`) : null,
       });
     }
     // ── v0.3.19 — EXTEND EVERY ACTIVE LICENCE TO ONE DATE ────────────────
@@ -3414,7 +3513,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       }
     }
     if (m === "GET" && p === "/admin/api/hosting/instances") {
-      const rows = hosting.store.instances().sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+      // Each row keeps its raw operator failureReason; supportReference is
+      // the code the customer sees beside the plain-language version.
+      const rows = hosting.store.instances().sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+        .map((row) => ({ ...row, bootstrapTokenHash: row.bootstrapTokenHash ? "(set)" : null, managementTokenHash: row.managementTokenHash ? "(set)" : null,
+          credentialReset: row.credentialReset ? { ...row.credentialReset, nonce: "(set)" } : row.credentialReset, supportReference: row.failureReason ? customerFailureMessage(row.id, row.failureReason).reference : null }));
       return sendJson(res, 200, { ok: true, instances: rows }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/outbox")) {
@@ -3437,6 +3540,17 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const body = await readJsonBody(req);
       const r = hosting.adminForceDelete(id, typeof body?.reason === "string" ? body.reason : "", rateLimitNow());
       return r.ok ? sendJson(res, 200, { ok: true, note: "delete job queued — an operator-forced delete is still processed through the ordinary lease-guarded pipeline" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, error: r.error });
+    }
+    // Operator-requested temporary password reset: the same audited path as
+    // the customer's, without the daily cap; the email goes to the owner.
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/reset-password")) {
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/reset-password".length);
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" && body.by.trim() ? body.by.trim().slice(0, 80) : "admin";
+      const r = await hosting.requestCredentialReset(id, { kind: "operator", by }, rateLimitNow());
+      if (!r.ok) return sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+      const row = hosting.store.getInstance(id);
+      return sendJson(res, 200, { ok: true, resetId: r.value.resetId, alreadyPending: r.value.alreadyPending, note: row?.credentialAgentSeenAtMs ? "queued — the server applies it on its next check (about five minutes), then the owner is emailed" : "queued, but this server's agent has never polled for resets (it predates them); it will not apply until the agent is updated" }, { "cache-control": "no-store" });
     }
     // A deletion hold (`HostingService.adminHoldDeletion`/`adminReleaseHold`)
     // — `/release-hold` is checked as its OWN `endsWith`, never derived by

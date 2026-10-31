@@ -248,7 +248,9 @@ await test("the welcome page shows the licence and mints a one-time install comm
   assert.match(html, /Hi Ada, here is your install/);
   assert.match(html, /Active/);
   assert.match(html, /unleashed-test/);
-  const m = /curl -q -fsSL &quot;https:\/\/hub\.test\/hub\/install\/([A-Za-z0-9_-]+)&quot; \| sudo bash/.exec(html);
+  // The command downloads to a temp file with --fail-with-body, so a refusal
+  // prints the Hub's reason instead of piping an empty script into bash.
+  const m = /curl -q --fail-with-body [^<]*&#39;https:\/\/hub\.test\/hub\/install\/([A-Za-z0-9_-]+)&#39; -o [^<]*sudo bash/.exec(html);
   assert.ok(m, "the page carries the one-line install command");
   installTokenA = m[1];
   assert.ok(!html.includes("LHK1."), "the page never shows the licence key");
@@ -273,7 +275,7 @@ await test("/install/<token> serves the personalised installer ONCE, with the cu
 
 await test("an expired install token is refused; a reloaded page mints a fresh one", async () => {
   const page = await (await fetch(`${h.origin}/welcome/${pageTokenA}`)).text();
-  const tok = /\/install\/([A-Za-z0-9_-]+)&quot;/.exec(page)[1];
+  const tok = /\/install\/([A-Za-z0-9_-]+)&#39;/.exec(page)[1];
   const saved = clock;
   clock += 25 * 3_600_000; // past the 24h token life
   const res = await fetch(`${h.origin}/install/${tok}`);
@@ -462,7 +464,7 @@ await test("a one-time purchase with no Stripe customer is keyed by email and ge
 await test("a chargeback revokes the licence, the install page says so, and outstanding commands die", async () => {
   // Stripe names only the charge on a dispute; the Hub learned it from the invoice.
   const page = await (await fetch(`${h.origin}/welcome/${pageTokenB}`)).text();
-  const openTok = /\/install\/([A-Za-z0-9_-]+)&quot;/.exec(page)[1];
+  const openTok = /\/install\/([A-Za-z0-9_-]+)&#39;/.exec(page)[1];
   const r = await postEvent("live", event("charge.dispute.created", { id: "dp_1", object: "dispute", charge: "ch_B1", payment_intent: "pi_B1", reason: "fraudulent", status: "needs_response" }, true));
   assert.equal(r.body.outcome, "applied");
   assert.equal(licenses().find((l) => l.id === licenseB.id).revoked, true);
