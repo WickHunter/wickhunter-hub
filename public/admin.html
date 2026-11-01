@@ -690,6 +690,16 @@
 </div>
 <div id="billingEvents"><div class="muted">loading&hellip;</div></div>
 
+<h2 style="margin:1.2rem 0 .2rem">Dashboard password resets</h2>
+<p class="muted">Codes emailed to licence owners who forgot their dashboard password, and what happened to each. Codes are never stored or shown.</p>
+<div class="actions">
+  <button type="button" id="passwordResetsRefresh">Refresh</button>
+</div>
+<div class="tbl"><table class="custtable">
+  <thead><tr><th>When (UTC)</th><th>Outcome</th><th>Licence</th><th>Install</th><th>Browser IP (approx.)</th><th>Sent to</th></tr></thead>
+  <tbody id="passwordResetRows"><tr><td colspan="6">loading&hellip;</td></tr></tbody>
+</table></div>
+
 </section>
 </section>
 
@@ -839,7 +849,7 @@ async function loadHubPage(page, force = false) {
   if (!force && loadedPages.has(key)) return;
   const loaders = {
     overview: [briefingRefresh, opsRefresh, billingReportRefresh], reports: [fbRefresh], support: [supportRefresh],
-    licenses: [refresh, billingCustomersRefresh, billingEventsRefresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
+    licenses: [refresh, billingCustomersRefresh, billingEventsRefresh, passwordResetsRefresh], "market-data": [cdRefresh, mcRefresh, lqRefresh],
     marketplace: [mktRefresh, mktProvidersRefresh],
     billing: [billingLaunchRefresh, billingReportRefresh],
     system: [opsRefresh, leaseRefresh, releaseStatusRefresh],
@@ -3245,6 +3255,28 @@ async function billingEventsRefresh() {
   }
 }
 document.getElementById("billingEventsRefresh").onclick = billingEventsRefresh;
+
+// ── dashboard password resets (src/password-reset.ts) ──────────────────
+const PASSWORD_RESET_OUTCOMES = {
+  requested: "Code requested", emailed: "Code emailed", email_failed: "Email failed", no_email_on_file: "No email on file — nothing sent",
+  email_not_configured: "Email not configured — nothing sent", verified: "Code accepted — password reset",
+  wrong_code: "Wrong code", locked: "Locked after wrong codes", expired: "Expired code", used: "Code already used", unknown_request: "Unknown request",
+};
+async function passwordResetsRefresh() {
+  const body = document.getElementById("passwordResetRows");
+  try {
+    const d = await api("/admin/api/password-resets");
+    const rows = Array.isArray(d.entries) ? d.entries : [];
+    body.innerHTML = rows.length ? rows.slice(0, 100).map((e) => "<tr><td>" + esc(new Date(e.at).toISOString().replace("T", " ").slice(0, 19))
+      + "</td><td>" + esc(PASSWORD_RESET_OUTCOMES[e.kind] || e.kind) + (e.detail ? ' <span class="muted">' + esc(e.detail) + "</span>" : "")
+      + "</td><td>" + esc(String(e.licenseId || "").slice(0, 8)) + "</td><td>" + esc(String(e.installId || "").slice(0, 8))
+      + "</td><td>" + esc(e.requesterIpApprox || "") + "</td><td>" + esc(e.to || "") + "</td></tr>").join("")
+      : '<tr><td colspan="6" class="muted">No password resets yet.</td></tr>';
+  } catch (e) {
+    if (e.message !== "unauthorized") body.innerHTML = '<tr><td colspan="6">Could not load password resets. Refresh to try again.</td></tr>';
+  }
+}
+document.getElementById("passwordResetsRefresh").onclick = passwordResetsRefresh;
 
 // ── hosting (H4/H5/H6) ──────────────────────────────────────────────────
 const HOSTING_POLICY_NUMBER_FIELDS = [

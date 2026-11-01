@@ -11,6 +11,8 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 // Surfaces, outermost first:
 //   public   GET  /api/health                    liveness + version
 //   keyed    POST /api/license/checkin           bot phone-home; answers revoked (also for a 2nd install — see src/seats.ts)
+//   keyed    POST /api/license/password-reset/request  install asks for an emailed dashboard reset code (token in body)
+//   keyed    POST /api/license/password-reset/verify   code -> signed one-time WHPR1 approval (src/password-reset.ts)
 //   keyed    POST /api/feedback                  tester bug/feature reports (license token in body)
 //   keyed    GET  /install.sh?key=<token>        templated tester installer
 //   keyed    GET  /install/channels/{beta,production}.sh explicit fresh-install channel bootstrap (feature-gated)
@@ -50,6 +52,7 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   admin    GET  /admin/api/flags                per-licence feature flags
 //   admin    POST /admin/api/flags                {id|"default", flag, state:true|false|null}
 //   admin    GET  /admin/api/licenses/command    ?id= -> rebuilt install command (active only)
+//   admin    GET  /admin/api/password-resets     recent dashboard password-reset audit (no codes)
 //   admin    GET  /admin/api/feedback            report list (sans logs)
 //   admin    GET  /admin/api/feedback/detail     one report with logs/diagnostics/picture
 //   admin    POST /admin/api/feedback/status     {id, status: new|discussing|fixed}
@@ -189,6 +192,7 @@ import {
   HostingPolicyError,
 } from "./hosting/policy.js";
 import { classifyProbeStatus, type ProbeResult } from "./hosting/readiness.js";
+import { PasswordResetService, type PasswordResetDeps } from "./password-reset.js";
 
 /** The provider fetcher for the market-cap producer. A separate shape from the
  *  candles' `FetchLike` because this one carries an API-key HEADER — which is
@@ -306,6 +310,11 @@ export interface HubDeps {
   customerSessionFetch?: CustomerSessionServiceDeps["fetchLike"];
   customerSessionNow?: CustomerSessionServiceDeps["now"];
   customerSessionRandomBytes?: CustomerSessionServiceDeps["randomBytes"];
+  /** Injectable so password-reset tests never reach an email provider and
+   *  can know the code and drive the 15-minute expiry. */
+  passwordResetFetch?: PasswordResetDeps["fetchLike"];
+  passwordResetNow?: PasswordResetDeps["now"];
+  passwordResetNewCode?: PasswordResetDeps["newCode"];
   /** Injectable seat clock: a seat frees after 30 minutes of silence, which a
    *  suite cannot wait out. */
   seatNow?: () => number;
@@ -560,6 +569,19 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // generous against an honest retry (the token itself lasts 15 minutes)
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  // ── dashboard password reset by emailed code (src/password-reset.ts) ──────
+  // The install authenticates with its licence token exactly like check-in.
+  // Per licence: 3 codes per 15 minutes (each one emails the owner) and 20
+  // verify calls per 15 minutes; per caller IP the same order of magnitude,
+  // so one host cannot spray many licences either.
+  const passwordReset = new PasswordResetService(cfg.dataDir, store,
+    (licenseId) => billing.store.findByLicense(licenseId)?.email ?? null,
+    () => billing.config().email,
+    { now: deps.passwordResetNow, fetchLike: deps.passwordResetFetch, newCode: deps.passwordResetNewCode });
+  const passwordResetRequestLicenseLimiter = new SlidingWindowLimiter({ max: 3, windowMs: 15 * 60_000 });
+  const passwordResetRequestIpLimiter = new SlidingWindowLimiter({ max: 10, windowMs: 15 * 60_000 });
+  const passwordResetVerifyLicenseLimiter = new SlidingWindowLimiter({ max: 20, windowMs: 15 * 60_000 });
+  const passwordResetVerifyIpLimiter = new SlidingWindowLimiter({ max: 60, windowMs: 15 * 60_000 });
   const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
@@ -910,6 +932,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       return sendJson(res, 200, { ok: true, version: HUB_VERSION, ...operationsStatus(false) });
     }
     if (m === "POST" && p === "/api/license/checkin") return checkin(req, res);
+    if (m === "POST" && p === "/api/license/password-reset/request") return passwordResetRoute(req, res, "request");
+    if (m === "POST" && p === "/api/license/password-reset/verify") return passwordResetRoute(req, res, "verify");
     if (m === "POST" && p === "/api/license/lease/challenge") return leaseChallenge(req, res);
     if (m === "POST" && p === "/api/license/lease/activate") return leaseOperation(req, res, "activate");
     if (m === "POST" && p === "/api/license/lease/renew") return leaseOperation(req, res, "renew");
@@ -1154,6 +1178,28 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   }
 
   // ── tester surface ────────────────────────────────────────────────────────
+
+  async function passwordResetRoute(req: IncomingMessage, res: ServerResponse, op: "request" | "verify"): Promise<void> {
+    const ip = clientIp(req);
+    const ipRate = (op === "request" ? passwordResetRequestIpLimiter : passwordResetVerifyIpLimiter).take(ip, rateLimitNow());
+    if (!ipRate.ok) { req.resume(); return sendRateLimited(res, ipRate, "password reset"); }
+    const body = await readJsonBody(req, 16 * 1024);
+    if (body === null) return sendJson(res, 400, { ok: false, error: "bad password reset body" });
+    const auth = passwordReset.authenticate(body);
+    if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error }, { "cache-control": "no-store" });
+    const licenseRate = (op === "request" ? passwordResetRequestLicenseLimiter : passwordResetVerifyLicenseLimiter).take(auth.licenseId, rateLimitNow());
+    if (!licenseRate.ok) return sendRateLimited(res, licenseRate, "password reset");
+    if (op === "request") {
+      const r = await passwordReset.request(auth.licenseId, auth.installId, body.label, body.requesterIp, ip);
+      return r.ok
+        ? sendJson(res, 200, { ok: true, requestId: r.requestId, expiresAtMs: r.expiresAtMs }, { "cache-control": "no-store" })
+        : sendJson(res, r.status, { ok: false, error: r.error }, { "cache-control": "no-store" });
+    }
+    const v = passwordReset.verify(auth.licenseId, auth.installId, body.requestId, body.code, body.nonce, ip);
+    return v.ok
+      ? sendJson(res, 200, { ok: true, approval: v.approval, expiresAtMs: v.expiresAtMs }, { "cache-control": "no-store" })
+      : sendJson(res, v.status, { ok: false, error: v.error, ...(v.locked ? { locked: true } : {}) }, { "cache-control": "no-store" });
+  }
 
   async function checkin(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // IP gate FIRST, before the body is even read — the same shape
@@ -3031,6 +3077,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       const report = feedbackDetail(cfg.dataDir, id);
       if (!report) return sendJson(res, 404, { ok: false, error: "unknown report id" });
       return sendJson(res, 200, { ok: true, report }, { "cache-control": "no-store" });
+    }
+    if (m === "GET" && p === "/admin/api/password-resets") {
+      // Recent dashboard password-reset activity: who asked, for which
+      // licence/install, the outcome, a masked recipient — never a code.
+      return sendJson(res, 200, { ok: true, entries: passwordReset.recentAudit(200) }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p === "/admin/api/feedback") {
       // List view is intentionally light. Logs, the diagnostic tree and image
