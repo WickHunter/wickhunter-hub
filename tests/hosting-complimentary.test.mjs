@@ -249,6 +249,10 @@ await test("end: the ordinary intentional-cancellation schedule — suspended no
     assert.equal(gone.stage, "deleted");
     const subjects = f.mails().slice(before).map((m) => m.subject);
     assert.ok(f.mails().slice(before).every((m) => m.to[0] === NORMALIZED));
+    const endMail = f.mails().slice(before).find((m) => /will end/.test(m.subject));
+    assert.match(endMail.subject, /^Your complimentary server will end on /);
+    assert.match(endMail.text, /Your complimentary Wick Hunter server \(host_[^)]+\) will end on /);
+    for (const word of [/cancel/i, /software licen[cs]e/i, /Manage hosting/i, /subscription/i, /renew/i]) { assert.doesNotMatch(endMail.text, word); assert.doesNotMatch(endMail.html, word); }
     assert.deepEqual(subjects.map((s) => /will end/.test(s) ? "end" : /terminated/.test(s) ? "terminated" : s), ["end", "terminated"],
       "the end notice and the termination notice only — no payment-requesting suspended/countdown notice for a server nobody pays for");
     assert.match(f.mails().at(-1).text, /complimentary server; no hosting payment was taken/);
@@ -321,6 +325,51 @@ await test("paying customers are unaffected: a paid checkout from the SAME email
     assert.equal(role.subscriptionStatus, "past_due");
     assert.equal(f.hosting.store.getInstance(paidRow.id).stage, "past_due", "the ordinary nonpayment schedule still applies to a paying owner");
     assert.equal(f.hosting.store.getInstance(comp.body.instanceId).stage, "ordered", "the grant is untouched by the paid owner's events");
+  } finally { await f.h.close(); }
+});
+
+await test("S2: only the server a grant created is ever started by it — a legacy record or a grant naming another instance never queues provisioning", async () => {
+  const f = await fixture();
+  try {
+    const legacyOwner = "admin-vps-test:20261005-s2";
+    f.billing.store.putRoleSubscription({ key: `${legacyOwner}::hosting`, customerKey: legacyOwner, role: "hosting", livemode: false, subscriptionId: null, subscriptionStatus: "active", periodEndMs: null, chargeIds: [], disputed: false, refunded: false,
+      createdAtMs: f.now(), updatedAtMs: f.now(), lastEventType: "admin.complimentary_vps_test", lastEventAtMs: f.now(),
+      complimentary: { by: "migration-0.4.104", reason: "legacy", createdAtMs: f.now(), idempotencyKey: null, instanceId: null, endsAtMs: null, endedAtMs: null, endedBy: null, endReason: null, legacy: true } });
+    const stray = f.hosting.store.reserveInstance({ id: "host_legacy_stray", ownerId: legacyOwner, environment: "test", region: "nrt", planId: "vc2-2c-2gb", stripeCustomerId: "", nowMs: f.now() });
+    // A real grant, then a second ordered row slipped under the same owner.
+    const r = await f.admin("/admin/api/hosting/complimentary", grant());
+    const granted = f.hosting.store.getInstance(r.body.instanceId);
+    for (const job of f.hosting.store.outboxFor(granted.id)) assert.equal(job.jobType, "provision");
+    f.hosting.store.updateInstance(granted.id, granted.version, (d) => { d.stage = "deleted"; d.lifecycleVersion += 1; }, f.now());
+    const other = f.hosting.store.reserveInstance({ id: "host_not_the_grant", ownerId: OWNER, environment: "test", region: "nrt", planId: "vc2-2c-2gb", stripeCustomerId: "", nowMs: f.now() });
+    for (let i = 0; i < 3; i++) { f.hosting.reconcileAll(f.now()); await f.tick(); f.advance(30_000); }
+    assert.equal(f.hosting.store.outboxFor(stray.id).length, 0, "the legacy record started nothing");
+    assert.equal(f.hosting.store.outboxFor(other.id).length, 0, "a row the grant did not create is never provisioned by it");
+    assert.equal(f.hosting.store.getInstance(stray.id).stage, "ordered"); assert.equal(f.hosting.store.getInstance(other.id).stage, "ordered");
+    assert.equal(f.provider.createCalls.length, 0);
+  } finally { await f.h.close(); }
+});
+
+await test("S1: the grant's role record is written only after the reservation exists; a failed write closes the reservation and nothing is provisioned", async () => {
+  const f = await fixture();
+  try {
+    const store = f.billing.store, original = store.putRoleSubscription.bind(store);
+    let seenRowAtWrite = null;
+    store.putRoleSubscription = (rec) => { if (rec.complimentary) seenRowAtWrite = rec.complimentary.instanceId ? f.hosting.store.getInstance(rec.complimentary.instanceId) : null; return original(rec); };
+    const ok = await f.admin("/admin/api/hosting/complimentary", grant());
+    assert.equal(ok.status, 200);
+    assert.ok(seenRowAtWrite && seenRowAtWrite.id === ok.body.instanceId && seenRowAtWrite.complimentary === true, "the reservation existed (and was marked) before the grant named it");
+    await f.admin(`/admin/api/hosting/instances/${ok.body.instanceId}/end-complimentary`, { reason: "next case" });
+    f.hosting.store.updateInstance(ok.body.instanceId, f.hosting.store.getInstance(ok.body.instanceId).version, (d) => { d.stage = "deleted"; }, f.now());
+    store.putRoleSubscription = (rec) => { if (rec.complimentary && rec.complimentary.idempotencyKey === "comp-fixture-key-fail") throw new Error("disk full (fixture)"); return original(rec); };
+    const bad = await f.admin("/admin/api/hosting/complimentary", grant({ idempotencyKey: "comp-fixture-key-fail" }));
+    assert.equal(bad.status, 409); assert.match(bad.body.error, /reservation was closed/);
+    const rows = f.hosting.store.instances().filter((r) => r.ownerId === OWNER && r.id !== ok.body.instanceId);
+    assert.equal(rows.length, 1); assert.equal(rows[0].stage, "deleted");
+    assert.equal(f.hosting.store.outboxFor(rows[0].id).length, 0, "no provision job for the closed reservation");
+    assert.notEqual(f.billing.store.getRoleSubscription(OWNER, "hosting").complimentary.instanceId, rows[0].id, "no grant names the closed reservation");
+    for (let i = 0; i < 3; i++) { await f.tick(); f.advance(30_000); }
+    assert.equal(f.provider.createCalls.length, 0);
   } finally { await f.h.close(); }
 });
 

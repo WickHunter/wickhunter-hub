@@ -1666,6 +1666,7 @@ export class HostingService {
           billingSummary: row.complimentary ? "This server is complimentary: no hosting payment is taken." : bundlePlan?.lifetime ? `Your Lifetime software purchase remains yours. VPS hosting renews at ${bundlePrice} per month.` : bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
+        if (row.complimentary) return tmpl.complimentaryEndingEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs);
         return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan && !bundlePlan.lifetime);
       case "overdue":
         return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan?.lifetime ? "This invoice renews VPS hosting only. Your paid Lifetime software access remains yours." : bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
@@ -1966,18 +1967,27 @@ export class HostingService {
     const id = this.store.newId("host");
     const prior = this.billing.store.getRoleSubscription(ownerId, "hosting");
     const mark: ComplimentaryHostingMark = { by, reason, createdAtMs: nowMs, idempotencyKey: input.idempotencyKey, instanceId: id, endsAtMs, endedAtMs: null, endedBy: null, endReason: null };
-    this.billing.store.putRoleSubscription({
-      key: `${ownerId}::hosting`, customerKey: ownerId, role: "hosting", livemode: environment === "live",
-      subscriptionId: null, subscriptionStatus: "complimentary", periodEndMs: endsAtMs, chargeIds: [], disputed: false, refunded: false,
-      createdAtMs: prior?.createdAtMs ?? nowMs, updatedAtMs: nowMs, lastEventType: "admin.hosting.complimentary", lastEventAtMs: nowMs,
-      complimentary: mark,
-    });
+    // Reserve first: the role record (which names this instance) is written
+    // only once the reservation exists, and a failure to write it closes the
+    // reservation again, so a grant never points at a row that is not there
+    // and no row is provisioned without its grant.
     const reserved = this.store.reserveInstance({ id, ownerId, environment, region, planId, stripeCustomerId: "", nowMs });
     if (!reserved) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this email already has a complimentary server" };
     const row = this.store.updateInstance(reserved.id, reserved.version, (d) => {
       d.complimentary = true; d.releasePin = input.releaseRef; d.providerPlanMonthlyCostCents = quote!; d.paidThroughMs = endsAtMs;
     }, nowMs);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "the new reservation changed underneath the request" };
+    try {
+      this.billing.store.putRoleSubscription({
+        key: `${ownerId}::hosting`, customerKey: ownerId, role: "hosting", livemode: environment === "live",
+        subscriptionId: null, subscriptionStatus: "complimentary", periodEndMs: endsAtMs, chargeIds: [], disputed: false, refunded: false,
+        createdAtMs: prior?.createdAtMs ?? nowMs, updatedAtMs: nowMs, lastEventType: "admin.hosting.complimentary", lastEventAtMs: nowMs,
+        complimentary: mark,
+      });
+    } catch (err) {
+      this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.terminatedAtMs = nowMs; d.failureReason = "complimentary grant could not be recorded"; d.lifecycleVersion += 1; }, nowMs);
+      return { ok: false, code: "PROVISIONING_DISABLED", error: `the grant could not be recorded; the reservation was closed: ${(err as Error).message}` };
+    }
     this.enqueueProvisionJob(row, nowMs);
     this.billing.store.appendEvent({
       id: `hosting-complimentary-create:${row.id}`, type: "admin.hosting.complimentary.create", livemode: environment === "live", receivedAtMs: nowMs, outcome: "applied",
@@ -2038,6 +2048,10 @@ export class HostingService {
   private reconcileComplimentary(ownerId: string, sub: RoleSubscriptionRecord, comp: ComplimentaryHostingMark, nowMs: number): void {
     const instance = this.store.activeInstanceForOwner(ownerId, sub.livemode ? "live" : "test");
     if (!instance) return;
+    // Only the server this exact grant created is ever started or ended
+    // here. A legacy (migrated) record names no instance, so it can never
+    // start a server; any other row under the owner is left untouched.
+    if (!comp.instanceId || comp.instanceId !== instance.id || !instance.complimentary) return;
     const endAt = comp.endedAtMs ?? comp.endsAtMs;
     if (endAt === null || nowMs < endAt) {
       if (instance.stage === "ordered" && !instance.providerInstanceId) this.enqueueProvisionJob(instance, nowMs);

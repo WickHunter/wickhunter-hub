@@ -97,6 +97,19 @@ export function cancellationScheduledEmail(to: string, instanceReference: string
   return withTo(wrap(`Your VPS hosting will end on ${hostingEndDate}`, text, html), to);
 }
 
+/** v0.4.104 — the end notice for an operator-granted complimentary server.
+ *  Nothing was bought, so nothing is "cancelled", no licence or billing is
+ *  mentioned and there is no hosting page to manage it from: it says when
+ *  the server ends and when its data is deleted. */
+export function complimentaryEndingEmail(to: string, instanceReference: string, suspendAt: number, deleteAt: number): EmailMessage {
+  const endDate = fmtDate(suspendAt).split(",")[0];
+  const lines = [
+    `Your complimentary Wick Hunter server (${instanceReference}) will end on ${fmtDate(suspendAt)}. It will then be stopped, and the server and its data are scheduled to be deleted at ${fmtDate(deleteAt)}.`,
+    `Export any settings you want to keep before it ends. Stopping the server stops bot management; open positions and orders stay on your exchange until you close them there.`,
+  ];
+  return withTo(wrap(`Your complimentary server will end on ${endDate}`, lines.join("\n\n"), lines.map(escapeHtml).join("\n\n")), to);
+}
+
 export function overdueEmail(to: string, instanceReference: string, suspendAt: number, deleteAt: number, payUrl: string, softwareNotice: string): EmailMessage {
   const text = [
     `We have not received the hosting renewal payment for ${instanceReference}. Update your payment details or complete payment to keep hosting active.`,
