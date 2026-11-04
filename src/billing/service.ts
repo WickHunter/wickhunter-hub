@@ -1936,6 +1936,7 @@ export class BillingService {
       siteOrigin: cfg.siteOrigin,
       livemode: rec.livemode,
       starterPack: starterPackEligible(rec),
+      complimentary: !!rec.complimentary,
     });
     const result = await sendEmail(cfg.email, msg, this.fetchLike);
     if (result.ok) {
@@ -1958,6 +1959,61 @@ export class BillingService {
     if (rec.welcomeError) return { ok: false, status: 502, error: rec.welcomeError };
     void note;
     return { ok: true, sentTo: rec.email };
+  }
+
+  /** v0.4.104 — the software half of an operator-granted complimentary
+   *  server (`HostingService.adminCreateComplimentary`). Creates or reuses
+   *  the `complimentary:<email>` customer record and binds it to a
+   *  non-revoked, unexpired licence: an existing one is reused (its expiry
+   *  only ever moves later, to cover the requested term); otherwise a fresh
+   *  licence is minted. No Stripe customer, subscription or charge exists or
+   *  is invented. A record under the same key that is NOT complimentary is
+   *  refused, never converted. */
+  ensureComplimentaryCustomer(input: { ownerKey: string; email: string; by: string; reason: string; licenseExpMs: number }, now = this.now()):
+    { ok: true; licenseId: string; reusedLicense: boolean; createdCustomer: boolean } | { ok: false; error: string } {
+    const livemode = this.config().mode === "live";
+    const existing = this.store.getCustomer(input.ownerKey);
+    if (existing && !existing.complimentary) return { ok: false, error: "a paid customer record already uses this key" };
+    if (existing && existing.livemode !== livemode) return { ok: false, error: `the complimentary record for this email belongs to ${existing.livemode ? "live" : "test"} mode` };
+    let licenseId = existing?.licenseId ?? "";
+    let reusedLicense = false;
+    const current = licenseId ? this.licenses.get(licenseId) : null;
+    if (current && !this.licenses.isRevoked(licenseId) && (current.exp === undefined || current.exp === null || current.exp > now)) {
+      reusedLicense = true;
+      // A licence can never run past 3650 days from its own issue; an
+      // open-ended grant just needs it as long as that allows.
+      const want = Math.min(input.licenseExpMs, current.iat + 3650 * DAY_MS);
+      if (typeof current.exp === "number" && current.exp < want) {
+        let extended = null;
+        try { extended = this.licenses.setExpiry(licenseId, want, now); } catch { extended = null; }
+        if (!extended) return { ok: false, error: "the existing complimentary licence could not be extended to cover the term" };
+      }
+    } else {
+      try {
+        licenseId = this.licenses.issueUntil(`Complimentary - ${input.email}`.slice(0, 120), input.licenseExpMs, livemode ? "unleashed-complimentary" : "unleashed-complimentary-test", now).payload.id;
+      } catch (err) { return { ok: false, error: `licence could not be issued: ${(err as Error).message}` }; }
+    }
+    const rec: CustomerRecord = existing
+      ? { ...existing, licenseId, updatedAtMs: now, lastEventType: "admin.hosting.complimentary", lastEventAtMs: now, ...(reusedLicense ? {} : { welcomeSentAtMs: null, welcomeError: null }) }
+      : {
+        key: input.ownerKey, stripeCustomerId: "", email: input.email, name: "Complimentary", livemode, licenseId, planKey: null,
+        subscriptionId: null, subscriptionStatus: null, periodEndMs: null, chargeIds: [], createdAtMs: now, updatedAtMs: now,
+        welcomeSentAtMs: null, welcomeError: null, disputed: false, refunded: false, lastEventType: "admin.hosting.complimentary", lastEventAtMs: now,
+        complimentary: { by: input.by, reason: input.reason, createdAtMs: now },
+      };
+    this.store.putCustomer(rec);
+    return { ok: true, licenseId, reusedLicense, createdCustomer: !existing };
+  }
+
+  /** v0.4.104 — the ordinary welcome email (licence + install page) for a
+   *  complimentary customer, once per licence. Same template, same sender,
+   *  same failure recording as a paid purchase's welcome. */
+  async sendComplimentaryWelcome(customerKey: string): Promise<{ sent: boolean; alreadySent: boolean; error: string | null }> {
+    const rec = this.store.getCustomer(customerKey);
+    if (!rec?.complimentary) return { sent: false, alreadySent: false, error: "not a complimentary customer" };
+    if (rec.welcomeSentAtMs !== null) return { sent: false, alreadySent: true, error: null };
+    await this.sendWelcomeIfNeeded(rec, this.config(), this.now(), false);
+    return { sent: rec.welcomeSentAtMs !== null, alreadySent: false, error: rec.welcomeError };
   }
 
   async recoverDestroyedInstall(customerKey: string, expectedEmail: string, options: DeviceRecoveryOptions): Promise<

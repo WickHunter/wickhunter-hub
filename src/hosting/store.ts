@@ -158,6 +158,25 @@ export interface HostingInstanceRow {
    *  release it, and a stale lease (past `leaseUntilMs`) may be reclaimed. */
   leaseToken: string | null;
   leaseUntilMs: number | null;
+  /** v0.4.104 — true for an operator-granted complimentary server
+   *  (`HostingService.adminCreateComplimentary`). Absent on every other row. */
+  complimentary?: boolean;
+  /** v0.4.104 — a signed-manifest sha256 chosen at creation (the complimentary
+   *  route pins the Hub's current verified Beta release). Every generation of
+   *  this row pins it instead of `policy.releaseRef`. Absent = policy. */
+  releasePin?: string | null;
+  /** v0.4.104 — SHA256 fingerprints of the fleet public keys this
+   *  generation's cloud-init was given (policy `fleetAuthorizedKeys`). */
+  fleetKeysOffered?: string[];
+  /** v0.4.104 — when the bootstrap reported every offered fleet key present
+   *  in root's authorized_keys (null/absent = never confirmed). */
+  fleetKeysConfirmedAtMs?: number | null;
+  /** v0.4.104 — the SSH host-key fingerprints the bootstrap reported, first
+   *  seen per generation (pin these). A later different report never
+   *  overwrites them; it sets `sshHostKeysMismatchAtMs`. */
+  sshHostKeys?: Array<{ type: string; fingerprint: string }>;
+  sshHostKeysAtMs?: number | null;
+  sshHostKeysMismatchAtMs?: number | null;
   /** Optimistic-concurrency version. Every `updateInstance` bumps it. */
   version: number;
   createdAtMs: number;

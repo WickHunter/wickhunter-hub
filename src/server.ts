@@ -31,6 +31,8 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   admin    POST /admin/api/billing/test-email  {to}
 //   admin    GET  /admin/api/billing/events      recent webhook events + outcomes
 //   admin    POST /admin/api/billing/reconcile-subscription {subscriptionId|customerId, dryRun?, by, reason}
+//   admin    POST /admin/api/hosting/complimentary {email, reason, idempotencyKey, channel:"beta", by?, region?, plan?, months?} (v0.4.104)
+//   admin    POST /admin/api/hosting/instances/:id/end-complimentary {by, reason} (v0.4.104)
 //                                               apply a missed paid term from Stripe (dry run by default)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   keyed    GET  /api/candles/snapshot          signed last-N-closed-candles, whole venue (v1)
@@ -561,6 +563,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
   const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  /** v0.4.104 — operator complimentary server grants (each one creates a paid provider server). */
+  const complimentaryLimiter = new SlidingWindowLimiter({ max: 10, windowMs: 10 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
@@ -1980,7 +1984,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (status === null) continue;
       results.push({ venueId: (r as any).venueId, outcome: classifyProbeStatus(status) });
     }
-    const r = await hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter);
+    // v0.4.104 — host-key fingerprints and the fleet-key count, exact shapes only.
+    const sshHostKeys = Array.isArray(body.sshHostKeys)
+      ? body.sshHostKeys.slice(0, 6).filter((k: any) => k && typeof k.type === "string" && /^[A-Z0-9]{2,12}$/.test(k.type) && typeof k.fingerprint === "string" && /^SHA256:[A-Za-z0-9+/]{43}$/.test(k.fingerprint))
+        .map((k: any) => ({ type: k.type as string, fingerprint: k.fingerprint as string }))
+      : undefined;
+    const fleetKeysPresent = Number.isSafeInteger(body.fleetKeysPresent) && (body.fleetKeysPresent as number) >= 0 && (body.fleetKeysPresent as number) <= 10 ? body.fleetKeysPresent as number : undefined;
+    const r = await hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter, { sshHostKeys, fleetKeysPresent });
     if (!r.ok) return sendJson(res, r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, ready: r.value.ready }, { "cache-control": "no-store" });
   }
@@ -2607,6 +2617,40 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     const html = fs.readFileSync(path.join(cfg.publicDir, "admin.html"));
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
     res.end(html);
+  }
+
+  /** The admin JSON/CSRF contract the Marketplace configuration route
+   *  established: the fixed custom header, a JSON body, never cross-site. */
+  function adminJsonAction(req: IncomingMessage): boolean {
+    const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+    return req.headers[MARKETPLACE_CSRF_HEADER] === MARKETPLACE_CSRF_VALUE && /^application\/json(?:\s*;|$)/.test(contentType) && req.headers["sec-fetch-site"] !== "cross-site";
+  }
+
+  /** v0.4.104 — the admin Hosting page's rows: each instance with the
+   *  customer it belongs to (name/email from the billing record; a bundle
+   *  reservation through its bound subscription) and the app's last
+   *  check-in from the licence roster. The bootstrap/management token
+   *  hashes are reduced to booleans (the temporary password is derived from
+   *  the bootstrap hash), and the raw Checkout request body is dropped. */
+  function adminHostingRows(rows: ReturnType<typeof hosting.store.instances>): Array<Record<string, unknown>> {
+    const roster = readRoster(cfg.dataDir);
+    const customers = billing.store.customers();
+    return rows.map((row) => {
+      let rec = customers[row.ownerId] ?? null;
+      if (!rec && row.stripeSubscriptionId) {
+        const bound = billing.store.getBundleSubscription(row.stripeSubscriptionId);
+        if (bound) rec = customers[bound.customerId] ?? billing.store.findByStripeCustomer(bound.customerId) ?? null;
+      }
+      const seen = rec ? roster[rec.licenseId] : undefined;
+      const { bootstrapTokenHash, managementTokenHash, checkoutRequestBody, checkoutIdempotencyKey, leaseToken, ...rest } = row;
+      return {
+        ...rest,
+        bootstrapTokenActive: !!bootstrapTokenHash, managementTokenSet: !!managementTokenHash, checkoutRequestStored: !!checkoutRequestBody,
+        leaseHeld: !!leaseToken,
+        customer: rec ? { key: rec.key, name: rec.name, email: rec.email, licenseId: rec.licenseId, complimentary: !!rec.complimentary } : null,
+        app: seen ? { version: seen.version, lastSeenMs: seen.lastSeen, ip: seen.ip, onThisServer: !!row.ip && seen.ip === row.ip } : null,
+      };
+    });
   }
 
   function adminAuthorized(req: IncomingMessage): boolean {
@@ -3472,9 +3516,66 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         throw err;
       }
     }
+    // ── v0.4.104 — complimentary servers (operator-granted, no Stripe) ────
+    // `HostingService.adminCreateComplimentary`: same reservation, provision
+    // job, bootstrap, readiness and emails as a paid server. Admin bearer +
+    // the fixed CSRF header + a JSON body; at most 10 grants per 10 minutes.
+    if (m === "POST" && p === "/admin/api/hosting/complimentary") {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "complimentary servers require the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const rate = complimentaryLimiter.take("admin", rateLimitNow());
+      if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "complimentary server grants"); }
+      const body = await readJsonBody(req, 8 * 1024);
+      if (body === null || typeof body.email !== "string" || typeof body.reason !== "string" || typeof body.idempotencyKey !== "string"
+        || (body.by !== undefined && typeof body.by !== "string") || (body.region !== undefined && typeof body.region !== "string")
+        || (body.plan !== undefined && typeof body.plan !== "string") || (body.months !== undefined && body.months !== null && typeof body.months !== "number")) {
+        return sendJson(res, 400, { ok: false, error: "expected {email, reason, idempotencyKey, channel:\"beta\", by?, region?, plan?, months?}" }, { "cache-control": "no-store" });
+      }
+      if (body.channel !== "beta") return sendJson(res, 400, { ok: false, error: "channel must be \"beta\" — the hosted install serves the Hub's verified customer Beta release" }, { "cache-control": "no-store" });
+      const latest = readLatest();
+      if (!latest || cfg.releaseChannel !== "beta") return sendJson(res, 503, { ok: false, error: "no verified Beta release is published on this Hub; nothing was created" }, { "cache-control": "no-store" });
+      const r = await hosting.adminCreateComplimentary({
+        email: body.email, by: typeof body.by === "string" ? body.by : "admin", reason: body.reason, idempotencyKey: body.idempotencyKey,
+        region: typeof body.region === "string" && body.region ? body.region : undefined, planId: typeof body.plan === "string" && body.plan ? body.plan : undefined,
+        months: typeof body.months === "number" ? body.months : undefined, releaseRef: latest.sha256,
+      });
+      if (!r.ok) {
+        const status = r.code === "INVALID_REQUEST" ? 400 : r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 409;
+        return sendJson(res, status, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+      }
+      // The ordinary welcome email (licence + install page), once per
+      // licence; a replay retries one that failed earlier.
+      const welcome = await billing.sendComplimentaryWelcome(r.value.ownerId);
+      return sendJson(res, 200, { ok: true, ...r.value, releaseVersion: r.value.releaseRef === latest.sha256 ? latest.version : null, welcome }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/end-complimentary")) {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "ending a complimentary server requires the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/end-complimentary".length);
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by : "admin";
+      const reason = typeof body?.reason === "string" ? body.reason : "";
+      if (!reason.trim()) return sendJson(res, 400, { ok: false, error: "a reason is required for the audit log" }, { "cache-control": "no-store" });
+      const r = hosting.adminEndComplimentary(id, by, reason);
+      return r.ok ? sendJson(res, 200, { ok: true, ...r.value }, { "cache-control": "no-store" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    }
+    // v0.4.104 — "Install update key on existing hosted servers". The dry run
+    // lists targets (audited). There is no Hub-to-server command channel
+    // after bootstrap (see HostingService.fleetKeyPlan), so the apply step
+    // refuses by name and changes nothing.
+    if (m === "POST" && (p === "/admin/api/hosting/fleet-key/plan" || p === "/admin/api/hosting/fleet-key/apply")) {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "the fleet-key action requires the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by.trim().slice(0, 80) || "admin" : "admin";
+      const plan = hosting.fleetKeyPlan();
+      const apply = p.endsWith("/apply");
+      billing.store.appendEvent({ id: `hosting-fleet-key-${apply ? "apply" : "plan"}:${Date.now()}`, type: apply ? "admin.hosting.fleet-key.apply-refused" : "admin.hosting.fleet-key.plan", livemode: billing.config().mode === "live",
+        receivedAtMs: Date.now(), outcome: apply ? "ignored" : "applied", note: JSON.stringify({ by, targets: plan.targets.map((t) => t.instanceId), confirmed: plan.confirmed.length, configuredKeys: plan.configuredKeys }) });
+      const explanation = "The Hub has no command channel to a hosted server after its first boot: cloud-init runs once, the readiness agent only sends a boot proof to the Hub (it never reads or runs anything the Hub returns), and the Vultr API cannot run commands on a running server. New servers get the key from their bootstrap; existing ones need a server-side step outside the Hub.";
+      if (apply) return sendJson(res, 409, { ok: false, code: "NO_CHANNEL", error: explanation, dryRun: plan }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, dryRun: true, ...plan, explanation }, { "cache-control": "no-store" });
+    }
     if (m === "GET" && p === "/admin/api/hosting/instances") {
       const rows = hosting.store.instances().sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-      return sendJson(res, 200, { ok: true, instances: rows }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, instances: adminHostingRows(rows) }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/outbox")) {
       const id = p.slice("/admin/api/hosting/instances/".length, -"/outbox".length);
