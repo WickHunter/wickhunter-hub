@@ -1,3 +1,7 @@
+## v0.4.107 — Linked server dashboards can edit Earn settings
+
+- A server dashboard linked by an admin to a partner's Earn account (dashboard grant) can now save the payout destination and UIDs from the app, not only view them. Operator decision 2026-11-05, accepting the weaker payout safeguard; granting stays admin-only and every payout destination change is recorded in the Earn audit trail.
+
 ## v0.4.106 — One-time crypto Yearly purchases earn referral commission
 
 - **Self-hosted one-time Yearly.** A paid, discounted, payment-mode Yearly Checkout Session (the launch crypto checkout: non-renewing, software only, inline `price_data` for the Yearly product) now earns the referrer's commission once, exactly like a self-hosted Lifetime purchase: keyed by the Session id (`stripe:checkout:cs_…`), applied registered promotion and coupon, exactly one one-time line inside the coupon's product scope, a discount actually applied, the persisted launch purchase (required: crypto, plan `yearly`, payment mode, no hosting, same product/amount/currency), a `cus_` customer, the self-referral guards, and a succeeded PaymentIntent with a `ch_`/`py_` charge. Basis = min(subtotal − discount, total − tax). Row kind `yearly`; ledger note "N% referral commission (yearly)". Refunds/disputes reconcile against the recorded charge. Like Lifetime, a one-time purchase reads the tier count but adds no referral row. Card Yearly and hosted Yearly bundles are subscription-mode Sessions credited by their invoices; they make no Stripe read on the Checkout event and are refused by the one-time path even when called directly.
@@ -2085,6 +2089,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.107 — Dashboard-granted licences edit (not only view) the owner's Earn settings; payout destination changes stay audited.
 - v0.4.106 — Referral commission on one-time crypto Yearly purchases (same proofs as self-hosted Lifetime, launch purchase required; subscription-mode Yearly stays on the invoice path); `referral-purchases-reconcile` dry run applies full eligibility and reports a reason per session, and the real run continues past per-session refusals.
 - v0.4.105 — Referral commission on Lifetime purchases: the software line of a hosted Lifetime bundle's initial invoice and self-hosted one-time Lifetime Checkout purchases (same strict proofs, VPS-only renewals still never earn); `referral-purchases-reconcile` backfill route for one-time purchases.
 - v0.4.104 — Operator complimentary servers (`POST /admin/api/hosting/complimentary`, `…/end-complimentary`) through the ordinary provision/bootstrap/readiness/email pipeline with no Stripe charge, nonpayment or dunning; legacy test record migration; admin Hosting page redesign (chips, filters, search, customer names, drawer) with token hashes removed from the instances API; policy `fleetAuthorizedKeys` installed on new servers by cloud-init, SSH host-key fingerprints recorded at readiness, fleet-key dry run for existing servers (apply refuses: no post-bootstrap channel).

@@ -1788,7 +1788,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
           if (allowed) {
             const dashboardOwner=earn.dashboardOwner(payload.id);
-            if(dashboardOwner){owner=dashboardOwner;readOnly=true;}
+            // 0.4.107 (operator decision 2026-11-05, accepting the weaker payout
+            // safeguard): a reviewed dashboard grant can edit the owner's Earn
+            // settings from the app. Granting stays admin-only and every payout
+            // destination change is recorded in the Earn audit trail.
+            if(dashboardOwner){owner=dashboardOwner;readOnly=false;}
             else owner=boundEarnOwner(record?[record]:[],payload.id);
           }
           name = record?.email || store.get(payload.id)?.name || "WH member";
