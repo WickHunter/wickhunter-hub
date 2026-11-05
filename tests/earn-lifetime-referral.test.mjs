@@ -132,15 +132,21 @@ try{
   assert.equal(balance(),before-39960);assert.ok(!calls.slice(n).some(p=>p.startsWith('/v1/subscriptions/')));
   refunds.ch_self=0;await svc.handleEvent(ev('charge.refunded',{id:'ch_self'}));assert.equal(balance(),before);
  });
- await test('self-hosted Lifetime: operator purchase backfill dry-runs, admits missed sessions once, and is idempotent',async()=>{
+ await test('self-hosted Lifetime: operator purchase backfill dry-runs with per-session eligibility, admits missed sessions once, continues past refusals, and is idempotent',async()=>{
   const snapshot=JSON.stringify(ledger.admin());
   const dry=await svc.reconcileReferralPurchases(owner,50,true);assert.equal(JSON.stringify(ledger.admin()),snapshot,'dry run writes nothing');
-  assert.deepEqual([...dry.purchases].sort(),['cs_missed','cs_self','cs_selfref','cs_wrongproduct'].sort());assert.equal(dry.alreadyRecorded,1);
+  assert.deepEqual([...dry.purchases].sort(),['cs_missed','cs_self']);assert.equal(dry.alreadyRecorded,1);
+  const why=Object.fromEntries(dry.sessions.map(o=>[o.session,o]));
+  assert.equal(why.cs_selfref.eligible,false);assert.equal(why.cs_selfref.reason,'self-referral');
+  assert.equal(why.cs_wrongproduct.eligible,false);assert.match(why.cs_wrongproduct.reason,/price, product or applied discount/);
+  assert.equal(why.cs_self.reason,'already recorded');assert.equal(why.cs_missed.reason,'eligible');
   await assert.rejects(svc.reconcileReferralPurchases(owner,40,false),/rate changed/);
-  delete sessions.cs_wrongproduct;
   const before=balance(),r=await svc.reconcileReferralPurchases(owner,50,false);
-  assert.equal(r.purchases,3);assert.equal(r.admitted,2);assert.equal(r.skipped,1);assert.equal(r.adjusted,0);
-  assert.equal(rows().cs_missed.commission,39960);assert.equal(rows().cs_selfref,undefined);assert.equal(balance()-before,39960);
+  assert.equal(r.purchases,2);assert.equal(r.refused,2);assert.equal(r.admitted,2);assert.equal(r.skipped,0);assert.equal(r.adjusted,0);
+  const out=Object.fromEntries(r.sessions.map(o=>[o.session,o]));
+  assert.equal(out.cs_missed.reason,'admitted');assert.equal(out.cs_self.reason,'already recorded');
+  assert.equal(out.cs_selfref.eligible,false);assert.match(out.cs_wrongproduct.reason,/price, product or applied discount/);
+  assert.equal(rows().cs_missed.commission,39960);assert.equal(rows().cs_selfref,undefined);assert.equal(rows().cs_wrongproduct,undefined);assert.equal(balance()-before,39960);
   const again=await svc.reconcileReferralPurchases(owner,50,false);assert.equal(again.adjusted,0);assert.equal(balance()-before,39960);
   assert.equal(ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_missed').length,1);
  });

@@ -15,8 +15,13 @@ type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:
 /** `kind:'lifetime'` marks the one-time Lifetime software commission: either
  * the software line of a hosted Lifetime bundle's initial invoice (keyed by
  * in_) or a self-hosted one-time Checkout purchase (keyed by cs_, with no
- * subscription). Rows without a kind are recurring software invoices. */
-type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean;kind?:'lifetime'};
+ * subscription). `kind:'yearly'` marks a self-hosted one-time (crypto)
+ * Yearly Checkout purchase (keyed by cs_, no subscription). Rows without a
+ * kind are recurring software invoices (including hosted yearly bundles). */
+type OneTimeKind='lifetime'|'yearly';
+type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean;kind?:OneTimeKind};
+type PurchaseProof={ok:false;reason:string}|{ok:true;member:StripeObject;customerId:string;paid:number;basis:number;charge:string;period:string;kind:OneTimeKind};
+type PurchaseOutcome={session:string;eligible:boolean;reason:string};
 const sources:EarnSource[]=['referral','exchange','marketplace'];
 const POSTED_RECHECK_MS=6*60*60_000;
 const SEEN_EVENT_MAX=10_000;
@@ -226,22 +231,27 @@ export class EarnStripeService {
    const commission=Math.floor(row.basis*expectedRate/100);
    const net=(n:number)=>row.disputed?0:n-Math.min(n,Math.floor(n*Math.min(row.refunded,row.paid)/row.paid));
    const delta=net(commission)-net(row.commission);
-   if(delta)s.entries.push(entry(owner,'referral','adjustment',delta,'stripe:rate:'+rowId+':'+randomUUID(),row.period,`${row.rate}% to ${expectedRate}% ${row.kind==='lifetime'?'lifetime':'recurring'} referral commission correction`,this.now()));
+   if(delta)s.entries.push(entry(owner,'referral','adjustment',delta,'stripe:rate:'+rowId+':'+randomUUID(),row.period,`${row.rate}% to ${expectedRate}% ${row.kind||'recurring'} referral commission correction`,this.now()));
    row.rate=expectedRate;row.commission=commission;tally.adjusted++;tally.deltaCents+=delta;return true;
   });
  }
- /** Operator-requested backfill for self-hosted Lifetime purchases. These are
-  * one-time Checkout Sessions with no subscription, so the subscription walk
-  * above never reaches them. Every attributed, paid, payment-mode Lifetime
-  * Session is read from Stripe; admission uses the same proofs as the
-  * webhook path (checkoutPurchase) and the same rate-correction rule. */
+ /** Operator-requested backfill for self-hosted one-time purchases (Lifetime
+  * and one-time crypto Yearly). These are payment-mode Checkout Sessions with
+  * no subscription, so the subscription walk above never reaches them. Every
+  * attributed, paid, payment-mode one-time Session is read from Stripe and
+  * judged by the same proofs as the webhook path (provePurchase). The dry run
+  * reports each candidate's outcome {session, eligible, reason} without
+  * writing; the real run admits eligible Sessions, records a per-session
+  * refusal and continues, and applies the same rate-correction rule. A changed
+  * reviewed rate or Earn mode still aborts the whole run. */
  reconcileReferralPurchases(owner:string,expectedRate:number,dryRun=true){return this.serial(async()=>{
   const c=this.settings();if(!c.enabled)throw Error('Earn is disabled');
   const member=this.liveLedger.admin().members.find(m=>m.id===owner);
   if(!member||!Number.isInteger(expectedRate)||expectedRate<0||expectedRate>100||member.commissionPercent!==expectedRate)throw Error('Reviewed commission rate changed');
-  const api=this.api(c.mode),profile=this.profile(c.mode,owner),lifetimeKeys=new Set(this.lifetimePlans(c.mode).map(x=>x.plan.key));
+  const api=this.api(c.mode),profile=this.profile(c.mode,owner),oneTimeKeys=new Set(this.oneTimePlans(c.mode).map(x=>x.plan.key));
   const allowed=[profile.promotion,...(profile.promotionHistory||[]).map((x:StripeObject)=>x.promotion),...(profile.partnerPromotions||[]).map((x:StripeObject)=>x.promotion)].filter(Boolean);
-  const sessions:string[]=[];let cursor='';
+  const sessions:string[]=[],outcomes:PurchaseOutcome[]=[],refuse=(session:string,error:unknown)=>outcomes.push({session,eligible:false,reason:error instanceof Error?error.message:String(error)});
+  let cursor='';
   for(let page=0;page<100;page++){
    const batch=await api.call('GET','/v1/checkout/sessions',{status:'complete',limit:100,'expand[0]':'data.total_details.breakdown',...(cursor?{starting_after:cursor}:{})});
    if(!Array.isArray(batch.data)||typeof batch.has_more!=='boolean')throw Error('Incomplete referral Checkout page');
@@ -249,28 +259,57 @@ export class EarnStripeService {
     const applied=(session.total_details?.breakdown?.discounts||[]).map((x:StripeObject)=>x.discount);
     const ds=applied.length?applied:Array.isArray(session.discounts)?session.discounts:[];
     if(ds.length!==1||!allowed.includes(id(ds[0]?.promotion_code||ds[0]?.source?.promotion_code)))continue;
-    if(session.mode!=='payment'||session.payment_status!=='paid'||!lifetimeKeys.has(String(session.metadata?.plan||'')))continue;
-    if(!id(session).startsWith('cs_')||session.livemode!==(c.mode==='live')||session.status!=='complete')throw Error('Incomplete attributed Checkout identity or mode');
-    const found=await this.appliedReferral(c.mode,{...session,discounts:ds});if(!found||found.owner!==owner)continue;
-    if(!sessions.includes(session.id))sessions.push(session.id);
+    if(session.mode!=='payment'||session.payment_status!=='paid'||!oneTimeKeys.has(String(session.metadata?.plan||'')))continue;
+    const sessionId=id(session);if(sessions.includes(sessionId)||outcomes.some(o=>o.session===sessionId))continue;
+    // This owner's registered promotion is applied; a malformed Session is
+    // reported for review instead of hiding every other purchase.
+    try{
+     if(!/^cs_[A-Za-z0-9_]+$/.test(sessionId)||session.livemode!==(c.mode==='live')||session.status!=='complete')throw Error('Incomplete attributed Checkout identity or mode');
+     const found=await this.appliedReferral(c.mode,{...session,discounts:ds});if(!found||found.owner!==owner)continue;
+     sessions.push(sessionId);
+    }catch(error){refuse(sessionId||'(missing id)',error);}
    }
    if(!batch.has_more)break;
    const last=id(batch.data.at(-1));if(!last||last===cursor||page===99)throw Error('Referral Checkout pagination did not finish');cursor=last;
   }
-  const ledger=this.ledger(c.mode),prior=book(ledger.admin()).invoices as Record<string,Invoice>;
-  for(const sessionId of sessions)if(prior[sessionId]&&prior[sessionId].owner!==owner)throw Error('Referral purchase owner conflict');
-  if(dryRun)return {dryRun:true,owner,rate:expectedRate,purchases:sessions,alreadyRecorded:sessions.filter(x=>prior[x]).length};
+  const ledger=this.ledger(c.mode),prior=()=>book(ledger.admin()).invoices as Record<string,Invoice>;
   const checkRate=()=>{if(this.liveLedger.admin().members.find(m=>m.id===owner)?.commissionPercent!==expectedRate||this.settings().mode!==c.mode)throw Error('Reviewed commission rate or mode changed');};
   const tally={admitted:0,skipped:0,adjusted:0,deltaCents:0};
   for(const sessionId of sessions){
-   checkRate();await this.checkoutPurchase(c.mode,sessionId);checkRate();
+   const row=prior()[sessionId];
+   if(row&&row.owner!==owner){refuse(sessionId,Error('Referral purchase owner conflict'));continue;}
+   if(dryRun){
+    if(row){outcomes.push({session:sessionId,eligible:true,reason:'already recorded'});continue;}
+    try{const proof=await this.provePurchase(c.mode,sessionId);outcomes.push({session:sessionId,eligible:proof.ok,reason:proof.ok?'eligible':proof.reason});}
+    catch(error){refuse(sessionId,error);}
+    continue;
+   }
+   checkRate();
+   let result:{recorded:boolean;reason:string};
+   try{result=await this.checkoutPurchase(c.mode,sessionId);}catch(error){refuse(sessionId,error);continue;}
+   checkRate();
+   if(!result.recorded){outcomes.push({session:sessionId,eligible:false,reason:result.reason});continue;}
    this.correctRecordedRate(c.mode,owner,sessionId,expectedRate,tally);
+   outcomes.push({session:sessionId,eligible:true,reason:result.reason});
   }
-  return {dryRun:false,owner,rate:expectedRate,purchases:sessions.length,...tally};
+  const eligible=outcomes.filter(o=>o.eligible).map(o=>o.session);
+  if(dryRun)return {dryRun:true,owner,rate:expectedRate,purchases:eligible,alreadyRecorded:eligible.filter(x=>prior()[x]).length,sessions:outcomes};
+  return {dryRun:false,owner,rate:expectedRate,purchases:eligible.length,refused:outcomes.length-eligible.length,...tally,sessions:outcomes};
  });}
- private lifetimePlans(mode:BillingMode){
-  const cfg=this.billing();
-  return cfg.plans.filter(p=>p.role==='software'&&!p.interval&&p.lifetime===true).map(plan=>({plan,price:cfg.stripe[mode].priceIds[plan.key]})).filter(x=>typeof x.price==='string'&&x.price.startsWith('price_'));
+ /** One-time software plans that can earn a self-hosted Checkout referral:
+  * Lifetime (a configured one-time price) and the one-time crypto Yearly
+  * purchase of a recurring yearly plan. The launch checkout sells that Yearly
+  * plan in payment mode with inline price_data (its configured product and
+  * amount), so its proof is the persisted launch purchase, not a price id. */
+ private oneTimePlans(mode:BillingMode){
+  const cfg=this.billing(),out:{plan:BillingConfig['plans'][number];kind:OneTimeKind;price:string}[]=[];
+  for(const plan of cfg.plans){
+   if(plan.role!=='software'||plan.checkout!=='payment-link')continue;
+   const price=cfg.stripe[mode].priceIds[plan.key];
+   if(!plan.interval&&plan.lifetime===true&&typeof price==='string'&&price.startsWith('price_'))out.push({plan,kind:'lifetime',price});
+   else if(plan.interval==='year'&&plan.lifetime!==true)out.push({plan,kind:'yearly',price:''});
+  }
+  return out;
  }
  /** Complete Checkout redemptions are purchase facts, never subscription or
   * commission entries. The provider's applied promotion, configured one-time
@@ -525,12 +564,12 @@ export class EarnStripeService {
   const before=ledger.fileVersion(),api=this.api(mode),o=ev.object;
   if(['invoice.paid','invoice.payment_succeeded'].includes(ev.type))await this.invoice(mode,id(o));
   else if(ev.type.startsWith('checkout.session.')){
-   // Only a paid, discounted, payment-mode Lifetime Session can be a
-   // self-hosted one-time software referral. Every other Checkout (including
-   // subscription-mode hosted bundles, credited through their invoice) makes
-   // no Stripe read here.
+   // Only a paid, discounted, payment-mode one-time Lifetime or Yearly
+   // Session can be a self-hosted one-time software referral. Every other
+   // Checkout (including subscription-mode card Yearly and hosted bundles,
+   // credited through their invoices) makes no Stripe read here.
    const cs=o as StripeObject,discounted=Number(cs.total_details?.amount_discount)>0||(Array.isArray(cs.discounts)&&cs.discounts.length>0);
-   if(cs.mode==='payment'&&cs.payment_status==='paid'&&discounted&&this.lifetimePlans(mode).some(x=>x.plan.key===cs.metadata?.plan))await this.checkoutPurchase(mode,id(cs));
+   if(cs.mode==='payment'&&cs.payment_status==='paid'&&discounted&&this.oneTimePlans(mode).some(x=>x.plan.key===cs.metadata?.plan))await this.checkoutPurchase(mode,id(cs));
   }
   else if(ev.type.startsWith('customer.subscription.')){
    const state=ledger.admin(),tracked=state.referrals.find(r=>r.subscription===id(o));
@@ -691,57 +730,85 @@ export class EarnStripeService {
    if(commission)s.entries.push(entry(member.id,'referral','earning',commission,'stripe:invoice:'+invoiceId,period,lifetimeBundle?`${rate}% referral commission (lifetime)`:`${rate}% recurring referral commission`,this.now()));
   });await this.adjustInvoice(mode,invoiceId);
  }
- /** A self-hosted Lifetime purchase is a one-time payment-mode Checkout
-  * Session with no subscription or invoice. Its software payment earns the
-  * referrer's commission once, keyed by the Session id, with the same proofs
-  * as the one-time referral status scan: the applied registered promotion
-  * and coupon, the exact configured one-time Lifetime price inside the
-  * coupon's product scope, a discount actually applied, the persisted launch
-  * checkout when the Session names one, the self-referral guards, and a
-  * settled PaymentIntent/charge chain. Refunds and disputes then reconcile
-  * through adjustInvoice against the recorded charge. */
- private async checkoutPurchase(mode:BillingMode,sessionId:string){
-  const ledger=this.ledger(mode);if(!/^cs_[A-Za-z0-9_]+$/.test(sessionId))return;
-  if(book(ledger.admin()).invoices[sessionId]){await this.adjustInvoice(mode,sessionId);return;}
+ /** A self-hosted one-time purchase (Lifetime, or the one-time crypto
+  * Yearly) is a payment-mode Checkout Session with no subscription or
+  * invoice. Its software payment earns the referrer's commission once, keyed
+  * by the Session id, with the same proofs as the one-time referral status
+  * scan: the applied registered promotion and coupon, exactly one software
+  * line inside the coupon's product scope (the configured one-time Lifetime
+  * price, or the persisted crypto Yearly price_data), a discount actually
+  * applied, the persisted launch checkout (required for Yearly), the
+  * self-referral guards, and a settled PaymentIntent/charge chain. Refunds
+  * and disputes then reconcile through adjustInvoice against the recorded
+  * charge. A subscription-mode Session (card Yearly, hosted bundles) never
+  * enters here: its invoices are credited by invoice(). */
+ private async checkoutPurchase(mode:BillingMode,sessionId:string):Promise<{recorded:boolean;reason:string}>{
+  const ledger=this.ledger(mode);if(!/^cs_[A-Za-z0-9_]+$/.test(sessionId))return {recorded:false,reason:'not a Checkout Session id'};
+  if(book(ledger.admin()).invoices[sessionId]){await this.adjustInvoice(mode,sessionId);return {recorded:true,reason:'already recorded'};}
+  const proof=await this.provePurchase(mode,sessionId);
+  if(!proof.ok)return {recorded:false,reason:proof.reason};
+  const {member,customerId,paid,basis,charge,period,kind}=proof;
+  this.syncMember(mode,member.id);
+  let created=false;
+  ledger.transaction(s=>{const b=book(s);if(b.invoices[sessionId])return;
+   // One-time purchases read the tier count but add no referral row.
+   const count=s.referrals.filter(r=>r.code===member.code&&r.active&&(r.paidThrough||0)>this.now()).length;
+   const rate=member.commissionPercent??tierPercent(count),commission=Math.floor(basis*rate/100);
+   b.invoices[sessionId]={id:sessionId,owner:member.id,subscription:'',customer:customerId,paid,basis,commission,rate,period,paidThrough:0,charges:[charge],refunded:0,disputed:false,kind};
+   if(commission)s.entries.push(entry(member.id,'referral','earning',commission,'stripe:checkout:'+sessionId,period,`${rate}% referral commission (${kind})`,this.now()));
+   created=true;
+  });await this.adjustInvoice(mode,sessionId);
+  return {recorded:true,reason:created?'admitted':'already recorded'};
+ }
+ /** Read-only admission proof for a one-time purchase. A {ok:false} result is
+  * an unrelated or non-payable Session; a throw is a review condition. */
+ private async provePurchase(mode:BillingMode,sessionId:string):Promise<PurchaseProof>{
   const api=this.api(mode),session=await api.call('GET','/v1/checkout/sessions/'+sessionId,{'expand[0]':'total_details.breakdown'});
   if(id(session)!==sessionId||session.livemode!==(mode==='live'))throw Error('Referral Checkout identity or mode changed');
-  if(session.mode!=='payment'||session.status!=='complete'||session.payment_status!=='paid'||session.currency!=='usd')return;
-  const planKey=String(session.metadata?.plan||''),candidates=this.lifetimePlans(mode).filter(x=>x.plan.key===planKey);
-  if(!candidates.length)return; // Only Lifetime is in scope for one-time software referral commission.
+  if(session.mode!=='payment'||id(session.subscription))return {ok:false,reason:'not a one-time payment Checkout'};
+  if(session.status!=='complete'||session.payment_status!=='paid')return {ok:false,reason:'Checkout is not complete and paid'};
+  if(session.currency!=='usd')return {ok:false,reason:'Checkout currency is not USD'};
+  const planKey=String(session.metadata?.plan||''),candidates=this.oneTimePlans(mode).filter(x=>x.plan.key===planKey);
+  if(!candidates.length)return {ok:false,reason:'plan is not a one-time Lifetime or Yearly software plan'};
+  if(candidates.length!==1)throw Error('One-time plan configuration is ambiguous');
+  const {kind,price:configuredPrice}=candidates[0],label=kind==='lifetime'?'Lifetime':'Yearly';
   const applied=(session.total_details?.breakdown?.discounts||[]).map((x:StripeObject)=>x.discount);
   const ds=applied.length?applied:Array.isArray(session.discounts)?session.discounts:[];
-  if(!ds.length)return;
-  const found=await this.appliedReferral(mode,{...session,discounts:ds});if(!found)return;
+  if(!ds.length)return {ok:false,reason:'no discount applied'};
+  const found=await this.appliedReferral(mode,{...session,discounts:ds});if(!found)return {ok:false,reason:'no registered referral promotion applied'};
   const {member,offer}=found;
   const appliedCoupon=id(ds[0]?.coupon||ds[0]?.source?.coupon);if(appliedCoupon&&appliedCoupon!==offer.proof?.coupon)throw Error('Applied Checkout coupon disagrees with promotion proof');
   const items=await api.call('GET','/v1/checkout/sessions/'+sessionId+'/line_items',{limit:100});
   if(!Array.isArray(items.data)||items.has_more!==false)throw Error('Incomplete attributed Checkout items');
-  if(items.data.length!==1)throw Error('Lifetime Checkout must contain exactly one software line');
+  if(items.data.length!==1)throw Error(`${label} Checkout must contain exactly one software line`);
   const item=items.data[0],priceId=id(item.price);
-  if(!candidates.some(x=>x.price===priceId)||item.price?.type!=='one_time'||item.price?.recurring!=null||!Array.isArray(offer.products)||!offer.products.includes(id(item.price?.product))||item.quantity!==1||
-    !Number.isSafeInteger(item.amount_subtotal)||item.amount_subtotal<=0||!Number.isSafeInteger(item.amount_discount)||item.amount_discount<=0||item.amount_discount>=item.amount_subtotal)throw Error('One-time Lifetime price, product or applied discount mismatch');
-  if(session.metadata?.wh_launch_intent){
+  if((kind==='lifetime'&&priceId!==configuredPrice)||!priceId.startsWith('price_')||item.price?.type!=='one_time'||item.price?.recurring!=null||!Array.isArray(offer.products)||!offer.products.includes(id(item.price?.product))||item.quantity!==1||
+    !Number.isSafeInteger(item.amount_subtotal)||item.amount_subtotal<=0||!Number.isSafeInteger(item.amount_discount)||item.amount_discount<=0||item.amount_discount>=item.amount_subtotal)throw Error(`One-time ${label} price, product or applied discount mismatch`);
+  if(kind==='yearly'){
+   // The only seller of a payment-mode Yearly is the launch crypto checkout:
+   // a non-renewing, software-only, payment-mode intent whose single line is
+   // inline price_data for the configured Yearly product and amount.
+   if(!session.metadata?.wh_launch_intent||session.metadata?.non_renewing!=='true')throw Error('One-time Yearly Checkout has no persisted launch purchase');
+   const grant=launchGrant(this.dir,session.metadata,mode==='live',sessionId) as (StripeObject|null),params=grant?.stripeParams||{};
+   if(!grant||grant.mode!==mode||grant.plan!==planKey||grant.payment!=='crypto'||grant.hosting||grant.hostingRequested===true||params.mode!=='payment'||params['line_items[0][price]']!==undefined||params['line_items[1][price]']!==undefined||
+     params['line_items[0][quantity]']!==1||params['line_items[0][price_data][product]']!==id(item.price?.product)||params['line_items[0][price_data][currency]']!==session.currency||
+     !Number.isSafeInteger(params['line_items[0][price_data][unit_amount]'])||item.price?.unit_amount!==params['line_items[0][price_data][unit_amount]']||item.amount_subtotal!==params['line_items[0][price_data][unit_amount]'])throw Error('One-time Yearly Checkout differs from its persisted launch purchase');
+  } else if(session.metadata?.wh_launch_intent){
    const grant=launchGrant(this.dir,session.metadata,mode==='live',sessionId) as (StripeObject|null);
    if(!grant||grant.mode!==mode||grant.plan!==planKey||grant.hosting||grant.stripeParams?.['line_items[0][price]']!==priceId)throw Error('Lifetime Checkout differs from its persisted launch purchase');
   }
-  const customerId=id(session.customer);if(!customerId.startsWith('cus_'))throw Error('Lifetime Checkout has no Stripe customer');
-  if(await this.selfReferral(mode,customerId,member.id))return;
+  const customerId=id(session.customer);if(!customerId.startsWith('cus_'))throw Error(`${label} Checkout has no Stripe customer`);
+  if(await this.selfReferral(mode,customerId,member.id))return {ok:false,reason:'self-referral'};
   const tax=session.total_details?.amount_tax;
-  if(!Number.isSafeInteger(session.amount_total)||session.amount_total<=0||!Number.isSafeInteger(tax)||tax<0||tax>session.amount_total)throw Error('Lifetime Checkout totals are incomplete');
+  if(!Number.isSafeInteger(session.amount_total)||session.amount_total<=0||!Number.isSafeInteger(tax)||tax<0||tax>session.amount_total)throw Error(`${label} Checkout totals are incomplete`);
   const basis=Math.min(item.amount_subtotal-item.amount_discount,session.amount_total-tax);
   const payment=id(session.payment_intent);if(!payment.startsWith('pi_'))throw Error('One-time purchase has no settled payment');
   // Stripe returns ch_ and py_ charge IDs (including crypto payments).
   const pi=await api.call('GET','/v1/payment_intents/'+payment,{'expand[0]':'latest_charge'}),charge=pi.latest_charge;
   if(pi.id!==payment||pi.livemode!==(mode==='live')||pi.status!=='succeeded'||id(pi.customer)!==customerId||!Number.isSafeInteger(pi.amount_received)||pi.amount_received<session.amount_total||pi.currency!==session.currency||!charge||typeof charge!=='object'||!['ch_','py_'].some(prefix=>id(charge).startsWith(prefix))||charge.livemode!==(mode==='live')||id(charge.payment_intent)!==payment||charge.paid!==true||charge.currency!==session.currency||!Number.isSafeInteger(charge.amount)||charge.amount<session.amount_total)throw Error('One-time purchase payment facts are incomplete');
-  if(basis<=0)return;
-  const paid=session.amount_total,period=new Date(Number(charge.created||session.created)*1000).toISOString().slice(0,7);
-  this.syncMember(mode,member.id);
-  ledger.transaction(s=>{const b=book(s);if(b.invoices[sessionId])return;
-   const count=s.referrals.filter(r=>r.code===member.code&&r.active&&(r.paidThrough||0)>this.now()).length;
-   const rate=member.commissionPercent??tierPercent(count),commission=Math.floor(basis*rate/100);
-   b.invoices[sessionId]={id:sessionId,owner:member.id,subscription:'',customer:customerId,paid,basis,commission,rate,period,paidThrough:0,charges:[id(charge)],refunded:0,disputed:false,kind:'lifetime'};
-   if(commission)s.entries.push(entry(member.id,'referral','earning',commission,'stripe:checkout:'+sessionId,period,`${rate}% referral commission (lifetime)`,this.now()));
-  });await this.adjustInvoice(mode,sessionId);
+  if(basis<=0)return {ok:false,reason:'no payable software net'};
+  const period=new Date(Number(charge.created||session.created)*1000).toISOString().slice(0,7);
+  return {ok:true,member,customerId,paid:session.amount_total,basis,charge:id(charge),period,kind};
  }
  private async adjustInvoice(mode:BillingMode,invoiceId:string){
   const ledger=this.ledger(mode),row=book(ledger.admin()).invoices[invoiceId] as Invoice|undefined;if(!row)return;

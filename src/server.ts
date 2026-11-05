@@ -2731,7 +2731,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             result=await earnStripe.reconcileReferralInvoices(String(body.owner),body.expectedRate,body.dryRun);break;
           }
           case "/admin/api/earn/referral-purchases-reconcile": {
-            // Self-hosted Lifetime purchases: one-time Checkout Sessions with no subscription.
+            // Self-hosted one-time purchases (Lifetime, crypto Yearly): payment-mode Checkout Sessions with no subscription.
             if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
             result=await earnStripe.reconcileReferralPurchases(String(body.owner),body.expectedRate,body.dryRun);break;
           }
