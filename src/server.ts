@@ -2730,6 +2730,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
             result=await earnStripe.reconcileReferralInvoices(String(body.owner),body.expectedRate,body.dryRun);break;
           }
+          case "/admin/api/earn/referral-purchases-reconcile": {
+            // Self-hosted Lifetime purchases: one-time Checkout Sessions with no subscription.
+            if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
+            result=await earnStripe.reconcileReferralPurchases(String(body.owner),body.expectedRate,body.dryRun);break;
+          }
           case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
           case "/admin/api/earn/stripe-run": result = await earnStripe.run(); break;
