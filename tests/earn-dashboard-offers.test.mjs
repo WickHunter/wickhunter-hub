@@ -120,7 +120,7 @@ await test('mixed purchase proves invoice-specific allocation when one PaymentIn
  }
  assert.equal(f.ledger.admin().entries.length,0,'allocation inspection never replays commission');
 });
-await test('view grants never bind billing identity and cannot mutate any Earn endpoint',async()=>{
+await test('dashboard grants never bind billing identity and edit the owner payout destination with an audit row (0.4.107)',async()=>{
  const h=await freshHub();try{
   const e=new EarnService(h.dataDir);e.member(owner,'Verified owner');e.transaction(s=>{s.members[0].uids=[{exchange:'weex',uid:'PRIVATE_UID',verified:true,submittedAt:new Date().toISOString()}];s.members[0].payoutPreference={method:'paypal',address:'private@example.test',revision:'fixture'};});const token=h.store.issueUntil('Different billing license',Date.now()+86400000,'unleashed');
   e.grantDashboard(token.payload.id,owner,'reviewed fixture');assert.equal(e.boundOwner(['license:'+token.payload.id]),null);assert.throws(()=>e.grantDashboard(token.payload.id,earnOwner('other'),'fixture'));
@@ -129,7 +129,7 @@ await test('view grants never bind billing identity and cannot mutate any Earn e
   setFlag(h.dataDir,token.payload.id,'earn',true);
   h.hub.earnStripe.configure({enabled:true,mode:'test'});h.hub.earnStripe.ledger('test').copyMember(e.admin().members[0]);
   const rawTest=h.hub.earnStripe.view(owner).test;assert.equal(rawTest.member.uids[0].uid,'PRIVATE_UID');assert.equal(rawTest.member.payoutPreference.address,'private@example.test');
-  const got=await(await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(got.member.id,owner);assert.equal(got.capabilities.readOnly,false);assert.equal(Object.hasOwn(got.stripe,'test'),false);
+  const got=await(await fetch(h.origin+'/api/hub/earn',{headers})).json();assert.equal(got.member.id,owner);assert.equal(got.capabilities.readOnly,false);assert.equal(got.member.payoutPreference.address,'private@example.test');
   // 0.4.107: the reviewed dashboard grant edits the owner's payout destination, audited.
   const audits=(e.admin().audit??[]).length;
   const saved=await(await fetch(h.origin+'/api/hub/earn/payout-preference',{method:'POST',headers,body:JSON.stringify({method:'usdt-polygon',address:'0x'+'ab'.repeat(20),expectedRevision:'fixture'})})).json();
