@@ -31,6 +31,8 @@ import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 //   admin    POST /admin/api/billing/test-email  {to}
 //   admin    GET  /admin/api/billing/events      recent webhook events + outcomes
 //   admin    POST /admin/api/billing/reconcile-subscription {subscriptionId|customerId, dryRun?, by, reason}
+//   admin    POST /admin/api/hosting/complimentary {email, reason, idempotencyKey, channel:"beta", by?, region?, plan?, months?} (v0.4.104)
+//   admin    POST /admin/api/hosting/instances/:id/end-complimentary {by, reason} (v0.4.104)
 //                                               apply a missed paid term from Stripe (dry run by default)
 //   keyed    GET  /api/candles/seed              signed 1m candle seed (contract v1)
 //   keyed    GET  /api/candles/snapshot          signed last-N-closed-candles, whole venue (v1)
@@ -91,9 +93,9 @@ import type { HttpLike } from "./marketcap/cmc.js";
 import { LiqService, DEFAULT_LIQ_SERVICE_CONFIG, type LiqFetchLike } from "./liq/service.js";
 import { CommunityService } from "./community.js";
 import { CANDLE_KEY_ID, CandleKeyStore } from "./candles/key.js";
-import { isVenueId } from "./candles/venues.js";
+import { isVenueId, type VenueId } from "./candles/venues.js";
 import { isSnapshotDepth, isSnapshotInterval, SNAPSHOT_INTERVALS, SNAPSHOT_MAX_DEPTH } from "./candles/snapshot.js";
-import { isTimeframeInterval, TIMEFRAME_INTERVALS } from "./candles/timeframe.js";
+import { isTimeframeInterval, TIMEFRAME_INTERVALS, type TimeframeBoundary } from "./candles/timeframe.js";
 import {
   AsyncGzipQueue, GzipCapacityError,
   type AsyncGzipLimits, type GzipFunction, type GzipReservation,
@@ -268,6 +270,8 @@ export interface HubDeps {
   candleNow?: CandleServiceDeps["now"];
   /** Where a snapshot rebuild reports its cost; production prints it. */
   candleLog?: CandleServiceDeps["log"];
+  /** v0.4.103 — where a long timeframe window is built (default: worker pool). */
+  candleTimeframeBuild?: CandleServiceDeps["timeframeBuild"];
   /** Injectable async response compressor and limits for deterministic tests. */
   responseGzip?: GzipFunction;
   responseGzipLimits?: Partial<AsyncGzipLimits>;
@@ -559,6 +563,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
   // and tight against a flood of one address's inbox.
   const customerSigninEmailLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
   const hostingBundleIpLimiter = new SlidingWindowLimiter({ max: 5, windowMs: 15 * 60_000 });
+  /** v0.4.104 — operator complimentary server grants (each one creates a paid provider server). */
+  const complimentaryLimiter = new SlidingWindowLimiter({ max: 10, windowMs: 10 * 60_000 });
   const seats = new SeatStore(cfg.dataDir, cfg.seats ?? DEFAULT_SEAT_POLICY);
   const seatNow = deps.seatNow ?? Date.now;
   const community = new CommunityService(cfg.dataDir);
@@ -614,15 +620,22 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       keyId: cfg.candleKeyId,
       options: cfg.candleOptions,
       tickMs: cfg.candleTickMs,
+      timeframeHorizon: cfg.candleTimeframeHorizon,
     },
     {
       sign: signSeed,
+      timeframeBuild: deps.candleTimeframeBuild,
       fetchLike: deps.candleFetch,
       sleep: deps.candleSleep,
       now: deps.candleNow,
       log: deps.candleLog,
     },
   );
+  // v0.4.103 — a refused HUB_TIMEFRAME_HORIZON runs the Hub without one, loudly.
+  if (cfg.candleTimeframeHorizonError) console.error(`[candles] ${cfg.candleTimeframeHorizonError} — running with no timeframe horizon`);
+  for (const v of Object.keys(cfg.candleTimeframeHorizon ?? {})) {
+    if (!cfg.candleVenues.includes(v as VenueId)) console.warn(`[candles] HUB_TIMEFRAME_HORIZON names ${v}, which has no collector (HUB_CANDLE_VENUES); ignored`);
+  }
   // ── THE MARKET-CAP PRODUCER ───────────────────────────────────────────────
   // Built only when it is configured AND usable. A refusal is PRINTED and the
   // service stays null: the hub also does licensing and candle seeding, and a
@@ -1775,7 +1788,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           const record = Object.values(billing.store.customers()).find(c => c.licenseId === payload.id && c.livemode);
           if (allowed) {
             const dashboardOwner=earn.dashboardOwner(payload.id);
-            if(dashboardOwner){owner=dashboardOwner;readOnly=true;}
+            // 0.4.107 (operator decision 2026-11-05, accepting the weaker payout
+            // safeguard): a reviewed dashboard grant can edit the owner's Earn
+            // settings from the app. Granting stays admin-only and every payout
+            // destination change is recorded in the Earn audit trail.
+            if(dashboardOwner){owner=dashboardOwner;readOnly=false;}
             else owner=boundEarnOwner(record?[record]:[],payload.id);
           }
           name = record?.email || store.get(payload.id)?.name || "WH member";
@@ -1971,7 +1988,13 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
       if (status === null) continue;
       results.push({ venueId: (r as any).venueId, outcome: classifyProbeStatus(status) });
     }
-    const r = await hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter);
+    // v0.4.104 — host-key fingerprints and the fleet-key count, exact shapes only.
+    const sshHostKeys = Array.isArray(body.sshHostKeys)
+      ? body.sshHostKeys.slice(0, 6).filter((k: any) => k && typeof k.type === "string" && /^[A-Z0-9]{2,12}$/.test(k.type) && typeof k.fingerprint === "string" && /^SHA256:[A-Za-z0-9+/]{43}$/.test(k.fingerprint))
+        .map((k: any) => ({ type: k.type as string, fingerprint: k.fingerprint as string }))
+      : undefined;
+    const fleetKeysPresent = Number.isSafeInteger(body.fleetKeysPresent) && (body.fleetKeysPresent as number) >= 0 && (body.fleetKeysPresent as number) <= 10 ? body.fleetKeysPresent as number : undefined;
+    const r = await hosting.reportReadiness(instanceId, bootstrapToken ?? managementToken!, body.generation, results, undefined, managementCounter, { sshHostKeys, fleetKeysPresent });
     if (!r.ok) return sendJson(res, r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 404, { ok: false, error: r.error }, { "cache-control": "no-store" });
     sendJson(res, 200, { ok: true, ready: r.value.ready }, { "cache-control": "no-store" });
   }
@@ -2275,6 +2298,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     });
   }
 
+  /** v0.4.103 — UNSIGNED venue-boundary facts beside a long timeframe seed.
+   *  Never in the body: the v2 envelope's key set is pinned on both sides.
+   *  They are hints (the app proves a listing boundary against the venue
+   *  itself); a leading gap in the signed body is never proof on its own. */
+  function timeframeBoundaryHeaders(b: TimeframeBoundary | null): Record<string, string> {
+    if (!b) return {};
+    const out: Record<string, string> = { "x-wh-horizon-from-ms": String(b.horizonFromMs) };
+    if (b.floor) {
+      out["x-wh-venue-floor-ms"] = String(b.floor.atMs);
+      out["x-wh-venue-floor-checked-from-ms"] = String(b.floor.checkedFromMs);
+      out["x-wh-venue-floor-proofs"] = String(b.floor.confirmations);
+      out["x-wh-venue-floor-first-proof-ms"] = String(b.floor.firstAt);
+      out["x-wh-venue-floor-last-proof-ms"] = String(b.floor.lastAt);
+    }
+    return out;
+  }
+
   /** Gzipped snapshot bodies, keyed by the exact served buffer. */
   const snapshotGzip = new WeakMap<Buffer, Promise<Buffer>>();
 
@@ -2321,12 +2361,43 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         return sendJson(res, 400, { ok: false,
           error: `interval must be 1 or one of ${TIMEFRAME_INTERVALS.join(",")} minutes` });
       }
+      const tfReq = { venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo) };
+      // v0.4.103 — a window longer than 60 days of a horizon interval is built
+      // off the event loop and arrives already signed. Its compression slot is
+      // reserved AFTER the build, so a slow build never holds one.
+      if (candles.isLongTimeframeRequest(tfReq)) {
+        const served = await candles.timeframeSeedAsync(tfReq);
+        if (!served.ok) {
+          return sendJson(res, served.code, { ok: false, error: served.error },
+            served.retryAfter ? { "retry-after": String(served.retryAfter), "cache-control": "no-store" } : undefined);
+        }
+        const body = served.body ?? Buffer.from(JSON.stringify(served.payload), "utf8");
+        const boundary = served.body ? timeframeBoundaryHeaders(served.boundary) : {};
+        const etag = `"${createHash("sha256").update(body).update(JSON.stringify(boundary)).digest("base64url").slice(0, 32)}"`;
+        const inm = String(req.headers["if-none-match"] ?? "");
+        if (inm && inm.split(",").some((t) => t.trim() === etag)) {
+          res.writeHead(304, { etag, "cache-control": "public, max-age=60", ...boundary });
+          return void res.end();
+        }
+        const reservation = wantsGzip ? responseGzip.reserve() : null;
+        if (wantsGzip && !reservation) return compressionBusy(res);
+        try {
+          const bytes = reservation ? await compressedBytes(body, reservation, res) : body;
+          if (!bytes) return;
+          res.writeHead(200, {
+            "content-type": "application/json; charset=utf-8", "content-length": bytes.length,
+            ...(wantsGzip ? { "content-encoding": "gzip" } : {}),
+            etag, "cache-control": "public, max-age=60", ...boundary,
+          });
+          return void res.end(bytes);
+        } finally {
+          reservation?.release();
+        }
+      }
       const reservation = wantsGzip ? responseGzip.reserve() : null;
       if (wantsGzip && !reservation) return compressionBusy(res);
       try {
-        const outcome = candles.timeframeSeed({
-          venue, symbol, interval, fromMs: Number(rawFrom), toMs: Number(rawTo),
-        });
+        const outcome = candles.timeframeSeed(tfReq);
         if (!outcome.ok) {
           return sendJson(res, outcome.code, { ok: false, error: outcome.error });
         }
@@ -2552,6 +2623,40 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     res.end(html);
   }
 
+  /** The admin JSON/CSRF contract the Marketplace configuration route
+   *  established: the fixed custom header, a JSON body, never cross-site. */
+  function adminJsonAction(req: IncomingMessage): boolean {
+    const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+    return req.headers[MARKETPLACE_CSRF_HEADER] === MARKETPLACE_CSRF_VALUE && /^application\/json(?:\s*;|$)/.test(contentType) && req.headers["sec-fetch-site"] !== "cross-site";
+  }
+
+  /** v0.4.104 — the admin Hosting page's rows: each instance with the
+   *  customer it belongs to (name/email from the billing record; a bundle
+   *  reservation through its bound subscription) and the app's last
+   *  check-in from the licence roster. The bootstrap/management token
+   *  hashes are reduced to booleans (the temporary password is derived from
+   *  the bootstrap hash), and the raw Checkout request body is dropped. */
+  function adminHostingRows(rows: ReturnType<typeof hosting.store.instances>): Array<Record<string, unknown>> {
+    const roster = readRoster(cfg.dataDir);
+    const customers = billing.store.customers();
+    return rows.map((row) => {
+      let rec = customers[row.ownerId] ?? null;
+      if (!rec && row.stripeSubscriptionId) {
+        const bound = billing.store.getBundleSubscription(row.stripeSubscriptionId);
+        if (bound) rec = customers[bound.customerId] ?? billing.store.findByStripeCustomer(bound.customerId) ?? null;
+      }
+      const seen = rec ? roster[rec.licenseId] : undefined;
+      const { bootstrapTokenHash, managementTokenHash, checkoutRequestBody, checkoutIdempotencyKey, leaseToken, ...rest } = row;
+      return {
+        ...rest,
+        bootstrapTokenActive: !!bootstrapTokenHash, managementTokenSet: !!managementTokenHash, checkoutRequestStored: !!checkoutRequestBody,
+        leaseHeld: !!leaseToken,
+        customer: rec ? { key: rec.key, name: rec.name, email: rec.email, licenseId: rec.licenseId, complimentary: !!rec.complimentary } : null,
+        app: seen ? { version: seen.version, lastSeenMs: seen.lastSeen, ip: seen.ip, onThisServer: !!row.ip && seen.ip === row.ip } : null,
+      };
+    });
+  }
+
   function adminAuthorized(req: IncomingMessage): boolean {
     if (!cfg.adminToken) return false;
     return sameSecret(String(req.headers["x-hub-admin"] ?? ""), cfg.adminToken);
@@ -2628,6 +2733,11 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
           case "/admin/api/earn/referral-invoices-reconcile": {
             if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
             result=await earnStripe.reconcileReferralInvoices(String(body.owner),body.expectedRate,body.dryRun);break;
+          }
+          case "/admin/api/earn/referral-purchases-reconcile": {
+            // Self-hosted one-time purchases (Lifetime, crypto Yearly): payment-mode Checkout Sessions with no subscription.
+            if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
+            result=await earnStripe.reconcileReferralPurchases(String(body.owner),body.expectedRate,body.dryRun);break;
           }
           case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
@@ -2945,6 +3055,8 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         signer: cfg.candleSigner,
         requiresLicense: cfg.candleRequireLicense,
         retentionDays: cfg.candleOptions.retentionDays,
+        // v0.4.103 — standing long-horizon progress per venue × interval.
+        timeframeHorizon: { ...candles.horizonHealth(), error: cfg.candleTimeframeHorizonError ?? null },
         seedPublicKey,
         candleKeyId: CANDLE_KEY_ID,
         candlePublicKey,
@@ -3413,9 +3525,66 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
         throw err;
       }
     }
+    // ── v0.4.104 — complimentary servers (operator-granted, no Stripe) ────
+    // `HostingService.adminCreateComplimentary`: same reservation, provision
+    // job, bootstrap, readiness and emails as a paid server. Admin bearer +
+    // the fixed CSRF header + a JSON body; at most 10 grants per 10 minutes.
+    if (m === "POST" && p === "/admin/api/hosting/complimentary") {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "complimentary servers require the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const rate = complimentaryLimiter.take("admin", rateLimitNow());
+      if (!rate.ok) { req.resume(); return sendRateLimited(res, rate, "complimentary server grants"); }
+      const body = await readJsonBody(req, 8 * 1024);
+      if (body === null || typeof body.email !== "string" || typeof body.reason !== "string" || typeof body.idempotencyKey !== "string"
+        || (body.by !== undefined && typeof body.by !== "string") || (body.region !== undefined && typeof body.region !== "string")
+        || (body.plan !== undefined && typeof body.plan !== "string") || (body.months !== undefined && body.months !== null && typeof body.months !== "number")) {
+        return sendJson(res, 400, { ok: false, error: "expected {email, reason, idempotencyKey, channel:\"beta\", by?, region?, plan?, months?}" }, { "cache-control": "no-store" });
+      }
+      if (body.channel !== "beta") return sendJson(res, 400, { ok: false, error: "channel must be \"beta\" — the hosted install serves the Hub's verified customer Beta release" }, { "cache-control": "no-store" });
+      const latest = readLatest();
+      if (!latest || cfg.releaseChannel !== "beta") return sendJson(res, 503, { ok: false, error: "no verified Beta release is published on this Hub; nothing was created" }, { "cache-control": "no-store" });
+      const r = await hosting.adminCreateComplimentary({
+        email: body.email, by: typeof body.by === "string" ? body.by : "admin", reason: body.reason, idempotencyKey: body.idempotencyKey,
+        region: typeof body.region === "string" && body.region ? body.region : undefined, planId: typeof body.plan === "string" && body.plan ? body.plan : undefined,
+        months: typeof body.months === "number" ? body.months : undefined, releaseRef: latest.sha256,
+      });
+      if (!r.ok) {
+        const status = r.code === "INVALID_REQUEST" ? 400 : r.code === "PROVIDER_STATUS_UNKNOWN" ? 503 : 409;
+        return sendJson(res, status, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+      }
+      // The ordinary welcome email (licence + install page), once per
+      // licence; a replay retries one that failed earlier.
+      const welcome = await billing.sendComplimentaryWelcome(r.value.ownerId);
+      return sendJson(res, 200, { ok: true, ...r.value, releaseVersion: r.value.releaseRef === latest.sha256 ? latest.version : null, welcome }, { "cache-control": "no-store" });
+    }
+    if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/end-complimentary")) {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "ending a complimentary server requires the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const id = p.slice("/admin/api/hosting/instances/".length, -"/end-complimentary".length);
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by : "admin";
+      const reason = typeof body?.reason === "string" ? body.reason : "";
+      if (!reason.trim()) return sendJson(res, 400, { ok: false, error: "a reason is required for the audit log" }, { "cache-control": "no-store" });
+      const r = hosting.adminEndComplimentary(id, by, reason);
+      return r.ok ? sendJson(res, 200, { ok: true, ...r.value }, { "cache-control": "no-store" }) : sendJson(res, r.code === "NOT_FOUND" ? 404 : 409, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+    }
+    // v0.4.104 — "Install update key on existing hosted servers". The dry run
+    // lists targets (audited). There is no Hub-to-server command channel
+    // after bootstrap (see HostingService.fleetKeyPlan), so the apply step
+    // refuses by name and changes nothing.
+    if (m === "POST" && (p === "/admin/api/hosting/fleet-key/plan" || p === "/admin/api/hosting/fleet-key/apply")) {
+      if (!adminJsonAction(req)) return sendJson(res, 403, { ok: false, error: "the fleet-key action requires the admin JSON/CSRF contract" }, { "cache-control": "no-store" });
+      const body = await readJsonBody(req);
+      const by = typeof body?.by === "string" ? body.by.trim().slice(0, 80) || "admin" : "admin";
+      const plan = hosting.fleetKeyPlan();
+      const apply = p.endsWith("/apply");
+      billing.store.appendEvent({ id: `hosting-fleet-key-${apply ? "apply" : "plan"}:${Date.now()}`, type: apply ? "admin.hosting.fleet-key.apply-refused" : "admin.hosting.fleet-key.plan", livemode: billing.config().mode === "live",
+        receivedAtMs: Date.now(), outcome: apply ? "ignored" : "applied", note: JSON.stringify({ by, targets: plan.targets.map((t) => t.instanceId), confirmed: plan.confirmed.length, configuredKeys: plan.configuredKeys }) });
+      const explanation = "The Hub has no command channel to a hosted server after its first boot: cloud-init runs once, the readiness agent only sends a boot proof to the Hub (it never reads or runs anything the Hub returns), and the Vultr API cannot run commands on a running server. New servers get the key from their bootstrap; existing ones need a server-side step outside the Hub.";
+      if (apply) return sendJson(res, 409, { ok: false, code: "NO_CHANNEL", error: explanation, dryRun: plan }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, dryRun: true, ...plan, explanation }, { "cache-control": "no-store" });
+    }
     if (m === "GET" && p === "/admin/api/hosting/instances") {
       const rows = hosting.store.instances().sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-      return sendJson(res, 200, { ok: true, instances: rows }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, instances: adminHostingRows(rows) }, { "cache-control": "no-store" });
     }
     if (m === "GET" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/outbox")) {
       const id = p.slice("/admin/api/hosting/instances/".length, -"/outbox".length);

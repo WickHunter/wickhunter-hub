@@ -47,7 +47,7 @@ import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-p
 import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
 import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
-import { EarnStripeApi } from "../earn-stripe-api.js";
+import { EarnStripeApi, EarnStripeError } from "../earn-stripe-api.js";
 import { componentPriceId, softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
 
 import { launchGrant, reconcileLaunchSession, type LaunchIntent } from "./launch.js";
@@ -513,6 +513,18 @@ export class BillingService {
     const foreignFamilyNote = this.foreignProductFamilyNote(ev);
     if (foreignFamilyNote) return { outcome: "ignored", note: foreignFamilyNote };
 
+    // A refund or dispute on a charge no earlier event indexed: under
+    // 2025-03-31.basil and later (the live endpoint renders
+    // 2026-08-26.dahlia) an invoice no longer names its charge or
+    // PaymentIntent, so a subscription payment's charge is unknown here
+    // until Stripe's invoice payments link it back to its invoice. Runs
+    // before every identity/role decision below, which then see the charge
+    // exactly as the old-shape invoice event would have indexed it.
+    if (ev.type === "charge.refunded" || ev.type === "charge.dispute.created") {
+      const parked = await this.resolveUnknownCharge(ev, cfg);
+      if (parked) return parked;
+    }
+
     if (ev.type === "checkout.session.expired") {
       const f = checkoutFacts(ev.object);
       if (f.metadata.bundle !== "software-hosting-v2") return { outcome: "ignored", note: "unowned checkout expiry" };
@@ -575,6 +587,198 @@ export class BillingService {
       default:
         return { outcome: "ignored", note: "event type not handled" };
     }
+  }
+
+  /** Link a refunded/disputed charge that no earlier event indexed to the
+   *  subscription invoice it paid, and index it the way that invoice's
+   *  old-shape `charge`/`payment_intent` fields would have been indexed
+   *  (`applyPaidInvoiceTerm`, the hosting invoice handler, `classify`).
+   *
+   *  Basil/dahlia invoices carry neither field, and their charges carry no
+   *  `invoice`; the link is `GET /v1/invoice_payments` filtered by the
+   *  charge's PaymentIntent (a dispute without one reads its charge first),
+   *  then the invoice itself. A pre-basil `charge.invoice` is used directly.
+   *
+   *  Returns null to continue the ordinary flow: the records already hold
+   *  the charge completely (`chargeHolding`; a role-index entry alone, or a
+   *  bundle charge held by its hosting record only, is not enough and is
+   *  re-resolved), no secret key is saved (today's behaviour), the ids are not
+   *  readable Stripe ids, Stripe proves the payment funded no invoice, or the
+   *  invoice belongs to no subscription this Hub records. Returns an
+   *  `unclassified` result when the evidence is complete but ambiguous or
+   *  conflicting (more than one page or invoice, a different customer or
+   *  mode, a role conflict, a deterministic Stripe 4xx other than 408, 409
+   *  or 429); nothing is indexed then. Throws (500, Stripe
+   *  retries, the event is not marked seen) when Stripe cannot be read or
+   *  answers with something other than the requested objects. Never writes a
+   *  role or charge without the invoice that proves it, and writes the role
+   *  index only after the record(s) holding the charge are saved. */
+  private async resolveUnknownCharge(ev: StripeEvent, cfg: BillingConfig): Promise<ApplyResult | null> {
+    const refund = ev.type === "charge.refunded";
+    const cf = refund ? chargeFacts(ev.object) : null;
+    const df = refund ? null : disputeFacts(ev.object);
+    const chargeId = cf ? cf.chargeId : df!.chargeId;
+    const paymentIntentId = cf ? cf.paymentIntentId : df!.paymentIntentId;
+    const invoiceId = cf?.invoiceId ?? "";
+    const named = [chargeId, paymentIntentId, invoiceId].filter(Boolean);
+    if (!named.length) return null;
+    const held = this.chargeHolding(named);
+    if (held.state === "held") return null;
+    if (held.state === "conflict") return { outcome: "unclassified", note: `${ev.type} on ${chargeId || paymentIntentId}: ${held.why} — recorded for reconciliation, applied to neither software nor hosting` };
+    // "unheld" (no record holds it — even when the role index already names
+    // it: a crash between the index write and the record write) and
+    // "partial" (a bundle with only one side holding it) re-run the
+    // resolution, whose writes are idempotent. A Lifetime bundle's VPS-only
+    // renewal is legitimately held by hosting alone: its re-run is best
+    // effort and any failure continues the ordinary flow exactly as before.
+    const lenient = held.state === "partial" && held.lenient;
+    try {
+      let r: ApplyResult | null;
+      try { r = await this.resolveChargeThroughInvoice(ev, cfg, chargeId, paymentIntentId, invoiceId); }
+      catch (err) {
+        // A deterministic refusal (404 resource_missing, 400, 401, 403 …)
+        // fails identically on every Stripe retry for ~3 days: park it with
+        // its status/code. 408, 409, 429, 5xx, transport errors and malformed
+        // answers still throw (500, not seen, Stripe retries).
+        if (!(err instanceof EarnStripeError) || err.status < 400 || err.status >= 500 || [408, 409, 429].includes(err.status)) throw err;
+        r = { outcome: "unclassified", note: `${ev.type} on ${chargeId || paymentIntentId}: Stripe answered ${err.status} ${err.code} while linking the charge to its invoice — recorded for reconciliation, applied to neither software nor hosting` };
+      }
+      if (r && lenient && r.outcome === "unclassified") { this.log(`[billing] ${ev.type} ${ev.id}: Lifetime bundle re-resolution parked (${r.note}); continuing with the recorded hosting charge`); return null; }
+      return r;
+    } catch (err) {
+      if (!lenient) throw err;
+      this.log(`[billing] ${ev.type} ${ev.id}: Lifetime bundle re-resolution failed (${(err as Error).message}); continuing with the recorded hosting charge`);
+      return null;
+    }
+  }
+
+  /** How completely the records already hold a refunded/disputed charge.
+   *  "held": every record that must hold it does, and (outside a bundle,
+   *  whose events never use the role index) the role index names it — the
+   *  ordinary flow can proceed. A record that holds it while the index is
+   *  missing (a crash after the record write, before the index write) is
+   *  repaired here from the record, as `migrateLegacySoftwareRoles` does.
+   *  "partial": a bundle subscription whose hosting record holds it but whose
+   *  software record does not (a crash or hosting-hook failure between the
+   *  two writes). "unheld": no record holds it. "conflict": the index names
+   *  a different role than the record holding it. */
+  private chargeHolding(named: readonly string[]): { state: "held" | "unheld" | "partial"; lenient?: boolean } | { state: "conflict"; why: string } {
+    let sw: CustomerRecord | null = null, host: RoleSubscriptionRecord | null = null;
+    for (const id of named) { sw ??= this.store.findByCharge(id); host ??= this.store.findRoleSubscriptionByCharge("hosting", id); }
+    if (!sw && !host) return { state: "unheld" };
+    if (host) {
+      const sub = host.subscriptionId ?? "";
+      const bound = sub ? this.store.getBundleSubscription(sub) : null;
+      const partner = sub ? this.store.findBySubscription(sub) ?? (bound ? this.store.getCustomer(bound.customerId) : null) : null;
+      if (bound || (partner && partner.key === host.customerKey)) {
+        if (partner && sw?.key !== partner.key) return { state: "partial", lenient: bound?.planKey === "lifetime" };
+        return { state: "held" };
+      }
+    }
+    const role: BillingRole = sw ? "software" : "hosting";
+    if (sw && host) return { state: "held" }; // two unrelated records: the existing flow decides, as before
+    if (sw?.subscriptionId) {
+      // A bundle's software record: bundle events never use the role index,
+      // so there is nothing to repair here and the existing flow decides.
+      const hostOfSub = this.store.findRoleSubscriptionBySubscription("hosting", sw.subscriptionId);
+      if (this.store.getBundleSubscription(sw.subscriptionId) || hostOfSub?.customerKey === sw.key) return { state: "held" };
+    }
+    const now = this.now();
+    for (const id of named) {
+      const known = this.store.roleFor(id);
+      if (known && known !== role) return { state: "conflict", why: `${id} is recorded under ${known} but held by a ${role} record` };
+    }
+    for (const id of named) {
+      if (role === "software" ? sw!.chargeIds.includes(id) : host!.chargeIds.includes(id)) this.store.noteRole(id, role, now);
+    }
+    return { state: "held" };
+  }
+
+  private async resolveChargeThroughInvoice(ev: StripeEvent, cfg: BillingConfig, chargeId: string, paymentIntentId: string, invoiceId: string): Promise<ApplyResult | null> {
+    const cf = ev.type === "charge.refunded" ? chargeFacts(ev.object) : null;
+    const mode: BillingMode = ev.livemode ? "live" : "test";
+    const secretKey = cfg.stripe[mode].secretKey;
+    if (!secretKey) return null;
+    const CHARGE_RE = /^(ch|py)_[A-Za-z0-9_]{1,200}$/, PI_RE = /^pi_[A-Za-z0-9_]{1,200}$/, INVOICE_RE = /^in_[A-Za-z0-9_]{1,200}$/;
+    if (chargeId && !CHARGE_RE.test(chargeId) || paymentIntentId && !PI_RE.test(paymentIntentId) || invoiceId && !INVOICE_RE.test(invoiceId)) return null;
+    const idOf = (v: unknown): string => typeof v === "string" ? v : v && typeof v === "object" && typeof (v as Record<string, unknown>).id === "string" ? (v as Record<string, string>).id : "";
+    const label = chargeId || paymentIntentId;
+    const park = (why: string): ApplyResult => ({ outcome: "unclassified", note: `${ev.type} on ${label}: ${why} — recorded for reconciliation, applied to neither software nor hosting` });
+    const api = new EarnStripeApi(secretKey, this.launchFetch);
+    if (!invoiceId && !paymentIntentId) {
+      if (!chargeId) return null;
+      const ch = await api.call("GET", `/v1/charges/${chargeId}`);
+      if (idOf(ch) !== chargeId || ch.livemode !== ev.livemode) throw Error(`Stripe charge ${chargeId} read back a different object or mode`);
+      invoiceId = idOf(ch.invoice);
+      paymentIntentId = idOf(ch.payment_intent);
+      if (invoiceId && !INVOICE_RE.test(invoiceId) || paymentIntentId && !PI_RE.test(paymentIntentId)) throw Error(`Stripe charge ${chargeId} names an unreadable invoice or payment`);
+      if (!invoiceId && !paymentIntentId) return null;
+    }
+    if (!invoiceId) {
+      const list = await api.call("GET", "/v1/invoice_payments", { "payment[type]": "payment_intent", "payment[payment_intent]": paymentIntentId, limit: 100 });
+      if (!Array.isArray(list.data) || typeof list.has_more !== "boolean") throw Error(`Stripe invoice payments for ${paymentIntentId} are malformed`);
+      if (list.has_more) return park(`payment ${paymentIntentId} has more invoice payments than one complete page`);
+      const invoices = new Set<string>();
+      for (const row of list.data as Record<string, any>[]) {
+        if (!row || typeof row !== "object" || row.livemode !== ev.livemode || row.payment?.type !== "payment_intent"
+          || idOf(row.payment?.payment_intent) !== paymentIntentId || !INVOICE_RE.test(idOf(row.invoice))) throw Error(`Stripe invoice payment for ${paymentIntentId} does not match the requested payment`);
+        invoices.add(idOf(row.invoice));
+      }
+      if (invoices.size === 0) return null; // Stripe proves this payment funded no invoice
+      if (invoices.size > 1) return park(`payment ${paymentIntentId} is allocated to ${invoices.size} invoices (${[...invoices].join(", ")})`);
+      invoiceId = [...invoices][0];
+    }
+    const invoice = await api.call("GET", `/v1/invoices/${invoiceId}`);
+    if (idOf(invoice) !== invoiceId || invoice.livemode !== ev.livemode) throw Error(`Stripe invoice ${invoiceId} read back a different object or mode`);
+    const f = invoiceFacts(invoice);
+    const foreign = foreignProductFamilyRefusal({ productFamily: f.metadata.productFamily ?? "" });
+    if (foreign) return { outcome: "ignored", note: foreign };
+    if (!f.subscriptionId) return null;
+    if (!f.customerId) return park(`invoice ${invoiceId} names no customer`);
+    if (cf?.customerId && cf.customerId !== f.customerId) return park(`invoice ${invoiceId} names customer ${f.customerId}, the charge ${cf.customerId}`);
+    const ids = [chargeId, paymentIntentId].filter(Boolean);
+    const now = this.now();
+    const bound = this.store.getBundleSubscription(f.subscriptionId);
+    const host = this.store.findRoleSubscriptionBySubscription("hosting", f.subscriptionId);
+    const sw = this.store.findBySubscription(f.subscriptionId) ?? (bound ? this.store.getCustomer(bound.customerId) : null);
+    for (const rec of [sw, host]) {
+      const recorded = !rec ? "" : "stripeCustomerId" in rec ? rec.stripeCustomerId ?? "" : rec.customerKey.startsWith("cus_") ? rec.customerKey : "";
+      if (rec && (rec.livemode !== ev.livemode || (recorded && recorded !== f.customerId))) {
+        return park(`invoice ${invoiceId} (customer ${f.customerId}) does not match the recorded subscription ${f.subscriptionId}`);
+      }
+    }
+    if (bound && bound.customerId !== f.customerId) return park(`invoice ${invoiceId} names customer ${f.customerId}, the bundle ${bound.customerId}`);
+    const indexed: string[] = [];
+    if (bound || (sw && host && sw.key === host.customerKey)) {
+      // A bundle subscription bills both roles. Lifetime software was one
+      // purchase on the initial mixed invoice; its hosting-only renewals
+      // never index onto the software record (applyBundleEvent).
+      const softwareLine = !bound || bound.planKey !== "lifetime" || f.priceIds.includes(bound.priceId);
+      // Hosting first, software last: chargeHolding treats a bundle whose
+      // hosting record holds the charge but whose software record does not
+      // as a partial write (a crash or hosting-hook failure between the two)
+      // and re-runs this resolution, which only writes what is missing.
+      if (host) { if (ids.some(id => !host.chargeIds.includes(id))) { for (const id of ids) this.noteHostingCharge(host, id); this.saveHostingRecord(host); } indexed.push("hosting"); }
+      if (sw && softwareLine) { if (ids.some(id => !sw.chargeIds.includes(id))) { for (const id of ids) this.noteCharge(sw, id); this.store.putCustomer(sw); } indexed.push("software"); }
+    } else {
+      const fresh = classifyRole({ priceIds: f.priceIds, productIds: f.productIds, planRole: null }, cfg.roles[mode]);
+      const role = fresh !== "unknown" ? fresh : this.roleFromIndex([invoiceId, f.subscriptionId]);
+      if (!role) return park(`invoice ${invoiceId} could not be attributed to a product role`);
+      const rec = role === "software" ? sw : host;
+      if (!rec) return null;
+      // The record first, the role index last. The index alone must never
+      // know a charge no record holds: a crash between the two used to leave
+      // exactly that, and the retry then short-circuited to "dispute on
+      // unknown charge" (marked seen, licence live). The conflict check that
+      // noteRole performs is made first, without writing.
+      for (const id of ids) { const known = this.store.roleFor(id); if (known && known !== role) return park(`${id} is already recorded under a different role`); }
+      if (role === "software") { for (const id of ids) this.noteCharge(sw!, id); this.store.putCustomer(sw!); }
+      else { for (const id of ids) this.noteHostingCharge(host!, id); this.saveHostingRecord(host!); }
+      for (const id of ids) this.store.noteRole(id, role, now); // cannot refuse: checked above, no await between
+      indexed.push(role);
+    }
+    if (indexed.length) this.log(`[billing] ${ev.type} ${ev.id}: ${ids.join("/")} resolved through invoice ${invoiceId} (subscription ${f.subscriptionId}); indexed for ${indexed.join(" and ")}`);
+    return null;
   }
 
   private async withBundleLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -801,7 +1005,7 @@ export class BillingService {
           const f = invoiceFacts(ev.object);
           const synthetic = { ...ev, object: { amount_subtotal: softwareEvent.object.amount_subtotal, total_details: softwareEvent.object.total_details, amount_total: softwareEvent.object.amount_paid, id: grant.sessionId, mode: 'payment', payment_status: 'paid', customer: bundle.customerId, customer_details: { email: f.email, name: f.name }, payment_intent: f.paymentIntentId, metadata: { wh_launch_intent: grant.id, plan: grant.plan, non_renewing: 'true', license_days: String(this.plan('lifetime')?.licenseDays ?? cfg.policy.oneOffDays) } } };
           software = await this.withCheckoutLocks([bundle.customerId], () => this.onPaymentCheckout(synthetic, cfg, checkoutFacts(synthetic.object)));
-          const rec = this.store.getCustomer(bundle.customerId); if (rec) { this.noteCharge(rec, f.chargeId); this.noteCharge(rec, f.paymentIntentId); this.store.putCustomer(rec); }
+          const rec = this.store.getCustomer(bundle.customerId); if (rec) { for (const id of f.paymentIds) this.noteCharge(rec, id); this.store.putCustomer(rec); }
         } else software = await this.onInvoicePaid(softwareEvent, cfg);
         break;
       case "invoice.payment_failed": software = this.onInvoiceFailed(softwareEvent, cfg); break;
@@ -916,7 +1120,7 @@ export class BillingService {
       case "invoice.payment_succeeded":
       case "invoice.payment_failed": {
         const f = invoiceFacts(ev.object);
-        const objectIds = [f.subscriptionId, f.invoiceId, f.chargeId, f.paymentIntentId].filter(Boolean);
+        const objectIds = [f.subscriptionId, f.invoiceId, ...f.paymentIds].filter(Boolean);
         const fresh = classifyRole({ priceIds: f.priceIds, productIds: f.productIds, planRole: null }, rcfg);
         const role = fresh !== "unknown" ? fresh : this.roleFromIndex(objectIds) ?? "unknown";
         return { role, objectIds };
@@ -1022,8 +1226,7 @@ export class BillingService {
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
         rec.subscriptionStatus = "active";
         if (f.periodEndMs !== null && (rec.periodEndMs === null || f.periodEndMs > rec.periodEndMs)) rec.periodEndMs = f.periodEndMs;
-        this.noteHostingCharge(rec, f.chargeId);
-        this.noteHostingCharge(rec, f.paymentIntentId);
+        for (const id of f.paymentIds) this.noteHostingCharge(rec, id);
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting invoice recorded; software licence untouched" };
@@ -1673,8 +1876,7 @@ export class BillingService {
       const paidAt = transitions?.paid_at;
       this.noteFirstActualPayment(rec, typeof paidAt === 'number' && Number.isSafeInteger(paidAt) && paidAt > 0 ? paidAt * 1000 : fallbackPaidAtMs);
     }
-    this.noteCharge(rec, f.chargeId);
-    this.noteCharge(rec, f.paymentIntentId);
+    for (const id of f.paymentIds) this.noteCharge(rec, id);
     return { periodEndMs: f.periodEndMs, licenseTargetMs };
   }
 
@@ -1734,6 +1936,7 @@ export class BillingService {
       siteOrigin: cfg.siteOrigin,
       livemode: rec.livemode,
       starterPack: starterPackEligible(rec),
+      complimentary: !!rec.complimentary,
     });
     const result = await sendEmail(cfg.email, msg, this.fetchLike);
     if (result.ok) {
@@ -1756,6 +1959,61 @@ export class BillingService {
     if (rec.welcomeError) return { ok: false, status: 502, error: rec.welcomeError };
     void note;
     return { ok: true, sentTo: rec.email };
+  }
+
+  /** v0.4.104 — the software half of an operator-granted complimentary
+   *  server (`HostingService.adminCreateComplimentary`). Creates or reuses
+   *  the `complimentary:<email>` customer record and binds it to a
+   *  non-revoked, unexpired licence: an existing one is reused (its expiry
+   *  only ever moves later, to cover the requested term); otherwise a fresh
+   *  licence is minted. No Stripe customer, subscription or charge exists or
+   *  is invented. A record under the same key that is NOT complimentary is
+   *  refused, never converted. */
+  ensureComplimentaryCustomer(input: { ownerKey: string; email: string; by: string; reason: string; licenseExpMs: number }, now = this.now()):
+    { ok: true; licenseId: string; reusedLicense: boolean; createdCustomer: boolean } | { ok: false; error: string } {
+    const livemode = this.config().mode === "live";
+    const existing = this.store.getCustomer(input.ownerKey);
+    if (existing && !existing.complimentary) return { ok: false, error: "a paid customer record already uses this key" };
+    if (existing && existing.livemode !== livemode) return { ok: false, error: `the complimentary record for this email belongs to ${existing.livemode ? "live" : "test"} mode` };
+    let licenseId = existing?.licenseId ?? "";
+    let reusedLicense = false;
+    const current = licenseId ? this.licenses.get(licenseId) : null;
+    if (current && !this.licenses.isRevoked(licenseId) && (current.exp === undefined || current.exp === null || current.exp > now)) {
+      reusedLicense = true;
+      // A licence can never run past 3650 days from its own issue; an
+      // open-ended grant just needs it as long as that allows.
+      const want = Math.min(input.licenseExpMs, current.iat + 3650 * DAY_MS);
+      if (typeof current.exp === "number" && current.exp < want) {
+        let extended = null;
+        try { extended = this.licenses.setExpiry(licenseId, want, now); } catch { extended = null; }
+        if (!extended) return { ok: false, error: "the existing complimentary licence could not be extended to cover the term" };
+      }
+    } else {
+      try {
+        licenseId = this.licenses.issueUntil(`Complimentary - ${input.email}`.slice(0, 120), input.licenseExpMs, livemode ? "unleashed-complimentary" : "unleashed-complimentary-test", now).payload.id;
+      } catch (err) { return { ok: false, error: `licence could not be issued: ${(err as Error).message}` }; }
+    }
+    const rec: CustomerRecord = existing
+      ? { ...existing, licenseId, updatedAtMs: now, lastEventType: "admin.hosting.complimentary", lastEventAtMs: now, ...(reusedLicense ? {} : { welcomeSentAtMs: null, welcomeError: null }) }
+      : {
+        key: input.ownerKey, stripeCustomerId: "", email: input.email, name: "Complimentary", livemode, licenseId, planKey: null,
+        subscriptionId: null, subscriptionStatus: null, periodEndMs: null, chargeIds: [], createdAtMs: now, updatedAtMs: now,
+        welcomeSentAtMs: null, welcomeError: null, disputed: false, refunded: false, lastEventType: "admin.hosting.complimentary", lastEventAtMs: now,
+        complimentary: { by: input.by, reason: input.reason, createdAtMs: now },
+      };
+    this.store.putCustomer(rec);
+    return { ok: true, licenseId, reusedLicense, createdCustomer: !existing };
+  }
+
+  /** v0.4.104 — the ordinary welcome email (licence + install page) for a
+   *  complimentary customer, once per licence. Same template, same sender,
+   *  same failure recording as a paid purchase's welcome. */
+  async sendComplimentaryWelcome(customerKey: string): Promise<{ sent: boolean; alreadySent: boolean; error: string | null }> {
+    const rec = this.store.getCustomer(customerKey);
+    if (!rec?.complimentary) return { sent: false, alreadySent: false, error: "not a complimentary customer" };
+    if (rec.welcomeSentAtMs !== null) return { sent: false, alreadySent: true, error: null };
+    await this.sendWelcomeIfNeeded(rec, this.config(), this.now(), false);
+    return { sent: rec.welcomeSentAtMs !== null, alreadySent: false, error: rec.welcomeError };
   }
 
   async recoverDestroyedInstall(customerKey: string, expectedEmail: string, options: DeviceRecoveryOptions): Promise<

@@ -115,6 +115,8 @@ export interface WelcomeEmailInput {
   siteOrigin: string;
   livemode: boolean;
   starterPack?: boolean;
+  /** v0.4.104 — an operator-granted complimentary licence (no payment). */
+  complimentary?: boolean;
 }
 
 // Light-theme tokens lifted from the app itself. Dark email bodies get
@@ -160,7 +162,9 @@ export function welcomeEmail(to: string, input: WelcomeEmailInput): EmailMessage
   const accessLine = input.lifetime ? 'Your Lifetime access is active. Technical licence renewal is automatic and does not create a charge.' : `Your licence is active until ${until}.`;
   const firstCharge = input.firstPaymentAtMs ? `Your first subscription charge is scheduled for ${new Intl.DateTimeFormat('en-US', { dateStyle: 'long', timeZone: 'America/New_York' }).format(input.firstPaymentAtMs)} (Eastern Time). Cancel in Manage billing before then to avoid that charge.` : '';
   const planValue = input.livemode ? "Unleashed" : "Unleashed (test)";
-  const renewalValue = input.subscription
+  const renewalValue = input.complimentary
+    ? "Complimentary — no payment is taken"
+    : input.subscription
     ? "Extends automatically each time your subscription renews"
     : "One-time purchase";
   const origin = input.siteOrigin.replace(/\/+$/, "");

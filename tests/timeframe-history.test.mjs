@@ -70,7 +70,7 @@ await test("native adapters use proved interval tokens and preserve venue OHLCV"
     "bybit", "BTCUSDT", 180, DAY0, DAY0), /no proved native 180m/);
 
   const fixtures = {
-    bitunix: { code: 0, data: [{ time: String(DAY0), open: "1", high: "3", low: "0.5", close: "2", quoteVol: "7", baseVol: "14" }] },
+    bitunix: { code: 0, data: [{ time: String(DAY0), open: "1", high: "3", low: "0.5", close: "2", baseVol: "7", quoteVol: "14" }] },
     bitget: { code: "00000", data: [[String(DAY0), "1", "3", "0.5", "2", "7", "14"]] },
     binance: [[DAY0, "1", "3", "0.5", "2", "7"]],
     aster: [[DAY0, "1", "3", "0.5", "2", "7"]],

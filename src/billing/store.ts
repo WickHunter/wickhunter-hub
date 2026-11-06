@@ -33,6 +33,10 @@ export const EVENTS_SEEN_FILE = "billing-events-seen.v1.json";
 export const ROLE_SUBSCRIPTIONS_FILE = "billing-role-subscriptions.v1.json";
 export const ROLE_INDEX_FILE = "billing-role-index.v1.json";
 export const ROLE_MIGRATION_MARKER_FILE = "billing-role-migration.v1.json";
+/** v0.4.104 one-shot marker: legacy operator test hosting records marked complimentary. */
+export const COMPLIMENTARY_MIGRATION_MARKER_FILE = "billing-complimentary-migration.v1.json";
+/** The `lastEventType` the 2026-10-05 hand-written operator VPS test records carry. */
+export const LEGACY_COMPLIMENTARY_EVENT_TYPE = "admin.complimentary_vps_test";
 export const BUNDLE_SUBSCRIPTIONS_FILE = "billing-bundle-subscriptions.v1.json";
 export const CHECKOUT_SESSIONS_DIR = "billing-checkout-sessions.v1";
 export const CHECKOUT_PENDING_DIR = "billing-checkout-pending.v1";
@@ -91,6 +95,41 @@ export interface CustomerRecord {
   launchManaged?: boolean;
   /** Signed first launch checkout completion, durable across webhook retries. */
   starterPackGrantedAtMs?: number;
+  /** v0.4.104 — an operator-granted complimentary customer (no Stripe
+   *  customer, no payment). Never adopted by a later paid checkout's email
+   *  match (`findByEmail`), so a real purchase always gets its own record. */
+  complimentary?: ComplimentaryCustomerMark;
+}
+
+export interface ComplimentaryCustomerMark {
+  by: string;
+  reason: string;
+  createdAtMs: number;
+  /** A pre-0.4.104 hand-written operator test record, marked by the
+   *  one-shot `migrateLegacyComplimentaryHosting`. */
+  legacy?: true;
+}
+
+/** v0.4.104 — the complimentary marker on a hosting role record. No Stripe
+ *  subscription exists; the hosting lifecycle (`HostingService.
+ *  reconcileComplimentary`) treats the server as paid until `endsAtMs` or an
+ *  explicit admin end, and never derives nonpayment, dunning or a Stripe
+ *  cancellation from it. */
+export interface ComplimentaryHostingMark {
+  by: string;
+  reason: string;
+  createdAtMs: number;
+  /** The admin request's idempotency key — a repeat with the same key
+   *  answers with the same server instead of a refusal. */
+  idempotencyKey: string | null;
+  /** The instance this grant created (null for a legacy record). */
+  instanceId: string | null;
+  /** Fixed term end (optional); null = until an admin ends it. */
+  endsAtMs: number | null;
+  endedAtMs: number | null;
+  endedBy: string | null;
+  endReason: string | null;
+  legacy?: true;
 }
 
 export type TokenKind = "page" | "install";
@@ -151,6 +190,8 @@ export interface RoleSubscriptionRecord {
   /** Durable identity for recovering an interrupted exact-event application. */
   lastEventId?: string;
   lastEventAtMs: number | null;
+  /** v0.4.104 — see `ComplimentaryHostingMark`. */
+  complimentary?: ComplimentaryHostingMark;
 }
 
 export interface BundleSubscriptionRecord {
@@ -219,6 +260,7 @@ export class BillingStore {
   private readonly roleSubscriptionsFile: string;
   private readonly roleIndexFile: string;
   private readonly roleMigrationFile: string;
+  private readonly complimentaryMigrationFile: string;
   private readonly bundleSubscriptionsFile: string;
   private readonly checkoutSessionsDir: string;
   private readonly checkoutPendingDir: string;
@@ -231,10 +273,12 @@ export class BillingStore {
     this.roleSubscriptionsFile = path.join(dataDir, ROLE_SUBSCRIPTIONS_FILE);
     this.roleIndexFile = path.join(dataDir, ROLE_INDEX_FILE);
     this.roleMigrationFile = path.join(dataDir, ROLE_MIGRATION_MARKER_FILE);
+    this.complimentaryMigrationFile = path.join(dataDir, COMPLIMENTARY_MIGRATION_MARKER_FILE);
     this.bundleSubscriptionsFile = path.join(dataDir, BUNDLE_SUBSCRIPTIONS_FILE);
     this.checkoutSessionsDir = path.join(dataDir, CHECKOUT_SESSIONS_DIR);
     this.checkoutPendingDir = path.join(dataDir, CHECKOUT_PENDING_DIR);
     this.migrateLegacySoftwareRoles();
+    this.migrateLegacyComplimentaryHosting();
   }
 
   private checkoutSessionPath(sessionId: string): string {
@@ -422,7 +466,10 @@ export class BillingStore {
   findByEmail(email: string, livemode?: boolean): CustomerRecord | null {
     const e = email.trim().toLowerCase();
     if (!e) return null;
-    for (const rec of Object.values(this.customers())) if (rec.email === e && (livemode === undefined || rec.livemode === livemode)) return rec;
+    // A complimentary (operator-granted) record is never adopted by email:
+    // `findCustomer` would otherwise bind a later paid checkout to it,
+    // because it has no Stripe customer id to disagree with.
+    for (const rec of Object.values(this.customers())) if (rec.email === e && !rec.complimentary && (livemode === undefined || rec.livemode === livemode)) return rec;
     return null;
   }
 
@@ -524,6 +571,40 @@ export class BillingStore {
       for (const chargeId of rec.chargeIds) this.noteRole(chargeId, "software", rec.createdAtMs);
     }
     writeJsonAtomic(this.roleMigrationFile, { migratedAtMs: now });
+  }
+
+  /** v0.4.104 — one shot, marker-guarded. The 2026-10-05 operator VPS test
+   *  wrote a hosting role record and a customer record by hand
+   *  (`lastEventType: "admin.complimentary_vps_test"`, no Stripe
+   *  subscription). Mark both complimentary (legacy) so hosting reconcile
+   *  takes the complimentary path (no "refusing unreserved hosting payment"
+   *  line, nothing reserved or cancelled) and a later paid checkout for the
+   *  same email is never merged into the test customer. No date, status or
+   *  licence changes; an owner whose server still existed would keep it
+   *  (endedAtMs stays null — ending one is an explicit admin action). */
+  private migrateLegacyComplimentaryHosting(): void {
+    if (fs.existsSync(this.complimentaryMigrationFile)) return;
+    const now = Date.now();
+    const marked: string[] = [];
+    const roles = this.roleSubscriptions();
+    let rolesChanged = false;
+    for (const rec of Object.values(roles)) {
+      if (rec.role !== "hosting" || rec.subscriptionId || rec.complimentary || rec.lastEventType !== LEGACY_COMPLIMENTARY_EVENT_TYPE) continue;
+      rec.complimentary = { by: "migration-0.4.104", reason: "pre-0.4.104 hand-written operator VPS test record", createdAtMs: rec.createdAtMs, idempotencyKey: null, instanceId: null, endsAtMs: null, endedAtMs: null, endedBy: null, endReason: null, legacy: true };
+      rolesChanged = true;
+      marked.push(rec.customerKey);
+    }
+    if (rolesChanged) writeJsonAtomic(this.roleSubscriptionsFile, roles);
+    const customers = this.customers();
+    let customersChanged = false;
+    for (const rec of Object.values(customers)) {
+      if (rec.complimentary || rec.stripeCustomerId || rec.subscriptionId || rec.lastEventType !== LEGACY_COMPLIMENTARY_EVENT_TYPE) continue;
+      rec.complimentary = { by: "migration-0.4.104", reason: "pre-0.4.104 hand-written operator VPS test record", createdAtMs: rec.createdAtMs, legacy: true };
+      customersChanged = true;
+      if (!marked.includes(rec.key)) marked.push(rec.key);
+    }
+    if (customersChanged) writeJsonAtomic(this.customersFile, customers);
+    writeJsonAtomic(this.complimentaryMigrationFile, { migratedAtMs: now, marked });
   }
 
   // ── events ────────────────────────────────────────────────────────────────

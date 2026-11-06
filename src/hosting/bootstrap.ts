@@ -20,7 +20,7 @@
 // reaches the instance's boot log. It fetches and runs the same signed
 // customer installer used by self-hosted boxes, with the hosted app's
 // forced-password-change and connected-account-limit environment contracts.
-import type { ProbeVenue } from "./policy.js";
+import { FLEET_KEY_RE, type ProbeVenue } from "./policy.js";
 
 export interface BootstrapInput {
   instanceId: string;
@@ -30,6 +30,9 @@ export interface BootstrapInput {
   hubOrigin: string;
   maxAccounts: number;
   probeVenues: readonly ProbeVenue[];
+  /** v0.4.104 — validated OpenSSH public-key lines (policy
+   *  `fleetAuthorizedKeys`) appended to root's authorized_keys. */
+  fleetAuthorizedKeys?: readonly string[];
 }
 
 /** The fleet's GC tuning for the customer app's unit. Keep these three in
@@ -80,6 +83,8 @@ WH_HUB_ORIGIN=${shellSingleQuote(input.hubOrigin)}
 WH_INSTANCE_ID=${shellSingleQuote(input.instanceId)}
 WH_GENERATION=${input.generation}
 WH_HOSTED_MAX_ACCOUNTS=${input.maxAccounts}
+
+${fleetKeyBlock(input.fleetAuthorizedKeys ?? [])}
 
 # Fetch the existing personalized installer through the instance-scoped
 # bootstrap credential. The credential stays in the POST body (not the URL or
@@ -240,7 +245,9 @@ probe() {
 }
 ${probeLines}
 
-printf '{"token":"%s","generation":%s,"results":[%s]}' "$WH_BOOTSTRAP_TOKEN" "$WH_GENERATION" "$RESULTS" \\
+${HOST_KEY_BLOCK}
+
+printf '{"token":"%s","generation":%s,"results":[%s],"sshHostKeys":[%s],"fleetKeysPresent":%s}' "$WH_BOOTSTRAP_TOKEN" "$WH_GENERATION" "$RESULTS" "$WH_HOST_KEYS" "$WH_FLEET_KEYS_PRESENT" \\
   | curl -q -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 90 \\
       --retry 2 --retry-delay 1 -H 'content-type: application/json' --data-binary @- \\
       "$WH_HUB_ORIGIN/api/hosting/instances/$WH_INSTANCE_ID/readiness" -o /dev/null
@@ -248,6 +255,54 @@ printf '{"token":"%s","generation":%s,"results":[%s]}' "$WH_BOOTSTRAP_TOKEN" "$W
 unset WH_BOOTSTRAP_TOKEN
 `;
 }
+
+/** v0.4.104 — append the configured fleet public keys to root's
+ *  authorized_keys: idempotent (an exact line already present is not added
+ *  again), never removes or rewrites another key, repairs a missing final
+ *  newline before appending, and is non-fatal (a failure is reported to the
+ *  Hub as fewer keys present, never an aborted install). Each key is
+ *  re-validated here so nothing but a plain public-key line can reach the
+ *  quoted heredoc. `WH_ROOT_SSH_DIR` exists for the offline test only. */
+export function fleetKeyBlock(keys: readonly string[]): string {
+  const valid = keys.filter((k) => FLEET_KEY_RE.test(k));
+  if (valid.length !== keys.length) throw new Error("fleet key list contains a line that is not a plain OpenSSH public key");
+  return `# BEGIN HOSTING FLEET KEY
+WH_FLEET_KEYS_PRESENT=0
+install_fleet_keys() {
+  local dir="\${WH_ROOT_SSH_DIR:-/root/.ssh}" ak key
+  ak="$dir/authorized_keys"
+  install -d -m 700 "$dir" || return 1
+  [ -e "$ak" ] || { : > "$ak" || return 1; }
+  chmod 600 "$ak" || return 1
+  if [ -s "$ak" ] && [ -n "$(tail -c1 "$ak")" ]; then printf '\\n' >> "$ak" || return 1; fi
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if grep -qxF -- "$key" "$ak"; then :; else printf '%s\\n' "$key" >> "$ak" || return 1; fi
+    if grep -qxF -- "$key" "$ak"; then WH_FLEET_KEYS_PRESENT=$((WH_FLEET_KEYS_PRESENT + 1)); fi
+  done <<'WH_FLEET_KEYS'
+${valid.join("\n")}
+WH_FLEET_KEYS
+}
+install_fleet_keys || echo "fleet key: authorized_keys could not be updated" >&2
+# END HOSTING FLEET KEY`;
+}
+
+/** v0.4.104 — the server's SSH host-key fingerprints, reported with the
+ *  bootstrap readiness proof so the Hub can pin them. Only strings matching
+ *  the exact `SHA256:<43 base64>` / key-type shapes are reported. */
+export const HOST_KEY_BLOCK = `# BEGIN HOSTING HOST KEYS
+WH_HOST_KEYS=""
+for pub in \${WH_SSH_HOST_KEY_GLOB:-/etc/ssh/ssh_host_*_key.pub}; do
+  [ -r "$pub" ] || continue
+  line=$(ssh-keygen -lf "$pub" 2>/dev/null) || continue
+  fp=$(printf '%s\\n' "$line" | awk '{print $2}')
+  kt=$(printf '%s\\n' "$line" | awk '{print $NF}' | tr -d '()')
+  [[ "$fp" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || continue
+  [[ "$kt" =~ ^[A-Z0-9]{2,12}$ ]] || continue
+  WH_HOST_KEYS="\${WH_HOST_KEYS}\${WH_HOST_KEYS:+,}{\\"type\\":\\"\${kt}\\",\\"fingerprint\\":\\"\${fp}\\"}"
+done
+unset pub line fp kt
+# END HOSTING HOST KEYS`;
 
 function managementAgentScript(input: BootstrapInput, probeLines: string): string {
   return `#!/usr/bin/env bash

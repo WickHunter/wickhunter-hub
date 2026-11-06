@@ -49,18 +49,23 @@
 //
 // ── VOLUME: A TRAP WORTH THE PARAGRAPH ──────────────────────────────────────
 // `volume` on the wire is BASE volume (contracts/coins), consistently, on every
-// venue. Bitget's array carries base at index 5 and quote at index 6. Bitunix
-// returns an OBJECT WHOSE TWO VOLUME FIELDS ARE NAMED THE WRONG WAY ROUND:
-// measured on BTCUSDT, `quoteVol` was 16.0341 and `baseVol` 1026789.19294 at a
-// price near 64,045 — 16.0341 x 64,045 = 1,026,792, so the field LABELLED
-// `quoteVol` is the base volume and the one labelled `baseVol` is the quote
-// turnover. Reading the field by its name would inflate volume by roughly the
-// price of the coin — about 64,000x on BTC — and every seeded band derived from
-// it would be wrong. Bitunix's adapter therefore reads `quoteVol` for volume,
-// and that is not a typo. Aster's row is Binance-shaped: index 5 is base volume
-// and index 7 is the quote turnover, both honestly named in its docs.
+// venue. Bitget's array carries base at index 5 and quote at index 6. Aster's
+// row is Binance-shaped: index 5 is base volume and index 7 is the quote
+// turnover, both honestly named in its docs.
+//
+// Bitunix is the venue that moved under us. HISTORY: on 2026-08 BTCUSDT
+// measured `quoteVol` 16.0341 and `baseVol` 1026789.19294 at ~64,045, i.e. the
+// fields were labelled the wrong way round, and through 0.4.101 this adapter
+// read `quoteVol` for volume on purpose. Probed again 2026-10-30, the venue now
+// labels them correctly (`baseVol` 28.2534, `quoteVol` 2,185,328.73 at
+// ~77,364), so the Hub had been storing USDT turnover from REST while its
+// websocket stored coin volume — mixed units in one window. Since 0.4.102 the
+// Bitunix readers take `baseVol` ONLY when `quoteVol` agrees with it
+// (`bitunixBaseVolume`, bitunix-volume.ts) and refuse the page otherwise, so a
+// third flip is a visible refusal rather than another silent unit change.
 import type { Candle } from "./store.js";
 import { MINUTE_MS, newestClosedOpenMs } from "./store.js";
+import { BITUNIX_LINEAR_QUOTES, UnprovableVolumeError, bitunixBaseVolume } from "./bitunix-volume.js";
 
 export const VENUE_IDS = ["bybit", "bitunix", "bitget", "binance", "aster", "weex"] as const;
 export type VenueId = (typeof VENUE_IDS)[number];
@@ -200,6 +205,19 @@ function candle(t: unknown, o: unknown, h: unknown, l: unknown, c: unknown, v: u
   return cand;
 }
 
+/** One Bitunix kline object as a Candle with BASE volume, or null when the
+ *  row is structurally malformed (like `candle`). A row whose volume units
+ *  cannot be proven throws: the whole page is refused, never half-stored. */
+function bitunixRow(r: Record<string, unknown>): Candle | null {
+  const c = candle(r.time, r.open, r.high, r.low, r.close, 0);
+  if (!c) return null;
+  const volume = bitunixBaseVolume(r.baseVol, r.quoteVol, c.low, c.high);
+  if (volume === null) {
+    throw new UnprovableVolumeError(`bitunix kline volume is unreadable or contradictory at ${String(r.time)} (baseVol ${String(r.baseVol)}, quoteVol ${String(r.quoteVol)})`);
+  }
+  return { ...c, volume };
+}
+
 /** `Retry-After` is seconds or an HTTP date. Anything unparseable returns
  *  undefined so the collector uses its own backoff rather than a bogus number. */
 function retryAfterMs(res: { headers?: { get(name: string): string | null } }): number | undefined {
@@ -305,8 +323,16 @@ const bitunix: VenueAdapter = {
     const body = (await getJson(fetchLike, "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs")) as { data?: unknown[] };
     const out: VenueSymbol[] = [];
     for (const raw of asArray(body.data)) {
-      const r = raw as { symbol?: unknown; symbolStatus?: unknown };
+      const r = raw as { symbol?: unknown; symbolStatus?: unknown; quote?: unknown };
       if (typeof r.symbol !== "string") continue;
+      // v0.4.102 — linear (USDT/USDC-margined) contracts only. Coin-margined
+      // `…USD` contracts publish USD contracts in `baseVol` and coin in
+      // `quoteVol`, so no row of theirs passes the base-volume proof; tracking
+      // them would be permanent refusals and permanent gaps. A row without a
+      // `quote` field is judged by its symbol suffix.
+      const quote = typeof r.quote === "string" ? r.quote
+        : /USDT$/.test(r.symbol) ? "USDT" : /USDC$/.test(r.symbol) ? "USDC" : "";
+      if (!BITUNIX_LINEAR_QUOTES.has(quote)) continue;
       // OPEN = trading. PREVIEW = announced, not yet trading — listed by the
       // venue but with no candles behind it, so it is tracked and shown, never
       // polled as though it had history.
@@ -325,9 +351,10 @@ const bitunix: VenueAdapter = {
     const candles: Candle[] = [];
     for (const raw of list) {
       const r = raw as Record<string, unknown>;
-      // `quoteVol` IS the base volume on this venue — see the header note. Do
-      // not "fix" this to `baseVol`; that field is the USDT turnover.
-      const c = candle(r.time, r.open, r.high, r.low, r.close, r.quoteVol);
+      // v0.4.102 — `baseVol` is the coin volume, proven against `quoteVol`
+      // row by row (see the header note). An unprovable row refuses the PAGE:
+      // dropping it would leave a hole the repair path re-asks for forever.
+      const c = bitunixRow(r);
       if (c) candles.push(c);
     }
     return { candles: sortOldestFirst(candles), empty: list.length === 0 };
@@ -810,12 +837,60 @@ export function nativeTimeframePageLimit(venue: VenueId): number {
   return 1000;
 }
 
+/** v0.4.103 — how a native higher-timeframe page is fetched. `recent` is the
+ *  venue's ordinary kline route; `history` exists only for WEEX, whose
+ *  ordinary route answers the newest 1000 rows whatever range is asked. */
+export type NativeTimeframeRoute = "recent" | "history";
+
+/** Bitget history-candles refuses a span longer than this (probed 2026-10-31:
+ *  1Dutc over 90 days answered, 91 days answered code 40017). */
+export const BITGET_HISTORY_MAX_SPAN_MS = 90 * 24 * 3_600_000;
+/** WEEX newest-page rows a native timeframe page may rely on, leaving a
+ *  margin for clock skew between work emission and the venue's own window. */
+export const WEEX_RECENT_TIMEFRAME_ROWS = WEEX_RECENT_PAGE_LIMIT - 10;
+
+/** v0.4.103 — rows one native timeframe page may ask for, so that the venue
+ *  can never truncate the answer (a truncated page proves nothing about the
+ *  rows it left out). Probed 2026-10-31:
+ *   - Bybit /v5/market/kline: limit 1000.
+ *   - Binance/Aster /fapi/v1/klines: 1000 rows at weight 5 (1500 costs weight
+ *     10 — fewer rows per weight unit, and the collector's request pacing
+ *     assumes weight 5, so 1000 is kept).
+ *   - Bitget history-candles: limit 200 AND endTime-startTime <= 90 days.
+ *   - Bitunix kline: 200 rows ending at endTime (startTime is not honoured).
+ *   - WEEX klines (recent): the newest 1000 rows; historyKlines: 100 rows,
+ *     weight 5, intervals 1h/4h/1d (2h is refused, code -1142). */
+export function nativeTimeframePageRows(venue: VenueId, interval: number, route: NativeTimeframeRoute = "recent"): number {
+  if (venue === "bitget") return Math.max(1, Math.min(200, Math.floor(BITGET_HISTORY_MAX_SPAN_MS / (interval * MINUTE_MS))));
+  if (venue === "bitunix") return 200;
+  if (venue === "weex") return route === "history" ? WEEX_PAGE_LIMIT : WEEX_RECENT_TIMEFRAME_ROWS;
+  return 1000;
+}
+
+/** WEEX historyKlines interval tokens that were proved to answer. */
+const WEEX_HISTORY_TIMEFRAMES: readonly number[] = [60, 240, 1440];
+
+/** Request weight of one native timeframe page in the venue's own units
+ *  (only WEEX distinguishes; every other lane is paced per request). */
+export function nativeTimeframeWeight(venue: VenueId, route: NativeTimeframeRoute): number {
+  if (venue === "weex") return route === "history" ? WEEX_HISTORY_KLINE_WEIGHT : WEEX_RECENT_KLINE_WEIGHT;
+  return 1;
+}
+
+/** Can this venue fetch an arbitrary older range of this native interval? */
+export function nativeTimeframeHistoryRoute(venue: VenueId, interval: number): boolean {
+  return venue !== "weex" || WEEX_HISTORY_TIMEFRAMES.includes(interval);
+}
+
 function nativeToken(venue: VenueId, interval: number): string {
   if (!NATIVE_TIMEFRAMES[venue].includes(interval)) throw new Error(`${venue} has no proved native ${interval}m candle interval`);
   if (venue === "bybit") return interval === 1440 ? "D" : String(interval);
   if (venue === "bitget") return interval < 60 ? `${interval}m`
     : interval === 60 ? "1H" : interval === 240 ? "4H" : interval === 360 ? "6H"
-      : interval === 720 ? "12H" : "1D";
+      // v0.4.103 — `1Dutc`, not `1D`: Bitget's `1D` day opens at 16:00 UTC
+      // (UTC+8 midnight; probed 2026-10-31, open 1761840000000), which no
+      // UTC daily slot can hold. `1Dutc` opens at 00:00 UTC.
+      : interval === 720 ? "12H" : "1Dutc";
   if (venue === "bitunix" || venue === "aster" || venue === "binance" || venue === "weex") return interval < 60 ? `${interval}m`
     : interval === 1440 ? "1d" : `${interval / 60}h`;
   throw new Error(`${venue} native timeframe token is not configured`);
@@ -826,6 +901,7 @@ function nativeToken(venue: VenueId, interval: number): string {
  * accounting. Closure/alignment are enforced again by TimeframeHistory.record. */
 export async function fetchNativeTimeframeKlines(
   fetchLike: FetchLike, venue: VenueId, symbol: string, interval: number, startMs: number, endMs: number,
+  route: NativeTimeframeRoute = "recent",
 ): Promise<KlinePage> {
   const token = nativeToken(venue, interval);
   const span = interval * MINUTE_MS;
@@ -847,7 +923,12 @@ export async function fetchNativeTimeframeKlines(
   }
   if (venue === "bitget") {
     const body = (await getJson(fetchLike, `https://api.bitget.com/api/v2/mix/market/history-candles?symbol=${encodeURIComponent(symbol)}`
-      + `&productType=usdt-futures&granularity=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${limit}`)) as {
+      // v0.4.103 — history-candles selects by CLOSE time (open + span) and
+      // answers ceil((endTime - startTime) / span) rows backwards from the
+      // newest close <= endTime (probed 2026-10-31). `endMs + span - 1`
+      // therefore dropped the newest requested bar and returned one bar
+      // before startMs; `endMs + span` asks for exactly [startMs, endMs].
+      + `&productType=usdt-futures&granularity=${token}&startTime=${startMs}&endTime=${endMs + span}&limit=${limit}`)) as {
         code?: unknown; msg?: unknown; data?: unknown[];
       };
     if (body.code !== undefined && String(body.code) !== "00000") {
@@ -871,8 +952,7 @@ export async function fetchNativeTimeframeKlines(
     }
     const list = asArray(body.data);
     const candles = list.map((raw) => {
-      const r = raw as Record<string, unknown>;
-      return candle(r.time, r.open, r.high, r.low, r.close, r.quoteVol);
+      return bitunixRow(raw as Record<string, unknown>);
     }).filter((c): c is Candle => c !== null);
     return { candles: sortOldestFirst(candles), empty: list.length === 0 };
   }
@@ -895,6 +975,15 @@ export async function fetchNativeTimeframeKlines(
     return { candles: sortOldestFirst(candles), empty: list.length === 0, ...(slowDown ? { slowDown } : {}) };
   }
   if (venue === "weex") {
+    if (route === "history") {
+      // v0.4.103 — the ranged route: 100 rows, weight 5, 1h/4h/1d only.
+      if (!WEEX_HISTORY_TIMEFRAMES.includes(interval)) throw new Error(`weex has no proved history route for ${interval}m candles`);
+      const rows = (endMs - startMs) / span + 1;
+      if (!Number.isSafeInteger(rows) || rows < 1 || rows > WEEX_PAGE_LIMIT) throw new Error(`weex history page must hold 1..${WEEX_PAGE_LIMIT} rows`);
+      const url = `${WEEX_BASE}/capi/v3/market/historyKlines?symbol=${encodeURIComponent(symbol)}`
+        + `&interval=${token}&startTime=${startMs}&endTime=${endMs + span - 1}&limit=${WEEX_PAGE_LIMIT}&priceType=LAST`;
+      return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
+    }
     const url = `${WEEX_BASE}/capi/v3/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${token}&limit=${limit}`;
     return weexKlinePage(await getJson(fetchLike, url), startMs, endMs);
   }

@@ -19,6 +19,7 @@
 // decision; it was `vc2-1c-2gb` (1 vCPU, $10/mo) before. The 1 GB floor is
 // disqualified by this repo's own v0.90.63 crash-loop incident (CLAUDE.md,
 // liqhunter-private). Instances keep the plan they were reserved with.
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { readJson, writeJsonAtomic } from "../jsonfile.js";
 
@@ -159,7 +160,29 @@ export interface HostingPolicy {
    *  the admin page; provisioning refuses new instances (not existing ones)
    *  once projected spend would exceed it. 0 = no ceiling configured. */
   maximumProjectedMonthlyProviderCostCents: number;
+  /** v0.4.104 — OpenSSH PUBLIC keys (one line each, no options prefix) the
+   *  bootstrap appends to root's authorized_keys on every NEW hosted server,
+   *  e.g. the operator fleet update key. Public material only; existing keys
+   *  are never removed. Empty = none. */
+  fleetAuthorizedKeys: readonly string[];
   updatedAtMs: number | null;
+}
+
+/** One OpenSSH public-key line: a known key type, base64 key material and an
+ *  optional plain comment — never an `options` prefix (from=, command=…),
+ *  never a quote, newline or shell metacharacter. */
+export const FLEET_KEY_RE = /^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ssh-rsa) [A-Za-z0-9+/]{40,1024}={0,3}( [A-Za-z0-9@._+-]{1,64})?$/;
+const MAX_FLEET_KEYS = 4;
+
+/** `ssh-keygen -lf` style SHA256 fingerprint of a public-key line. */
+export function sshPublicKeyFingerprint(line: string): string {
+  const blob = Buffer.from(line.split(" ")[1] ?? "", "base64");
+  return `SHA256:${createHash("sha256").update(blob).digest("base64").replace(/=+$/, "")}`;
+}
+
+function fleetKeysFrom(raw: unknown): readonly string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((k): k is string => typeof k === "string" && FLEET_KEY_RE.test(k)).slice(0, MAX_FLEET_KEYS);
 }
 
 export interface HostingSecrets {
@@ -194,6 +217,7 @@ export function defaultHostingPolicy(): HostingPolicy {
     bootstrapTokenTtlMinutes: 60,
     maximumConcurrentProvisionJobs: 1,
     maximumProjectedMonthlyProviderCostCents: 0,
+    fleetAuthorizedKeys: [],
     updatedAtMs: null,
   };
 }
@@ -267,6 +291,7 @@ export function readHostingPolicy(dataDir: string): HostingPolicy {
     bootstrapTokenTtlMinutes: num(raw.bootstrapTokenTtlMinutes, d.bootstrapTokenTtlMinutes),
     maximumConcurrentProvisionJobs: num(raw.maximumConcurrentProvisionJobs, d.maximumConcurrentProvisionJobs),
     maximumProjectedMonthlyProviderCostCents: num(raw.maximumProjectedMonthlyProviderCostCents, d.maximumProjectedMonthlyProviderCostCents),
+    fleetAuthorizedKeys: fleetKeysFrom(raw.fleetAuthorizedKeys),
     updatedAtMs: typeof raw.updatedAtMs === "number" ? raw.updatedAtMs : null,
   };
 }
@@ -378,6 +403,12 @@ export function applyHostingPolicyPatch(current: HostingPolicy, patch: unknown):
   if (p.bootstrapTokenTtlMinutes !== undefined) next.bootstrapTokenTtlMinutes = intField(p.bootstrapTokenTtlMinutes, 5, 24 * 60, "bootstrapTokenTtlMinutes");
   if (p.maximumConcurrentProvisionJobs !== undefined) next.maximumConcurrentProvisionJobs = intField(p.maximumConcurrentProvisionJobs, 1, 50, "maximumConcurrentProvisionJobs");
   if (p.maximumProjectedMonthlyProviderCostCents !== undefined) next.maximumProjectedMonthlyProviderCostCents = intField(p.maximumProjectedMonthlyProviderCostCents, 0, 1_000_000_000, "maximumProjectedMonthlyProviderCostCents");
+  if (p.fleetAuthorizedKeys !== undefined) {
+    if (!Array.isArray(p.fleetAuthorizedKeys) || p.fleetAuthorizedKeys.length > MAX_FLEET_KEYS) throw new HostingPolicyError(`fleetAuthorizedKeys must be an array of at most ${MAX_FLEET_KEYS} public keys`);
+    const keys = p.fleetAuthorizedKeys.map((k) => typeof k === "string" ? k.trim() : k);
+    for (const k of keys) if (typeof k !== "string" || !FLEET_KEY_RE.test(k)) throw new HostingPolicyError("each fleetAuthorizedKeys entry must be one OpenSSH public key line (type, key, optional comment; no options, no private key)");
+    next.fleetAuthorizedKeys = [...new Set(keys as string[])];
+  }
   if (next.provisioningEnabled) {
     if (!next.osId) throw new HostingPolicyError("cannot keep provisioning enabled without an osId configured");
     if (!/^[0-9a-f]{64}$/.test(next.releaseRef)) throw new HostingPolicyError("cannot keep provisioning enabled without the signed customer artifact SHA-256 as releaseRef");

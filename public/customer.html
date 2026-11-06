@@ -440,7 +440,9 @@
     node.querySelector(".v-region").textContent = inst.regionLabel || inst.region;
     node.querySelector(".v-ip").textContent = inst.ip || "—";
     node.querySelector(".v-url").textContent = inst.appUrl || "—";
-    node.querySelector(".v-price-line").textContent = inst.bundleSubscription && inst.softwareLifetime !== true
+    node.querySelector(".v-price-line").textContent = inst.complimentary
+      ? "Complimentary — no hosting payment is taken"
+      : inst.bundleSubscription && inst.softwareLifetime !== true
       ? inst.billingPriceLabel + "/" + inst.billingInterval + " combined software + hosting"
       : inst.monthlyPriceLabel + "/month hosting";
     node.querySelector(".v-account-limit").textContent = "Up to " + inst.maximumConnectedAccounts;
@@ -479,7 +481,7 @@
     var errEl = node.querySelector(".v-action-err");
     var cancelBtn = node.querySelector(".v-cancel");
     var resumeBtn = node.querySelector(".v-resume");
-    if (inst.stage !== "cancel_scheduled" && inst.stage !== "suspended" && inst.stage !== "deleting" && inst.stage !== "deleted") {
+    if (!inst.complimentary && inst.stage !== "cancel_scheduled" && inst.stage !== "suspended" && inst.stage !== "deleting" && inst.stage !== "deleted") {
       cancelBtn.hidden = false;
       if (inst.bundleSubscription) cancelBtn.textContent = inst.softwareLifetime === true ? "Cancel VPS renewal" : "Cancel software + hosting renewal";
       cancelBtn.addEventListener("click", async function () {
@@ -495,7 +497,7 @@
         setTimeout(function () { boot(); }, 1200);
       });
     }
-    if (inst.stage === "cancel_scheduled") {
+    if (inst.stage === "cancel_scheduled" && !inst.complimentary) {
       resumeBtn.hidden = false;
       resumeBtn.textContent = inst.bundleSubscription ? (inst.softwareLifetime === true ? "Resume VPS renewal" : "Resume software + hosting renewal") : "Resume renewal";
       resumeBtn.addEventListener("click", async function () {

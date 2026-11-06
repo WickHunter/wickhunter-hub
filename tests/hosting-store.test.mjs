@@ -123,4 +123,30 @@ await test("bare(): a __proto__-named owner/key never touches Object.prototype",
   assert.equal(s.activeInstanceForOwner("__proto__", "live").id, "host_a");
 });
 
+// ── v0.4.102 — read-only queries parse the db once per on-disk version ─────
+await test("read queries reuse one parse until the file changes; returned rows are clones; CAS still reads disk", () => {
+  const dir = tmpDir("hosting-store-cache");
+  const s = new HostingStore(dir);
+  for (let i = 0; i < 40; i++) s.reserveInstance({ id: `host_${i}`, ownerId: `cus_${i}`, environment: "live", region: "nrt", planId: "p", stripeCustomerId: `cus_${i}`, nowMs: 1000 + i });
+  s.dbParses = 0;
+  for (let i = 0; i < 40; i++) assert.equal(s.activeInstanceForOwner(`cus_${i}`, "live").id, `host_${i}`);
+  s.instances(); s.getInstance("host_3"); s.duePending(5000);
+  assert.equal(s.dbParses, 1, "43 queries, one parse (was one per query)");
+  // A returned row is the caller's copy.
+  const row = s.getInstance("host_3");
+  row.stage = "deleted"; row.version = 999;
+  assert.equal(s.getInstance("host_3").stage, "ordered");
+  // Another writer (a second store on the same file) is seen at once.
+  const other = new HostingStore(dir);
+  const v = other.getInstance("host_5").version;
+  assert.ok(other.updateInstance("host_5", v, (d) => { d.label = "from-other"; }, 9000));
+  assert.equal(s.getInstance("host_5").label, "from-other", "file identity changed → re-parsed");
+  // CAS compares against disk, never against the cached copy.
+  assert.equal(s.updateInstance("host_5", v, (d) => { d.label = "stale"; }, 9001), null, "a stale version is refused");
+  const fresh = s.getInstance("host_5");
+  assert.ok(s.updateInstance("host_5", fresh.version, (d) => { d.label = "mine"; }, 9002));
+  assert.equal(s.getInstance("host_5").label, "mine", "own writes are visible immediately");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 summary("hosting-store");

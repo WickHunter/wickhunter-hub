@@ -28,10 +28,16 @@
 // anything (every transition here is idempotent: re-deriving the same
 // target state from the same source record is a no-op against a row
 // already in that state).
+//
+// v0.4.104 exception, by design: an operator's complimentary grant
+// (`adminCreateComplimentary`) has no Stripe event to derive from, so this
+// class writes that grant's own hosting role record (in its own
+// `complimentary:` key space, which no webhook can address) and asks
+// BillingService to create/bind the complimentary customer and licence.
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { isIP } from "node:net";
 import type { BillingService } from "../billing/service.js";
-import type { RoleSubscriptionRecord } from "../billing/store.js";
+import type { RoleSubscriptionRecord, ComplimentaryHostingMark } from "../billing/store.js";
 import type { EmailConfig } from "../billing/config.js";
 import type { HostedPriceProof } from "../billing/hosted-offer.js";
 import { launchGrant } from "../billing/launch.js";
@@ -39,7 +45,7 @@ import type { StripeObject } from "../earn-stripe-api.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
 import { HostingStore, type HostingInstanceRow, type HostingOutboxRow, type HostingStage, type HostingDeletionHold } from "./store.js";
-import { hostingPriceCoversCost, readHostingPolicy, readHostingSecrets, type HostingPolicy } from "./policy.js";
+import { hostingPriceCoversCost, readHostingPolicy, readHostingSecrets, sshPublicKeyFingerprint, type HostingPolicy } from "./policy.js";
 import { deadlines, type HostingDeadlines, type HostingEndReason } from "./deadlines.js";
 import { readinessVerdict, type ProbeResult, type ReadinessVerdict } from "./readiness.js";
 import { bootstrapPasswordFromTokenHash, hostingInstanceLabel, hashBootstrapToken, mintBootstrapToken, FakeProvider, VultrProvider, type HostingProvider } from "./provider.js";
@@ -133,7 +139,9 @@ export type HostingActionError =
   /** Renewal cannot be resumed: the Hub's mirror of Stripe says the
    *  subscription is not being billed, or a charge on it was refunded or
    *  disputed (see `reverseScheduledCancellation`). */
-  | "SUBSCRIPTION_NOT_ACTIVE";
+  | "SUBSCRIPTION_NOT_ACTIVE"
+  /** v0.4.104 — a malformed admin request (complimentary route). */
+  | "INVALID_REQUEST";
 
 export type HostingActionResult<T> = { ok: true; value: T } | { ok: false; code: HostingActionError; error: string };
 
@@ -559,6 +567,7 @@ export class HostingService {
   reconcileOwner(ownerId: string, nowMs = this.now()): void {
     const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
     if (!sub) return;
+    if (sub.complimentary) { this.reconcileComplimentary(ownerId, sub, sub.complimentary, nowMs); return; }
     const environment = sub.livemode ? "live" : "test";
     let instance = this.store.activeInstanceForOwner(ownerId, environment);
     if (!instance) {
@@ -623,11 +632,34 @@ export class HostingService {
     }
     if (this.withheldCancellations.delete(ownerId)) this.log(`[hosting] ${ownerId} (${instance.id}): software licence hold ended (${ineligible ? ineligible.kind : "eligible again"})`);
     if (ineligible) {
-      this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer (${ineligible.kind}${ineligible.kind === "lapsed" ? `, subscription ${ineligible.subscriptionStatus ?? "none"}` : ""})`);
-      if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
-      if (instance.stage === "ordered" && !instance.providerInstanceId) this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+      // Once per owner and reason per process: this branch re-derives the
+      // same verdict on every 30-second tick, and on 2026-10-29 two owners
+      // wrote ~1,000 identical journal lines in two hours.
+      const quietKey = `${ownerId}:${ineligible.kind}:${ineligible.kind === "lapsed" ? ineligible.subscriptionStatus ?? "none" : ""}`;
+      if (!this.quietIneligibleOwners.has(quietKey)) {
+        for (const k of this.quietIneligibleOwners) if (k.startsWith(`${ownerId}:`)) this.quietIneligibleOwners.delete(k);
+        this.quietIneligibleOwners.add(quietKey);
+        this.log(`[hosting] refusing paid hosting provisioning for ${ownerId}: no eligible software licence is bound to this exact customer (${ineligible.kind}${ineligible.kind === "lapsed" ? `, subscription ${ineligible.subscriptionStatus ?? "none"}` : ""}); logged once per reason`);
+      }
+      if (instance.stage === "ordered" && !instance.providerInstanceId) {
+        if (sub.subscriptionId) this.enqueueStripeCancellation(instance, sub.subscriptionId, "software-ineligible", nowMs);
+        this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.checkoutExpiresAtMs = null; }, nowMs);
+        return;
+      }
+      // A server that already exists still follows its own hosting billing
+      // record. Returning here (as before) meant the Stripe echo of this
+      // branch's own cancellation ("active (cancels at period end)") and the
+      // later "canceled" never scheduled suspend/delete, so the provider
+      // server outlived the paid hosting period indefinitely. The signal is
+      // applied in end-only mode — no provisioning, no restore — and BEFORE
+      // the cancellation is queued, so a schedule change cannot obsolete
+      // the queued cancellation (dedupe keys are permanent).
+      this.applyBillingSignal(instance, sub, nowMs, { endOnly: true });
+      const current = this.store.getInstance(instance.id) ?? instance;
+      if (sub.subscriptionId) this.enqueueStripeCancellation(current, sub.subscriptionId, "software-ineligible", nowMs);
       return;
     }
+    this.quietIneligibleOwners.forEach((k) => { if (k.startsWith(`${ownerId}:`)) this.quietIneligibleOwners.delete(k); });
     this.applyBillingSignal(instance, sub, nowMs);
   }
 
@@ -656,7 +688,13 @@ export class HostingService {
   /** Compute the target stage from the billing record and move the instance
    *  toward it. Every branch is a no-op if the instance is already there —
    *  the property that makes re-running this on every tick safe. */
-  private applyBillingSignal(instance: HostingInstanceRow, sub: RoleSubscriptionRecord, nowMs: number): void {
+  /** `endOnly` (an owner without an eligible software licence whose server
+   *  already exists): only the end-of-service transitions apply — a
+   *  scheduled cancellation, nonpayment or an ended subscription schedules
+   *  suspend/delete. No provision job, restore or paid-through renewal is
+   *  derived for an ineligible owner. */
+  private applyBillingSignal(instance: HostingInstanceRow, sub: RoleSubscriptionRecord, nowMs: number, opts: { endOnly?: boolean } = {}): void {
+    const endOnly = opts.endOnly === true;
     const policy = this.policy();
     const signal: BillingSignal = { subscriptionStatus: sub.subscriptionStatus, periodEndMs: sub.periodEndMs, refunded: sub.refunded, disputed: sub.disputed };
 
@@ -678,7 +716,7 @@ export class HostingService {
     // paid+ordered state on every reconciliation; the lifecycle-scoped dedupe
     // key makes repeats inert while still allowing a replacement if a real
     // lifecycle transition obsoletes an older job.
-    if (instance.stage === "ordered" && !instance.providerInstanceId && paidEvidenceExists(sub)) {
+    if (!endOnly && instance.stage === "ordered" && !instance.providerInstanceId && paidEvidenceExists(sub)) {
       this.enqueueProvisionJob(instance, nowMs);
     }
 
@@ -690,10 +728,11 @@ export class HostingService {
     // direction: never an invented FAILURE either). The operator acts on
     // it from the admin page's audit list.
     if ((signal.refunded || signal.disputed) && instance.failureReason !== hostingBillingFlagNote(signal)) {
-      this.store.updateInstance(instance.id, instance.version, (d) => { d.failureReason = hostingBillingFlagNote(signal); }, nowMs);
+      const flagged = this.store.updateInstance(instance.id, instance.version, (d) => { d.failureReason = hostingBillingFlagNote(signal); }, nowMs);
+      if (flagged) instance = flagged;
     }
 
-    const paidThroughAdvanced = signal.periodEndMs !== null && (instance.paidThroughMs === null || signal.periodEndMs > instance.paidThroughMs);
+    const paidThroughAdvanced = !endOnly && signal.periodEndMs !== null && (instance.paidThroughMs === null || signal.periodEndMs > instance.paidThroughMs);
     const scheduledCancel = signal.subscriptionStatus === "active (cancels at period end)";
     const nonpaying = signal.subscriptionStatus === "past_due";
     const ended = signal.subscriptionStatus === "canceled";
@@ -732,7 +771,21 @@ export class HostingService {
       return;
     }
     if (scheduledCancel && instance.cancellationReason !== "intentional_cancellation" && !TERMINAL_ISH.has(instance.stage)) {
-      this.scheduleEnd(instance, "intentional_cancellation", signal.periodEndMs ?? instance.paidThroughMs ?? nowMs, policy, nowMs);
+      const anchor = signal.periodEndMs ?? instance.paidThroughMs;
+      if (endOnly && anchor === null) {
+        // An intentional cancellation suspends AT its anchor, so the `nowMs`
+        // fallback would end an ineligible owner's server immediately on a
+        // fabricated date. Fail closed: schedule nothing and wait for a later
+        // signal that carries a real period end (logged once per instance
+        // lifecycle per process).
+        const quietKey = `${instance.id}:v${instance.lifecycleVersion}`;
+        if (!this.quietUnanchoredEnds.has(quietKey)) {
+          this.quietUnanchoredEnds.add(quietKey);
+          this.log(`[hosting] not scheduling the end of ${instance.id} for an owner without an eligible software licence: the cancellation names no period end and the server has no paid-through date; waiting for a later billing signal`);
+        }
+        return;
+      }
+      this.scheduleEnd(instance, "intentional_cancellation", anchor ?? nowMs, policy, nowMs);
       return;
     }
     if (nonpaying && !TERMINAL_ISH.has(instance.stage) && instance.cancellationReason !== "intentional_cancellation") {
@@ -823,6 +876,7 @@ export class HostingService {
     const row = this.owned(ownerId, instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
     if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this hosting instance cannot be cancelled from its current state" };
+    if (row.complimentary) return { ok: false, code: "NOT_CANCELLABLE", error: "this is a complimentary server with no subscription to cancel — ask support to end it" };
     const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
     if (!sub?.subscriptionId || !(await this.setStripeCancellation(sub.subscriptionId, true))) {
       return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: "Stripe did not confirm the cancellation; no local hosting deadline was changed" };
@@ -958,7 +1012,7 @@ export class HostingService {
    *  comparing the presented generation against the row's CURRENT one
    *  (H6: "late callbacks from a failed/replaced instance must not mark
    *  the replacement ready"). */
-  async reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number): Promise<HostingActionResult<{ ready: boolean }>> {
+  async reportReadiness(instanceId: string, presentedToken: string, generation: number, results: readonly ProbeResult[], nowMs = this.now(), managementCounter?: number, facts: BootstrapFacts = {}): Promise<HostingActionResult<{ ready: boolean }>> {
     const row = this.store.getInstance(instanceId);
     if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown instance" };
     if (managementCounter !== undefined) {
@@ -988,6 +1042,15 @@ export class HostingService {
       if (managementCounter !== undefined) d.managementCounter = managementCounter;
       d.readiness = { checkedAtMs: nowMs, ready: verdict.ready, refusals: verdict.refusals, regionTried: d.region };
       d.lastProviderCheckAtMs = nowMs;
+      // v0.4.104 — facts only the authenticated bootstrap proof carries.
+      if (managementCounter === undefined) {
+        if (facts.sshHostKeys && facts.sshHostKeys.length) {
+          if (!d.sshHostKeys || !d.sshHostKeys.length) { d.sshHostKeys = facts.sshHostKeys.map((k) => ({ ...k })); d.sshHostKeysAtMs = nowMs; }
+          else if (JSON.stringify(d.sshHostKeys) !== JSON.stringify(facts.sshHostKeys)) d.sshHostKeysMismatchAtMs = nowMs;
+        }
+        const offered = d.fleetKeysOffered?.length ?? 0;
+        if (offered > 0 && facts.fleetKeysPresent !== undefined && facts.fleetKeysPresent >= offered && !d.fleetKeysConfirmedAtMs) d.fleetKeysConfirmedAtMs = nowMs;
+      }
       if (providerIp) { d.ip = providerIp; d.appUrl = `https://${providerIp}/`; }
     }, nowMs);
     if (!fresh) return { ok: false, code: "NOT_FOUND", error: "changed underneath the request" };
@@ -1087,6 +1150,12 @@ export class HostingService {
    *  on (no Stripe subscription bound) and has been logged once by this
    *  process. Same in-memory, log-only rationale as above. */
   private readonly quietUnreservedOwners = new Set<string>();
+  /** `${ownerId}:${kind}:${status}` of each "refusing paid hosting
+   *  provisioning" verdict already logged by this process. Log-only, like
+   *  the two sets above; a changed reason logs again. */
+  private readonly quietIneligibleOwners = new Set<string>();
+  /** Instance lifecycles whose end-only cancellation had no anchor (logged once). */
+  private readonly quietUnanchoredEnds = new Set<string>();
 
   /** Owns its own periodic reconciliation (candles/liq's own `start`/`stop`
    *  shape — src/server.ts's `listen`/`close`), so every hub that
@@ -1151,6 +1220,14 @@ export class HostingService {
           this.log(`[hosting] ${row.id}: "${template}" deletion reminder suppressed — on an admin deletion hold (by ${row.deletionHold.by})`);
           return;
         }
+        // A complimentary server has nothing to pay: the suspended notice and
+        // the deletion countdown reminders each ask for a hosting payment or
+        // renewal, so they are not sent for it. Its end is announced by the
+        // "hosting will end" notice and closed by the "terminated" one.
+        if (row.complimentary && COMPLIMENTARY_SUPPRESSED_TEMPLATES.has(template)) {
+          this.log(`[hosting] ${row.id}: "${template}" notice not sent — complimentary server (no payment to request)`);
+          return;
+        }
         return this.drainEmail(row, template, nowMs);
       }
       default: return;
@@ -1191,7 +1268,9 @@ export class HostingService {
     // CAS or the stale version would make that mutation a silent no-op.
     row = this.store.getInstance(row.id) ?? row;
     if (row.providerPlanMonthlyCostCents === null || !Number.isSafeInteger(row.providerPlanMonthlyCostCents) || row.providerPlanMonthlyCostCents <= 0) throw new Error("provider price could not be verified — provisioning remains blocked");
-    if (!hostingPriceCoversCost(policy.monthlyPriceCents, row.providerPlanMonthlyCostCents, policy.minimumMonthlyMarginCents)) {
+    // A complimentary server has no price to cover; the cost ceiling below
+    // still applies to it.
+    if (!row.complimentary && !hostingPriceCoversCost(policy.monthlyPriceCents, row.providerPlanMonthlyCostCents, policy.minimumMonthlyMarginCents)) {
       this.failProvisioning(row, "advertised hosting price no longer covers the verified provider cost plus the minimum margin", nowMs);
       return;
     }
@@ -1225,7 +1304,10 @@ export class HostingService {
         d.bootstrapTokenExpiresAtMs = nowMs + policy.bootstrapTokenTtlMinutes * 60_000;
         d.managementTokenHash = hashBootstrapToken(rawManagementToken);
         d.managementCounter = 0;
-        d.releaseRef = policy.releaseRef;
+        d.releaseRef = d.releasePin || policy.releaseRef;
+        d.fleetKeysOffered = policy.fleetAuthorizedKeys.map(sshPublicKeyFingerprint);
+        d.fleetKeysConfirmedAtMs = null;
+        d.sshHostKeys = []; d.sshHostKeysAtMs = null; d.sshHostKeysMismatchAtMs = null;
       }, nowMs);
       const userData = buildBootstrapUserData({
         instanceId: row.id, generation: row.generation, bootstrapToken: rawToken,
@@ -1233,6 +1315,7 @@ export class HostingService {
         hubOrigin: this.origin,
         maxAccounts: policy.maximumConnectedAccounts,
         probeVenues: policy.probeVenues,
+        fleetAuthorizedKeys: policy.fleetAuthorizedKeys,
       });
       try {
         created = await provider.createInstance({ label, regionId: row.region, planId: row.planId, osId: policy.osId, userData, tags: [`wh-owner:${sha1short(row.ownerId)}`] });
@@ -1580,9 +1663,10 @@ export class HostingService {
           appUsername: "admin", sshUsername: "root", sshPort: 22, accessUrl: manageUrl,
           temporaryPassword: row.bootstrapTokenHash ? bootstrapPasswordFromTokenHash(row.bootstrapTokenHash) : "",
           maximumConnectedAccounts: policy.maximumConnectedAccounts,
-          billingSummary: bundlePlan?.lifetime ? `Your Lifetime software purchase remains yours. VPS hosting renews at ${bundlePrice} per month.` : bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
+          billingSummary: row.complimentary ? "This server is complimentary: no hosting payment is taken." : bundlePlan?.lifetime ? `Your Lifetime software purchase remains yours. VPS hosting renews at ${bundlePrice} per month.` : bundlePlan ? `Your combined software and hosting subscription is ${bundlePrice} per ${bundlePlan.interval}.` : `Hosting is ${priceLabel} per month in addition to your software license.`, renewalAt: row.paidThroughMs, backupScopeSentence: policy.managedBackupsIncluded ? "Backups are included." : "No managed backups are included at this time — export your settings while the server is active.",
         });
       case "cancellation_scheduled":
+        if (row.complimentary) return tmpl.complimentaryEndingEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs);
         return tmpl.cancellationScheduledEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, !!bundlePlan && !bundlePlan.lifetime);
       case "overdue":
         return tmpl.overdueEmail("", ref, row.suspendAtMs ?? nowMs, row.deleteAtMs ?? nowMs, manageUrl, bundlePlan?.lifetime ? "This invoice renews VPS hosting only. Your paid Lifetime software access remains yours." : bundlePlan ? "This invoice renews your combined software and hosting subscription." : "");
@@ -1595,7 +1679,7 @@ export class HostingService {
       case "restored":
         return tmpl.restoredEmail("", ref, row.appUrl ?? "", row.paidThroughMs, "Bots saved as enabled may resume through their normal readiness, admission, and protection gates; bots saved as paused remain paused.");
       case "terminated":
-        return tmpl.terminatedEmail("", ref, row.terminatedAtMs ?? nowMs, "Hosting billing has been stopped for this server.", manageUrl);
+        return tmpl.terminatedEmail("", ref, row.terminatedAtMs ?? nowMs, row.complimentary ? "This was a complimentary server; no hosting payment was taken." : "Hosting billing has been stopped for this server.", manageUrl);
       case "setup_failure":
         return tmpl.exceptionEmail("", "setup_failure", ref, row.failureReason ?? "Setup did not complete.", manageUrl);
       case "late_payment":
@@ -1638,11 +1722,27 @@ export class HostingService {
     const cfg = this.billing.config();
     const key = cfg.stripe[cfg.mode].secretKey;
     if (!key) return false;
+    const url = `https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`;
     try {
-      const response = await this.stripeFetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      const response = await this.stripeFetch(url, {
         method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/x-www-form-urlencoded" }, body: `cancel_at_period_end=${cancelAtPeriodEnd ? "true" : "false"}`,
       });
-      return response.ok;
+      if (response.ok) return true;
+    } catch { /* fall through to Stripe's own read below */ }
+    if (!cancelAtPeriodEnd) return false;
+    // Stripe refuses any cancel_at_period_end update on a subscription that
+    // has already ended (HTTP 400). A billing_reconcile job queued for such
+    // a subscription then failed every minute, forever (2026-10-15..29: four
+    // jobs on two ended subscriptions, ~16,000 attempts each). An ended
+    // subscription can bill nothing more, which is all the cancellation was
+    // for, so confirm it from a fresh read of that exact subscription only.
+    try {
+      const read = await this.stripeFetch(url, { method: "GET", headers: { authorization: `Bearer ${key}` } });
+      if (!read.ok) return false;
+      const body = JSON.parse(await read.text()) as { id?: unknown; status?: unknown };
+      if (body.id !== subscriptionId || (body.status !== "canceled" && body.status !== "incomplete_expired")) return false;
+      this.log(`[hosting] Stripe subscription ${subscriptionId} has already ended (${String(body.status)}); its cancellation request is complete`);
+      return true;
     } catch { return false; }
   }
 
@@ -1806,6 +1906,191 @@ export class HostingService {
     this.store.enqueue({ ...base, jobType: "delete", dedupeKey: `delete:${row.id}:v${row.lifecycleVersion}`, availableAtMs: d.deleteAt, payload: {} }, nowMs);
   }
 
+  // ── complimentary servers (v0.4.104) ────────────────────────────────────
+  // An operator-granted server for an email, with no Stripe charge. It goes
+  // through the SAME reservation, provision job, cloud-init bootstrap,
+  // installer, readiness proof and emails as a paid server; only the
+  // billing derivation differs: `reconcileComplimentary` treats it as paid
+  // until its optional term end or an explicit admin end, and never derives
+  // nonpayment, dunning, a restore or a Stripe cancellation from it.
+
+  /** The owner key of a complimentary grant — its own key space, so it can
+   *  never collide with a Stripe (`cus_…`) or email-checkout (`email:…`)
+   *  owner, and no Stripe webhook can ever write its role record. */
+  static complimentaryOwnerId(email: string): string {
+    return `complimentary:${email.trim().toLowerCase()}`;
+  }
+
+  /** POST /admin/api/hosting/complimentary. Idempotent per `idempotencyKey`:
+   *  a repeat answers with the server the key created (`created: false`);
+   *  any other request while this email has a live complimentary server is
+   *  refused `HOSTING_ALREADY_EXISTS`. The provider plan is verified and its
+   *  quote recorded before anything is written, and the configured provider
+   *  cost ceiling applies exactly as at checkout. */
+  async adminCreateComplimentary(input: ComplimentaryCreateInput, nowMs = this.now()): Promise<HostingActionResult<ComplimentaryCreateResult>> {
+    const email = input.email.trim().toLowerCase();
+    const by = input.by.trim().slice(0, 80) || "admin";
+    const reason = input.reason.trim().slice(0, 500);
+    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}$/.test(email)) return { ok: false, code: "INVALID_REQUEST", error: "a valid email address is required" };
+    if (!reason) return { ok: false, code: "INVALID_REQUEST", error: "a reason is required for the audit log" };
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(input.idempotencyKey)) return { ok: false, code: "INVALID_REQUEST", error: "idempotencyKey must be 8-128 letters, digits, dashes or underscores" };
+    if (input.months !== undefined && (!Number.isSafeInteger(input.months) || input.months < 1 || input.months > 120)) return { ok: false, code: "INVALID_REQUEST", error: "months must be a whole number from 1 to 120" };
+    if (!/^[0-9a-f]{64}$/.test(input.releaseRef)) return { ok: false, code: "PROVISIONING_DISABLED", error: "no verified release is available to pin" };
+    const policy = this.policy();
+    const region = input.region ?? policy.regions[0]?.id;
+    if (!region || !policy.regions.some((r) => r.id === region)) return { ok: false, code: "INVALID_REQUEST", error: `region must be one of the hosting policy regions (${policy.regions.map((r) => r.id).join(", ")})` };
+    const planId = input.planId ?? policy.planId;
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(planId)) return { ok: false, code: "INVALID_REQUEST", error: "planId looks malformed" };
+    const ownerId = HostingService.complimentaryOwnerId(email);
+    const environment = this.billing.config().mode;
+
+    const replay = this.complimentaryReplay(ownerId, environment, input.idempotencyKey);
+    if (replay) return replay;
+    if (!policy.provisioningEnabled) return { ok: false, code: "PROVISIONING_DISABLED", error: "the hosting provisioning master switch is off" };
+    const provider = this.provider();
+    if (!provider) return { ok: false, code: "PROVISIONING_DISABLED", error: "no provider API key is configured" };
+    let quote: number | undefined;
+    try { quote = (await provider.listPlans()).find((p) => p.id === planId)?.monthlyCostCents; }
+    catch (err) { return { ok: false, code: "PROVIDER_STATUS_UNKNOWN", error: `the provider's plan list could not be read: ${(err as Error).message}` }; }
+    if (quote === undefined) return { ok: false, code: "PROVISIONING_DISABLED", error: `the provider does not offer plan ${planId}` };
+    if (!Number.isSafeInteger(quote) || quote <= 0) return { ok: false, code: "PROVISIONING_DISABLED", error: "the provider plan has no verified positive cost" };
+    const ceiling = this.costCeilingRefusalWithQuote(quote, policy);
+    if (ceiling) return { ok: false, code: "PROVISIONING_DISABLED", error: ceiling };
+
+    // Everything below is synchronous: no other request can interleave
+    // between the re-check and the reservation.
+    const again = this.complimentaryReplay(ownerId, environment, input.idempotencyKey);
+    if (again) return again;
+    const endsAtMs = input.months === undefined ? null : addUtcMonths(nowMs, input.months);
+    const licence = this.billing.ensureComplimentaryCustomer({ ownerKey: ownerId, email, by, reason, licenseExpMs: endsAtMs ?? nowMs + 3649 * 24 * HOUR }, nowMs);
+    if (!licence.ok) return { ok: false, code: "SOFTWARE_LICENSE_REQUIRED", error: licence.error };
+    const id = this.store.newId("host");
+    const prior = this.billing.store.getRoleSubscription(ownerId, "hosting");
+    const mark: ComplimentaryHostingMark = { by, reason, createdAtMs: nowMs, idempotencyKey: input.idempotencyKey, instanceId: id, endsAtMs, endedAtMs: null, endedBy: null, endReason: null };
+    // Reserve first: the role record (which names this instance) is written
+    // only once the reservation exists, and a failure to write it closes the
+    // reservation again, so a grant never points at a row that is not there
+    // and no row is provisioned without its grant.
+    const reserved = this.store.reserveInstance({ id, ownerId, environment, region, planId, stripeCustomerId: "", nowMs });
+    if (!reserved) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: "this email already has a complimentary server" };
+    const row = this.store.updateInstance(reserved.id, reserved.version, (d) => {
+      d.complimentary = true; d.releasePin = input.releaseRef; d.providerPlanMonthlyCostCents = quote!; d.paidThroughMs = endsAtMs;
+    }, nowMs);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "the new reservation changed underneath the request" };
+    try {
+      this.billing.store.putRoleSubscription({
+        key: `${ownerId}::hosting`, customerKey: ownerId, role: "hosting", livemode: environment === "live",
+        subscriptionId: null, subscriptionStatus: "complimentary", periodEndMs: endsAtMs, chargeIds: [], disputed: false, refunded: false,
+        createdAtMs: prior?.createdAtMs ?? nowMs, updatedAtMs: nowMs, lastEventType: "admin.hosting.complimentary", lastEventAtMs: nowMs,
+        complimentary: mark,
+      });
+    } catch (err) {
+      this.store.updateInstance(row.id, row.version, (d) => { d.stage = "deleted"; d.terminatedAtMs = nowMs; d.failureReason = "complimentary grant could not be recorded"; d.lifecycleVersion += 1; }, nowMs);
+      return { ok: false, code: "PROVISIONING_DISABLED", error: `the grant could not be recorded; the reservation was closed: ${(err as Error).message}` };
+    }
+    this.enqueueProvisionJob(row, nowMs);
+    this.billing.store.appendEvent({
+      id: `hosting-complimentary-create:${row.id}`, type: "admin.hosting.complimentary.create", livemode: environment === "live", receivedAtMs: nowMs, outcome: "applied",
+      note: JSON.stringify({ by, reason, email, ownerId, instanceId: row.id, licenseId: licence.licenseId, reusedLicense: licence.reusedLicense, region, planId, providerMonthlyCostCents: quote, endsAtMs, releaseRef: input.releaseRef, idempotencyKey: input.idempotencyKey }),
+    });
+    this.log(`[hosting] ${row.id}: complimentary server reserved for ${ownerId} by ${by} (${region}, ${planId}, ${endsAtMs ? `until ${new Date(endsAtMs).toISOString()}` : "open-ended"}); provision job queued`);
+    return { ok: true, value: { created: true, instanceId: row.id, ownerId, licenseId: licence.licenseId, reusedLicense: licence.reusedLicense, stage: row.stage, endsAtMs, releaseRef: input.releaseRef } };
+  }
+
+  private complimentaryReplay(ownerId: string, environment: "live" | "test", idempotencyKey: string): HostingActionResult<ComplimentaryCreateResult> | null {
+    const sub = this.billing.store.getRoleSubscription(ownerId, "hosting");
+    const comp = sub?.complimentary;
+    if (comp && comp.idempotencyKey === idempotencyKey && comp.instanceId) {
+      const row = this.store.getInstance(comp.instanceId);
+      const customer = this.billing.store.getCustomer(ownerId);
+      if (row) return { ok: true, value: { created: false, instanceId: row.id, ownerId, licenseId: customer?.licenseId ?? "", reusedLicense: true, stage: row.stage, endsAtMs: comp.endsAtMs, releaseRef: row.releasePin ?? "" } };
+    }
+    const active = this.store.activeInstanceForOwner(ownerId, environment);
+    if (active) return { ok: false, code: "HOSTING_ALREADY_EXISTS", error: `this email already has a server (${active.id}, ${active.stage}); end it before granting another` };
+    return null;
+  }
+
+  /** POST /admin/api/hosting/instances/:id/end-complimentary. Records the
+   *  end on the grant and lets `reconcileComplimentary` schedule it through
+   *  the ordinary intentional-cancellation path: suspended now, deleted
+   *  after the policy retention, with the ordinary notices. Idempotent. */
+  adminEndComplimentary(instanceId: string, by: string, reason: string, nowMs = this.now()): HostingActionResult<{ changed: boolean; stage: HostingStage; suspendAtMs: number | null; deleteAtMs: number | null }> {
+    const row = this.store.getInstance(instanceId);
+    if (!row) return { ok: false, code: "NOT_FOUND", error: "unknown hosting instance" };
+    const sub = this.billing.store.getRoleSubscription(row.ownerId, "hosting");
+    if (!row.complimentary || !sub?.complimentary) return { ok: false, code: "NOT_CANCELLABLE", error: "not a complimentary server — paid servers end through their subscription" };
+    if (TERMINAL_ISH.has(row.stage)) return { ok: false, code: "NOT_CANCELLABLE", error: "this instance is already deleting or deleted" };
+    if (sub.complimentary.endedAtMs !== null) {
+      return { ok: true, value: { changed: false, stage: row.stage, suspendAtMs: row.suspendAtMs, deleteAtMs: row.deleteAtMs } };
+    }
+    const who = by.trim().slice(0, 80) || "admin";
+    const why = reason.trim().slice(0, 500);
+    this.billing.store.putRoleSubscription({ ...sub, updatedAtMs: nowMs, lastEventType: "admin.hosting.complimentary.end", lastEventAtMs: nowMs,
+      complimentary: { ...sub.complimentary, endedAtMs: nowMs, endedBy: who, endReason: why || null } });
+    this.billing.store.appendEvent({
+      id: `hosting-complimentary-end:${row.id}:${nowMs}`, type: "admin.hosting.complimentary.end", livemode: row.environment === "live", receivedAtMs: nowMs, outcome: "applied",
+      note: JSON.stringify({ by: who, reason: why, ownerId: row.ownerId, instanceId: row.id, stage: row.stage }),
+    });
+    this.reconcileOwner(row.ownerId, nowMs);
+    const after = this.store.getInstance(row.id) ?? row;
+    this.log(`[hosting] ${row.id}: complimentary server ended by ${who}; stage ${after.stage}, suspend ${after.suspendAtMs ? new Date(after.suspendAtMs).toISOString() : "-"}, delete ${after.deleteAtMs ? new Date(after.deleteAtMs).toISOString() : "-"}`);
+    return { ok: true, value: { changed: true, stage: after.stage, suspendAtMs: after.suspendAtMs, deleteAtMs: after.deleteAtMs } };
+  }
+
+  /** The billing derivation for a complimentary grant. With no live server
+   *  there is nothing to do (and nothing is logged — a legacy record's
+   *  deleted test server no longer produces the "refusing unreserved hosting
+   *  payment" line). Before the end: an ordered row keeps its provision job.
+   *  At or after the end: the ordinary intentional-cancellation schedule,
+   *  anchored at the end instant; a row that never reached the provider is
+   *  simply closed. Never past_due, never a dunning email, never a Stripe
+   *  call, never a restore. */
+  private reconcileComplimentary(ownerId: string, sub: RoleSubscriptionRecord, comp: ComplimentaryHostingMark, nowMs: number): void {
+    const instance = this.store.activeInstanceForOwner(ownerId, sub.livemode ? "live" : "test");
+    if (!instance) return;
+    // Only the server this exact grant created is ever started or ended
+    // here. A legacy (migrated) record names no instance, so it can never
+    // start a server; any other row under the owner is left untouched.
+    if (!comp.instanceId || comp.instanceId !== instance.id || !instance.complimentary) return;
+    const endAt = comp.endedAtMs ?? comp.endsAtMs;
+    if (endAt === null || nowMs < endAt) {
+      if (instance.stage === "ordered" && !instance.providerInstanceId) this.enqueueProvisionJob(instance, nowMs);
+      return;
+    }
+    if (TERMINAL_ISH.has(instance.stage) || instance.cancellationReason !== null) return;
+    if (instance.stage === "ordered" && !instance.providerInstanceId) {
+      const closed = this.store.updateInstance(instance.id, instance.version, (d) => { d.stage = "deleted"; d.terminatedAtMs = nowMs; d.failureReason = "complimentary grant ended before a server was created"; d.lifecycleVersion += 1; }, nowMs);
+      if (closed) this.store.obsoletePendingJobsOlderThan(closed.id, closed.lifecycleVersion, closed.generation, nowMs);
+      return;
+    }
+    this.scheduleEnd(instance, "intentional_cancellation", endAt, this.policy(), nowMs);
+  }
+
+  // ── fleet update key on existing servers (v0.4.104) ──────────────────────
+
+  /** The dry run behind "Install update key on existing hosted servers":
+   *  every live server (provider resource present, not deleting/deleted)
+   *  whose bootstrap never confirmed the current policy fleet keys. The Hub
+   *  has NO post-bootstrap command channel to a hosted server — cloud-init
+   *  runs once; the readiness agent only POSTs a boot proof to the Hub and
+   *  never reads a response; the Vultr API cannot execute commands on a
+   *  running server — so this lists targets and never changes a server. */
+  fleetKeyPlan(): FleetKeyPlan {
+    const policy = this.policy();
+    const wanted = policy.fleetAuthorizedKeys.map(sshPublicKeyFingerprint);
+    const targets: FleetKeyPlanRow[] = [], confirmed: FleetKeyPlanRow[] = [];
+    for (const row of this.store.instances()) {
+      if (TERMINAL_ISH.has(row.stage) || !row.providerInstanceId) continue;
+      const offered = row.fleetKeysOffered ?? [];
+      const ok = !!row.fleetKeysConfirmedAtMs && wanted.every((f) => offered.includes(f));
+      const entry: FleetKeyPlanRow = { instanceId: row.id, ownerId: row.ownerId, stage: row.stage, ip: row.ip, createdAtMs: row.createdAtMs,
+        fleetKeysConfirmedAtMs: row.fleetKeysConfirmedAtMs ?? null, sshHostKeys: row.sshHostKeys ?? [],
+        reason: ok ? "confirmed by its bootstrap" : offered.length ? "offered at bootstrap but never confirmed present" : "bootstrapped before the Hub carried a fleet key" };
+      (ok ? confirmed : targets).push(entry);
+    }
+    return { configuredKeys: wanted, channel: null, targets, confirmed };
+  }
+
   // ── views ────────────────────────────────────────────────────────────────
 
   customerView(ownerId: string, nowMs = this.now()): HostingCustomerView {
@@ -1849,6 +2134,8 @@ export interface HostingInstanceView {
   softwareLifetime: boolean;
   billingPriceLabel: string;
   billingInterval: "month" | "year";
+  /** v0.4.104 — an operator-granted server with no subscription. */
+  complimentary: boolean;
 }
 export interface HostingCustomerView {
   available: boolean;
@@ -1882,9 +2169,57 @@ function instanceView(row: HostingInstanceRow, policy: HostingPolicy, _nowMs: nu
     softwareLifetime: bundlePlan?.lifetime === true,
     billingPriceLabel: bundlePlan ? `$${(bundlePlan.amountCents / 100).toFixed(2)}` : `$${(policy.monthlyPriceCents / 100).toFixed(2)}`,
     billingInterval: bundlePlan?.interval === "year" ? "year" : "month",
+    complimentary: row.complimentary === true,
   };
 }
 
+export interface FleetKeyPlanRow {
+  instanceId: string; ownerId: string; stage: HostingStage; ip: string | null; createdAtMs: number;
+  fleetKeysConfirmedAtMs: number | null; sshHostKeys: Array<{ type: string; fingerprint: string }>; reason: string;
+}
+export interface FleetKeyPlan { configuredKeys: string[]; channel: null; targets: FleetKeyPlanRow[]; confirmed: FleetKeyPlanRow[] }
+
+/** v0.4.104 — what the bootstrap's readiness proof reports beyond venue
+ *  probes (validated by the route before it gets here). */
+export interface BootstrapFacts {
+  sshHostKeys?: Array<{ type: string; fingerprint: string }>;
+  fleetKeysPresent?: number;
+}
+
+export interface ComplimentaryCreateInput {
+  email: string;
+  by: string;
+  reason: string;
+  idempotencyKey: string;
+  region?: string;
+  planId?: string;
+  /** Optional fixed term; omitted = until an admin ends it. */
+  months?: number;
+  /** The verified signed-manifest sha256 to install (the route passes the
+   *  Hub's current Beta release). */
+  releaseRef: string;
+}
+export interface ComplimentaryCreateResult {
+  created: boolean;
+  instanceId: string;
+  ownerId: string;
+  licenseId: string;
+  reusedLicense: boolean;
+  stage: HostingStage;
+  endsAtMs: number | null;
+  releaseRef: string;
+}
+
+/** `months` calendar months after `ms` in UTC, clamped to the target
+ *  month's last day (Jan 31 + 1 month = Feb 28/29). */
+export function addUtcMonths(ms: number, months: number): number {
+  const d = new Date(ms);
+  const y = d.getUTCFullYear(), m = d.getUTCMonth() + months;
+  const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return Date.UTC(y, m, Math.min(d.getUTCDate(), last), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds());
+}
+
+const COMPLIMENTARY_SUPPRESSED_TEMPLATES = new Set<string>(["suspended", "three_days", "one_day", "overdue"]);
 const RECOVERABLE_STAGES = new Set<HostingStage>(["past_due", "cancel_scheduled", "suspended", "restoring"]);
 const TERMINAL_ISH = new Set<HostingStage>(["deleting", "deleted"]);
 

@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isVenueId, type VenueId } from "./candles/venues.js";
 import { collectorOptionsFromEnv } from "./candles/service.js";
+import { parseTimeframeHorizon, type TimeframeHorizon } from "./candles/timeframe.js";
 import type { CollectorOptions } from "./candles/collector.js";
 import {
   CANDLE_KEY_ID, CANDLE_SIGNERS, LICENSE_SEED_KEY_ID, RESERVED_KEY_IDS, isCandleSigner,
@@ -118,6 +119,12 @@ export interface HubConfig {
   candleRequireLicense: boolean;
   candleTickMs: number;
   candleOptions: CollectorOptions;
+  /** v0.4.103 — HUB_TIMEFRAME_HORIZON: standing long-horizon native
+   *  timeframes per venue. OPTIONAL (hand-built configs); absent = none. */
+  candleTimeframeHorizon?: TimeframeHorizon;
+  /** Why HUB_TIMEFRAME_HORIZON was refused, or null. A refused value runs
+   *  the Hub with NO horizon (0.4.102 behaviour), loudly, never a guess. */
+  candleTimeframeHorizonError?: string | null;
 
   // ── market-cap snapshot producer ──────────────────────────────────────────
   /** OPTIONAL for the same reason `candleStreamVenues` is: `HubConfig` is built
@@ -286,6 +293,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     candleRequireLicense: (env.HUB_CANDLE_REQUIRE_LICENSE ?? "1") !== "0",
     candleTickMs: Math.max(1000, Number(env.HUB_CANDLE_TICK_MS ?? 60_000) || 60_000),
     candleOptions: collectorOptionsFromEnv(env),
+    ...timeframeHorizonFromEnv(env),
     // Reads the same dataDir the rest of the hub uses, so a snapshot file with
     // no explicit path lands beside licenses.json rather than in a second state
     // root nobody remembers to back up.
@@ -293,4 +301,13 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): HubConfig {
     liqRecord: liqRecordEnabled(env),
     liqService: liqServiceConfigFromEnv(env, env.HUB_DATA_DIR ?? path.join(ROOT, "data")),
   };
+}
+
+/** v0.4.103 — parse HUB_TIMEFRAME_HORIZON. A malformed value is refused as a
+ *  whole and reported (startup log + admin card); the Hub then runs without a
+ *  horizon rather than with a partial or default one. */
+export function timeframeHorizonFromEnv(env: NodeJS.ProcessEnv): { candleTimeframeHorizon: TimeframeHorizon; candleTimeframeHorizonError: string | null } {
+  const parsed = parseTimeframeHorizon(env.HUB_TIMEFRAME_HORIZON);
+  if (parsed.ok) return { candleTimeframeHorizon: parsed.value, candleTimeframeHorizonError: null };
+  return { candleTimeframeHorizon: {}, candleTimeframeHorizonError: `HUB_TIMEFRAME_HORIZON refused: ${parsed.error}` };
 }
