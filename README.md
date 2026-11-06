@@ -1,3 +1,8 @@
+## v0.4.108 — Hub Earn page hides Exchange Rebates; backfill errors reported separately
+
+- The Hub customer portal's Earn page hides Exchange Rebates for now, matching the app (operator decision 2026-11-05). WH Referrals and payouts are unchanged.
+- `referral-purchases-reconcile` reports a Stripe rate limit/outage or network failure as `error:true` (counted in `errored`) instead of a proof refusal, so the operator knows to re-run.
+
 ## v0.4.107 — Linked server dashboards can edit Earn settings
 
 - A server dashboard linked by an admin to a partner's Earn account (dashboard grant) can now save the payout destination and UIDs from the app, not only view them. Operator decision 2026-11-05, accepting the weaker payout safeguard; granting stays admin-only and every payout destination change is recorded in the Earn audit trail.
@@ -2089,6 +2094,7 @@ real hub on an ephemeral loopback port. Nothing in the repo tree is touched.
 
 ## Changelog
 
+- v0.4.108 — Hub Earn page hides Exchange Rebates; purchases backfill separates transient errors (`errored`) from refusals.
 - v0.4.107 — Dashboard-granted licences edit (not only view) the owner's Earn settings; payout destination changes stay audited.
 - v0.4.106 — Referral commission on one-time crypto Yearly purchases (same proofs as self-hosted Lifetime, launch purchase required; subscription-mode Yearly stays on the invoice path); `referral-purchases-reconcile` dry run applies full eligibility and reports a reason per session, and the real run continues past per-session refusals.
 - v0.4.105 — Referral commission on Lifetime purchases: the software line of a hosted Lifetime bundle's initial invoice and self-hosted one-time Lifetime Checkout purchases (same strict proofs, VPS-only renewals still never earn); `referral-purchases-reconcile` backfill route for one-time purchases.

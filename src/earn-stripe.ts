@@ -21,7 +21,10 @@ type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:
 type OneTimeKind='lifetime'|'yearly';
 type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean;kind?:OneTimeKind};
 type PurchaseProof={ok:false;reason:string}|{ok:true;member:StripeObject;customerId:string;paid:number;basis:number;charge:string;period:string;kind:OneTimeKind};
-type PurchaseOutcome={session:string;eligible:boolean;reason:string};
+type PurchaseOutcome={session:string;eligible:boolean;reason:string;error?:true};
+/** 0.4.108 — a Stripe rate limit/outage or a network/ledger failure is an
+ *  ERROR for the operator to re-run, not a proof refusal of the purchase. */
+const transientFailure=(error:unknown)=>error instanceof EarnStripeError?(error.status===429||error.status>=500||error.status===0):!(error instanceof Error)||error.name==='TypeError'||error.name==='AbortError'||error.name==='TimeoutError';
 const sources:EarnSource[]=['referral','exchange','marketplace'];
 const POSTED_RECHECK_MS=6*60*60_000;
 const SEEN_EVENT_MAX=10_000;
@@ -250,7 +253,7 @@ export class EarnStripeService {
   if(!member||!Number.isInteger(expectedRate)||expectedRate<0||expectedRate>100||member.commissionPercent!==expectedRate)throw Error('Reviewed commission rate changed');
   const api=this.api(c.mode),profile=this.profile(c.mode,owner),oneTimeKeys=new Set(this.oneTimePlans(c.mode).map(x=>x.plan.key));
   const allowed=[profile.promotion,...(profile.promotionHistory||[]).map((x:StripeObject)=>x.promotion),...(profile.partnerPromotions||[]).map((x:StripeObject)=>x.promotion)].filter(Boolean);
-  const sessions:string[]=[],outcomes:PurchaseOutcome[]=[],refuse=(session:string,error:unknown)=>outcomes.push({session,eligible:false,reason:error instanceof Error?error.message:String(error)});
+  const sessions:string[]=[],outcomes:PurchaseOutcome[]=[],refuse=(session:string,error:unknown)=>outcomes.push({session,eligible:false,reason:error instanceof Error?error.message:String(error),...(transientFailure(error)?{error:true as const}:{})});
   let cursor='';
   for(let page=0;page<100;page++){
    const batch=await api.call('GET','/v1/checkout/sessions',{status:'complete',limit:100,'expand[0]':'data.total_details.breakdown',...(cursor?{starting_after:cursor}:{})});
@@ -293,8 +296,9 @@ export class EarnStripeService {
    outcomes.push({session:sessionId,eligible:true,reason:result.reason});
   }
   const eligible=outcomes.filter(o=>o.eligible).map(o=>o.session);
-  if(dryRun)return {dryRun:true,owner,rate:expectedRate,purchases:eligible,alreadyRecorded:eligible.filter(x=>prior()[x]).length,sessions:outcomes};
-  return {dryRun:false,owner,rate:expectedRate,purchases:eligible.length,refused:outcomes.length-eligible.length,...tally,sessions:outcomes};
+  if(dryRun)return {dryRun:true,owner,rate:expectedRate,purchases:eligible,alreadyRecorded:eligible.filter(x=>prior()[x]).length,errored:outcomes.filter(o=>o.error).length,sessions:outcomes};
+  const errored=outcomes.filter(o=>o.error).length;
+  return {dryRun:false,owner,rate:expectedRate,purchases:eligible.length,refused:outcomes.length-eligible.length-errored,errored,...tally,sessions:outcomes};
  });}
  /** One-time software plans that can earn a self-hosted Checkout referral:
   * Lifetime (a configured one-time price) and the one-time crypto Yearly

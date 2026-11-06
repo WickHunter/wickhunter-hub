@@ -43,9 +43,10 @@ const sessions={
  cs_year_sub:session('cs_year_sub','cus_buyer',{mode:'subscription',subscription:'sub_year',payment_intent:null}),
  cs_year_hosted:session('cs_year_hosted','cus_buyer',{mode:'subscription',subscription:'sub_hosted_year',payment_intent:null,metadata:{plan:'yearly',bundle:'software-hosting-v2',reservation:'res_y',wh_launch_intent:'f'.repeat(64)}}),
 };
-const refunds={},calls=[];
+const refunds={},calls=[];let throttled='';
 const fetcher=async(url,init)=>{
  const u=new URL(url),p=u.pathname;calls.push(p);assert.equal(init.method,'GET','no Stripe writes');
+ if(throttled&&p==='/v1/checkout/sessions/'+throttled)return new Response(JSON.stringify({error:{code:'rate_limit'}}),{status:429});
  const ok=v=>new Response(JSON.stringify(v)),missing=()=>new Response(JSON.stringify({error:{code:'resource_missing'}}),{status:404});
  if(p==='/v1/promotion_codes/promo_p')return ok({id:'promo_p',code:'PARTNER20',livemode:true,coupon:'coupon_p',metadata:{managed_by:'wh-earn',wh_earn_owner:owner}});
  if(p==='/v1/coupons/coupon_p')return ok({id:'coupon_p',valid:true,percent_off:20,duration:'forever',metadata:{managed_by:'wh-earn'},applies_to:{products:['prod_wh']}});
@@ -124,6 +125,15 @@ try{
   for(const k of ['cs_year_selfref','cs_year_wrongproduct','cs_year_wrongprice','cs_year_card','cs_year_nointent','cs_year_badmode'])assert.equal(rows()[k],undefined);
   const again=await svc.reconcileReferralPurchases(owner,50,false);assert.equal(again.adjusted,0);assert.equal(balance()-before,27960);
   assert.equal(ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_year_missed').length,1);
+ });
+ await test('0.4.108: a Stripe rate limit during backfill is reported as an error, not a refusal',async()=>{
+  throttled='cs_year_wrongprice';
+  try{
+   const dry=await svc.reconcileReferralPurchases(owner,50,true);const why=Object.fromEntries(dry.sessions.map(o=>[o.session,o]));
+   assert.equal(why.cs_year_wrongprice.error,true);assert.match(why.cs_year_wrongprice.reason,/429/);assert.equal(dry.errored,1);
+   assert.equal(why.cs_year_wrongproduct.error,undefined,'a proof refusal is not an error');
+   const r=await svc.reconcileReferralPurchases(owner,50,false);assert.equal(r.errored,1);assert.equal(r.refused+r.errored+r.purchases,r.sessions.length);
+  }finally{throttled='';}
  });
  await test('one-time Yearly: a reviewed-rate change corrects with a yearly note',async()=>{
   ledger.configure({owner,commissionPercent:40});
