@@ -2740,7 +2740,7 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             result=await earnStripe.reconcileReferralPurchases(String(body.owner),body.expectedRate,body.dryRun);break;
           }
           case "/admin/api/earn/fee-recalculation": {
-            // 0.4.109: unpaid legacy (gross) commissions recalculated on the net sale after the actual Stripe fee.
+            // 0.4.109: unpaid legacy (gross) commissions recalculated on the net sale after the standard-rate processing fee.
             if(typeof body.dryRun!=='boolean')throw Error('Explicit dry-run required');
             if(!body.dryRun&&(body.confirm!==FEE_RECALC_APPLY_CONFIRM||typeof body.digest!=='string'))throw Error('Reviewed dry-run digest and exact apply confirmation required');
             result=await earnStripe.feeRecalculation({dryRun:body.dryRun,digest:typeof body.digest==='string'?body.digest:undefined,actor:'hub-admin: net-of-fee recalculation'});break;

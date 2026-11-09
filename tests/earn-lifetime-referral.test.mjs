@@ -61,7 +61,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/customers/cus_referrer')return ok({email:'referrer@example.com'});
  if(p.startsWith('/v1/customers/'))return ok({email:'buyer@example.com'});
  if(p==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}],has_more:false});
- if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ch}});}
+ if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,paid:true,status:'succeeded',payment_method_details:{type:'us_bank_account'},amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ch}});}
  if(p==='/v1/checkout/sessions')return ok({data:Object.values(sessions),has_more:false});
  const line=/^\/v1\/checkout\/sessions\/(cs_[a-z_]+)\/line_items$/.exec(p);
  if(line){const s=sessions[line[1]];return ok({data:[{price:{id:'price_lifetime',type:'one_time',recurring:null,product:line[1]==='cs_wrongproduct'?'prod_other':'prod_wh'},quantity:1,amount_subtotal:99900,amount_discount:19980,amount_tax:0,amount_total:s.amount_total}],has_more:false});}

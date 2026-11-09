@@ -35,7 +35,7 @@ const fake=async (url,init)=>{
  if(endpoint==='/v1/subscriptions/sub_friend')return ok(subscriptionOverride||{id:'sub_friend',status:subStatus,cancel_at_period_end:cancelAtPeriodEnd,metadata:subscriptionCode?{wh_earn_code:subscriptionCode}:{},discounts:subscriptionPromos[mode]?[{promotion_code:subscriptionPromos[mode]}]:[],items:{data:[{price:subscriptionPriceId}]}});
  if(endpoint==='/v1/customers/cus_friend')return ok({email});
  if(endpoint==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'payment_intent',payment_intent:{latest_charge:'ch_'+u.searchParams.get('invoice')}}}]});
- if(endpoint.startsWith('/v1/charges/'))return ok({id:endpoint.split('/').at(-1),currency:'usd',amount:100000,balance_transaction:{id:'txn_'+endpoint.split('/').at(-1),object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:endpoint.split('/').at(-1)},amount_refunded:endpoint.endsWith('/'+refundChargeId)?refund:0,disputed:endpoint.endsWith('/'+refundChargeId)&&dispute,livemode:live});
+ if(endpoint.startsWith('/v1/charges/'))return ok({id:endpoint.split('/').at(-1),currency:'usd',amount:100000,paid:true,status:'succeeded',payment_method_details:{type:'us_bank_account'},balance_transaction:{id:'txn_'+endpoint.split('/').at(-1),object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:endpoint.split('/').at(-1)},amount_refunded:endpoint.endsWith('/'+refundChargeId)?refund:0,disputed:endpoint.endsWith('/'+refundChargeId)&&dispute,livemode:live});
  if(endpoint==='/v1/disputes')return ok({data:[{status:disputeStatus}]});
  if(endpoint==='/v2/core/accounts'&&init.method==='POST')return ok({id:'acct_'+mode});
  if(endpoint.startsWith('/v2/core/accounts/'))return ok({id:'acct_'+mode,defaults:{payout_methods:{usd:'usba_test_fixture'}},configuration:{recipient:{capabilities:{bank_accounts:{local:{status:'active'}}}}}});
@@ -112,7 +112,8 @@ await test('hosted monthly and yearly invoices earn on net software and refund a
     }
     invoiceOverride=validInvoice;subscriptionOverride=validSubscription;invoiceId=record.id;refundChargeId='ch_'+record.id;
     refund=6000;await only.handleEvent({...event('charge.refunded','evt_hosted_partial',{id:refundChargeId}),livemode:false});
-    assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,record.commission-Math.floor(record.commission*refund/paid),'partial clawback uses the aggregate collected bundle amount');
+    // 0.4.109: a fee-settled row never refunds the fee: rate x (basis - refund share of the basis, half-up - fee).
+    assert.equal(only.ledger('test').view(owner,'Referrer').balances.referral,Math.floor((record.basis-Math.round(refund*record.basis/paid)-record.feeCents)*record.rate/100),'partial clawback uses the aggregate collected bundle amount');
     invoiceId='in_hosted_customer_credit';refundChargeId='ch_'+invoiceId;refund=0;paid=6000;invoiceOverride={...invoiceOverride,id:invoiceId,amount_paid:paid,total_taxes:[{amount:1000}]};
     await only.handleEvent({...event('invoice.paid','evt_hosted_customer_credit',{id:invoiceId}),livemode:false});
     const credited=only.ledger('test').admin().stripe.invoices[invoiceId];assert.equal(credited.basis,3000,'cash basis is capped after tax and the full VPS charge when customer credit reduces collection');assert.equal(credited.paid,6000);assert.equal(credited.commission,600);

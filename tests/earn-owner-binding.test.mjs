@@ -127,7 +127,7 @@ const stripeFetch=async(url,init)=>{
   if(ep.startsWith('/v1/subscriptions/sub_'))return ok({id:ep.split('/').at(-1),status:'active',metadata:{wh_earn_code:refMember.code},discounts:ownerPromo?[{promotion_code:ownerPromo.id}]:[],items:{data:[{price:'price_month'}]}});
   if(ep==='/v1/customers/cus_payer')return ok({email:payer.email});
   if(ep==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}]});
-  if(ep.startsWith('/v1/charges/ch_'))return ok({id:ep.split('/').at(-1),currency:'usd',amount:100000,balance_transaction:{id:'txn_'+ep.split('/').at(-1),object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ep.split('/').at(-1)},amount_refunded:0,disputed:false,livemode:true});
+  if(ep.startsWith('/v1/charges/ch_'))return ok({id:ep.split('/').at(-1),currency:'usd',amount:100000,paid:true,status:'succeeded',payment_method_details:{type:'us_bank_account'},balance_transaction:{id:'txn_'+ep.split('/').at(-1),object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ep.split('/').at(-1)},amount_refunded:0,disputed:false,livemode:true});
   throw new Error('Unexpected fake Stripe request '+init.method+' '+ep);
 };
 const boundHub=await freshHub({}, {earnFetch:stripeFetch});
