@@ -926,7 +926,7 @@ export class EarnStripeService {
   const charges:string[]=[];for(const row of paymentRows.data||[]){if(row.status!=='paid')continue;const payment=row.payment;if(payment?.type==='payment_intent'){let pi=payment.payment_intent;if(typeof pi==='string')pi=await api.call('GET','/v1/payment_intents/'+pi);if(id(pi?.latest_charge))charges.push(id(pi.latest_charge));}else if(payment?.type==='charge'&&id(payment.charge))charges.push(id(payment.charge));}
   // Only real collected charge-backed invoices enter payable earnings.
   if(!charges.length)return;
-  // 0.4.109: the actual Stripe processing fee of those charges; unknown = pending, never gross or zero.
+  // 0.4.109: the processing fee of those charges (standard rate for card/crypto; other rails: balance transaction, unknown = pending, never gross or zero).
   const fees=await this.chargeFees(mode,charges);
   const paidThrough=Math.max(...lines.map((l:StripeObject)=>Number(l.period?.end||0)*1000));const period=new Date(Number(inv.status_transitions?.paid_at||inv.created)*1000).toISOString().slice(0,7);
   this.syncMember(mode,member.id);
