@@ -204,6 +204,10 @@ export interface BundleSubscriptionRecord {
   launchIntentId?: string;
   /** Exact admitted initial invoice, retained until both role writes and hooks finish. */
   initialPaidPending?: { eventSha256: string; checkoutWatermarkMs: number };
+  /** v0.4.110 — paid invoices whose term was applied (newest last, bounded);
+   *  lets a paid invoice delivered behind a newer lifecycle event record its
+   *  term exactly once. Absent on records written before 0.4.110. */
+  paidTermInvoiceIds?: string[];
   latestEventCreatedMs: number;
   pendingStatus: "past_due" | null;
   terminal: boolean;

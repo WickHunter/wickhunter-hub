@@ -387,4 +387,134 @@ for(const [point,fence] of [['reservation-hook',null],['post-software-write',nul
     assert.equal(hookCalls,1);assert.equal(c.h.store.get(before.licenseId).exp,Math.max(bootstrapExp,swEnd+grace));
   }finally{await c.h.close();}
 });
+// v0.4.110 — a paid invoice's term is never lost to delivery order. Stripe
+// stamps `created` at one-second resolution; on 2026-11-08 a dunning retry's
+// `customer.subscription.updated` (created 07:21:58) reached the Hub before
+// the `invoice.paid` it followed (created 07:21:57), and the watermark
+// discarded the paid month. The newest event owns status; the paid invoice
+// owns its term, applied once per invoice id.
+const DAY = 86400000;
+const noteOf = (c, type) => c.h.hub.billing.events(500).filter(e => e.type === type).sort((x, y) => y.receivedAtMs - x.receivedAtMs)[0]?.note ?? '';
+const subUpdated = (s, over = {}, lines = s.lines) => ({ id: 'sub_' + s.id, customer: 'cus_' + s.id, status: 'active', cancel_at_period_end: false, metadata: s.metadata, items: { data: lines.map(l => ({ price: l.price })) }, ...over });
+const renewalOf = (c, s, id, startSec, endSec, over = {}, lines = s.lines) => c.invoice(s, { id, billing_reason: 'subscription_cycle', charge: 'ch_' + id, payment_intent: 'pi_' + id, lines: { data: lines.map(l => ({ price: l.price, amount: l.amount_subtotal, discount_amounts: [], taxes: [], quantity: 1, period: { start: startSec, end: endSec } })), has_more: false }, ...over });
+async function paidMonthly(c) {
+  await c.checkout('monthly', true); const s = c.last();
+  assert.equal((await c.post('checkout.session.completed', c.paid(s))).status, 200);
+  assert.equal((await c.post('invoice.paid', c.invoice(s))).status, 200);
+  const rec = c.h.hub.billing.store.getCustomer('cus_' + s.id); assert.ok(rec.periodEndMs);
+  return { s, rec, end1: rec.periodEndMs / 1000 };
+}
+await test('2026-11-08 order: a paid dunning retry created one second before the subscription.updated delivered first still records its term once', async () => {
+  const c = await setup();
+  try {
+    const { s, rec, end1 } = await paidMonthly(c);
+    const grace = c.h.hub.billing.config().policy.graceDays * DAY, end2 = end1 + 30 * 86400;
+    c.advance(30 * DAY);
+    const renewal = renewalOf(c, s, 'in_retry', end1, end2);
+    const failed = await c.post('invoice.payment_failed', { ...renewal, paid: false, status: 'open' });
+    assert.equal(failed.status, 200); assert.equal(failed.body.outcome, 'applied');
+    let sw = c.h.hub.billing.store.getCustomer(rec.key);
+    assert.equal(sw.subscriptionStatus, 'past_due'); assert.equal(sw.unpaidPeriodStartMs, end1 * 1000);
+    const expBefore = c.h.store.get(rec.licenseId).exp;
+    c.advance(DAY);
+    const paidAt = c.now();
+    const update = await c.post('customer.subscription.updated', subUpdated(s), paidAt + 1000);
+    assert.equal(update.status, 200); assert.equal(update.body.outcome, 'applied');
+    const paid = await c.post('invoice.paid', renewal, paidAt);
+    assert.equal(paid.status, 200); assert.equal(paid.body.outcome, 'applied');
+    assert.match(noteOf(c, 'invoice.paid'), /paid term recorded behind a newer lifecycle event/);
+    sw = c.h.hub.billing.store.getCustomer(rec.key);
+    assert.equal(sw.periodEndMs, end2 * 1000); assert.equal(sw.paidPeriodEndMs, end2 * 1000);
+    assert.equal(sw.unpaidPeriodStartMs, undefined); assert.equal(sw.subscriptionStatus, 'active');
+    assert.equal(sw.accessEndsAtMs, end2 * 1000 + grace);
+    assert.ok(expBefore < end2 * 1000 + grace);
+    assert.equal(c.h.store.get(rec.licenseId).exp, end2 * 1000 + grace, 'licence = paid period end + grace');
+    assert.ok(sw.chargeIds.includes('ch_in_retry'));
+    const host = c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting');
+    assert.equal(host.periodEndMs, end2 * 1000); assert.equal(host.subscriptionStatus, 'active');
+    const ledger = c.h.hub.billing.store.getBundleSubscription('sub_' + s.id);
+    assert.equal(ledger.latestEventCreatedMs, Math.floor((paidAt + 1000) / 1000) * 1000, 'the stale invoice never moves the watermark');
+    assert.equal(ledger.pendingStatus, null, 'the failed period is settled');
+    assert.ok(ledger.paidTermInvoiceIds.includes('in_retry'));
+    const snapshot = JSON.stringify([c.h.hub.billing.store.getCustomer(rec.key), c.h.store.get(rec.licenseId), c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting')]);
+    const alias = await c.post('invoice.payment_succeeded', renewal, paidAt);
+    assert.equal(alias.status, 200); assert.equal(alias.body.outcome, 'ignored'); assert.match(noteOf(c, 'invoice.payment_succeeded'), /in_retry is already applied/);
+    assert.equal(JSON.stringify([c.h.hub.billing.store.getCustomer(rec.key), c.h.store.get(rec.licenseId), c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting')]), snapshot, 'the alias changes nothing');
+    c.advance(1000);
+    const later = await c.post('customer.subscription.updated', subUpdated(s, { cancel_at_period_end: true }));
+    assert.equal(later.body.outcome, 'applied');
+    sw = c.h.hub.billing.store.getCustomer(rec.key);
+    assert.equal(sw.subscriptionStatus, 'active (cancels at period end)'); assert.equal(sw.periodEndMs, end2 * 1000);
+    assert.equal(c.h.store.get(rec.licenseId).exp, end2 * 1000 + grace);
+  } finally { await c.h.close(); }
+});
+await test('a paid renewal behind a newer status update keeps the newer status and records only its term', async () => {
+  const c = await setup();
+  try {
+    const { s, rec, end1 } = await paidMonthly(c);
+    const grace = c.h.hub.billing.config().policy.graceDays * DAY, end2 = end1 + 30 * 86400;
+    c.advance(30 * DAY);
+    const at = c.now();
+    assert.equal((await c.post('customer.subscription.updated', subUpdated(s, { cancel_at_period_end: true }), at + 1000)).body.outcome, 'applied');
+    const paid = await c.post('invoice.paid', renewalOf(c, s, 'in_cycle', end1, end2), at);
+    assert.equal(paid.body.outcome, 'applied');
+    const sw = c.h.hub.billing.store.getCustomer(rec.key);
+    assert.equal(sw.subscriptionStatus, 'active (cancels at period end)', 'the older invoice never rewrites the newer status');
+    assert.equal(sw.periodEndMs, end2 * 1000); assert.equal(c.h.store.get(rec.licenseId).exp, end2 * 1000 + grace);
+    const host = c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting');
+    assert.equal(host.periodEndMs, end2 * 1000); assert.equal(host.subscriptionStatus, 'active (cancels at period end)');
+    assert.equal((await c.post('invoice.paid', renewalOf(c, s, 'in_cycle', end1, end2), at)).body.outcome, 'ignored', 'a second event for the same invoice applies nothing');
+    assert.match(noteOf(c, 'invoice.paid'), /in_cycle is already applied/);
+  } finally { await c.h.close(); }
+});
+await test('a stale paid invoice cannot clear a newer failure for a later period, and a failure without a located period still fences it', async () => {
+  const c = await setup();
+  try {
+    const { s, rec, end1 } = await paidMonthly(c);
+    const end2 = end1 + 30 * 86400, end3 = end2 + 30 * 86400;
+    c.advance(30 * DAY);
+    const at = c.now();
+    // A later period's failure (period start = end2) is newer than the paid end1→end2 invoice.
+    assert.equal((await c.post('invoice.payment_failed', { ...renewalOf(c, s, 'in_p3', end2, end3), paid: false, status: 'open' }, at + 1000)).body.outcome, 'applied');
+    const paid = await c.post('invoice.paid', renewalOf(c, s, 'in_p2', end1, end2), at);
+    assert.equal(paid.body.outcome, 'applied');
+    let sw = c.h.hub.billing.store.getCustomer(rec.key);
+    assert.equal(sw.periodEndMs, end2 * 1000, 'the paid term is recorded');
+    assert.equal(sw.unpaidPeriodStartMs, end2 * 1000, 'the later failed period stays unpaid');
+    assert.equal(sw.subscriptionStatus, 'past_due');
+    assert.equal(c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting').subscriptionStatus, 'past_due');
+    assert.equal(c.h.hub.billing.store.getBundleSubscription('sub_' + s.id).pendingStatus, 'past_due');
+    // A failure whose invoice carries no period start cannot be located: an older paid invoice stays inert.
+    const d = await setup();
+    try {
+      const m = await paidMonthly(d);
+      d.advance(30 * DAY);
+      const t = d.now(), e2 = m.end1 + 30 * 86400;
+      const noStart = renewalOf(d, m.s, 'in_nostart', m.end1, e2); noStart.lines.data.forEach(l => { delete l.period.start; });
+      assert.equal((await d.post('invoice.payment_failed', { ...noStart, paid: false, status: 'open' }, t + 1000)).body.outcome, 'applied');
+      const ignored = await d.post('invoice.paid', renewalOf(d, m.s, 'in_before', m.end1, e2), t);
+      assert.equal(ignored.body.outcome, 'ignored'); assert.equal(noteOf(d, 'invoice.paid'), 'older bundle lifecycle event ignored');
+      assert.equal(d.h.hub.billing.store.getCustomer(m.rec.key).periodEndMs, m.end1 * 1000);
+    } finally { await d.h.close(); }
+  } finally { await c.h.close(); }
+});
+await test('a Lifetime VPS renewal behind a newer status update records the hosting period and leaves Lifetime software untouched', async () => {
+  const c = await setup();
+  try {
+    await c.checkout('lifetime', true); const s = c.last();
+    assert.equal((await c.post('invoice.paid', c.invoice(s))).status, 200);
+    assert.equal((await c.post('checkout.session.completed', c.paid(s))).status, 200);
+    const rec = c.h.hub.billing.store.getCustomer('cus_' + s.id); assert.equal(rec.lifetimeAccess, true);
+    const before = JSON.stringify([rec, c.h.store.get(rec.licenseId)]);
+    const end1 = c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting').periodEndMs / 1000, end2 = end1 + 30 * 86400;
+    c.advance(30 * DAY);
+    const at = c.now(), hostLine = [s.lines[1]];
+    assert.equal((await c.post('customer.subscription.updated', subUpdated(s, {}, hostLine), at + 1000)).body.outcome, 'applied');
+    const paid = await c.post('invoice.paid', renewalOf(c, s, 'in_vps', end1, end2, {}, hostLine), at);
+    assert.equal(paid.body.outcome, 'applied');
+    assert.match(noteOf(c, 'invoice.paid'), /Lifetime software remains independent/);
+    assert.equal(c.h.hub.billing.store.getRoleSubscription(rec.key, 'hosting').periodEndMs, end2 * 1000);
+    assert.equal(JSON.stringify([c.h.hub.billing.store.getCustomer(rec.key), c.h.store.get(rec.licenseId)]), before, 'no software write, no second licence');
+  } finally { await c.h.close(); }
+});
 summary('Six-plan billing');

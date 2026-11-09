@@ -45,7 +45,7 @@ import {
 } from "./config.js";
 import { provisionPlans, StripeApiError, type ProvisionResult } from "./stripe-provision.js";
 import { escapeHtml, safeInstallCommand, reissuedInstallEmail, sendEmail, testEmail, welcomeEmail, type EmailFetch } from "./email.js";
-import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord } from "./store.js";
+import { BillingStore, INSTALL_TOKEN_TTL_MS, roleSubscriptionKey, type CheckoutSessionRecord, type CustomerRecord, type EventOutcome, type EventRecord, type RoleSubscriptionRecord, type BundleSubscriptionRecord } from "./store.js";
 import { AfterCommitOutbox } from "./after-commit-outbox.js";
 import { EarnStripeApi, EarnStripeError } from "../earn-stripe-api.js";
 import { componentPriceId, softwareInvoiceProjection, softwareCheckoutProjection } from "./software-component.js";
@@ -938,7 +938,28 @@ export class BillingService {
       && [knownSoftware, knownHosting].every(rec =>
         (rec.lastEventType?.startsWith("checkout.session.") && rec.periodEndMs === null)
         || (rec.lastEventType === ev.type && rec.lastEventId === ev.id)));
-    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout && !resumingInitialPaid) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+    // v0.4.110 — A PAID INVOICE'S TERM IS NEVER LOST TO DELIVERY ORDER.
+    // Stripe stamps `created` at one-second resolution and routinely creates
+    // a dunning retry's `customer.subscription.updated` (status → active) one
+    // second AFTER the `invoice.paid` it follows, then delivers the update
+    // first. The watermark above made the paid renewal `stale` and the whole
+    // paid month was discarded (2026-11-08: a customer charged for
+    // 2026-11-07 → 2026-12-07 kept a licence ending in the previous term's
+    // grace). Ownership is split instead: the newest lifecycle event owns
+    // STATUS; a paid invoice owns its TERM. `applyStalePaidTerm` moves only
+    // the forward-only term (period end, paid-through, licence, hosting
+    // period) once per invoice id and leaves status alone, except that it
+    // settles exactly the failed period this invoice pays for (a newer
+    // failure for a later period stays past due). Fences kept: an ended
+    // subscription (checked above), refunds/disputes, Lifetime software, a
+    // record still on its checkout bootstrap, and a newer failure the record
+    // could not locate by period.
+    if (stale && !activatingBehindFailure && !lifetimeInitialPaid && !initialPaidAfterCheckout && !resumingInitialPaid) {
+      const admitted = confirmed && hasEntitlements ? this.stalePaidTermAdmission(ev, prior!, knownSoftware, knownHosting) : null;
+      if (admitted === null) return { outcome: "ignored", note: "older bundle lifecycle event ignored" };
+      if ("outcome" in admitted) return admitted;
+      return this.applyStalePaidTerm(ev, cfg, bundle, prior!, admitted.invoiceId);
+    }
 
     if (initialPaidAfterCheckout) this.store.putBundleSubscription({
       ...prior!, initialPaidPending: { eventSha256, checkoutWatermarkMs: prior!.latestEventCreatedMs },
@@ -962,6 +983,7 @@ export class BillingService {
       latestEventCreatedMs: orderingRelevant ? Math.max(prior?.latestEventCreatedMs ?? 0, ev.createdMs) : (prior?.latestEventCreatedMs ?? 0),
       pendingStatus: failed ? "past_due" as const : (confirmed && !activatingBehindFailure ? null : prior?.pendingStatus ?? null),
       terminal: terminal || prior?.terminal === true,
+      ...paidTermInvoiceIdsAfter(prior, confirmed && ev.type.startsWith("invoice.") ? invoiceIdOf(ev.object) : ""),
       updatedAtMs: this.now(),
     };
     // A terminal record is written first and replayed idempotently. This
@@ -1037,6 +1059,87 @@ export class BillingService {
     return {
       outcome: software.outcome === "applied" || hosting.outcome === "applied" ? "applied" : software.outcome,
       note: `bundle software: ${software.note ?? software.outcome}; hosting: ${hosting.note ?? hosting.outcome}`,
+    };
+  }
+
+  /** Whether a paid invoice the ordering watermark calls `stale` may still
+   *  record its term (v0.4.110). `null`: fenced, the generic "older" answer.
+   *  An `ApplyResult`: a named no-op (this invoice's term was already
+   *  applied). Otherwise the admitted invoice id. A newer failure is located
+   *  by the unpaid period start it recorded, and the forward-only term
+   *  cannot clear a failed period it does not pay for; a failure the record
+   *  could not locate by period stays authoritative and fences the invoice. */
+  private stalePaidTermAdmission(ev: StripeEvent, prior: BundleSubscriptionRecord, knownSoftware: CustomerRecord | null, knownHosting: RoleSubscriptionRecord | null): ApplyResult | { invoiceId: string } | null {
+    if (ev.type !== "invoice.paid" && ev.type !== "invoice.payment_succeeded") return null;
+    const f = invoiceFacts(ev.object);
+    const invoiceId = invoiceIdOf(ev.object);
+    if (!f.paid || f.periodEndMs === null || !invoiceId) return null;
+    if (prior.paidTermInvoiceIds?.includes(invoiceId)) return { outcome: "ignored", note: `older bundle lifecycle event: the paid term of invoice ${invoiceId} is already applied` };
+    if (knownSoftware?.refunded || knownSoftware?.disputed || knownHosting?.refunded || knownHosting?.disputed) return null;
+    // A record still on its checkout bootstrap (no paid term yet) belongs to
+    // the initial-invoice admissions above, whose durable marker spans both
+    // role writes; this path only extends a term that already exists.
+    if ((knownSoftware && knownSoftware.periodEndMs === null) || (knownHosting && knownHosting.periodEndMs === null)) return null;
+    if (prior.pendingStatus === "past_due" && knownSoftware?.unpaidPeriodStartMs === undefined) return null;
+    return { invoiceId };
+  }
+
+  /** Record one paid invoice's TERM behind a newer lifecycle event without
+   *  letting the older event rewrite the newer STATUS (see the v0.4.110 note
+   *  in `applyBundleEvent`). Every write is forward-only and the invoice id
+   *  is recorded on the bundle ledger last, so a crash before it replays to
+   *  the same values and the alias event (`invoice.payment_succeeded` for the
+   *  same invoice) is a named no-op. The watermark is not moved. */
+  private applyStalePaidTerm(ev: StripeEvent, cfg: BillingConfig, bundle: { subscriptionId: string; planKey: string; hosting?: NonNullable<LaunchIntent['hosting']> }, prior: BundleSubscriptionRecord, invoiceId: string): ApplyResult {
+    const now = this.now();
+    const f = invoiceFacts(ev.object);
+    let softwareNote: string, softwareMoved = false;
+    // True only when this invoice pays the failed period a newer failure
+    // recorded: the one status change a stale paid invoice may make.
+    let settlesFailure = false;
+    const sw = this.store.findBySubscription(bundle.subscriptionId);
+    if (bundle.planKey === "lifetime" || sw?.lifetimeAccess) softwareNote = "Lifetime software remains independent of VPS renewals";
+    else if (!sw) softwareNote = "no software record";
+    else {
+      const termInvoice = bundle.hosting ? softwareInvoiceProjection(ev.object, bundle.hosting) : ev.object;
+      const status = sw.subscriptionStatus;
+      const beforePeriodEnd = sw.periodEndMs, beforePaid = sw.paidPeriodEndMs, beforeUnpaid = sw.unpaidPeriodStartMs;
+      const term = this.applyPaidInvoiceTerm(sw, termInvoice, cfg, ev.createdMs, !!bundle.hosting, true);
+      settlesFailure = beforeUnpaid !== undefined && sw.unpaidPeriodStartMs === undefined;
+      if (sw.unpaidPeriodStartMs !== undefined) sw.subscriptionStatus = "past_due";
+      else if (settlesFailure && status === "past_due") sw.subscriptionStatus = "active";
+      else sw.subscriptionStatus = status;
+      const extended = term.licenseTargetMs !== null && this.extendLicense(sw, term.licenseTargetMs, cfg, now);
+      softwareMoved = extended || sw.periodEndMs !== beforePeriodEnd || sw.paidPeriodEndMs !== beforePaid || sw.unpaidPeriodStartMs !== beforeUnpaid;
+      if (softwareMoved) {
+        this.touch(sw, ev, now);
+        this.store.putCustomer(sw);
+        softwareNote = `paid term recorded behind a newer lifecycle event (period end ${new Date(sw.periodEndMs ?? 0).toISOString().slice(0, 10)}${extended ? `; licence extended to ${new Date(this.licenseExp(sw) ?? 0).toISOString().slice(0, 10)}` : ""}; status ${sw.subscriptionStatus})`;
+      } else softwareNote = "paid term already recorded";
+    }
+    let hostingNote = "no hosting record", hostingMoved = false;
+    const host = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
+    if (host && !host.refunded && !host.disputed) {
+      const beforeEnd = host.periodEndMs, beforeStatus = host.subscriptionStatus, beforeCharges = host.chargeIds.length;
+      if (f.periodEndMs !== null && (host.periodEndMs === null || f.periodEndMs > host.periodEndMs)) host.periodEndMs = f.periodEndMs;
+      if (settlesFailure && host.subscriptionStatus === "past_due") host.subscriptionStatus = "active";
+      for (const id of f.paymentIds) this.noteHostingCharge(host, id);
+      hostingMoved = host.periodEndMs !== beforeEnd || host.subscriptionStatus !== beforeStatus;
+      if (hostingMoved || host.chargeIds.length !== beforeCharges) {
+        this.touchHosting(host, ev, now);
+        this.saveHostingRecord(host);
+      }
+      hostingNote = hostingMoved ? `hosting paid period recorded behind a newer lifecycle event (status ${host.subscriptionStatus})` : "hosting paid period already recorded";
+    }
+    this.store.putBundleSubscription({
+      ...prior,
+      ...paidTermInvoiceIdsAfter(prior, invoiceId),
+      pendingStatus: settlesFailure ? null : prior.pendingStatus,
+      updatedAtMs: now,
+    });
+    return {
+      outcome: softwareMoved || hostingMoved ? "applied" : "ignored",
+      note: `bundle software: ${softwareNote}; hosting: ${hostingNote}`,
     };
   }
 
@@ -2813,6 +2916,22 @@ export class BillingService {
 export function renderTemplate(template: string, vars: Record<string, string>, flags: Record<string, boolean>): string {
   const withBlocks = template.replace(/\{\{#if ([A-Za-z0-9_]+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (_m, flag: string, body: string) => (flags[flag] ? body : ""));
   return withBlocks.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_m, name: string) => escapeHtml(vars[name] ?? ""));
+}
+
+/** A Stripe invoice's own id (`in_…`), or "" when the object carries none. */
+function invoiceIdOf(invoice: Record<string, unknown>): string {
+  return typeof invoice.id === "string" && /^in_[A-Za-z0-9_]{1,200}$/.test(invoice.id) ? invoice.id : "";
+}
+
+/** Invoice ids whose paid term the bundle ledger has applied — the
+ *  idempotency key for a paid invoice that arrives behind a newer lifecycle
+ *  event (v0.4.110). Bounded: two years of monthly renewals plus aliases is
+ *  far below 48, and an id older than that cannot be `stale` any more. */
+const PAID_TERM_INVOICE_IDS_MAX = 48;
+function paidTermInvoiceIdsAfter(prior: BundleSubscriptionRecord | null | undefined, invoiceId: string): { paidTermInvoiceIds?: string[] } {
+  const ids = (prior?.paidTermInvoiceIds ?? []).filter((id) => id !== invoiceId);
+  if (invoiceId) ids.push(invoiceId);
+  return ids.length ? { paidTermInvoiceIds: ids.slice(-PAID_TERM_INVOICE_IDS_MAX) } : {};
 }
 
 function normalizeInstallEmail(value: string): string { return value.trim().toLowerCase(); }
