@@ -128,6 +128,32 @@ export interface BillingPolicy {
   revokeOnRefund: boolean;
 }
 
+/** 0.4.109 — the Stripe processing fee deducted from a referral sale before
+ *  commission is a STANDARD RATE, not the per-charge fee: the live account
+ *  bills fees separately and its charges' balance transactions carry fee 0
+ *  (operator decision 2026-11-09). Integer basis points (290 = 2.9%) plus
+ *  fixed cents per successful charge; fee = round-half-up(amount × bps /
+ *  10000) + fixedCents, capped at the charge amount. */
+export interface ProcessingFeeRate { bps: number; fixedCents: number }
+/** `card` = payment_method_details.type "card" (incl. Link, Apple Pay and
+ *  Google Pay card wallets); `crypto` = Stripe crypto ("crypto", py_). A rail
+ *  set to null was stored but unreadable: commission refuses (never a guessed
+ *  rate) until the operator fixes it. Any other payment method keeps the
+ *  balance-transaction fee path. */
+export interface ProcessingFees { card: ProcessingFeeRate | null; crypto: ProcessingFeeRate | null }
+export const DEFAULT_PROCESSING_FEES: { card: ProcessingFeeRate; crypto: ProcessingFeeRate } = Object.freeze({
+  card: Object.freeze({ bps: 290, fixedCents: 30 }),
+  crypto: Object.freeze({ bps: 150, fixedCents: 0 }),
+}) as { card: ProcessingFeeRate; crypto: ProcessingFeeRate };
+export const MAX_FEE_BPS = 2000, MAX_FEE_FIXED_CENTS = 500;
+/** Strict check of one stored/patched rail; null when malformed. */
+export function feeRateFrom(raw: unknown): ProcessingFeeRate | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const ok = (n: unknown, max: number) => Number.isSafeInteger(n) && (n as number) >= 0 && (n as number) <= max;
+  return ok(o.bps, MAX_FEE_BPS) && ok(o.fixedCents, MAX_FEE_FIXED_CENTS) ? { bps: o.bps as number, fixedCents: o.fixedCents as number } : null;
+}
+
 export interface BillingConfig {
   v: 1;
   mode: BillingMode;
@@ -143,6 +169,9 @@ export interface BillingConfig {
   roles: Record<BillingMode, ModeRoleConfig>;
   /** The public website, for links in emails and on the welcome page. */
   siteOrigin: string;
+  /** Standard-rate processing fees for referral commission (see above).
+   *  Optional for older in-memory configs; absent = the defaults. */
+  processingFees?: ProcessingFees;
   updatedAtMs: number | null;
 }
 
@@ -169,6 +198,7 @@ export function defaultBillingConfig(): BillingConfig {
     policy: { ...DEFAULT_BILLING_POLICY },
     roles: { test: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } }, live: { software: { priceIds: [], productIds: [] }, hosting: { priceIds: [], productIds: [] } } },
     siteOrigin: "",
+    processingFees: { card: { ...DEFAULT_PROCESSING_FEES.card }, crypto: { ...DEFAULT_PROCESSING_FEES.crypto } },
     updatedAtMs: null,
   };
 }
@@ -232,6 +262,14 @@ function modeRoleConfigFrom(raw: unknown): ModeRoleConfig {
   return { software: roleAllowlistFrom(o.software), hosting: roleAllowlistFrom(o.hosting) };
 }
 
+/** Absent file block or rail = the default rate. A rail that IS stored but
+ *  malformed reads as null (refuse), never as a silent default or zero. */
+function processingFeesFrom(raw: unknown): ProcessingFees {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const rail = (k: "card" | "crypto") => (o[k] === undefined ? { ...DEFAULT_PROCESSING_FEES[k] } : feeRateFrom(o[k]));
+  return { card: rail("card"), crypto: rail("crypto") };
+}
+
 export function readBillingConfig(dataDir: string): BillingConfig {
   const raw = readJson<Record<string, unknown>>(path.join(dataDir, BILLING_CONFIG_FILE), {});
   const d = defaultBillingConfig();
@@ -262,6 +300,7 @@ export function readBillingConfig(dataDir: string): BillingConfig {
       revokeOnRefund: bool(policy.revokeOnRefund, d.policy.revokeOnRefund),
     },
     siteOrigin: str(raw.siteOrigin),
+    processingFees: processingFeesFrom(raw.processingFees),
     updatedAtMs: typeof raw.updatedAtMs === "number" ? raw.updatedAtMs : null,
   };
 }
@@ -530,6 +569,18 @@ export function applyBillingPatch(current: BillingConfig, patch: Record<string, 
       next.policy[field] = p[field] as boolean;
     }
   }
+  if (patch.processingFees !== undefined) {
+    if (!patch.processingFees || typeof patch.processingFees !== "object") throw new BillingConfigError("processingFees must be an object");
+    const f = patch.processingFees as Record<string, unknown>;
+    const fees: ProcessingFees = { ...(current.processingFees ?? { card: { ...DEFAULT_PROCESSING_FEES.card }, crypto: { ...DEFAULT_PROCESSING_FEES.crypto } }) };
+    for (const k of Object.keys(f)) {
+      if (k !== "card" && k !== "crypto") throw new BillingConfigError(`processingFees has no rail "${k.slice(0, 16)}" (card or crypto)`);
+      const rate = feeRateFrom(f[k]);
+      if (!rate) throw new BillingConfigError(`processingFees.${k} must be {bps: whole number 0-${MAX_FEE_BPS}, fixedCents: whole number 0-${MAX_FEE_FIXED_CENTS}}`);
+      fees[k] = rate;
+    }
+    next.processingFees = fees;
+  }
   if (patch.plans !== undefined) next.plans = validatePlans(patch.plans);
   if (patch.siteOrigin !== undefined) {
     if (typeof patch.siteOrigin !== "string") throw new BillingConfigError("siteOrigin must be a string");
@@ -595,6 +646,7 @@ export function maskedBillingConfig(cfg: BillingConfig, publicOrigin: string, re
     email: { provider: cfg.email.provider, apiKey: maskSecret(cfg.email.apiKey), from: cfg.email.from, replyTo: cfg.email.replyTo },
     policy: { ...cfg.policy },
     siteOrigin: cfg.siteOrigin,
+    processingFees: cfg.processingFees ?? { card: { ...DEFAULT_PROCESSING_FEES.card }, crypto: { ...DEFAULT_PROCESSING_FEES.crypto } },
     ready,
     updatedAtMs: cfg.updatedAtMs,
   };

@@ -61,7 +61,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/customers/cus_referrer')return ok({email:'referrer@example.com'});
  if(p.startsWith('/v1/customers/'))return ok({email:'buyer@example.com'});
  if(p==='/v1/invoice_payments')return ok({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}],has_more:false});
- if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,amount_refunded:refunds[ch]||0,disputed:false});}
+ if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,paid:true,status:'succeeded',payment_method_details:{type:'us_bank_account'},amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ch}});}
  if(p==='/v1/checkout/sessions')return ok({data:Object.values(sessions),has_more:false});
  const line=/^\/v1\/checkout\/sessions\/(cs_[a-z_]+)\/line_items$/.exec(p);
  if(line){const s=sessions[line[1]];return ok({data:[{price:{id:'price_lifetime',type:'one_time',recurring:null,product:line[1]==='cs_wrongproduct'?'prod_other':'prod_wh'},quantity:1,amount_subtotal:99900,amount_discount:19980,amount_tax:0,amount_total:s.amount_total}],has_more:false});}
@@ -86,7 +86,7 @@ try{
   const id=put(inv('in_first','sub_life',[softwareLine(),hostingLine()],81920,'subscription_create'));
   await svc.handleEvent(ev('invoice.paid',{id}));
   const row=rows()[id];assert.ok(row);assert.equal(row.basis,79920);assert.equal(row.commission,39960);assert.equal(row.rate,50);assert.equal(row.kind,'lifetime');assert.equal(row.paid,81920);
-  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:invoice:in_first');assert.equal(entries.length,1);assert.equal(entries[0].cents,39960);assert.equal(entries[0].note,'50% referral commission (lifetime)');
+  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:invoice:in_first');assert.equal(entries.length,1);assert.equal(entries[0].cents,39960);assert.equal(entries[0].note,'50% referral commission (lifetime) on the net sale after the $0.00 Stripe processing fee');
   assert.equal(balance(),39960);
  });
  await test('hosted Lifetime: replay of the paid invoice is idempotent',async()=>{
@@ -110,7 +110,7 @@ try{
  await test('self-hosted Lifetime: a paid one-time Checkout credits 50% of software net once',async()=>{
   const before=balance();await svc.handleEvent(ev('checkout.session.completed',{...sessions.cs_self}));
   const row=rows().cs_self;assert.ok(row);assert.equal(row.basis,79920);assert.equal(row.commission,39960);assert.equal(row.subscription,'');assert.equal(row.kind,'lifetime');assert.deepEqual(row.charges,['ch_self']);
-  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_self');assert.equal(entries.length,1);assert.equal(entries[0].note,'50% referral commission (lifetime)');
+  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_self');assert.equal(entries.length,1);assert.equal(entries[0].note,'50% referral commission (lifetime) on the net sale after the $0.00 Stripe processing fee');
   assert.equal(balance()-before,39960);
   await svc.handleEvent(ev('checkout.session.async_payment_succeeded',{...sessions.cs_self}));
   assert.equal(ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_self').length,1);assert.equal(balance()-before,39960);

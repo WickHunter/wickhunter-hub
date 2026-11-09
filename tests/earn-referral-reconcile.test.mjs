@@ -23,7 +23,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/promotion_codes/promo_own')return result({id:'promo_own',code:member.code,livemode:true,coupon:'coupon_own',metadata:{managed_by:'wh-earn',wh_earn_owner:owner}});
  if(p==='/v1/coupons/coupon_own')return result({id:'coupon_own',valid:true,percent_off:10,duration:'forever',metadata:{managed_by:'wh-earn'},applies_to:{products:['prod_software']}});
  if(p==='/v1/invoice_payments')return result({data:[{status:'paid',payment:{type:'charge',charge:'ch_'+u.searchParams.get('invoice')}}],has_more:false});
- if(p.startsWith('/v1/charges/'))return result({livemode:true,amount_refunded:p.endsWith('_a')?refund:0,disputed:p.endsWith('_c')&&disputed});
+ if(p.startsWith('/v1/charges/'))return result({id:p.split('/').at(-1),currency:'usd',amount:10000,paid:true,status:'succeeded',payment_method_details:{type:'us_bank_account'},balance_transaction:{id:'txn_'+p.split('/').at(-1),object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:p.split('/').at(-1)},livemode:true,amount_refunded:p.endsWith('_a')?refund:0,disputed:p.endsWith('_c')&&disputed});
  if(p==='/v1/disputes')return result({data:[{status:disputed?'needs_response':'won'}]});
  throw Error('Unexpected fixture request '+p);
 };
