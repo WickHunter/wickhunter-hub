@@ -52,7 +52,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/coupons/coupon_p')return ok({id:'coupon_p',valid:true,percent_off:20,duration:'forever',metadata:{managed_by:'wh-earn'},applies_to:{products:['prod_wh']}});
  if(p==='/v1/customers/cus_referrer')return ok({email:'referrer@example.com'});
  if(p.startsWith('/v1/customers/'))return ok({email:'buyer@example.com'});
- if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,amount_refunded:refunds[ch]||0,disputed:false});}
+ if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,currency:'usd',source:ch}});}
  if(p==='/v1/checkout/sessions')return ok({data:Object.values(sessions).filter(s=>s.status==='complete'),has_more:false});
  const line=/^\/v1\/checkout\/sessions\/(cs_[a-z_]+)\/line_items$/.exec(p);
  if(line){const s=sessions[line[1]],product=line[1]==='cs_year_wrongproduct'?'prod_other':'prod_wh';
@@ -70,7 +70,7 @@ try{
   sessions.cs_year.payment_status='paid';
   await svc.handleEvent(ev('checkout.session.async_payment_succeeded',{...sessions.cs_year}));
   const row=rows().cs_year;assert.ok(row);assert.equal(row.kind,'yearly');assert.equal(row.basis,55920);assert.equal(row.commission,27960);assert.equal(row.rate,50);assert.equal(row.subscription,'');assert.deepEqual(row.charges,['py_year']);assert.equal(row.paidThrough,0);
-  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_year');assert.equal(entries.length,1);assert.equal(entries[0].note,'50% referral commission (yearly)');assert.equal(entries[0].cents,27960);
+  const entries=ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_year');assert.equal(entries.length,1);assert.equal(entries[0].note,'50% referral commission (yearly) on the net sale after the $0.00 Stripe processing fee');assert.equal(entries[0].cents,27960);
   assert.equal(balance(),27960);
   await svc.handleEvent(ev('checkout.session.completed',{...sessions.cs_year}));await svc.handleEvent(ev('checkout.session.async_payment_succeeded',{...sessions.cs_year}));
   assert.equal(ledger.admin().entries.filter(e=>e.reference==='stripe:checkout:cs_year').length,1);assert.equal(balance(),27960);

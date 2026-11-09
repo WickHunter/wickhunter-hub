@@ -3,7 +3,7 @@ import { SupportChat, SupportError } from "./support-chat.js";
 import { readReleaseControlState, countUnresolvedHubBugs, DEFAULT_PRODUCTION_SOAK_MS } from "./release-controls.js";
 import { MarketingSettings } from './marketing-settings.js';
 import { MarketingCustomerSync, type MarketingCustomerSyncResult } from './marketing-customer-sync.js';
-import { EarnStripeService } from "./earn-stripe.js";
+import { EarnStripeService, FEE_RECALC_APPLY_CONFIRM, FEE_RECALC_REVERT_CONFIRM } from "./earn-stripe.js";
 import { EarnConflictError, EarnService, earnOwner } from "./earn.js";
 // src/server.ts
 // The hub's HTTP server: node:http, no framework, no runtime dependencies.
@@ -2738,6 +2738,16 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
             // Self-hosted one-time purchases (Lifetime, crypto Yearly): payment-mode Checkout Sessions with no subscription.
             if(typeof body.dryRun!=='boolean'||typeof body.expectedRate!=='number')throw Error('Explicit dry-run and reviewed rate required');
             result=await earnStripe.reconcileReferralPurchases(String(body.owner),body.expectedRate,body.dryRun);break;
+          }
+          case "/admin/api/earn/fee-recalculation": {
+            // 0.4.109: unpaid legacy (gross) commissions recalculated on the net sale after the actual Stripe fee.
+            if(typeof body.dryRun!=='boolean')throw Error('Explicit dry-run required');
+            if(!body.dryRun&&(body.confirm!==FEE_RECALC_APPLY_CONFIRM||typeof body.digest!=='string'))throw Error('Reviewed dry-run digest and exact apply confirmation required');
+            result=await earnStripe.feeRecalculation({dryRun:body.dryRun,digest:typeof body.digest==='string'?body.digest:undefined,actor:'hub-admin: net-of-fee recalculation'});break;
+          }
+          case "/admin/api/earn/fee-recalculation-revert": {
+            if(body.confirm!==FEE_RECALC_REVERT_CONFIRM||typeof body.runId!=='string')throw Error('Run id and exact revert confirmation required');
+            result=await earnStripe.revertFeeRecalculation(body.runId,'hub-admin: net-of-fee recalculation revert');break;
           }
           case "/admin/api/earn/stripe-configure": result = earnStripe.configure(body); break;
           case "/admin/api/earn/stripe-readiness": result = await earnStripe.readiness(); break;
