@@ -4,7 +4,7 @@ import path from 'node:path';
 import {EarnService,earnOwner,boundOwnerFromBindings,tierPercent,type EarnState,type Entry,type EarnSource} from './earn.js';
 import {EarnStripeApi,EarnStripeError,type StripeObject} from './earn-stripe-api.js';
 import {readJson,writeJsonAtomic} from './jsonfile.js';
-import type {BillingConfig,BillingMode} from './billing/config.js';
+import {DEFAULT_PROCESSING_FEES,type BillingConfig,type BillingMode,type ProcessingFeeRate} from './billing/config.js';
 import {launchGrant} from './billing/launch.js';
 import {BillingStore} from './billing/store.js';
 import {componentPriceId,invoiceLineDiscount,invoiceLineNet} from './billing/software-component.js';
@@ -20,21 +20,32 @@ type Job={id:string;owner:string;cycle:string;recipient:string;financialAccount:
  * kind are recurring software invoices (including hosted yearly bundles). */
 type OneTimeKind='lifetime'|'yearly';
 /** 0.4.109 — commission is earned on the NET sale: the software basis minus
- * its share of the actual Stripe processing fee (balance_transaction.fee of
- * every recorded charge). `feeStatus` absent = a legacy row credited on the
- * gross basis before 0.4.109 (left as is unless the operator's reviewed
- * net-of-fee recalculation settles it). `pending` = the fee is not yet known:
- * the row exists for refund/dispute tracking but no commission is credited
- * (neither gross nor zero) until a later read settles it. */
+ * its share of the charge's Stripe processing fee. For card and Stripe crypto
+ * charges that fee is the configured STANDARD RATE (billing config
+ * processingFees; default cards 2.9% + $0.30, crypto 1.5%), because the live
+ * account bills its fees separately and never itemizes them per charge
+ * (operator decision 2026-11-09). Any other payment method keeps the
+ * balance_transaction.fee path. `feeStatus` absent = a legacy row credited on
+ * the gross basis before 0.4.109 (left as is unless the operator's reviewed
+ * net-of-fee recalculation settles it). `pending` = the fee is not yet known
+ * (other rails only): the row exists for refund/dispute tracking but no
+ * commission is credited (neither gross nor zero) until a later read settles
+ * it. A settled row's refunds never return the fee: standing commission =
+ * rate × max(0, basis − refund share − fee). */
 type FeeStatus='settled'|'pending';
 type FeeRecalc={runId:string;oldCommission:number;entry:string|null;at:number;actor:string};
+type FeeSource='standard_rate'|'stripe_balance_transaction';
+type FeeRail='card'|'crypto';
+/** The standard rate applied to one charge (recorded on the row for audit). */
+type AppliedRate={charge:string;rail:FeeRail;bps:number;fixedCents:number;amount:number;fee:number};
 type Invoice={id:string;owner:string;subscription:string;customer:string;paid:number;basis:number;commission:number;rate:number;period:string;paidThrough:number;charges:string[];refunded:number;disputed:boolean;kind?:OneTimeKind;
- feeStatus?:FeeStatus;feeCents?:number;feeTotalCents?:number;feeChargeCents?:number;feeCurrency?:'usd';feeTransactions?:string[];feeSource?:'stripe_balance_transaction';feeSettledAt?:number;feeRecalc?:FeeRecalc};
-/** The exact fee facts of a row's charges, or proof that Stripe has not yet
- * created a balance transaction. Never a fabricated zero. */
-type ChargeFees={status:'known';fee:number;amount:number;transactions:string[]}|{status:'pending';reason:string};
+ feeStatus?:FeeStatus;feeCents?:number;feeTotalCents?:number;feeChargeCents?:number;feeCurrency?:'usd';feeTransactions?:string[];feeSource?:FeeSource;feeRates?:AppliedRate[];feeSettledAt?:number;feeRecalc?:FeeRecalc};
+/** The fee facts of a row's charges: the standard rate (card/crypto) or the
+ * balance transaction's fee (other rails), or proof that an other-rail fee is
+ * not known yet. Never a fabricated zero. */
+type ChargeFees={status:'known';fee:number;amount:number;source:FeeSource;transactions:string[];rates:AppliedRate[]}|{status:'pending';reason:string};
 type RecalcItem={sale:string;owner:string;kind:string;period:string;status:'adjust'|'no_change'|'paid_out'|'fee_pending'|'error';reason:string;
- grossCents:number;paidCents:number;feeTotalCents:number|null;feeShareCents:number|null;netBasisCents:number|null;rate:number;oldCommission:number;newCommission:number|null;oldNetCents:number;newNetCents:number|null;deltaCents:number;feeSource:string;transactions:string[]};
+ grossCents:number;paidCents:number;feeTotalCents:number|null;feeShareCents:number|null;netBasisCents:number|null;rate:number;oldCommission:number;newCommission:number|null;oldNetCents:number;newNetCents:number|null;deltaCents:number;feeSource:string;transactions:string[];rates?:AppliedRate[]};
 const FEE_RETRY_MS=5*60_000,FEE_RETRY_PER_TICK=25;
 export const FEE_RECALC_APPLY_CONFIRM='APPLY NET-OF-FEE COMMISSION RECALCULATION';
 export const FEE_RECALC_REVERT_CONFIRM='REVERT NET-OF-FEE COMMISSION RECALCULATION';
@@ -47,13 +58,38 @@ export function allocatedFee(basis:number,fee:number,amount:number):number{
  const share=Number((BigInt(fee)*BigInt(basis)*2n+BigInt(amount))/(2n*BigInt(amount)));
  return Math.min(share,basis);
 }
+/** Standard-rate processing fee of one charge in USD minor units:
+ * round-half-up(amount × bps / 10000) + fixedCents, capped at the amount. */
+export function standardRateFee(amount:number,rate:ProcessingFeeRate):number{
+ if(!Number.isSafeInteger(amount)||amount<=0||!Number.isSafeInteger(rate.bps)||rate.bps<0||!Number.isSafeInteger(rate.fixedCents)||rate.fixedCents<0)throw Error('Standard-rate fee facts are invalid');
+ const pct=Number((BigInt(amount)*BigInt(rate.bps)*2n+10000n)/20000n);
+ return Math.min(amount,pct+rate.fixedCents);
+}
+/** The part of the recorded refund that belongs to the commission basis
+ * (proportional when the charge also paid tax/VPS; half-up). */
+const refundOnBasis=(row:{refunded:number;paid:number;basis:number})=>{
+ if(!(row.paid>0)||!(row.refunded>0))return 0;
+ const r=Math.min(row.refunded,row.paid);
+ return Math.min(row.basis,Number((BigInt(r)*BigInt(row.basis)*2n+BigInt(row.paid))/(2n*BigInt(row.paid))));
+};
+type StandingRow={refunded:number;paid:number;disputed:boolean;basis:number;rate:number;feeStatus?:FeeStatus;feeCents?:number};
 /** The commission still standing after the recorded refund/dispute state, the
- * same rule adjustInvoice applies (a disputed row stands at zero). */
-const standing=(n:number,row:{refunded:number;paid:number;disputed:boolean})=>row.disputed?0:n-Math.min(n,Math.floor(n*Math.min(row.refunded,row.paid)/row.paid));
-const clawback=(n:number,row:{refunded:number;paid:number;disputed:boolean})=>n-standing(n,row);
+ * same rule adjustInvoice applies (a disputed row stands at zero).
+ * Fee-settled rows (or an explicit `fee`): the processing fee is never
+ * refunded, so standing = floor(max(0, basis − refund share − fee) × rate%),
+ * never above n. Legacy gross rows (or `fee:null`): the pre-0.4.109
+ * proportional rule n × (1 − refunded/paid), unchanged. */
+const standing=(n:number,row:StandingRow,opts:{fee?:number|null;rate?:number}={})=>{
+ if(row.disputed)return 0;
+ const fee=opts.fee===null?undefined:opts.fee??(row.feeStatus==='settled'?row.feeCents:undefined);
+ if(fee===undefined)return n-Math.min(n,Math.floor(n*Math.min(row.refunded,row.paid)/row.paid));
+ return Math.min(n,Math.floor(Math.max(0,row.basis-refundOnBasis(row)-fee)*(opts.rate??row.rate)/100));
+};
+const clawback=(n:number,row:StandingRow)=>n-standing(n,row);
 const usd=(c:number)=>'$'+(c/100).toFixed(2);
 const earningReference=(rowId:string)=>(rowId.startsWith('cs_')?'stripe:checkout:':'stripe:invoice:')+rowId;
-const commissionNote=(rate:number,kind:OneTimeKind|undefined,fee:number)=>`${kind?`${rate}% referral commission (${kind})`:`${rate}% recurring referral commission`} on the net sale after the ${usd(fee)} Stripe processing fee`;
+const feeLabel=(source:FeeSource|undefined)=>source==='standard_rate'?'payment processing fee (standard rate)':'Stripe processing fee';
+const commissionNote=(rate:number,kind:OneTimeKind|undefined,fee:number,source:FeeSource|undefined)=>`${kind?`${rate}% referral commission (${kind})`:`${rate}% recurring referral commission`} on the net sale after the ${usd(fee)} ${feeLabel(source)}`;
 type PurchaseProof={ok:false;reason:string}|{ok:true;member:StripeObject;customerId:string;paid:number;basis:number;charge:string;period:string;kind:OneTimeKind};
 type PurchaseOutcome={session:string;eligible:boolean;reason:string;error?:true};
 /** 0.4.108 — a Stripe rate limit/outage or a network/ledger failure is an
@@ -153,7 +189,7 @@ export class EarnStripeService {
  private referralSales(mode:BillingMode,owner:string){
   return (Object.values(book(this.ledger(mode).admin()).invoices) as Invoice[]).filter(r=>r.owner===owner).sort((a,b)=>b.period.localeCompare(a.period)).slice(0,200).map(r=>({
    period:r.period,kind:r.kind||'recurring',grossCents:r.basis,rate:r.rate,
-   feeStatus:r.feeStatus??'gross',feeCents:r.feeStatus==='settled'?r.feeCents!:null,netCents:r.feeStatus==='settled'?r.basis-r.feeCents!:r.feeStatus==='pending'?null:r.basis,
+   feeStatus:r.feeStatus??'gross',feeSource:r.feeStatus==='settled'?r.feeSource??'stripe_balance_transaction':null,feeCents:r.feeStatus==='settled'?r.feeCents!:null,netCents:r.feeStatus==='settled'?r.basis-r.feeCents!:r.feeStatus==='pending'?null:r.basis,
    commissionCents:r.feeStatus==='pending'?null:standing(r.commission,r),refunded:r.refunded>0,disputed:r.disputed}));
  }
  /** A bounded, owner-filtered status projection, not an earnings calculation.
@@ -288,8 +324,7 @@ export class EarnStripeService {
    // A pending-fee row has credited nothing; it settles later at the corrected rate.
    if(row.feeStatus==='pending'){row.rate=expectedRate;tally.adjusted++;return true;}
    const commission=Math.floor((row.basis-(row.feeStatus==='settled'?row.feeCents!:0))*expectedRate/100);
-   const net=(n:number)=>standing(n,row);
-   const delta=net(commission)-net(row.commission);
+   const delta=standing(commission,row,{rate:expectedRate})-standing(row.commission,row);
    if(delta)s.entries.push(entry(owner,'referral','adjustment',delta,'stripe:rate:'+rowId+':'+randomUUID(),row.period,`${row.rate}% to ${expectedRate}% ${row.kind||'recurring'} referral commission correction`,this.now()));
    row.rate=expectedRate;row.commission=commission;tally.adjusted++;tally.deltaCents+=delta;return true;
   });
@@ -567,15 +602,16 @@ export class EarnStripeService {
    const none={feeTotalCents:null,feeShareCents:null,netBasisCents:null,newCommission:null,newNetCents:null,deltaCents:0,transactions:[] as string[]};
    if(paidOut.get(r.id)){items.push({...base,...none,status:'paid_out',reason:'paid out or in a payout batch; untouched',feeSource:'not read'});continue;}
    let fees:ChargeFees;
-   try{fees=await this.chargeFees(mode,r.charges);}catch(error){items.push({...base,...none,status:'error',reason:error instanceof Error?error.message.slice(0,200):'Stripe fee read failed',feeSource:'stripe_balance_transaction'});continue;}
+   try{fees=await this.chargeFees(mode,r.charges);}catch(error){items.push({...base,...none,status:'error',reason:error instanceof Error?error.message.slice(0,200):'Stripe fee read failed',feeSource:'not determined'});continue;}
    if(fees.status==='pending'){items.push({...base,...none,status:'fee_pending',reason:fees.reason,feeSource:'stripe_balance_transaction'});continue;}
    known.set(r.id,fees);
-   const share=allocatedFee(r.basis,fees.fee,fees.amount),commission=Math.floor((r.basis-share)*r.rate/100),net=standing(commission,r);
-   items.push({...base,status:net===base.oldNetCents&&commission===r.commission?'no_change':'adjust',reason:share===fees.fee?'whole charge fee':'fee allocated to the software basis in proportion to the charge',
-    feeTotalCents:fees.fee,feeShareCents:share,netBasisCents:r.basis-share,newCommission:commission,newNetCents:net,deltaCents:net-base.oldNetCents,feeSource:'stripe_balance_transaction',transactions:fees.transactions});
+   const share=allocatedFee(r.basis,fees.fee,fees.amount),commission=Math.floor((r.basis-share)*r.rate/100),net=standing(commission,r,{fee:share});
+   const rateText=fees.rates.map(x=>`${x.rail} ${x.bps/100}% + ${usd(x.fixedCents)}`).join(', ');
+   items.push({...base,status:net===base.oldNetCents&&commission===r.commission?'no_change':'adjust',reason:(share===fees.fee?'whole charge fee':'fee allocated to the software basis in proportion to the charge')+(rateText?` (standard rate: ${rateText})`:''),
+    feeTotalCents:fees.fee,feeShareCents:share,netBasisCents:r.basis-share,newCommission:commission,newNetCents:net,deltaCents:net-base.oldNetCents,feeSource:fees.source,transactions:fees.transactions,rates:fees.rates});
   }
   const planned=items.filter(i=>i.status==='adjust'||i.status==='no_change');
-  const digest=createHash('sha256').update(JSON.stringify([mode,planned.map(i=>[i.sale,i.owner,i.oldCommission,i.oldNetCents,i.newCommission,i.deltaCents,i.feeShareCents,i.feeTotalCents,i.transactions])])).digest('hex');
+  const digest=createHash('sha256').update(JSON.stringify([mode,planned.map(i=>[i.sale,i.owner,i.oldCommission,i.oldNetCents,i.newCommission,i.deltaCents,i.feeShareCents,i.feeTotalCents,i.feeSource,i.transactions,(i.rates||[]).map(x=>[x.charge,x.rail,x.bps,x.fixedCents,x.amount,x.fee])])])).digest('hex');
   const balance=(s:EarnState,owner:string)=>s.entries.filter(e=>e.owner===owner&&e.source==='referral').reduce((n,e)=>n+e.cents,0);
   const partners=[...new Set(items.map(i=>i.owner))].map(owner=>{
    const own=items.filter(i=>i.owner===owner),unpaid=own.filter(i=>i.status!=='paid_out'),plan=own.filter(i=>planned.includes(i)),delta=plan.reduce((n,i)=>n+i.deltaCents,0),before=balance(state,owner);
@@ -597,8 +633,9 @@ export class EarnStripeService {
     if(!row||row.owner!==i.owner||row.feeStatus!==undefined||fresh.get(i.sale)||row.commission!==i.oldCommission||standing(row.commission,row)!==i.oldNetCents)throw Error('Reviewed net-of-fee recalculation changed; run the dry run again and review it');
     const reference='stripe:fee:'+i.sale;if(s.entries.some(e=>e.reference===reference))throw Error('A net-of-fee adjustment already exists for this sale; manual review is required');
     let entryId:string|null=null;
-    if(i.deltaCents){const e=entry(row.owner,'referral','adjustment',i.deltaCents,reference,row.period,`Commission recalculated on the net sale after the ${usd(i.feeShareCents!)} Stripe processing fee (${usd(i.oldNetCents)} to ${usd(i.newNetCents!)})`,at);e.actor='stripe-fee-recalculation';s.entries.push(e);entryId=e.id;}
-    Object.assign(row,{commission:i.newCommission!,feeStatus:'settled',feeCents:i.feeShareCents!,feeTotalCents:fees.fee,feeChargeCents:fees.amount,feeCurrency:'usd',feeTransactions:fees.transactions,feeSource:'stripe_balance_transaction',feeSettledAt:at,feeRecalc:{runId,oldCommission:i.oldCommission,entry:entryId,at,actor}});
+    if(i.deltaCents){const e=entry(row.owner,'referral','adjustment',i.deltaCents,reference,row.period,`Commission recalculated on the net sale after the ${usd(i.feeShareCents!)} ${feeLabel(fees.source)} (${usd(i.oldNetCents)} to ${usd(i.newNetCents!)})`,at);e.actor='stripe-fee-recalculation';s.entries.push(e);entryId=e.id;}
+    Object.assign(row,{commission:i.newCommission!,...this.feeFields(i.feeShareCents!,fees),feeSettledAt:at,feeRecalc:{runId,oldCommission:i.oldCommission,entry:entryId,at,actor}});
+    if(standing(row.commission,row)!==i.newNetCents)throw Error('Net-of-fee recalculation standing commission mismatch; manual review is required');
     done.push({sale:i.sale,owner:i.owner,oldCommission:i.oldCommission,newCommission:i.newCommission,deltaCents:i.deltaCents,feeCents:i.feeShareCents,entry:entryId});
    }
    (b.feeRecalculations??=[]).push({runId,at,actor,mode,digest,items:done});
@@ -616,10 +653,10 @@ export class EarnStripeService {
    let reverted=0,deltaCents=0;const at=this.now();
    for(const item of run.items as StripeObject[]){
     const row=(b.invoices as Record<string,Invoice>)[item.sale];if(!row||row.feeRecalc?.runId!==runId)continue;
-    const delta=standing(row.feeRecalc.oldCommission,row)-standing(row.commission,row);
+    const delta=standing(row.feeRecalc.oldCommission,row,{fee:null})-standing(row.commission,row);
     if(delta){const e=entry(row.owner,'referral','adjustment',delta,'stripe:fee-revert:'+runId+':'+row.id,row.period,'Net-of-fee commission recalculation reverted',at);e.actor='stripe-fee-recalculation';s.entries.push(e);}
     row.commission=row.feeRecalc.oldCommission;
-    for(const k of ['feeStatus','feeCents','feeTotalCents','feeChargeCents','feeCurrency','feeTransactions','feeSource','feeSettledAt','feeRecalc'] as const)delete row[k];
+    for(const k of ['feeStatus','feeCents','feeTotalCents','feeChargeCents','feeCurrency','feeTransactions','feeSource','feeRates','feeSettledAt','feeRecalc'] as const)delete row[k];
     reverted++;deltaCents+=delta;
    }
    run.revertedAt=at;run.revertedBy=String(actor).slice(0,200);
@@ -900,7 +937,7 @@ export class EarnStripeService {
    const count=s.referrals.filter(r=>r.code===member.code&&r.active&&(r.paidThrough||0)>this.now()).length;
    const rate=member.commissionPercent??tierPercent(count),net=this.netCommission(basis,rate,fees);
    b.invoices[invoiceId]={id:invoiceId,owner:member.id,subscription,customer:id(inv.customer),paid,basis,commission:net.commission,rate,period,paidThrough,charges,refunded:0,disputed:false,...(lifetimeBundle?{kind:'lifetime' as const}:{}),...net.fields};
-   if(net.commission)s.entries.push(entry(member.id,'referral','earning',net.commission,'stripe:invoice:'+invoiceId,period,commissionNote(rate,lifetimeBundle?'lifetime':undefined,net.fields.feeCents!),this.now()));
+   if(net.commission)s.entries.push(entry(member.id,'referral','earning',net.commission,'stripe:invoice:'+invoiceId,period,commissionNote(rate,lifetimeBundle?'lifetime':undefined,net.fields.feeCents!,net.fields.feeSource),this.now()));
   });await this.adjustInvoice(mode,invoiceId);
  }
  /** A self-hosted one-time purchase (Lifetime, or the one-time crypto
@@ -929,7 +966,7 @@ export class EarnStripeService {
    const count=s.referrals.filter(r=>r.code===member.code&&r.active&&(r.paidThrough||0)>this.now()).length;
    const rate=member.commissionPercent??tierPercent(count),net=this.netCommission(basis,rate,fees);
    b.invoices[sessionId]={id:sessionId,owner:member.id,subscription:'',customer:customerId,paid,basis,commission:net.commission,rate,period,paidThrough:0,charges:[charge],refunded:0,disputed:false,kind,...net.fields};
-   if(net.commission)s.entries.push(entry(member.id,'referral','earning',net.commission,'stripe:checkout:'+sessionId,period,commissionNote(rate,kind,net.fields.feeCents!),this.now()));
+   if(net.commission)s.entries.push(entry(member.id,'referral','earning',net.commission,'stripe:checkout:'+sessionId,period,commissionNote(rate,kind,net.fields.feeCents!,net.fields.feeSource),this.now()));
    created=true;
   });await this.adjustInvoice(mode,sessionId);
   return {recorded:true,reason:created?'admitted':'already recorded'};
@@ -1000,10 +1037,10 @@ export class EarnStripeService {
     const net=this.netCommission(i.basis,i.rate,fees),reference=earningReference(i.id);
     if(s.entries.some(e=>e.reference===reference&&e.kind==='earning'))throw Error('Pending-fee commission already has an earning entry; manual review is required');
     Object.assign(i,{commission:net.commission,...net.fields,feeSettledAt:this.now()});
-    if(i.commission)s.entries.push(entry(i.owner,'referral','earning',i.commission,reference,i.period,commissionNote(i.rate,i.kind,i.feeCents!),this.now()));
+    if(i.commission)s.entries.push(entry(i.owner,'referral','earning',i.commission,reference,i.period,commissionNote(i.rate,i.kind,i.feeCents!,i.feeSource),this.now()));
     previous=0;
    }
-   const target=clawback(i.commission,{refunded,paid:i.paid,disputed}),delta=previous-target;
+   const target=clawback(i.commission,{...i,refunded,disputed}),delta=previous-target;
    if(delta)s.entries.push(entry(i.owner,'referral','adjustment',delta,'stripe:adjust:'+invoiceId+':'+randomUUID(),i.period,disputed?'Referral commission held for a disputed payment':'Referral commission reconciled to Stripe refund/dispute status',this.now()));i.refunded=refunded;i.disputed=disputed;
    if(subscription){const r=s.referrals.find(r=>r.subscription===i.subscription);if(r)r.active=subscription.status==='active'&&(Object.values(b.invoices) as Invoice[]).some(v=>v.subscription===i.subscription&&v.paidThrough>this.now()&&!v.disputed&&v.refunded<v.paid);}
   });
@@ -1013,19 +1050,46 @@ export class EarnStripeService {
  private netCommission(basis:number,rate:number,fees:ChargeFees):{commission:number;fields:Partial<Invoice>}{
   if(fees.status==='pending')return {commission:0,fields:{feeStatus:'pending'}};
   const share=allocatedFee(basis,fees.fee,fees.amount);
-  return {commission:Math.floor((basis-share)*rate/100),fields:{feeStatus:'settled',feeCents:share,feeTotalCents:fees.fee,feeChargeCents:fees.amount,feeCurrency:'usd',feeTransactions:fees.transactions,feeSource:'stripe_balance_transaction'}};
+  return {commission:Math.floor((basis-share)*rate/100),fields:this.feeFields(share,fees)};
  }
- /** Exact Stripe processing fee of every charge: balance_transaction.fee in
-  * USD minor units. A charge without a balance transaction yet is pending; a
-  * non-USD balance transaction or any malformed fact is a review error. */
+ private feeFields(share:number,fees:ChargeFees&{status:'known'}):Partial<Invoice>{
+  return {feeStatus:'settled',feeCents:share,feeTotalCents:fees.fee,feeChargeCents:fees.amount,feeCurrency:'usd',feeSource:fees.source,
+   ...(fees.source==='standard_rate'?{feeRates:fees.rates.map(x=>({...x}))}:{feeTransactions:fees.transactions})};
+ }
+ /** The configured standard rate for a rail; a stored-but-malformed rate
+  * refuses (the outbox retries) instead of guessing. */
+ private standardRate(rail:FeeRail):ProcessingFeeRate{
+  const fees=this.billing().processingFees;
+  const rate=fees===undefined?DEFAULT_PROCESSING_FEES[rail]:fees[rail];
+  if(!rate)throw Error(`Billing processing-fee rate for ${rail} is unreadable; fix processingFees in the billing config`);
+  return rate;
+ }
+ /** Processing fee of every charge in USD minor units. Card charges
+  * (payment_method_details.type "card", including Link and Apple/Google Pay
+  * wallets) and Stripe crypto charges ("crypto", py_) use the configured
+  * standard rate on the charge amount — always known, never pending. Any
+  * other payment method keeps the balance_transaction.fee path: a charge
+  * without a balance transaction yet, or one whose fee Stripe does not
+  * itemize, is pending; a non-USD balance transaction or any malformed fact
+  * is a review error. A row mixing the two sources needs manual review. */
  private async chargeFees(mode:BillingMode,charges:string[],read?:Map<string,StripeObject>):Promise<ChargeFees>{
   if(!charges.length)throw Error('Commission row has no recorded charge');
-  let fee=0,amount=0;const transactions:string[]=[];
+  let fee=0,amount=0;const transactions:string[]=[],rates:AppliedRate[]=[];
   for(const charge of charges){
    let ch=read?.get(charge);
-   if(!ch||typeof ch.balance_transaction==='string')ch=await this.api(mode).call('GET','/v1/charges/'+charge,{'expand[0]':'balance_transaction'});
+   if(!ch||typeof ch.payment_method_details!=='object'||ch.payment_method_details===null)ch=await this.api(mode).call('GET','/v1/charges/'+charge,{'expand[0]':'balance_transaction'});
    if(id(ch)!==charge||ch.livemode!==(mode==='live'))throw Error('Charge identity or mode changed while reading its Stripe fee');
    if(ch.currency!=='usd'||money(ch.amount)===null||ch.amount<=0)throw Error('Charge amount or currency is unavailable for its Stripe fee');
+   if(ch.paid!==true||ch.status!=='succeeded')throw Error(`Charge ${charge} is not a successful payment; manual review is required`);
+   const type=ch.payment_method_details?.type;
+   if(typeof type!=='string'||!type)throw Error(`Charge ${charge} has no payment method type for its processing fee`);
+   const rail:FeeRail|null=type==='card'?'card':type==='crypto'?'crypto':null;
+   if(rail){
+    const rate=this.standardRate(rail),f=standardRateFee(ch.amount,rate);
+    rates.push({charge,rail,bps:rate.bps,fixedCents:rate.fixedCents,amount:ch.amount,fee:f});fee+=f;amount+=ch.amount;continue;
+   }
+   if(typeof ch.balance_transaction==='string')ch=await this.api(mode).call('GET','/v1/charges/'+charge,{'expand[0]':'balance_transaction'});
+   if(id(ch)!==charge||ch.livemode!==(mode==='live'))throw Error('Charge identity or mode changed while reading its Stripe fee');
    const bt=ch.balance_transaction;
    if(bt===null||bt===undefined||bt==='')return {status:'pending',reason:`Stripe has not created the balance transaction for ${charge} yet`};
    if(typeof bt!=='object'||!id(bt).startsWith('txn_'))throw Error('Stripe did not expand the charge balance transaction');
@@ -1038,7 +1102,8 @@ export class EarnStripeService {
    if(f===0&&!(Array.isArray(bt.fee_details)&&bt.fee_details.length>0))return {status:'pending',reason:`Stripe does not itemize the processing fee on ${charge}'s balance transaction (fees billed separately)`};
    fee+=f;amount+=ch.amount;transactions.push(id(bt));
   }
-  return {status:'known',fee,amount,transactions};
+  if(rates.length&&transactions.length)throw Error('Commission row mixes standard-rate and balance-transaction fees; manual review is required');
+  return {status:'known',fee,amount,source:rates.length?'standard_rate':'stripe_balance_transaction',transactions,rates};
  }
  start(){if(this.timer)return;this.timer=setInterval(()=>{if(this.tickRunning)return;this.tickRunning=true;void this.run().then(()=>{this.lastError=null;},e=>{this.lastError=e instanceof EarnStripeError?e.message:'Payout reconciliation needs attention';}).finally(()=>{this.tickRunning=false;});},60_000);this.timer.unref();}
  stop(){if(this.timer)clearInterval(this.timer);this.timer=undefined;}
