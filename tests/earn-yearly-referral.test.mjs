@@ -52,7 +52,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/coupons/coupon_p')return ok({id:'coupon_p',valid:true,percent_off:20,duration:'forever',metadata:{managed_by:'wh-earn'},applies_to:{products:['prod_wh']}});
  if(p==='/v1/customers/cus_referrer')return ok({email:'referrer@example.com'});
  if(p.startsWith('/v1/customers/'))return ok({email:'buyer@example.com'});
- if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,currency:'usd',source:ch}});}
+ if(p.startsWith('/v1/charges/')){const ch=p.split('/').at(-1);return ok({id:ch,livemode:true,currency:'usd',amount:99900,amount_refunded:refunds[ch]||0,disputed:false,balance_transaction:{id:'txn_'+ch,object:'balance_transaction',fee:0,fee_details:[{amount:0,currency:'usd',type:'stripe_fee'}],currency:'usd',source:ch}});}
  if(p==='/v1/checkout/sessions')return ok({data:Object.values(sessions).filter(s=>s.status==='complete'),has_more:false});
  const line=/^\/v1\/checkout\/sessions\/(cs_[a-z_]+)\/line_items$/.exec(p);
  if(line){const s=sessions[line[1]],product=line[1]==='cs_year_wrongproduct'?'prod_other':'prod_wh';

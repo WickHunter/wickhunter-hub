@@ -16,7 +16,7 @@ const offer={promotion:'promo_own',code:member.code,percent:10,products:['prod_s
 ledger.transaction(s=>{s.stripe={profiles:{[owner]:{partnerPromotions:[offer]}},invoices:{},jobs:[],seen:{}};});
 // Per-invoice fixture facts: amount paid, tax, charge id, Stripe fee (null = no balance transaction yet), fee currency, refund.
 const facts={};
-const sale=(n,{paid=10000,tax=0,charge='ch_'+n,fee=320,currency='usd',refund=0}={})=>{facts[n]={paid,tax,charge,fee,currency,refund};return n;};
+const sale=(n,{paid=10000,tax=0,charge='ch_'+n,fee=320,currency='usd',refund=0,itemized=true}={})=>{facts[n]={paid,tax,charge,fee,currency,refund,itemized};return n;};
 const byCharge=ch=>Object.entries(facts).find(([,f])=>f.charge===ch);
 const calls=[],listed=[];
 const fetcher=async(url,init)=>{
@@ -33,7 +33,7 @@ const fetcher=async(url,init)=>{
  if(p==='/v1/invoice_payments'){const n=u.searchParams.get('invoice').slice(3);return ok({data:[{status:'paid',payment:{type:'charge',charge:facts[n].charge}}],has_more:false});}
  if(p.startsWith('/v1/charges/')){
   const ch=p.split('/').at(-1),[,f]=byCharge(ch),expanded=u.searchParams.get('expand[0]')==='balance_transaction';
-  const bt=f.fee===null?null:expanded?{id:'txn_'+ch,object:'balance_transaction',fee:f.fee,currency:f.currency,source:ch,status:'pending'}:'txn_'+ch;
+  const bt=f.fee===null?null:expanded?{id:'txn_'+ch,object:'balance_transaction',fee:f.fee,fee_details:f.itemized?[{amount:f.fee,currency:f.currency,type:'stripe_fee'}]:[],currency:f.currency,source:ch,status:'pending'}:'txn_'+ch;
   return ok({id:ch,livemode:true,currency:'usd',amount:f.paid,amount_refunded:f.refund,disputed:false,balance_transaction:bt});
  }
  throw Error('Unexpected fixture request '+p);
@@ -90,6 +90,14 @@ try{
  await test('partial refund after a known fee claws back proportionally from the net commission',async()=>{
   const before=balance();facts.known.refund=2500;await svc.handleEvent(refundEvent('ch_known'));
   assert.equal(balance(),before-1210);facts.known.refund=0;await svc.handleEvent(refundEvent('ch_known'));assert.equal(balance(),before);
+ });
+ await test('fees billed separately: a zero, un-itemized balance-transaction fee is not the charge fee and stays pending',async()=>{
+  const before=balance();sale('aggregated',{fee:0,itemized:false});await svc.handleEvent(paidEvent('aggregated'));
+  const r=rows().in_aggregated;assert.equal(r.feeStatus,'pending');assert.equal(r.commission,0);assert.equal(earning('aggregated').length,0);assert.equal(balance(),before);
+  now+=10*60_000;await svc.run();assert.equal(rows().in_aggregated.feeStatus,'pending');
+  assert.match(svc.admin().feeRetry['live:in_aggregated']?.error??'none',/none/);
+  // A genuinely itemized zero fee is a known fact.
+  sale('zero',{fee:0});await svc.handleEvent(paidEvent('zero'));assert.equal(rows().in_zero.feeStatus,'settled');assert.equal(rows().in_zero.commission,5000);
  });
  await test('missing or malformed fee facts refuse admission for retry instead of fabricating a commission',async()=>{
   const before=JSON.stringify(ledger.admin().entries);

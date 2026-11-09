@@ -1032,6 +1032,10 @@ export class EarnStripeService {
    if(bt.source!==undefined&&bt.source!==null&&id(bt.source)!==charge)throw Error('Balance transaction belongs to a different charge');
    if(bt.currency!=='usd')throw Error(`Stripe fee for ${charge} is settled in ${String(bt.currency||'an unknown currency').slice(0,8)}, not USD; manual review is required`);
    const f=money(bt.fee);if(f===null)throw Error('Stripe fee is unavailable on the balance transaction');
+   // Accounts whose Stripe fees are billed separately (daily/monthly
+   // `stripe_fee` balance transactions) report fee 0 with no fee_details on
+   // every charge. That zero is not this charge's fee: stay pending.
+   if(f===0&&!(Array.isArray(bt.fee_details)&&bt.fee_details.length>0))return {status:'pending',reason:`Stripe does not itemize the processing fee on ${charge}'s balance transaction (fees billed separately)`};
    fee+=f;amount+=ch.amount;transactions.push(id(bt));
   }
   return {status:'known',fee,amount,transactions};
