@@ -181,6 +181,14 @@ export interface RoleSubscriptionRecord {
   /** What the customer has paid THROUGH for this role — this role's OWN
    *  figure, never blended with any other role's. */
   periodEndMs: number | null;
+  /** v0.4.111 — the latest period end a PAID invoice proved for this role
+   *  (forward only). Absent on records written before 0.4.111: unknown,
+   *  never read as either "paid" or "not paid". */
+  paidPeriodEndMs?: number;
+  /** v0.4.111 — the period end of a failed renewal invoice no paid invoice
+   *  has covered yet. Set by `invoice.payment_failed`; cleared only by a paid
+   *  invoice whose period end reaches it. */
+  unpaidPeriodEndMs?: number;
   chargeIds: string[];
   disputed: boolean;
   refunded: boolean;

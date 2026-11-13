@@ -41,6 +41,7 @@ import type { RoleSubscriptionRecord, ComplimentaryHostingMark } from "../billin
 import type { EmailConfig } from "../billing/config.js";
 import type { HostedPriceProof } from "../billing/hosted-offer.js";
 import { launchGrant } from "../billing/launch.js";
+import { invoiceFacts, subscriptionFacts } from "../billing/stripe.js";
 import type { StripeObject } from "../earn-stripe-api.js";
 import { sendEmail, type EmailFetch } from "../billing/email.js";
 import type { LicenseStore } from "../license.js";
@@ -125,6 +126,21 @@ export interface HostingServiceDeps {
   provider?: HostingProvider;
   stripeTimeoutMs?: number;
   publicHealthFetch?: PublicHealthFetch;
+  /** v0.4.111 — release the licence-lease activation of a hosted server the
+   *  Hub destroyed itself (region replacement). Wired in server.ts to the
+   *  lease service; absent (tests, a disabled lease service) releases nothing. */
+  retireMachineLease?: (input: RetiredHostingMachine) => { released: string[]; note: string };
+}
+
+/** v0.4.111 — the old generation of a hosted server that a region replacement
+ *  has just deleted at the provider. */
+export interface RetiredHostingMachine {
+  instanceId: string;
+  ownerId: string;
+  licenseId: string | null;
+  generation: number;
+  ip: string | null;
+  providerInstanceId: string | null;
 }
 
 export type HostingActionError =
@@ -164,6 +180,7 @@ export class HostingService {
   private readonly injectedProvider: HostingProvider | undefined;
   private readonly stripeTimeoutMs: number;
   private readonly publicHealthFetch: PublicHealthFetch;
+  private readonly retireMachineLease: HostingServiceDeps["retireMachineLease"];
 
   constructor(
     readonly dataDir: string,
@@ -180,6 +197,7 @@ export class HostingService {
     this.injectedProvider = deps.provider;
     this.stripeTimeoutMs = deps.stripeTimeoutMs ?? 20_000;
     this.publicHealthFetch = deps.publicHealthFetch ?? fetchBoundedPublicHealth;
+    this.retireMachineLease = deps.retireMachineLease;
   }
 
   policy(): HostingPolicy {
@@ -770,6 +788,19 @@ export class HostingService {
       }
       return;
     }
+    if (!endOnly && nonpaymentSettledByPaidTerm(instance, sub)) {
+      // v0.4.111 — a nonpayment schedule whose failed period a paid invoice
+      // already covers, while that invoice's period end is not LATER than
+      // the row's paid-through date (so `paidThroughAdvanced` is false). The
+      // shape of a pre-0.4.111 row whose paid-through date an unpaid
+      // `subscription.updated` had already moved: the late payment's period
+      // end equalled it and nothing cleared the overdue schedule (2026-11-13,
+      // three paid hosts still scheduled to suspend). Gated on the 0.4.111
+      // paid-evidence fields, never on equality alone.
+      if (instance.stage === "suspended") this.restore(instance, Math.max(instance.paidThroughMs!, sub.paidPeriodEndMs!), nowMs);
+      else this.settleNonpaymentSchedule(instance, { origin: "billing", by: "stripe", reason: `paid invoice covers the period through ${new Date(sub.paidPeriodEndMs!).toISOString()}` }, sub.paidPeriodEndMs!, nowMs);
+      return;
+    }
     if (scheduledCancel && instance.cancellationReason !== "intentional_cancellation" && !TERMINAL_ISH.has(instance.stage)) {
       const anchor = signal.periodEndMs ?? instance.paidThroughMs;
       if (endOnly && anchor === null) {
@@ -807,6 +838,39 @@ export class HostingService {
       // nonpayment-shaped grace, never an instant suspend.
       this.scheduleEnd(instance, "renewal_unpaid", instance.paidThroughMs ?? nowMs, policy, nowMs);
     }
+  }
+
+  /** v0.4.111 — return a `past_due`/`renewal_unpaid` row whose renewal is
+   *  proven paid to `ready`, the way `reverseScheduledCancellation` returns a
+   *  reversed cancellation: the deadlines and any deletion hold are cleared,
+   *  the lifecycle version moves so every pending suspend/delete/reminder job
+   *  is obsoleted, and one billing audit row records it. The server was never
+   *  suspended, so no restore proof is needed, and no customer email is
+   *  queued. `paidThroughMs` moves forward only. Returns the fresh row, or
+   *  null when the row is not in that state or changed underneath. */
+  settleNonpaymentSchedule(row: HostingInstanceRow, origin: { origin: "billing" | "operator"; by: string; reason: string }, paidThroughMs: number, nowMs: number): HostingInstanceRow | null {
+    if (row.stage !== "past_due" || row.cancellationReason !== "renewal_unpaid") return null;
+    const before = { stage: row.stage, cancellationReason: row.cancellationReason, paidThroughMs: row.paidThroughMs, suspendAtMs: row.suspendAtMs, deleteAtMs: row.deleteAtMs, lifecycleVersion: row.lifecycleVersion };
+    const hadHold = row.deletionHold;
+    const fresh = this.store.updateInstance(row.id, row.version, (d) => {
+      d.paidThroughMs = d.paidThroughMs === null ? paidThroughMs : Math.max(d.paidThroughMs, paidThroughMs);
+      d.cancellationReason = null; d.suspendAtMs = null; d.deleteAtMs = null; d.stage = "ready"; d.deletionHold = null; d.lifecycleVersion += 1;
+    }, nowMs);
+    if (!fresh) return null;
+    const obsoleted = this.store.obsoletePendingJobsOlderThan(fresh.id, fresh.lifecycleVersion, fresh.generation, nowMs);
+    const type = origin.origin === "operator" ? "admin.hosting.billing-repair" : "billing.hosting.nonpayment-settled";
+    try {
+      this.billing.store.appendEvent({
+        id: `hosting-nonpayment-settled:${fresh.id}:${nowMs}`, type, livemode: fresh.environment === "live",
+        receivedAtMs: this.now(), outcome: "applied",
+        note: JSON.stringify({ actor: origin.origin, by: origin.by, reason: origin.reason, instanceId: fresh.id, ownerId: fresh.ownerId, subscriptionId: fresh.stripeSubscriptionId, obsoletedJobs: obsoleted, releasedHold: hadHold ? { by: hadHold.by, atMs: hadHold.atMs } : null,
+          before, after: { stage: fresh.stage, cancellationReason: fresh.cancellationReason, paidThroughMs: fresh.paidThroughMs, suspendAtMs: fresh.suspendAtMs, deleteAtMs: fresh.deleteAtMs, lifecycleVersion: fresh.lifecycleVersion } }),
+      });
+    } catch (err) {
+      this.log(`[hosting] ${fresh.id}: nonpayment schedule settled but its audit row could not be written: ${(err as Error).message}`);
+    }
+    this.log(`[hosting] ${fresh.id}: nonpayment schedule cleared (${origin.origin}${origin.by ? ` ${origin.by}` : ""}) — ${origin.reason}; paid through ${new Date(fresh.paidThroughMs ?? 0).toISOString()}; ${obsoleted} pending end job(s) obsoleted${hadHold ? "; deletion hold released" : ""}`);
+    return fresh;
   }
 
   private scheduleEnd(instance: HostingInstanceRow, reason: HostingEndReason, anchor: number, policy: HostingPolicy, nowMs: number): void {
@@ -924,6 +988,127 @@ export class HostingService {
     }
     const r = await this.reverseScheduledCancellation(row, { origin: "operator", by: by || "admin", reason }, nowMs);
     return r.ok ? { ok: true, value: { stage: r.value.stage, changed: true } } : r;
+  }
+
+  /** POST /admin/api/hosting/billing-repair (v0.4.111). Recomputes each
+   *  live hosting row's billing stage from Stripe's PAID invoices (read-only
+   *  GETs: the subscription and its newest 24 invoices) and reports, per row,
+   *  what the row says, what Stripe proves and the one repair that follows:
+   *
+   *  - `CLEAR_PAID` — a `past_due`/`renewal_unpaid` row whose renewal Stripe
+   *    proves paid (latest invoice paid, subscription active/trialing, paid
+   *    period end reaching the row's paid-through date). Apply writes the
+   *    paid term and Stripe's status onto the hosting role record and returns
+   *    the row to `ready` (deadlines cleared, pending end jobs obsoleted, no
+   *    email), with one billing audit row. The only class an apply changes.
+   *  - `CORRECT_PAID_THROUGH` — the row's paid-through date is LATER than any
+   *    paid invoice proves (an unpaid `subscription.updated` advanced it before
+   *    0.4.111). Reported with the corrected date and, for a nonpayment
+   *    schedule, the suspend/delete dates that correction would derive. Never
+   *    applied here: moving an unpaid customer's schedule is an operator
+   *    decision.
+   *  - `REVIEW` — evidence is incomplete or contradictory (read failure,
+   *    identity mismatch, a suspended row, a refund/dispute). Nothing applied.
+   *  - `NO_CHANGE` — the row already matches Stripe's paid evidence.
+   *
+   *  A dry run (the default) writes nothing. An apply needs `{by, reason,
+   *  instanceIds, confirm}`, re-reads Stripe, and changes only listed rows
+   *  that are still `CLEAR_PAID` and unchanged since that read. */
+  async adminBillingRepair(opts: { dryRun?: boolean; instanceIds?: unknown; by?: unknown; reason?: unknown; confirm?: unknown }, nowMs = this.now()): Promise<HostingActionResult<{ dryRun: boolean; rows: HostingBillingRepairRow[]; applied: string[] }>> {
+    const dryRun = opts.dryRun !== false;
+    const by = typeof opts.by === "string" ? opts.by.trim().slice(0, 80) : "";
+    const reason = typeof opts.reason === "string" ? opts.reason.trim().slice(0, 500) : "";
+    const ids = Array.isArray(opts.instanceIds) ? opts.instanceIds.filter((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 64) : null;
+    if (opts.instanceIds !== undefined && (!ids || ids.length !== (opts.instanceIds as unknown[]).length)) return { ok: false, code: "INVALID_REQUEST", error: "instanceIds must be an array of instance ids" };
+    if (!dryRun && (!by || !reason || !ids || ids.length === 0 || opts.confirm !== HOSTING_BILLING_REPAIR_CONFIRM)) {
+      return { ok: false, code: "INVALID_REQUEST", error: `an apply needs {by, reason, instanceIds: [...], confirm: "${HOSTING_BILLING_REPAIR_CONFIRM}"}; a dry run (the default) needs none of them` };
+    }
+    const policy = this.policy();
+    const cfg = this.billing.config();
+    const candidates = this.store.instances().filter((r) => !TERMINAL_ISH.has(r.stage) && r.stage !== "ordered" && !r.complimentary && (!ids || ids.includes(r.id)))
+      .sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id));
+    const rows: HostingBillingRepairRow[] = [];
+    const applied: string[] = [];
+    for (const before of candidates) {
+      const sub = this.billing.store.getRoleSubscription(before.ownerId, "hosting");
+      const row: HostingBillingRepairRow = {
+        instanceId: before.id, ownerId: before.ownerId, environment: before.environment, subscriptionId: sub?.subscriptionId ?? before.stripeSubscriptionId ?? null,
+        stage: before.stage, cancellationReason: before.cancellationReason, paidThroughMs: before.paidThroughMs, suspendAtMs: before.suspendAtMs, deleteAtMs: before.deleteAtMs,
+        role: sub ? { status: sub.subscriptionStatus, periodEndMs: sub.periodEndMs, paidPeriodEndMs: sub.paidPeriodEndMs ?? null, unpaidPeriodEndMs: sub.unpaidPeriodEndMs ?? null } : null,
+        stripe: null, action: "REVIEW", after: null, note: "", applied: false,
+      };
+      rows.push(row);
+      const subscriptionId = row.subscriptionId;
+      if (!sub || !subscriptionId) { row.note = "no hosting subscription is bound to this row"; continue; }
+      if (sub.refunded || sub.disputed) { row.note = `a hosting charge was ${sub.disputed ? "disputed" : "refunded"}; support review first`; continue; }
+      const key = cfg.stripe[before.environment].secretKey;
+      if (!key) { row.note = `no ${before.environment} Stripe key is saved; nothing was read`; continue; }
+      let rawSub: Record<string, any>, rawInvoices: Record<string, any>;
+      try {
+        rawSub = await this.stripeGetJson(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, key);
+        rawInvoices = await this.stripeGetJson(`https://api.stripe.com/v1/invoices?subscription=${encodeURIComponent(subscriptionId)}&limit=24`, key);
+      } catch (err) { row.note = `Stripe read failed (${(err as Error).message}); nothing was written`; continue; }
+      const sf = subscriptionFacts(rawSub);
+      const list = Array.isArray(rawInvoices?.data) ? (rawInvoices.data as Record<string, any>[]).slice().sort((a, b) => (Number(b?.created) || 0) - (Number(a?.created) || 0)) : null;
+      if (!list) { row.note = "Stripe's invoice list was unreadable; nothing was written"; continue; }
+      const latest = list.find((i) => !["void", "deleted", "draft"].includes(String(i?.status))) ?? null;
+      const paid = list.filter((i) => String(i?.status) === "paid" && invoiceFacts(i).subscriptionId === subscriptionId);
+      let paidEndMs: number | null = null;
+      for (const i of paid) { const end = invoiceFacts(i).periodEndMs; if (end !== null && (paidEndMs === null || end > paidEndMs)) paidEndMs = end; }
+      const latestFacts = latest ? invoiceFacts(latest) : null;
+      row.stripe = {
+        status: sf.status || null, cancelAtPeriodEnd: sf.cancelAtPeriodEnd, currentPeriodEndMs: sf.currentPeriodEndMs,
+        latestInvoice: latest ? { id: String(latest.id ?? ""), status: String(latest.status ?? ""), billingReason: String(latest.billing_reason ?? ""), periodEndMs: latestFacts!.periodEndMs } : null,
+        paidPeriodEndMs: paidEndMs, paidInvoiceIds: paid.map((i) => String(i.id ?? "")), historyComplete: rawInvoices.has_more !== true,
+      };
+      const ownerCustomer = before.ownerId.startsWith("cus_") ? before.ownerId : before.stripeCustomerId;
+      if (sf.subscriptionId !== subscriptionId || (ownerCustomer && sf.customerId !== ownerCustomer) || (typeof rawSub.livemode === "boolean" && rawSub.livemode !== (before.environment === "live"))) {
+        row.note = `Stripe's subscription (customer ${sf.customerId || "?"}) does not match this row (owner ${before.ownerId}, ${before.environment})`; continue;
+      }
+      if (paidEndMs === null) { row.note = rawInvoices.has_more === true ? "no paid invoice among the newest 24; reconcile by hand" : "Stripe has no paid invoice for this subscription"; continue; }
+      const statusActive = sf.status === "active" || sf.status === "trialing";
+      const latestPaid = latest !== null && String(latest.status) === "paid";
+      const paidProven = statusActive && latestPaid && before.paidThroughMs !== null && paidEndMs >= before.paidThroughMs;
+      if (before.cancellationReason === "renewal_unpaid" && paidProven) {
+        if (before.stage !== "past_due") { row.note = `Stripe proves payment through ${iso(paidEndMs)}, but the row is ${before.stage}; a suspended server is returned through its restore path, not this repair`; continue; }
+        row.action = "CLEAR_PAID";
+        row.after = { stage: "ready", cancellationReason: null, paidThroughMs: Math.max(before.paidThroughMs!, paidEndMs), suspendAtMs: null, deleteAtMs: null,
+          roleStatus: sf.cancelAtPeriodEnd && sf.status === "active" ? "active (cancels at period end)" : sf.status, rolePeriodEndMs: Math.max(sub.periodEndMs ?? 0, paidEndMs) };
+        row.note = `the renewal is paid (latest invoice ${latest!.id} paid, Stripe ${sf.status}${sf.cancelAtPeriodEnd ? ", cancels at period end" : ""}); the overdue schedule should not exist${sf.cancelAtPeriodEnd ? ". Stripe still has cancel_at_period_end=true, so the next reconcile schedules an intentional cancellation at the period end" : ""}`;
+      } else if (before.paidThroughMs !== null && paidEndMs < before.paidThroughMs) {
+        row.action = "CORRECT_PAID_THROUGH";
+        const sched = before.cancellationReason !== null ? deadlines(paidEndMs, before.cancellationReason, policy) : null;
+        row.after = { stage: before.stage, cancellationReason: before.cancellationReason, paidThroughMs: paidEndMs, suspendAtMs: sched ? sched.suspendAt : before.suspendAtMs, deleteAtMs: sched ? sched.deleteAt : before.deleteAtMs,
+          roleStatus: sub.subscriptionStatus, rolePeriodEndMs: paidEndMs };
+        row.note = `the row is paid through ${iso(before.paidThroughMs)}, but Stripe's paid invoices end ${iso(paidEndMs)} (latest invoice ${latest ? `${latest.id} ${latest.status}` : "none"}, Stripe ${sf.status})${sched ? `; re-deriving the ${before.cancellationReason} schedule from the true paid end moves suspend ${iso(before.suspendAtMs)} → ${iso(sched.suspendAt)} and delete ${iso(before.deleteAtMs)} → ${iso(sched.deleteAt)}` : ""}. Decision item: never applied by this route`;
+      } else if (before.cancellationReason === "renewal_unpaid") {
+        row.action = "NO_CHANGE";
+        row.note = `the renewal is not proven paid (latest invoice ${latest ? `${latest.id} ${latest.status}` : "none"}, Stripe ${sf.status}); the overdue schedule stands`;
+      } else {
+        row.action = "NO_CHANGE";
+        row.note = "the row matches Stripe's paid evidence";
+      }
+      if (dryRun || row.action !== "CLEAR_PAID") continue;
+      // ── apply: one listed CLEAR_PAID row, unchanged since the read ──
+      const fresh = this.store.getInstance(before.id);
+      const freshSub = this.billing.store.getRoleSubscription(before.ownerId, "hosting");
+      if (!fresh || fresh.version !== before.version || JSON.stringify(freshSub) !== JSON.stringify(sub)) { row.note += "; NOT APPLIED: the row or its billing record changed while Stripe was being read — run again"; continue; }
+      const written = this.billing.repairHostingRolePaidTerm(before.ownerId, subscriptionId, { paidPeriodEndMs: paidEndMs, subscriptionStatus: row.after!.roleStatus ?? "active" }, nowMs);
+      if (!written) { row.note += "; NOT APPLIED: the billing record could not be written"; continue; }
+      const settled = this.settleNonpaymentSchedule(fresh, { origin: "operator", by, reason: `${reason} — Stripe paid invoices ${row.stripe.paidInvoiceIds.join(", ")} cover the period through ${iso(paidEndMs)}` }, paidEndMs, nowMs);
+      if (!settled) { row.note += "; NOT APPLIED: the row left past_due/renewal_unpaid"; continue; }
+      row.applied = true;
+      applied.push(before.id);
+    }
+    return { ok: true, value: { dryRun, rows, applied } };
+  }
+
+  private async stripeGetJson(url: string, key: string): Promise<Record<string, any>> {
+    const res = await this.stripeFetch(url, { method: "GET", headers: { authorization: `Bearer ${key}` } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = JSON.parse(await res.text()) as unknown;
+    if (!body || typeof body !== "object") throw new Error("not a JSON object");
+    return body as Record<string, any>;
   }
 
   /** The one implementation behind the customer's `resumeRenewal` and the
@@ -1388,6 +1573,13 @@ export class HostingService {
     for (const resource of this.store.resourcesFor(row.id)) {
       if (resource.generation === row.generation && resource.cleanupState === "present") this.store.markResourceRemoved(resource.id, nowMs);
     }
+    // v0.4.111 — the deleted server's install still held the licence's
+    // machine seat, so the replacement's install was refused "machine limit
+    // reached" (2026-10-05, nrt → itm: refused hourly for five weeks). The
+    // seat is released here, after the provider confirmed the delete and
+    // before `ip` is cleared, because the old server's address is what
+    // identifies its install. Never blocks the replacement.
+    this.releaseRetiredMachineLease(row);
     const current = this.store.getInstance(row.id);
     if (!current) return;
     if (!nextRegionId) {
@@ -1410,6 +1602,20 @@ export class HostingService {
       d.stage = "provisioning";
     }, nowMs);
     if (fresh) this.enqueueProvisionJob(fresh, nowMs);
+  }
+
+  private releaseRetiredMachineLease(row: HostingInstanceRow): void {
+    if (!this.retireMachineLease) return;
+    const input: RetiredHostingMachine = {
+      instanceId: row.id, ownerId: row.ownerId, licenseId: this.billing.store.getCustomer(row.ownerId)?.licenseId ?? null,
+      generation: row.generation, ip: row.ip, providerInstanceId: row.providerInstanceId,
+    };
+    try {
+      const r = this.retireMachineLease(input);
+      this.log(`[hosting] ${row.id} generation ${row.generation} (${row.ip ?? "no address"}) retired: ${r.released.length ? `released lease activation ${r.released.join(", ")}` : "no lease activation released"} — ${r.note}`);
+    } catch (err) {
+      this.log(`[hosting] ${row.id} generation ${row.generation} (${row.ip ?? "no address"}) retired, but its lease activation could not be released: ${(err as Error).message} — the replacement continues; release the old activation from /admin/api/license-leases if the new install reports "machine limit reached"`);
+    }
   }
 
   /** Records `providerPlanMonthlyCostCents` on the row from
@@ -2222,6 +2428,46 @@ export function addUtcMonths(ms: number, months: number): number {
 const COMPLIMENTARY_SUPPRESSED_TEMPLATES = new Set<string>(["suspended", "three_days", "one_day", "overdue"]);
 const RECOVERABLE_STAGES = new Set<HostingStage>(["past_due", "cancel_scheduled", "suspended", "restoring"]);
 const TERMINAL_ISH = new Set<HostingStage>(["deleting", "deleted"]);
+
+export const HOSTING_BILLING_REPAIR_CONFIRM = "APPLY HOSTING BILLING REPAIR";
+
+export interface HostingBillingRepairRow {
+  instanceId: string;
+  ownerId: string;
+  environment: string;
+  subscriptionId: string | null;
+  stage: HostingStage;
+  cancellationReason: HostingEndReason | null;
+  paidThroughMs: number | null;
+  suspendAtMs: number | null;
+  deleteAtMs: number | null;
+  role: { status: string | null; periodEndMs: number | null; paidPeriodEndMs: number | null; unpaidPeriodEndMs: number | null } | null;
+  stripe: { status: string | null; cancelAtPeriodEnd: boolean; currentPeriodEndMs: number | null; latestInvoice: { id: string; status: string; billingReason: string; periodEndMs: number | null } | null; paidPeriodEndMs: number | null; paidInvoiceIds: string[]; historyComplete: boolean } | null;
+  action: "CLEAR_PAID" | "CORRECT_PAID_THROUGH" | "REVIEW" | "NO_CHANGE";
+  after: { stage: HostingStage; cancellationReason: HostingEndReason | null; paidThroughMs: number | null; suspendAtMs: number | null; deleteAtMs: number | null; roleStatus: string | null; rolePeriodEndMs: number | null } | null;
+  note: string;
+  applied: boolean;
+}
+
+function iso(ms: number | null | undefined): string {
+  return typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : "none";
+}
+
+/** v0.4.111 — whether a hosting role record PROVES that a paid invoice
+ *  covers the failed renewal behind this row's nonpayment schedule: the
+ *  record carries a paid period end (written only by a paid invoice) that
+ *  reaches the row's paid-through date (the schedule's anchor), no failed
+ *  renewal on the record is still unpaid, and Stripe is billing the
+ *  subscription. A record without the 0.4.111 fields proves nothing. */
+export function nonpaymentSettledByPaidTerm(row: HostingInstanceRow, sub: RoleSubscriptionRecord): boolean {
+  return row.cancellationReason === "renewal_unpaid"
+    && (row.stage === "past_due" || row.stage === "suspended")
+    && row.paidThroughMs !== null
+    && sub.paidPeriodEndMs !== undefined && Number.isSafeInteger(sub.paidPeriodEndMs) && sub.paidPeriodEndMs >= row.paidThroughMs
+    && sub.unpaidPeriodEndMs === undefined
+    && ACTIVE_SUBSCRIPTION_STATUSES.has(sub.subscriptionStatus ?? "")
+    && !sub.refunded && !sub.disputed;
+}
 
 function paidEvidenceExists(sub: RoleSubscriptionRecord): boolean {
   return sub.subscriptionStatus === "active" || sub.subscriptionStatus === "active (cancels at period end)" || sub.subscriptionStatus === "trialing" || (sub.periodEndMs !== null && sub.periodEndMs > 0);

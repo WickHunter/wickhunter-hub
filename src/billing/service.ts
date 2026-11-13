@@ -1121,10 +1121,11 @@ export class BillingService {
     const host = this.store.findRoleSubscriptionBySubscription("hosting", bundle.subscriptionId);
     if (host && !host.refunded && !host.disputed) {
       const beforeEnd = host.periodEndMs, beforeStatus = host.subscriptionStatus, beforeCharges = host.chargeIds.length;
-      if (f.periodEndMs !== null && (host.periodEndMs === null || f.periodEndMs > host.periodEndMs)) host.periodEndMs = f.periodEndMs;
-      if (settlesFailure && host.subscriptionStatus === "past_due") host.subscriptionStatus = "active";
+      const beforePaid = host.paidPeriodEndMs, beforeUnpaid = host.unpaidPeriodEndMs;
+      const hostSettles = this.notePaidHostingTerm(host, f.periodEndMs);
+      if ((settlesFailure || hostSettles) && host.unpaidPeriodEndMs === undefined && host.subscriptionStatus === "past_due") host.subscriptionStatus = "active";
       for (const id of f.paymentIds) this.noteHostingCharge(host, id);
-      hostingMoved = host.periodEndMs !== beforeEnd || host.subscriptionStatus !== beforeStatus;
+      hostingMoved = host.periodEndMs !== beforeEnd || host.subscriptionStatus !== beforeStatus || host.paidPeriodEndMs !== beforePaid || host.unpaidPeriodEndMs !== beforeUnpaid;
       if (hostingMoved || host.chargeIds.length !== beforeCharges) {
         this.touchHosting(host, ev, now);
         this.saveHostingRecord(host);
@@ -1297,11 +1298,43 @@ export class BillingService {
     rec.updatedAtMs = now;
   }
 
+  /** v0.4.111 — the operator billing repair's one write to a hosting role
+   *  record (`HostingService.adminBillingRepair`): the paid term a fresh
+   *  Stripe read proved (paid invoices only) and Stripe's own status, written
+   *  forward only and WITHOUT the hosting hook — the caller settles the
+   *  instance row itself, synchronously, so the two writes land together.
+   *  Returns the record as written, or null when the record changed identity. */
+  repairHostingRolePaidTerm(customerKey: string, subscriptionId: string, facts: { paidPeriodEndMs: number; subscriptionStatus: string }, nowMs: number): RoleSubscriptionRecord | null {
+    const rec = this.store.getRoleSubscription(customerKey, "hosting");
+    if (!rec || rec.subscriptionId !== subscriptionId || rec.refunded || rec.disputed) return null;
+    if (!Number.isSafeInteger(facts.paidPeriodEndMs) || facts.paidPeriodEndMs <= 0) return null;
+    if (rec.periodEndMs === null || facts.paidPeriodEndMs > rec.periodEndMs) rec.periodEndMs = facts.paidPeriodEndMs;
+    if (rec.paidPeriodEndMs === undefined || facts.paidPeriodEndMs > rec.paidPeriodEndMs) rec.paidPeriodEndMs = facts.paidPeriodEndMs;
+    if (rec.unpaidPeriodEndMs !== undefined && facts.paidPeriodEndMs >= rec.unpaidPeriodEndMs) delete rec.unpaidPeriodEndMs;
+    rec.subscriptionStatus = facts.subscriptionStatus;
+    rec.updatedAtMs = nowMs;
+    this.store.putRoleSubscription(rec);
+    return rec;
+  }
+
   private noteHostingCharge(rec: RoleSubscriptionRecord, id: string): void {
     if (id && !rec.chargeIds.includes(id)) {
       rec.chargeIds.push(id);
       if (rec.chargeIds.length > 50) rec.chargeIds.splice(0, rec.chargeIds.length - 50);
     }
+  }
+
+  /** v0.4.111 — record one PAID invoice's term on a hosting role record:
+   *  the period end (forward only), the paid period end, and, when the
+   *  invoice reaches a recorded failed renewal's period, that failure's
+   *  settlement. Returns true when it settled a recorded failure. The only
+   *  writer of `paidPeriodEndMs`; called only with paid-invoice evidence. */
+  private notePaidHostingTerm(rec: RoleSubscriptionRecord, periodEndMs: number | null): boolean {
+    if (periodEndMs === null) return false;
+    if (rec.periodEndMs === null || periodEndMs > rec.periodEndMs) rec.periodEndMs = periodEndMs;
+    if (rec.paidPeriodEndMs === undefined || periodEndMs > rec.paidPeriodEndMs) rec.paidPeriodEndMs = periodEndMs;
+    if (rec.unpaidPeriodEndMs !== undefined && periodEndMs >= rec.unpaidPeriodEndMs) { delete rec.unpaidPeriodEndMs; return true; }
+    return false;
   }
 
   private applyHostingEvent(ev: StripeEvent): ApplyResult {
@@ -1327,8 +1360,10 @@ export class BillingService {
         if (!f.customerId && !f.email) return { outcome: "ignored", note: "hosting invoice carried neither a customer nor an email" };
         const rec = this.ensureHostingCustomer(f.customerId, f.email, ev.livemode, now);
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
-        rec.subscriptionStatus = "active";
-        if (f.periodEndMs !== null && (rec.periodEndMs === null || f.periodEndMs > rec.periodEndMs)) rec.periodEndMs = f.periodEndMs;
+        this.notePaidHostingTerm(rec, f.periodEndMs);
+        // A paid invoice for an EARLIER period than a recorded failed renewal
+        // does not pay that renewal: the record stays past due (v0.4.111).
+        rec.subscriptionStatus = rec.unpaidPeriodEndMs !== undefined ? "past_due" : "active";
         for (const id of f.paymentIds) this.noteHostingCharge(rec, id);
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
@@ -1338,6 +1373,15 @@ export class BillingService {
         const f = invoiceFacts(ev.object);
         const rec = this.findHostingCustomer(f.customerId, f.email);
         if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
+        // v0.4.111 — the failed invoice's own period is recorded, so only a
+        // paid invoice that reaches it can settle it, and a delayed failure
+        // for a term a paid invoice already covered cannot undo that payment
+        // (the software side's rule). Without a recorded paid term (records
+        // written before 0.4.111) the failure applies exactly as before.
+        if (f.periodEndMs !== null && rec.paidPeriodEndMs !== undefined && rec.paidPeriodEndMs >= f.periodEndMs) {
+          return { outcome: "ignored", note: "hosting failure belongs to an already paid term" };
+        }
+        if (f.periodEndMs !== null) rec.unpaidPeriodEndMs = Math.max(rec.unpaidPeriodEndMs ?? f.periodEndMs, f.periodEndMs);
         rec.subscriptionStatus = "past_due";
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
@@ -1349,7 +1393,14 @@ export class BillingService {
         if (!rec) return { outcome: "ignored", note: "hosting customer not known" };
         rec.subscriptionId = f.subscriptionId || rec.subscriptionId;
         rec.subscriptionStatus = f.cancelAtPeriodEnd && f.status === "active" ? "active (cancels at period end)" : f.status || rec.subscriptionStatus;
-        if ((f.status === "active" || f.status === "trialing") && f.currentPeriodEndMs !== null && (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs)) rec.periodEndMs = f.currentPeriodEndMs;
+        // v0.4.111 — Stripe moves an active subscription into its next
+        // period BEFORE it collects that period's invoice (2026-11-08: the
+        // update arrived ~1 h before the failed charge). An active update is
+        // therefore not payment and never advances the hosting paid-through
+        // date; only a paid invoice does (`notePaidHostingTerm`), exactly as
+        // the software side (`onSubscriptionUpdated`). A trial period is
+        // granted by Stripe without a charge and keeps its old behavior.
+        if (f.status === "trialing" && f.currentPeriodEndMs !== null && (rec.periodEndMs === null || f.currentPeriodEndMs > rec.periodEndMs)) rec.periodEndMs = f.currentPeriodEndMs;
         this.touchHosting(rec, ev, now);
         this.saveHostingRecord(rec);
         return { outcome: "applied", note: "hosting status updated; software licence untouched" };
