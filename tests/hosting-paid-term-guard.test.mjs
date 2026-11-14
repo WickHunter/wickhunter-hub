@@ -424,6 +424,15 @@ async function incidentCancelled(c, { hold = true, paid = false } = {}) {
   await provisioned(c, s);
   c.set(FIRST_TICK_AFTER_LAPSE); await c.tick();
   c.set(ECHO_UPDATE);
+  if (!paid) {
+    // v0.4.111: an active (cancels at period end) echo no longer advances the
+    // hosting period (only a paid invoice does). Seed the hosting period the
+    // pre-0.4.111 handler wrote from this echo, before the echo is applied.
+    const host = c.h.hub.billing.store.getRoleSubscription(c.key(s), "hosting");
+    assert.equal(host.periodEndMs, null, "no paid invoice, no hosting period");
+    host.periodEndMs = PERIOD_END;
+    c.h.hub.billing.store.putRoleSubscription(host);
+  }
   assert.equal((await c.post("customer.subscription.updated", c.subscriptionObject(s, { cancel_at_period_end: true }), ECHO_UPDATE)).body.outcome, "applied");
   // Seed the historical pre-fix overextension explicitly. Current code must
   // never reproduce it from an active status event (asserted above).
@@ -540,7 +549,11 @@ await test("operator reversal refusals: admin token required, unknown instance, 
       const running = await adminResume(c, c.instance(s).id);
       assert.equal(running.status, 200); assert.equal(running.body.changed, false); assert.equal(c.stripeCalls.length, 0);
       c.set(ECHO_UPDATE);
-      assert.equal((await c.post("invoice.payment_failed", c.invoice(s, { id: "in_fail_" + s.id, paid: false, status: "open", billing_reason: "subscription_cycle" }))).body.outcome, "applied");
+      // The NEXT period's renewal fails (v0.4.111: a failure for the term the
+      // paid invoice already covers is ignored by hosting).
+      const failed = c.invoice(s, { id: "in_fail_" + s.id, paid: false, status: "open", billing_reason: "subscription_cycle" });
+      failed.lines.data = failed.lines.data.map(l => ({ ...l, period: { start: Math.floor(PERIOD_END / 1000), end: Math.floor((PERIOD_END + 30 * DAY) / 1000) } }));
+      assert.equal((await c.post("invoice.payment_failed", failed)).body.outcome, "applied");
       await c.tick();
       const row = c.instance(s);
       assert.equal(row.stage, "past_due"); assert.equal(row.cancellationReason, "renewal_unpaid");

@@ -181,6 +181,14 @@ export interface RoleSubscriptionRecord {
   /** What the customer has paid THROUGH for this role — this role's OWN
    *  figure, never blended with any other role's. */
   periodEndMs: number | null;
+  /** v0.4.111 — the latest period end a PAID invoice proved for this role
+   *  (forward only). Absent on records written before 0.4.111: unknown,
+   *  never read as either "paid" or "not paid". */
+  paidPeriodEndMs?: number;
+  /** v0.4.111 — the period end of a failed renewal invoice no paid invoice
+   *  has covered yet. Set by `invoice.payment_failed`; cleared only by a paid
+   *  invoice whose period end reaches it. */
+  unpaidPeriodEndMs?: number;
   chargeIds: string[];
   disputed: boolean;
   refunded: boolean;
@@ -204,6 +212,10 @@ export interface BundleSubscriptionRecord {
   launchIntentId?: string;
   /** Exact admitted initial invoice, retained until both role writes and hooks finish. */
   initialPaidPending?: { eventSha256: string; checkoutWatermarkMs: number };
+  /** v0.4.110 — paid invoices whose term was applied (newest last, bounded);
+   *  lets a paid invoice delivered behind a newer lifecycle event record its
+   *  term exactly once. Absent on records written before 0.4.110. */
+  paidTermInvoiceIds?: string[];
   latestEventCreatedMs: number;
   pendingStatus: "past_due" | null;
   terminal: boolean;

@@ -154,6 +154,8 @@ export interface LicenseLeaseDeps {
   readonly randomBytes?: (size: number) => Buffer;
   readonly randomId?: () => string;
   readonly featuresFor?: (licenseId: string) => readonly string[];
+  /** Journal sink for activation refusals (v0.4.111); console by default. */
+  readonly log?: (line: string) => void;
 }
 
 interface ChallengeFacts {
@@ -210,7 +212,13 @@ type LeaseAuditEvent =
       readonly kind: "activation_deactivated";
       readonly atMs: number;
       readonly nonceHash: string | null;
-      readonly actor: "install" | "admin";
+      /** v0.4.111 — "hosting": the Hub released the activation of a hosted
+       *  server it destroyed itself (a region replacement). Written as the
+       *  existing kind with a non-install, non-admin actor so a rollback to
+       *  0.4.110 still replays the ledger (that build only checks
+       *  `nonceHash === null` for a non-install actor) and, unlike an admin
+       *  deactivation, it does not recovery-lock the licence. */
+      readonly actor: "install" | "admin" | "hosting";
       readonly reason: string;
       readonly activation: LeaseActivation;
     }
@@ -796,6 +804,8 @@ export class LicenseLeaseService {
   private readonly ledgerRotateBytes: number;
   private readonly ledgerMaxBytes: number;
   private replayCache: ReplayCache | null = null;
+  private readonly log: (line: string) => void;
+  private readonly refusalsByKey = new Map<string, { licenseId: string; installId: string; reason: string; firstAtMs: number; lastAtMs: number; count: number; loggedAtMs?: number }>();
   private readonly wallClockAnchorMs: number;
   private readonly monotonicAnchorMs: number;
 
@@ -810,6 +820,7 @@ export class LicenseLeaseService {
     this.nonceBytes = deps.randomBytes ?? randomBytes;
     this.randomId = deps.randomId ?? randomUUID;
     this.featuresFor = deps.featuresFor ?? (() => []);
+    this.log = deps.log ?? ((line) => console.warn(line));
     this.leaseDurationMs = finiteInt("leaseDurationMs", cfg.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS, 60_000, 7 * 86_400_000);
     this.cachedGraceMs = finiteInt("cachedGraceMs", cfg.cachedGraceMs ?? DEFAULT_LEASE_GRACE_MS, 0, 30 * 86_400_000);
     this.challengeTtlMs = finiteInt("challengeTtlMs", cfg.challengeTtlMs ?? DEFAULT_CHALLENGE_TTL_MS, 10_000, 60 * 60_000);
@@ -1416,6 +1427,15 @@ export class LicenseLeaseService {
   activate(token: string, nonce: string, signature: string): LeaseOperationResult {
     const c = this.consume(token, "activate", nonce, signature);
     if (c.replay) return c.replay;
+    try {
+      return this.activateConsumed(c);
+    } catch (err) {
+      try { this.recordActivationRefusal(c.license.id, c.facts.installId, err); } catch { /* visibility never changes the refusal */ }
+      throw err;
+    }
+  }
+
+  private activateConsumed(c: { license: LicensePayload; state: ReplayState; facts: ChallengeFacts; now: number; nonceHash: string }): LeaseOperationResult {
     const duplicate = [...c.state.activations.values()].find((a) =>
       a.licenseId === c.license.id && a.status === "active" && a.installId === c.facts.installId);
     if (duplicate && duplicate.installPublicKey !== c.facts.installPublicKey) {
@@ -1532,6 +1552,64 @@ export class LicenseLeaseService {
     return activation;
   }
 
+  /** v0.4.111 — release every active activation of `installId` on
+   *  `licenseId` because the hosted server it ran on was destroyed by the
+   *  Hub's own region replacement (the old generation's provider instance is
+   *  deleted before this is called). Audited as `activation_deactivated` with
+   *  actor "hosting"; it frees the seat for the replacement server's install
+   *  without the admin recovery lock. Idempotent: an install with no active
+   *  activation releases nothing. */
+  releaseRetiredHostingMachine(licenseId: string, installId: string, reason: string): LeaseActivation[] {
+    const id = boundedText("licenseId", licenseId, 128);
+    const install = boundedText("installId", installId, 128);
+    const why = boundedText("reason", reason, 500);
+    if (!this.licenses.isKnown(id)) throw new Error("unknown license id");
+    const released: LeaseActivation[] = [];
+    for (let i = 0; i < 8; i++) {
+      const state = this.replay();
+      const current = [...state.activations.values()].find((a) => a.licenseId === id && a.installId === install && a.status === "active");
+      if (!current) break;
+      const now = this.serverNow(state);
+      const activation: LeaseActivation = {
+        ...current, status: "deactivated", updatedAtMs: now, deactivatedAtMs: now,
+        deactivationReason: why, revision: current.revision + 1,
+      };
+      this.appendEvent({ schemaVersion: 1, eventId: this.randomId(), kind: "activation_deactivated",
+        atMs: now, nonceHash: null, actor: "hosting", reason: why, activation }, state.lastHash);
+      released.push(activation);
+    }
+    return released;
+  }
+
+  /** v0.4.111 — activation refusals are thrown before any audit write (a
+   *  refusal is not a ledger event, and one per hourly retry would bloat the
+   *  signed ledger). They are kept here instead: a bounded in-memory list for
+   *  the admin snapshot, and one journal line per (licence, install, reason)
+   *  per hour. Never the bearer, nonce or signature. */
+  private recordActivationRefusal(licenseId: string, installId: string, error: unknown): void {
+    const reason = String((error as Error)?.message ?? error).slice(0, 300);
+    const atMs = this.now();
+    const key = `${licenseId}\u0000${installId}\u0000${reason}`;
+    const prior = this.refusalsByKey.get(key);
+    const entry = { licenseId, installId, reason, firstAtMs: prior?.firstAtMs ?? atMs, lastAtMs: atMs, count: (prior?.count ?? 0) + 1 };
+    this.refusalsByKey.delete(key);
+    this.refusalsByKey.set(key, entry);
+    while (this.refusalsByKey.size > 200) this.refusalsByKey.delete(this.refusalsByKey.keys().next().value!);
+    if (!prior || atMs - (prior.loggedAtMs ?? 0) >= 3_600_000) {
+      (entry as { loggedAtMs?: number }).loggedAtMs = atMs;
+      this.log(`[license-lease] activation refused for licence ${licenseId.slice(0, 8)}… install ${installId.slice(0, 8)}…: ${reason} (${entry.count} refusal${entry.count === 1 ? "" : "s"} since ${new Date(entry.firstAtMs).toISOString()})`);
+    } else {
+      (entry as { loggedAtMs?: number }).loggedAtMs = prior.loggedAtMs;
+    }
+  }
+
+  /** Recent activation refusals, newest first (bounded, in memory). */
+  activationRefusals(licenseId?: string): readonly { licenseId: string; installId: string; reason: string; firstAtMs: number; lastAtMs: number; count: number }[] {
+    return [...this.refusalsByKey.values()].filter((r) => !licenseId || r.licenseId === licenseId)
+      .sort((a, b) => b.lastAtMs - a.lastAtMs)
+      .map(({ licenseId: l, installId, reason, firstAtMs, lastAtMs, count }) => ({ licenseId: l, installId, reason, firstAtMs, lastAtMs, count }));
+  }
+
   observeRevocation(licenseId: string, reason: string): void {
     const state = this.replay();
     const now = this.serverNow(state);
@@ -1577,6 +1655,7 @@ export class LicenseLeaseService {
     readonly seatOverrides: Readonly<Record<string, number>>;
     readonly audit: readonly LeaseAuditEvent[];
     readonly recoveryLockedLicenses: readonly string[];
+    readonly activationRefusals: ReturnType<LicenseLeaseService["activationRefusals"]>;
   } {
     const state = this.replay();
     const activations = [...state.activations.values()]
@@ -1596,6 +1675,7 @@ export class LicenseLeaseService {
       defaultMaxMachines: this.defaultMaxMachines, auditRevision: state.events.length,
       activations, seatOverrides, audit,
       recoveryLockedLicenses: [...state.adminRecoveryLocked].filter((id) => !licenseId || id === licenseId).sort(),
+      activationRefusals: this.activationRefusals(licenseId),
     };
   }
 }

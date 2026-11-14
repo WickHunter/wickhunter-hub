@@ -518,6 +518,23 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     randomBytes: deps.hostingRandomBytes,
     provider: deps.hostingProvider,
     publicHealthFetch: deps.hostingPublicHealthFetch,
+    // v0.4.111 — a region replacement releases the destroyed server's
+    // machine seat. The old install is identified by the licence's latest
+    // check-in coming from the destroyed server's address; anything less
+    // exact releases nothing (a customer's own machine is never touched).
+    retireMachineLease: (m) => {
+      if (!licenseLeases) return { released: [], note: "the machine-bound lease service is unavailable" };
+      if (!m.licenseId) return { released: [], note: "no software licence is bound to this hosting owner" };
+      if (!m.ip) return { released: [], note: "the retired server had no recorded address" };
+      const seen = readRoster(cfg.dataDir)[m.licenseId];
+      const norm = (ip: string) => ip.startsWith("::ffff:") && isIP(ip.slice(7)) === 4 ? ip.slice(7) : ip;
+      if (!seen || norm(String(seen.ip ?? "")) !== norm(m.ip)) {
+        return { released: [], note: `the licence's latest check-in is ${seen ? "from another address" : "absent"}, so the retired server's install cannot be identified` };
+      }
+      const released = licenseLeases.releaseRetiredHostingMachine(m.licenseId, seen.installId,
+        `hosting region replacement: ${m.instanceId} generation ${m.generation} at ${m.ip}${m.providerInstanceId ? ` (provider ${m.providerInstanceId})` : ""} was deleted by the Hub; install ${seen.installId} last checked in from it`);
+      return { released: released.map((a) => a.id), note: released.length ? `install ${seen.installId} last checked in from the retired server` : `install ${seen.installId} holds no active activation` };
+    },
   });
   function publicHostingOptions() {
     const policy = hosting.policy();
@@ -3642,6 +3659,18 @@ export function createHub(cfg: HubConfig, deps: HubDeps = {}): Hub {
     // `/api/hosting/:id/resume-renewal` with operator admission. Stripe
     // must confirm first; a Stripe refusal/timeout is 503 so the operator
     // retries, every other refusal is 409 with its code.
+    // v0.4.111 — POST /admin/api/hosting/billing-repair {dryRun?, instanceIds?,
+    // by, reason, confirm}: recompute each live hosting row's billing stage
+    // from Stripe's paid invoices (GET only). A dry run (the default) writes
+    // nothing; an apply changes only listed rows Stripe proves paid
+    // (`HostingService.adminBillingRepair`).
+    if (m === "POST" && p === "/admin/api/hosting/billing-repair") {
+      const body = await readJsonBody(req);
+      if (body === null) return sendJson(res, 400, { ok: false, error: "expected a JSON body" }, { "cache-control": "no-store" });
+      const r = await hosting.adminBillingRepair({ dryRun: body.dryRun !== false, instanceIds: body.instanceIds, by: body.by, reason: body.reason, confirm: body.confirm }, rateLimitNow());
+      if (!r.ok) return sendJson(res, 400, { ok: false, code: r.code, error: r.error }, { "cache-control": "no-store" });
+      return sendJson(res, 200, { ok: true, ...r.value }, { "cache-control": "no-store" });
+    }
     if (m === "POST" && p.startsWith("/admin/api/hosting/instances/") && p.endsWith("/resume-renewal")) {
       const id = p.slice("/admin/api/hosting/instances/".length, -"/resume-renewal".length);
       const body = await readJsonBody(req);

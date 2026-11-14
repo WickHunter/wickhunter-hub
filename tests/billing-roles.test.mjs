@@ -219,10 +219,13 @@ await test("REPRODUCED DEFECT, NOW FIXED: a payment failure on hosting never mar
   await postEvent("test", event("invoice.payment_failed", {
     id: "in_host_2", object: "invoice", customer: "cus_shared", customer_email: "zack@example.com", customer_name: "Zack",
     subscription: hostingSubscriptionId, charge: "", payment_intent: "", paid: false, status: "open",
-    billing_reason: "subscription_cycle", lines: { data: [{ period: { start: sec(), end: sec() + 30 * 86_400 }, price: { id: HOST_PRICE, product: HOST_PRODUCT } }] },
+    // The NEXT period's renewal fails (v0.4.111: a failure for the period
+    // the paid invoice above already covers is "an already paid term").
+    billing_reason: "subscription_cycle", lines: { data: [{ period: { start: sec() + 30 * 86_400, end: sec() + 60 * 86_400 }, price: { id: HOST_PRICE, product: HOST_PRODUCT } }] },
   }));
   assert.equal(swRec("cus_shared").subscriptionStatus, "active", "software status is untouched by a hosting payment failure");
   assert.equal(hostRec("cus_shared").subscriptionStatus, "past_due");
+  assert.equal(hostRec("cus_shared").unpaidPeriodEndMs, sec() * 1000 + 60 * DAY, "the failed renewal's own period is recorded");
 });
 
 await test("REPRODUCED DEFECT, NOW FIXED: a full refund on the hosting charge never revokes the software licence", async () => {
